@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Incoming};
 use std::{
     pin::Pin,

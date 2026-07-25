@@ -1,144 +1,256 @@
-#![allow(clippy::too_many_arguments)]
+mod browser_api;
+mod disk_space;
+mod download;
+mod listing;
+mod path_coordinator;
+mod rooted_fs;
+mod session;
+mod storage;
+mod upload;
 
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
-use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
-use crate::noscript::{detect_noscript, generate_noscript_html};
-use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
-use crate::Args;
-
-use anyhow::{anyhow, Result};
-use async_deflate_zip::{Compression, WriterOptions, ZipWriter};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bytes::Bytes;
-use chrono::{LocalResult, TimeZone, Utc};
-use futures_util::{pin_mut, TryStreamExt};
-use headers::{
-    AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
-    ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
-    IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
-};
-use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
-use hyper::body::Frame;
-use hyper::{
-    body::Incoming,
-    header::{
-        HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+use self::{
+    browser_api::BROWSER_API_PREFIX,
+    disk_space::DiskSpaceTracker,
+    listing::LIST_API_PATH,
+    path_coordinator::PathCoordinator,
+    rooted_fs::{RootedEntryKey, RootedFs},
+    session::{LOGIN_ERROR_QUERY, LOGIN_PATH, LOGOUT_PATH, LoginErrorStore},
+    storage::DurableStorage,
+    upload::{
+        UploadOptions, is_upload_temp_name, parse_upload_id, parse_upload_length,
+        parse_upload_offset,
     },
-    Method, StatusCode, Uri,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::fs::Metadata;
-use std::io::SeekFrom;
-use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
-use std::time::SystemTime;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
-use tokio::{fs, io};
+use crate::{
+    Args, app_error::AppError, auth::session_token_from_cookie, http_utils::body_full,
+    request_context::RequestContext, utils::decode_uri,
+};
 
-use tokio_util::io::{ReaderStream, StreamReader};
-use uuid::Uuid;
-use walkdir::{DirEntry, WalkDir};
-use xml::escape::escape_str_pcdata;
+use anyhow::Result;
+use bytes::Bytes;
+use headers::{ContentType, HeaderMapExt};
+use http_body_util::combinators::BoxBody;
+use hyper::{
+    Method, StatusCode,
+    body::Incoming,
+    header::{CACHE_CONTROL, CONTENT_DISPOSITION, COOKIE, HeaderValue},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, atomic::AtomicBool},
+    time::{Duration, SystemTime},
+};
+use tokio::sync::Semaphore;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub type Request = hyper::Request<Incoming>;
 pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
 
-const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
 const INDEX_JS: &str = include_str!("../assets/index.js");
+const MODULE_API_JS: &str = include_str!("../assets/modules/api.js");
+const MODULE_APP_JS: &str = include_str!("../assets/modules/app.js");
+const MODULE_DOM_JS: &str = include_str!("../assets/modules/dom.js");
+const MODULE_LISTING_JS: &str = include_str!("../assets/modules/listing.js");
+const MODULE_OPERATIONS_JS: &str = include_str!("../assets/modules/operations.js");
+const MODULE_PATH_JS: &str = include_str!("../assets/modules/path.js");
+const MODULE_UPLOAD_JS: &str = include_str!("../assets/modules/upload.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
-const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
-const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
-const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
-pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
+const CSRF_AUTH_ERROR: &str = "csrf";
 
 pub struct Server {
     args: Args,
     assets_prefix: String,
-    html: Cow<'static, str>,
-    single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    path_coordinator: PathCoordinator,
+    rooted_fs: RootedFs,
+    storage: DurableStorage,
+    active_upload_files: Arc<Mutex<HashSet<RootedEntryKey>>>,
+    login_slots: Arc<Semaphore>,
+    upload_slots: Arc<Semaphore>,
+    search_slots: Arc<Semaphore>,
+    zip_slots: Arc<Semaphore>,
+    disk_space: DiskSpaceTracker,
+    login_errors: Mutex<LoginErrorStore>,
+    work_tasks: TaskTracker,
+    commit_tasks: TaskTracker,
+    shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
 }
 
 impl Server {
-    pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
-        let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
-        let single_file_req_paths = if args.path_is_file {
-            vec![
-                args.uri_prefix.to_string(),
-                args.uri_prefix[0..args.uri_prefix.len() - 1].to_string(),
-                encode_uri(&format!(
-                    "{}{}",
-                    &args.uri_prefix,
-                    get_file_name(&args.serve_path)
-                )),
-            ]
-        } else {
-            vec![]
-        };
-        let html = match args.assets.as_ref() {
-            Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
-            None => Cow::Borrowed(INDEX_HTML),
-        };
+    pub fn init(
+        args: Args,
+        running: Arc<AtomicBool>,
+        work_tasks: TaskTracker,
+        commit_tasks: TaskTracker,
+        shutdown: CancellationToken,
+        force_shutdown: CancellationToken,
+    ) -> Result<Self> {
+        let assets_prefix = embedded_assets_prefix();
+        let rooted_fs = RootedFs::new(&args.serve_path)?;
+        let max_concurrent_uploads = args.max_concurrent_uploads;
+        let max_concurrent_searches = args.max_concurrent_searches;
+        let max_concurrent_zips = args.max_concurrent_zips;
+        let storage = DurableStorage::new(rooted_fs.clone());
         Ok(Self {
             args,
             running,
-            single_file_req_paths,
             assets_prefix,
-            html,
+            path_coordinator: PathCoordinator::new(rooted_fs.clone()),
+            rooted_fs,
+            storage,
+            active_upload_files: Arc::new(Mutex::new(HashSet::new())),
+            login_slots: Arc::new(Semaphore::new(2)),
+            upload_slots: Arc::new(Semaphore::new(max_concurrent_uploads)),
+            search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
+            zip_slots: Arc::new(Semaphore::new(max_concurrent_zips)),
+            disk_space: DiskSpaceTracker::new(),
+            login_errors: Mutex::new(LoginErrorStore::default()),
+            work_tasks,
+            commit_tasks,
+            shutdown,
+            force_shutdown,
         })
+    }
+
+    pub(super) fn spawn_background<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let force_shutdown = self.force_shutdown.clone();
+        drop(self.work_tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = force_shutdown.cancelled() => {}
+                _ = task => {}
+            }
+        }));
+    }
+
+    pub fn start_maintenance(self: &Arc<Self>) {
+        let server = self.clone();
+        drop(self.work_tasks.spawn(async move {
+            server.run_upload_maintenance().await;
+        }));
+    }
+
+    pub(super) async fn run_commit<F, T>(&self, task: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.commit_tasks
+            .spawn(async move {
+                let result = task.await;
+                if let Err(err) = &result {
+                    error!("Tracked filesystem mutation failed error={err:#}");
+                }
+                result
+            })
+            .await?
+    }
+
+    async fn run_tracked_upload(
+        self: &Arc<Self>,
+        path: &Path,
+        options: UploadOptions,
+        req: Request,
+        upload_permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Response> {
+        let server = self.clone();
+        let path = path.to_path_buf();
+        self.run_commit(async move {
+            let _upload_permit = upload_permit;
+            let mut response = Response::default();
+            server
+                .handle_upload(&path, options, req, &mut response)
+                .await?;
+            Ok(response)
+        })
+        .await
     }
 
     pub async fn call(
         self: Arc<Self>,
         req: Request,
-        addr: Option<SocketAddr>,
+        addr: SocketAddr,
     ) -> Result<Response, hyper::Error> {
-        let uri = req.uri().clone();
-        let assets_prefix = &self.assets_prefix;
-        let enable_cors = self.args.enable_cors;
-        let mut http_log_data = self.args.http_logger.data(&req);
-        if let Some(addr) = addr {
-            http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
-        }
-
-        let mut res = match self.clone().handle(req).await {
-            Ok(res) => {
-                http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
-                if !uri.path().starts_with(assets_prefix) {
-                    self.args.http_logger.log(&http_log_data, None);
+        let public_asset_request = req.method() == Method::GET
+            && self
+                .resolve_path(req.uri().path())
+                .as_deref()
+                .is_some_and(|path| self.is_public_asset_path(path));
+        let upload_request = matches!(req.method(), &Method::PUT | &Method::PATCH);
+        let mut context = RequestContext::new(&req, addr, &self.args.http_logger);
+        let handle = self.clone().handle(req, &mut context);
+        let handle_result = if upload_request {
+            handle.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(self.args.request_timeout), handle).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let mut res = Response::default();
+                    status_error(&mut res, StatusCode::GATEWAY_TIMEOUT, "Request timed out");
+                    context.access_log_mut().insert(
+                        "status".to_string(),
+                        StatusCode::GATEWAY_TIMEOUT.as_u16().to_string(),
+                    );
+                    self.args.http_logger.log(
+                        context.access_log(),
+                        Some("request time budget exceeded".to_string()),
+                    );
+                    set_private_no_store(&mut res);
+                    return Ok(res);
                 }
-                res
-            }
-            Err(err) => {
-                let mut res = Response::default();
-                let status = StatusCode::INTERNAL_SERVER_ERROR;
-                *res.status_mut() = status;
-                http_log_data.insert("status".to_string(), status.as_u16().to_string());
-                self.args
-                    .http_logger
-                    .log(&http_log_data, Some(err.to_string()));
-                res
             }
         };
 
-        if enable_cors {
-            add_cors(&mut res);
+        let (mut res, successful_public_asset) = match handle_result {
+            Ok(res) => {
+                let successful_public_asset =
+                    public_asset_request && res.status() == StatusCode::OK;
+                context
+                    .access_log_mut()
+                    .insert("status".to_string(), res.status().as_u16().to_string());
+                if !successful_public_asset {
+                    self.args.http_logger.log(context.access_log(), None);
+                }
+                (res, successful_public_asset)
+            }
+            Err(err) => {
+                let mut res = Response::default();
+                let error = AppError::internal(err);
+                apply_app_error(&mut res, &error);
+                context
+                    .access_log_mut()
+                    .insert("status".to_string(), error.status().as_u16().to_string());
+                self.args
+                    .http_logger
+                    .log(context.access_log(), Some(error.to_string()));
+                (res, false)
+            }
+        };
+        if !successful_public_asset {
+            set_private_no_store(&mut res);
         }
+
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(
+        self: Arc<Self>,
+        req: Request,
+        context: &mut RequestContext,
+    ) -> Result<Response> {
         let mut res = Response::default();
 
         let req_path = req.uri().path();
@@ -146,1290 +258,451 @@ impl Server {
         let method = req.method().clone();
 
         let relative_path = match self.resolve_path(req_path) {
-            Some(v) => v,
+            Some(value) => value,
             None => {
                 status_bad_request(&mut res, "Invalid Path");
                 return Ok(res);
             }
         };
 
-        if method == Method::GET
-            && self
-                .handle_internal(&relative_path, headers, &mut res)
-                .await?
-        {
-            return Ok(res);
-        }
-
-        let user_agent = headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_lowercase())
-            .unwrap_or_default();
-
-        let is_microsoft_webdav = user_agent.starts_with("microsoft-webdav-miniredir/");
-
-        if is_microsoft_webdav {
-            // microsoft webdav requires this.
-            res.headers_mut()
-                .insert(CONNECTION, HeaderValue::from_static("close"));
-        }
-
-        let authorization = headers.get(AUTHORIZATION);
-
         let query = req.uri().query().unwrap_or_default();
-        let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+        let query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
 
-        let guard = self.args.auth.guard(
-            &relative_path,
-            &method,
-            authorization,
-            query_params.get("token"),
-            is_microsoft_webdav,
-        );
-
-        let (user, access_paths) = match guard {
-            (None, None) => {
-                self.auth_reject(&mut res)?;
-                return Ok(res);
-            }
-            (Some(_), None) => {
-                status_forbid(&mut res);
-                return Ok(res);
-            }
-            (x, Some(y)) => (x, y),
-        };
-
-        if detect_noscript(&user_agent) {
-            query_params.insert("noscript".to_string(), String::new());
-        }
-
-        if method.as_str() == "CHECKAUTH" {
-            match user.clone() {
-                Some(user) => {
-                    *res.body_mut() = body_full(user);
-                }
-                None => {
-                    if has_query_flag(&query_params, "login") || !access_paths.perm().readwrite() {
-                        self.auth_reject(&mut res)?
-                    } else {
-                        *res.body_mut() = body_full("");
-                    }
-                }
-            }
-            return Ok(res);
-        } else if method.as_str() == "LOGOUT" {
-            self.auth_reject(&mut res)?;
-            return Ok(res);
-        }
-
-        if has_query_flag(&query_params, "tokengen") {
-            self.handle_tokengen(&relative_path, user, &mut res).await?;
-            return Ok(res);
-        }
-
-        let head_only = method == Method::HEAD;
-
-        if self.args.path_is_file {
-            if self
-                .single_file_req_paths
-                .iter()
-                .any(|v| v.as_str() == req_path)
-            {
-                self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
-                    .await?;
-            } else {
-                self.handle_not_found(&query_params, headers, head_only, &mut res)
-                    .await?;
-            }
-            return Ok(res);
-        }
-        let path = match self.join_path(&relative_path) {
-            Some(v) => v,
-            None => {
-                status_forbid(&mut res);
-                return Ok(res);
-            }
-        };
-
-        let path = path.as_path();
-
-        let (is_miss, is_dir, is_file, size) = match fs::metadata(path).await.ok() {
-            Some(meta) => (false, meta.is_dir(), meta.is_file(), meta.len()),
-            None => (true, false, false, 0),
-        };
-
-        let allow_upload = self.args.allow_upload;
-        let allow_delete = self.args.allow_delete;
-        let allow_search = self.args.allow_search;
-        let allow_archive = self.args.allow_archive;
-        let render_index = self.args.render_index;
-        let render_spa = self.args.render_spa;
-        let render_try_index = self.args.render_try_index;
-
-        if self.guard_root_contained(path).await {
-            self.handle_not_found(&query_params, headers, head_only, &mut res)
-                .await?;
-            return Ok(res);
-        }
-
-        match method {
-            Method::GET | Method::HEAD => {
-                if is_dir {
-                    if render_try_index {
-                        if allow_archive && has_query_flag(&query_params, "zip") {
-                            if !allow_archive {
-                                self.handle_not_found(&query_params, headers, head_only, &mut res)
-                                    .await?;
-                                return Ok(res);
-                            }
-                            self.handle_zip_dir(path, head_only, access_paths, &mut res)
-                                .await?;
-                        } else if allow_search && query_params.contains_key("q") {
-                            self.handle_search_dir(
-                                path,
-                                &query_params,
-                                head_only,
-                                user,
-                                access_paths,
-                                &mut res,
-                            )
-                            .await?;
-                        } else {
-                            self.handle_render_index(
-                                path,
-                                &query_params,
-                                headers,
-                                head_only,
-                                user,
-                                access_paths,
-                                &mut res,
-                            )
-                            .await?;
-                        }
-                    } else if render_index || render_spa {
-                        self.handle_render_index(
-                            path,
-                            &query_params,
-                            headers,
-                            head_only,
-                            user,
-                            access_paths,
-                            &mut res,
-                        )
-                        .await?;
-                    } else if has_query_flag(&query_params, "zip") {
-                        if !allow_archive {
-                            status_not_found(&mut res);
-                            return Ok(res);
-                        }
-                        self.handle_zip_dir(path, head_only, access_paths, &mut res)
-                            .await?;
-                    } else if allow_search && query_params.contains_key("q") {
-                        self.handle_search_dir(
-                            path,
-                            &query_params,
-                            head_only,
-                            user,
-                            access_paths,
-                            &mut res,
-                        )
-                        .await?;
-                    } else {
-                        self.handle_ls_dir(
-                            path,
-                            true,
-                            &query_params,
-                            head_only,
-                            user,
-                            access_paths,
-                            &mut res,
-                        )
-                        .await?;
-                    }
-                } else if is_file {
-                    if has_query_flag(&query_params, "json") {
-                        self.handle_file_json(path, head_only, &mut res).await?;
-                    } else if has_query_flag(&query_params, "edit") {
-                        self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
-                            .await?;
-                    } else if has_query_flag(&query_params, "view") {
-                        self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
-                            .await?;
-                    } else if has_query_flag(&query_params, "hash") {
-                        if self.args.allow_hash {
-                            self.handle_hash_file(path, head_only, &mut res).await?;
-                        } else {
-                            status_forbid(&mut res);
-                        }
-                    } else {
-                        self.handle_send_file(path, headers, head_only, &mut res)
-                            .await?;
-                    }
-                } else if render_spa {
-                    self.handle_render_spa(path, &query_params, headers, head_only, &mut res)
-                        .await?;
-                } else if allow_upload && req_path.ends_with('/') {
-                    self.handle_ls_dir(
-                        path,
-                        false,
-                        &query_params,
-                        head_only,
-                        user,
-                        access_paths,
+        if relative_path == LOGIN_PATH {
+            match method {
+                Method::GET => {
+                    self.send_login_page_for_get(
+                        query_params.get(LOGIN_ERROR_QUERY).map(String::as_str),
                         &mut res,
-                    )
-                    .await?;
-                } else {
-                    self.handle_not_found(&query_params, headers, head_only, &mut res)
-                        .await?;
+                    )?;
                 }
-            }
-            Method::OPTIONS => {
-                set_webdav_headers(&mut res);
-            }
-            Method::PUT => {
-                if is_dir || !allow_upload || (!allow_delete && size > 0) {
-                    status_forbid(&mut res);
-                } else {
-                    self.handle_upload(path, None, size, req, &mut res).await?;
-                }
-            }
-            Method::PATCH => {
-                if is_miss {
-                    status_not_found(&mut res);
-                } else if !allow_upload {
-                    status_forbid(&mut res);
-                } else {
-                    let offset = match parse_upload_offset(headers, size) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            status_bad_request(&mut res, &err.to_string());
-                            return Ok(res);
-                        }
-                    };
-                    match offset {
-                        Some(offset) => {
-                            if offset < size && !allow_delete {
-                                status_forbid(&mut res);
-                                return Ok(res);
-                            }
-                            self.handle_upload(path, Some(offset), size, req, &mut res)
-                                .await?;
-                        }
-                        None => {
-                            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        }
-                    }
-                }
-            }
-            Method::DELETE => {
-                if !allow_delete {
-                    status_forbid(&mut res);
-                } else if !is_miss {
-                    self.handle_delete(path, is_dir, &mut res).await?
-                } else {
-                    status_not_found(&mut res);
-                }
-            }
-            method => match method.as_str() {
-                "PROPFIND" => {
-                    if is_dir {
-                        let access_paths =
-                            if access_paths.perm().indexonly() && authorization.is_none() {
-                                // see https://github.com/sigoden/dufs/issues/229
-                                AccessPaths::new(AccessPerm::ReadOnly)
-                            } else {
-                                access_paths
-                            };
-                        self.handle_propfind_dir(path, headers, access_paths, &mut res)
-                            .await?;
-                    } else if is_file {
-                        self.handle_propfind_file(path, &mut res).await?;
-                    } else {
-                        status_not_found(&mut res);
-                    }
-                }
-                "PROPPATCH" => {
-                    if is_file {
-                        self.handle_proppatch(req_path, &mut res).await?;
-                    } else {
-                        status_not_found(&mut res);
-                    }
-                }
-                "MKCOL" => {
-                    if !allow_upload {
-                        status_forbid(&mut res);
-                    } else if !is_miss {
-                        *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        *res.body_mut() = body_full("Already exists");
-                    } else {
-                        self.handle_mkcol(path, &mut res).await?;
-                    }
-                }
-                "COPY" => {
-                    if !allow_upload {
-                        status_forbid(&mut res);
-                    } else if is_miss {
-                        status_not_found(&mut res);
-                    } else {
-                        self.handle_copy(path, &req, &mut res).await?
-                    }
-                }
-                "MOVE" => {
-                    if !allow_upload || !allow_delete {
-                        status_forbid(&mut res);
-                    } else if is_miss {
-                        status_not_found(&mut res);
-                    } else {
-                        self.handle_move(path, &req, &mut res).await?
-                    }
-                }
-                "LOCK" => {
-                    // Fake lock
-                    if is_file {
-                        let has_auth = authorization.is_some();
-                        self.handle_lock(req_path, has_auth, &mut res).await?;
-                    } else {
-                        status_not_found(&mut res);
-                    }
-                }
-                "UNLOCK" => {
-                    // Fake unlock
-                    if is_miss {
-                        status_not_found(&mut res);
+                Method::POST => {
+                    if let Some(user) = self.handle_login(req, &mut res).await? {
+                        self.args
+                            .http_logger
+                            .set_authenticated_user(context.access_log_mut(), &user);
                     }
                 }
                 _ => {
                     *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
                 }
-            },
-        }
-        Ok(res)
-    }
-
-    async fn handle_upload(
-        &self,
-        path: &Path,
-        upload_offset: Option<u64>,
-        size: u64,
-        req: Request,
-        res: &mut Response,
-    ) -> Result<()> {
-        ensure_path_parent(path).await?;
-        let (mut file, status) = match upload_offset {
-            None => (fs::File::create(path).await?, StatusCode::CREATED),
-            Some(offset) if offset == size => (
-                fs::OpenOptions::new().append(true).open(path).await?,
-                StatusCode::NO_CONTENT,
-            ),
-            Some(offset) => {
-                let mut file = fs::OpenOptions::new().write(true).open(path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                (file, StatusCode::NO_CONTENT)
             }
+            return Ok(res);
+        }
+
+        let session_token = headers
+            .get(COOKIE)
+            .and_then(session_token_from_cookie)
+            .map(str::to_owned);
+        let Some((session_token, session)) = session_token.and_then(|token| {
+            self.args
+                .auth
+                .authenticate(&token)
+                .map(|session| (token, session))
+        }) else {
+            self.reject_unauthenticated(&method, headers, &mut res)?;
+            return Ok(res);
         };
-        let stream = IncomingStream::new(req.into_body());
+        self.args
+            .http_logger
+            .set_authenticated_user(context.access_log_mut(), &session.user);
 
-        let body_with_io_error = stream.map_err(io::Error::other);
-        let body_reader = StreamReader::new(body_with_io_error);
-
-        pin_mut!(body_reader);
-
-        let ret = io::copy(&mut body_reader, &mut file).await;
-        let size = fs::metadata(path)
-            .await
-            .map(|v| v.len())
-            .unwrap_or_default();
-        if ret.is_err() {
-            if upload_offset.is_none() && size < RESUMABLE_UPLOAD_MIN_SIZE {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-            ret?;
-        }
-
-        *res.status_mut() = status;
-
-        Ok(())
-    }
-
-    async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
-        match is_dir {
-            true => fs::remove_dir_all(path).await?,
-            false => fs::remove_file(path).await?,
-        }
-
-        status_no_content(res);
-        Ok(())
-    }
-
-    async fn handle_ls_dir(
-        &self,
-        path: &Path,
-        exist: bool,
-        query_params: &HashMap<String, String>,
-        head_only: bool,
-        user: Option<String>,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        let mut paths = vec![];
-        if !head_only && exist {
-            paths = match self.list_dir(path, path, access_paths.clone()).await {
-                Ok(paths) => paths,
-                Err(_) => {
-                    status_forbid(res);
-                    return Ok(());
-                }
-            }
-        };
-        self.send_index(
-            path,
-            paths,
-            exist,
-            query_params,
-            head_only,
-            user,
-            access_paths,
-            res,
-        )
-    }
-
-    async fn handle_search_dir(
-        &self,
-        path: &Path,
-        query_params: &HashMap<String, String>,
-        head_only: bool,
-        user: Option<String>,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        let mut paths: Vec<PathItem> = vec![];
-        let search = query_params
-            .get("q")
-            .ok_or_else(|| anyhow!("invalid q"))?
-            .to_lowercase();
-        if search.is_empty() {
-            return self
-                .handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
-                .await;
-        }
-
-        if !head_only {
-            let path_buf = path.to_path_buf();
-            let hidden = Arc::new(self.args.hidden.to_vec());
-            let search = search.clone();
-
-            let search_paths = tokio::spawn(collect_dir_entries(
-                access_paths.clone(),
-                self.running.clone(),
-                path_buf,
-                hidden,
-                self.args.allow_symlink,
-                self.args.serve_path.clone(),
-                move |x| get_file_name(x.path()).to_lowercase().contains(&search),
-            ))
-            .await?;
-
-            for search_path in search_paths.into_iter() {
-                if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
-                    paths.push(item);
-                }
-            }
-        }
-        self.send_index(
-            path,
-            paths,
-            true,
-            query_params,
-            head_only,
-            user,
-            access_paths,
-            res,
-        )
-    }
-
-    async fn handle_zip_dir(
-        &self,
-        path: &Path,
-        head_only: bool,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
-        let filename = try_get_file_name(path)?;
-        set_content_disposition(res, false, &format!("{filename}.zip"))?;
-        res.headers_mut()
-            .insert("content-type", HeaderValue::from_static("application/zip"));
-        if head_only {
-            return Ok(());
-        }
-        let path = path.to_owned();
-        let hidden = self.args.hidden.clone();
-        let running = self.running.clone();
-        let compression = self.args.compress.to_compression();
-        let follow_symlinks = self.args.allow_symlink;
-        let serve_path = self.args.serve_path.clone();
-        tokio::spawn(async move {
-            if let Err(e) = zip_dir(
-                &mut writer,
-                &path,
-                access_paths,
-                &hidden,
-                compression,
-                follow_symlinks,
-                serve_path,
-                running,
-            )
-            .await
-            {
-                error!("Failed to zip {}, {e}", path.display());
-            }
-        });
-        let reader_stream = ReaderStream::with_capacity(reader, BUF_SIZE);
-        let stream_body = StreamBody::new(
-            reader_stream
-                .map_ok(Frame::data)
-                .map_err(|err| anyhow!("{err}")),
-        );
-        let boxed_body = stream_body.boxed();
-        *res.body_mut() = boxed_body;
-        Ok(())
-    }
-
-    async fn handle_render_index(
-        &self,
-        path: &Path,
-        query_params: &HashMap<String, String>,
-        headers: &HeaderMap<HeaderValue>,
-        head_only: bool,
-        user: Option<String>,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        let index_path = path.join(INDEX_NAME);
-        if fs::metadata(&index_path)
-            .await
-            .ok()
-            .map(|v| v.is_file())
-            .unwrap_or_default()
+        if matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) && !self.csrf_is_valid(headers, req.uri(), &session_token, &session.csrf_token)
         {
-            self.handle_send_file(&index_path, headers, head_only, res)
-                .await?;
-        } else if self.args.render_try_index {
-            self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
-                .await?;
-        } else {
-            self.handle_not_found(query_params, headers, head_only, res)
-                .await?;
+            status_csrf_forbid(&mut res);
+            return Ok(res);
         }
-        Ok(())
-    }
 
-    async fn handle_file_json(
-        &self,
-        path: &Path,
-        head_only: bool,
-        res: &mut Response,
-    ) -> Result<()> {
-        let pathitem = match self.to_pathitem(path, &self.args.serve_path).await? {
-            Some(v) => v,
+        if method == Method::POST && relative_path == LOGOUT_PATH {
+            self.handle_logout(&session_token, &mut res);
+            return Ok(res);
+        }
+
+        if method == Method::GET && self.handle_internal(&relative_path, &mut res) {
+            return Ok(res);
+        }
+
+        if method == Method::GET && relative_path == LIST_API_PATH {
+            self.handle_list_api(&query_params, &mut res).await?;
+            return Ok(res);
+        }
+
+        if method == Method::POST && relative_path.starts_with(BROWSER_API_PREFIX) {
+            self.handle_browser_api(&relative_path, req, &mut res)
+                .await?;
+            return Ok(res);
+        }
+
+        if relative_path
+            .split('/')
+            .next()
+            .is_some_and(|part| self.is_reserved_internal_component(part))
+        {
+            status_not_found(&mut res);
+            return Ok(res);
+        }
+
+        let head_only = method == Method::HEAD;
+
+        let path = match self.join_path(&relative_path) {
+            Some(value) => value,
             None => {
-                status_not_found(res);
-                return Ok(());
+                status_forbid(&mut res);
+                return Ok(res);
             }
         };
-        let output = serde_json::to_string_pretty(&pathitem)?;
-        res.headers_mut()
-            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-        res.headers_mut()
-            .typed_insert(ContentLength(output.len() as u64));
-        if head_only {
-            return Ok(());
-        }
-        *res.body_mut() = body_full(output);
-        Ok(())
-    }
+        let path = path.as_path();
 
-    async fn handle_render_spa(
-        &self,
-        path: &Path,
-        query_params: &HashMap<String, String>,
-        headers: &HeaderMap<HeaderValue>,
-        head_only: bool,
-        res: &mut Response,
-    ) -> Result<()> {
-        if path.extension().is_none() {
-            let path = self.args.serve_path.join(INDEX_NAME);
-            self.handle_send_file(&path, headers, head_only, res)
-                .await?;
-        } else {
-            self.handle_not_found(query_params, headers, head_only, res)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn handle_not_found(
-        &self,
-        query_params: &HashMap<String, String>,
-        headers: &HeaderMap<HeaderValue>,
-        head_only: bool,
-        res: &mut Response,
-    ) -> Result<()> {
-        if let Some(error_page) = &self.args.error_page {
-            if !has_query_flag(query_params, "noscript") {
-                self.handle_send_file(error_page, headers, head_only, res)
-                    .await?;
-                *res.status_mut() = StatusCode::NOT_FOUND;
-                return Ok(());
-            }
-        }
-        status_not_found(res);
-        Ok(())
-    }
-
-    async fn handle_internal(
-        &self,
-        req_path: &str,
-        headers: &HeaderMap<HeaderValue>,
-        res: &mut Response,
-    ) -> Result<bool> {
-        if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
-            match self.args.assets.as_ref() {
-                Some(assets_path) => {
-                    let path = assets_path.join(name);
-                    if path.exists() {
-                        self.handle_send_file(&path, headers, false, res).await?;
-                    } else {
-                        status_not_found(res);
-                        return Ok(true);
-                    }
-                }
-                None => match name {
-                    "index.js" => {
-                        *res.body_mut() = body_full(INDEX_JS);
-                        res.headers_mut().insert(
-                            "content-type",
-                            HeaderValue::from_static("application/javascript; charset=UTF-8"),
-                        );
-                    }
-                    "index.css" => {
-                        *res.body_mut() = body_full(INDEX_CSS);
-                        res.headers_mut().insert(
-                            "content-type",
-                            HeaderValue::from_static("text/css; charset=UTF-8"),
-                        );
-                    }
-                    "favicon.ico" => {
-                        *res.body_mut() = body_full(FAVICON_ICO);
-                        res.headers_mut()
-                            .insert("content-type", HeaderValue::from_static("image/x-icon"));
-                    }
-                    _ => {
-                        status_not_found(res);
-                    }
-                },
-            }
-            res.headers_mut().insert(
-                "cache-control",
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-            res.headers_mut().insert(
-                "x-content-type-options",
-                HeaderValue::from_static("nosniff"),
-            );
-            Ok(true)
-        } else if req_path == HEALTH_CHECK_PATH {
-            res.headers_mut()
-                .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-
-            *res.body_mut() = body_full(r#"{"status":"OK"}"#);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn handle_send_file(
-        &self,
-        path: &Path,
-        headers: &HeaderMap<HeaderValue>,
-        head_only: bool,
-        res: &mut Response,
-    ) -> Result<()> {
-        let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
-        let (mut file, meta) = (file?, meta?);
-        let size = meta.len();
-        let mut use_range = true;
-        if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
-            if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
-                if !if_unmodified_since.precondition_passes(last_modified.into()) {
-                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
-                    return Ok(());
-                }
-            }
-            if let Some(if_match) = headers.typed_get::<IfMatch>() {
-                if !if_match.precondition_passes(&etag) {
-                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
-                    return Ok(());
-                }
-            }
-            if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
-                if !if_modified_since.is_modified(last_modified.into()) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-            if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-                if !if_none_match.precondition_passes(&etag) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-
-            res.headers_mut()
-                .typed_insert(CacheControl::new().with_no_cache());
-            res.headers_mut().typed_insert(last_modified);
-            res.headers_mut().typed_insert(etag.clone());
-
-            if headers.typed_get::<Range>().is_some() {
-                use_range = headers
-                    .typed_get::<IfRange>()
-                    .map(|if_range| !if_range.is_modified(Some(&etag), Some(&last_modified)))
-                    // Always be fresh if there is no validators
-                    .unwrap_or(true);
-            } else {
-                use_range = false;
-            }
+        if method == Method::DELETE && self.is_managed_root(path) {
+            status_forbid(&mut res);
+            return Ok(res);
         }
 
-        let ranges = if use_range {
-            headers.get(RANGE).map(|range| {
-                range
-                    .to_str()
-                    .ok()
-                    .and_then(|range| parse_range(range, size))
-            })
+        let mut upload_permit = if matches!(method, Method::PUT | Method::PATCH) {
+            match self.upload_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    status_error(
+                        &mut res,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many concurrent uploads",
+                    );
+                    res.headers_mut()
+                        .insert("retry-after", HeaderValue::from_static("1"));
+                    return Ok(res);
+                }
+            }
         } else {
             None
         };
 
-        res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&get_content_type(path).await?)?,
-        );
-
-        let filename = try_get_file_name(path)?;
-        set_content_disposition(res, true, filename)?;
-
-        res.headers_mut().typed_insert(AcceptRanges::bytes());
-
-        if let Some(ranges) = ranges {
-            if let Some(ranges) = ranges {
-                if ranges.len() == 1 {
-                    let (start, end) = ranges[0];
-                    file.seek(SeekFrom::Start(start)).await?;
-                    let range_size = end - start + 1;
-                    *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-                    let content_range = format!("bytes {start}-{end}/{size}");
-                    res.headers_mut()
-                        .insert(CONTENT_RANGE, content_range.parse()?);
-                    res.headers_mut()
-                        .insert(CONTENT_LENGTH, format!("{range_size}").parse()?);
-                    if head_only {
-                        return Ok(());
-                    }
-
-                    let stream_body = StreamBody::new(
-                        LengthLimitedStream::new(file, range_size as usize)
-                            .map_ok(Frame::data)
-                            .map_err(|err| anyhow!("{err}")),
-                    );
-                    let boxed_body = stream_body.boxed();
-                    *res.body_mut() = boxed_body;
-                } else {
-                    *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-                    let boundary = Uuid::new_v4();
-                    let mut body = Vec::new();
-                    let content_type = get_content_type(path).await?;
-                    for (start, end) in ranges {
-                        file.seek(SeekFrom::Start(start)).await?;
-                        let range_size = end - start + 1;
-                        let content_range = format!("bytes {start}-{end}/{size}");
-                        let part_header = format!(
-                            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {content_range}\r\n\r\n",
-                        );
-                        body.extend_from_slice(part_header.as_bytes());
-                        let mut buffer = vec![0; range_size as usize];
-                        file.read_exact(&mut buffer).await?;
-                        body.extend_from_slice(&buffer);
-                        body.extend_from_slice(b"\r\n");
-                    }
-                    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-                    res.headers_mut().insert(
-                        CONTENT_TYPE,
-                        format!("multipart/byteranges; boundary={boundary}").parse()?,
-                    );
-                    res.headers_mut()
-                        .insert(CONTENT_LENGTH, format!("{}", body.len()).parse()?);
-                    if head_only {
-                        return Ok(());
-                    }
-                    *res.body_mut() = body_full(body);
-                }
-            } else {
-                *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
-                res.headers_mut()
-                    .insert(CONTENT_RANGE, format!("bytes */{size}").parse()?);
-            }
+        let mut path_lease = if matches!(method, Method::PUT | Method::PATCH | Method::DELETE) {
+            Some(self.path_coordinator.acquire([path]).await)
         } else {
-            res.headers_mut()
-                .insert(CONTENT_LENGTH, format!("{size}").parse()?);
-            if head_only {
-                return Ok(());
-            }
-
-            let reader_stream = ReaderStream::with_capacity(file, BUF_SIZE);
-            let stream_body = StreamBody::new(
-                reader_stream
-                    .map_ok(Frame::data)
-                    .map_err(|err| anyhow!("{err}")),
-            );
-            let boxed_body = stream_body.boxed();
-            *res.body_mut() = boxed_body;
-        }
-        Ok(())
-    }
-
-    async fn handle_edit_file(
-        &self,
-        path: &Path,
-        kind: DataKind,
-        head_only: bool,
-        user: Option<String>,
-        res: &mut Response,
-    ) -> Result<()> {
-        let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
-        let (file, meta) = (file?, meta?);
-        let href = format!(
-            "/{}",
-            normalize_path(path.strip_prefix(&self.args.serve_path)?)
-        );
-        let mut buffer: Vec<u8> = vec![];
-        file.take(1024).read_to_end(&mut buffer).await?;
-        let editable =
-            meta.len() <= EDITABLE_TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
-        let data = EditData {
-            href,
-            kind,
-            uri_prefix: self.args.uri_prefix.clone(),
-            allow_upload: self.args.allow_upload,
-            allow_delete: self.args.allow_delete,
-            auth: self.args.auth.has_users(),
-            user,
-            editable,
+            None
         };
-        res.headers_mut()
-            .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-        let index_data = STANDARD.encode(serde_json::to_string(&data)?);
-        let output = self
-            .html
-            .replace(
-                "__ASSETS_PREFIX__",
-                &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-            )
-            .replace("__INDEX_DATA__", &index_data);
-        res.headers_mut()
-            .typed_insert(ContentLength(output.len() as u64));
-        res.headers_mut()
-            .typed_insert(CacheControl::new().with_no_cache());
-        if head_only {
-            return Ok(());
-        }
-        *res.body_mut() = body_full(output);
-        Ok(())
-    }
 
-    async fn handle_hash_file(
-        &self,
-        path: &Path,
-        head_only: bool,
-        res: &mut Response,
-    ) -> Result<()> {
-        let output = sha256_file(path).await?;
-        res.headers_mut()
-            .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-        res.headers_mut()
-            .typed_insert(ContentLength(output.len() as u64));
-        if head_only {
-            return Ok(());
-        }
-        *res.body_mut() = body_full(output);
-        Ok(())
-    }
-
-    async fn handle_tokengen(
-        &self,
-        relative_path: &str,
-        user: Option<String>,
-        res: &mut Response,
-    ) -> Result<()> {
-        let output = self
-            .args
-            .auth
-            .generate_token(relative_path, &user.unwrap_or_default())?;
-        res.headers_mut()
-            .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
-        res.headers_mut()
-            .typed_insert(ContentLength(output.len() as u64));
-        *res.body_mut() = body_full(output);
-        Ok(())
-    }
-
-    async fn handle_propfind_dir(
-        &self,
-        path: &Path,
-        headers: &HeaderMap<HeaderValue>,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        let depth: u32 = match headers.get("depth") {
-            Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
-                Some(0) => 0,
-                Some(1) => 1,
-                _ => {
-                    status_bad_request(res, "Invalid depth: only 0 and 1 are allowed.");
-                    return Ok(());
-                }
-            },
-            None => 1,
-        };
-        let mut paths = match self.to_pathitem(path, &self.args.serve_path).await? {
-            Some(v) => vec![v],
-            None => vec![],
-        };
-        if depth == 1 {
-            match self
-                .list_dir(path, &self.args.serve_path, access_paths)
-                .await
+        // Follow normal root-contained links for reads. If the final component
+        // is a dangling link or a link cycle, fall back to metadata for the link
+        // itself so authenticated DELETE and PUT can remove or replace it.
+        // openat2 reports root escapes as XDEV; those deliberately do not use
+        // the no-follow fallback and remain invisible.
+        let metadata = match self.rooted_fs.metadata(path).await {
+            Ok(metadata) => Some(metadata),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
             {
-                Ok(child) => paths.extend(child),
-                Err(_) => {
-                    status_forbid(res);
-                    return Ok(());
+                self.rooted_fs.metadata_nofollow(path).await.ok()
+            }
+            Err(_) => None,
+        };
+        let (is_miss, is_dir, is_file) = match metadata {
+            Some(meta) => (false, meta.is_dir(), meta.is_file()),
+            None => (true, false, false),
+        };
+
+        if is_miss && self.guard_root_contained(path).await {
+            status_not_found(&mut res);
+            return Ok(res);
+        }
+
+        if method == Method::HEAD {
+            match parse_upload_id(headers) {
+                Ok(Some(upload_id)) => {
+                    self.handle_upload_status(path, upload_id, &mut res).await?;
+                    return Ok(res);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    status_bad_request(&mut res, &err.to_string());
+                    return Ok(res);
                 }
             }
         }
-        let output = paths
-            .iter()
-            .map(|v| v.to_dav_xml(self.args.uri_prefix.as_str()))
-            .fold(String::new(), |mut acc, v| {
-                acc.push_str(&v);
-                acc
-            });
-        res_multistatus(res, &output);
-        Ok(())
-    }
 
-    async fn handle_propfind_file(&self, path: &Path, res: &mut Response) -> Result<()> {
-        if let Some(pathitem) = self.to_pathitem(path, &self.args.serve_path).await? {
-            res_multistatus(res, &pathitem.to_dav_xml(self.args.uri_prefix.as_str()));
-        } else {
-            status_not_found(res);
-        }
-        Ok(())
-    }
-
-    async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
-        fs::create_dir_all(path).await?;
-        *res.status_mut() = StatusCode::CREATED;
-        Ok(())
-    }
-
-    async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
-            Some(dest) => dest,
-            None => {
-                return Ok(());
-            }
-        };
-
-        let meta = fs::symlink_metadata(path).await?;
-        if meta.is_dir() {
-            status_forbid(res);
-            return Ok(());
-        }
-
-        ensure_path_parent(&dest).await?;
-
-        if self.guard_root_contained(&dest).await {
-            status_bad_request(res, "Invalid Destination");
-            return Ok(());
-        }
-
-        fs::copy(path, &dest).await?;
-
-        status_no_content(res);
-        Ok(())
-    }
-
-    async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
-            Some(dest) => dest,
-            None => {
-                return Ok(());
-            }
-        };
-
-        ensure_path_parent(&dest).await?;
-
-        if self.guard_root_contained(&dest).await {
-            status_bad_request(res, "Invalid Destination");
-            return Ok(());
-        }
-
-        fs::rename(path, &dest).await?;
-
-        status_no_content(res);
-        Ok(())
-    }
-
-    async fn handle_lock(&self, req_path: &str, auth: bool, res: &mut Response) -> Result<()> {
-        let token = if auth {
-            format!("opaquelocktoken:{}", Uuid::new_v4())
-        } else {
-            Utc::now().timestamp().to_string()
-        };
-
-        res.headers_mut().insert(
-            "content-type",
-            HeaderValue::from_static("application/xml; charset=utf-8"),
-        );
-        res.headers_mut()
-            .insert("lock-token", format!("<{token}>").parse()?);
-
-        *res.body_mut() = body_full(format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
-<D:locktoken><D:href>{token}</D:href></D:locktoken>
-<D:lockroot><D:href>{req_path}</D:href></D:lockroot>
-</D:activelock></D:lockdiscovery></D:prop>"#
-        ));
-        Ok(())
-    }
-
-    async fn handle_proppatch(&self, req_path: &str, res: &mut Response) -> Result<()> {
-        let output = format!(
-            r#"<D:response>
-<D:href>{req_path}</D:href>
-<D:propstat>
-<D:prop>
-</D:prop>
-<D:status>HTTP/1.1 403 Forbidden</D:status>
-</D:propstat>
-</D:response>"#
-        );
-        res_multistatus(res, &output);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn send_index(
-        &self,
-        path: &Path,
-        mut paths: Vec<PathItem>,
-        exist: bool,
-        query_params: &HashMap<String, String>,
-        head_only: bool,
-        user: Option<String>,
-        access_paths: AccessPaths,
-        res: &mut Response,
-    ) -> Result<()> {
-        if let Some(sort) = query_params.get("sort") {
-            if sort == "name" {
-                paths.sort_by(|v1, v2| v1.sort_by_name(v2))
-            } else if sort == "mtime" {
-                paths.sort_by(|v1, v2| v1.sort_by_mtime(v2))
-            } else if sort == "size" {
-                paths.sort_by(|v1, v2| v1.sort_by_size(v2))
-            }
-            if query_params
-                .get("order")
-                .map(|v| v == "desc")
-                .unwrap_or_default()
-            {
-                paths.reverse()
-            }
-        } else {
-            paths.sort_by(|v1, v2| v1.sort_by_name(v2))
-        }
-        if has_query_flag(query_params, "simple") {
-            let output = paths
-                .into_iter()
-                .map(|v| {
-                    let displayname = escape_str_pcdata(&v.name);
-                    if v.is_dir() {
-                        format!("{}/\n", displayname)
+        match method {
+            Method::GET | Method::HEAD => {
+                if is_dir {
+                    if has_query_flag(&query_params, "zip") {
+                        self.handle_zip_dir(path, head_only, &mut res).await?;
+                    } else if query_params.contains_key("q") {
+                        self.handle_search_dir(path, &query_params, head_only, session, &mut res)
+                            .await?;
                     } else {
-                        format!("{}\n", displayname)
+                        self.handle_ls_dir(path, true, &query_params, head_only, session, &mut res)
+                            .await?;
                     }
-                })
-                .collect::<Vec<String>>()
-                .join("");
-            res.headers_mut()
-                .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-            res.headers_mut()
-                .typed_insert(ContentLength(output.len() as u64));
-            *res.body_mut() = body_full(output);
-            if head_only {
-                return Ok(());
+                } else if is_file {
+                    self.handle_send_file(path, headers, head_only, &mut res)
+                        .await?;
+                } else if req_path.ends_with('/') {
+                    self.handle_ls_dir(path, false, &query_params, head_only, session, &mut res)
+                        .await?;
+                } else {
+                    status_not_found(&mut res);
+                }
             }
-            return Ok(());
+            Method::PUT => {
+                if is_dir {
+                    status_error(&mut res, StatusCode::CONFLICT, "Target is a directory");
+                } else {
+                    let upload_id = match parse_upload_id(headers) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            status_bad_request(&mut res, "The x-dufs-upload-id header is required");
+                            return Ok(res);
+                        }
+                        Err(err) => {
+                            status_bad_request(&mut res, &err.to_string());
+                            return Ok(res);
+                        }
+                    };
+                    let upload_length = match parse_upload_length(headers) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            status_bad_request(
+                                &mut res,
+                                "The x-dufs-upload-length header is required",
+                            );
+                            return Ok(res);
+                        }
+                        Err(err) => {
+                            status_bad_request(&mut res, &err.to_string());
+                            return Ok(res);
+                        }
+                    };
+                    res = self
+                        .run_tracked_upload(
+                            path,
+                            UploadOptions {
+                                resume: false,
+                                upload_id,
+                                upload_length,
+                                upload_offset: None,
+                                path_lease: path_lease.take().expect("PUT acquired a path lease"),
+                            },
+                            req,
+                            upload_permit.take().expect("PUT acquired an upload permit"),
+                        )
+                        .await?;
+                }
+            }
+            Method::PATCH => {
+                let upload_id = match parse_upload_id(headers) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        status_bad_request(&mut res, "The x-dufs-upload-id header is required");
+                        return Ok(res);
+                    }
+                    Err(err) => {
+                        status_bad_request(&mut res, &err.to_string());
+                        return Ok(res);
+                    }
+                };
+                let upload_length = match parse_upload_length(headers) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        status_bad_request(&mut res, "The x-dufs-upload-length header is required");
+                        return Ok(res);
+                    }
+                    Err(err) => {
+                        status_bad_request(&mut res, &err.to_string());
+                        return Ok(res);
+                    }
+                };
+                let upload_offset = match parse_upload_offset(headers) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        status_bad_request(&mut res, "The x-dufs-upload-offset header is required");
+                        return Ok(res);
+                    }
+                    Err(err) => {
+                        status_bad_request(&mut res, &err.to_string());
+                        return Ok(res);
+                    }
+                };
+                res = self
+                    .run_tracked_upload(
+                        path,
+                        UploadOptions {
+                            resume: true,
+                            upload_id,
+                            upload_length,
+                            upload_offset: Some(upload_offset),
+                            path_lease: path_lease.take().expect("PATCH acquired a path lease"),
+                        },
+                        req,
+                        upload_permit
+                            .take()
+                            .expect("PATCH acquired an upload permit"),
+                    )
+                    .await?;
+            }
+            Method::DELETE => {
+                if is_miss {
+                    status_not_found(&mut res);
+                } else {
+                    self.handle_delete(
+                        path,
+                        &mut res,
+                        path_lease.take().expect("DELETE acquired a path lease"),
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            }
         }
-        let href = format!(
-            "/{}",
-            normalize_path(path.strip_prefix(&self.args.serve_path)?)
-        );
-        let readwrite = access_paths.perm().readwrite();
-        let data = IndexData {
-            kind: DataKind::Index,
-            href,
-            uri_prefix: self.args.uri_prefix.clone(),
-            allow_upload: self.args.allow_upload && readwrite,
-            allow_delete: self.args.allow_delete && readwrite,
-            allow_search: self.args.allow_search,
-            allow_archive: self.args.allow_archive,
-            dir_exists: exist,
-            auth: self.args.auth.has_users(),
-            user,
-            paths,
-        };
-        let output = if has_query_flag(query_params, "json") {
+        Ok(res)
+    }
+
+    async fn handle_delete(
+        &self,
+        path: &Path,
+        res: &mut Response,
+        path_lease: path_coordinator::PathLease,
+    ) -> Result<()> {
+        let rooted_fs = self.rooted_fs.clone();
+        let path = path.to_path_buf();
+        let trash = self
+            .run_commit(async move {
+                let _path_lease = path_lease;
+                Ok(rooted_fs.move_to_trash(&path).await?)
+            })
+            .await?;
+        self.spawn_background(async move {
+            if let Err(err) = trash.purge().await {
+                warn!("Failed to purge an internal trash entry error={err:#}");
+            }
+        });
+        status_no_content(res);
+        Ok(())
+    }
+
+    fn handle_internal(&self, req_path: &str, res: &mut Response) -> bool {
+        if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
+            match name {
+                "index.js"
+                | "modules/api.js"
+                | "modules/app.js"
+                | "modules/dom.js"
+                | "modules/listing.js"
+                | "modules/operations.js"
+                | "modules/path.js"
+                | "modules/upload.js" => {
+                    let source = match name {
+                        "index.js" => INDEX_JS,
+                        "modules/api.js" => MODULE_API_JS,
+                        "modules/app.js" => MODULE_APP_JS,
+                        "modules/dom.js" => MODULE_DOM_JS,
+                        "modules/listing.js" => MODULE_LISTING_JS,
+                        "modules/operations.js" => MODULE_OPERATIONS_JS,
+                        "modules/path.js" => MODULE_PATH_JS,
+                        "modules/upload.js" => MODULE_UPLOAD_JS,
+                        _ => unreachable!(),
+                    };
+                    *res.body_mut() = body_full(source);
+                    res.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("application/javascript; charset=UTF-8"),
+                    );
+                }
+                "index.css" => {
+                    *res.body_mut() = body_full(INDEX_CSS);
+                    res.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("text/css; charset=UTF-8"),
+                    );
+                }
+                "favicon.ico" => {
+                    *res.body_mut() = body_full(FAVICON_ICO);
+                    res.headers_mut()
+                        .insert("content-type", HeaderValue::from_static("image/x-icon"));
+                }
+                _ => status_not_found(res),
+            }
+            if res.status() == StatusCode::OK {
+                res.headers_mut().insert(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                );
+            }
+            res.headers_mut().insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+            true
+        } else if req_path == HEALTH_CHECK_PATH {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-            serde_json::to_string_pretty(&data)?
-        } else if has_query_flag(query_params, "noscript") {
-            res.headers_mut()
-                .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-            generate_noscript_html(&data)?
+            *res.body_mut() = body_full(r#"{"status":"OK"}"#);
+            true
         } else {
-            res.headers_mut()
-                .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-
-            let index_data = STANDARD.encode(serde_json::to_string(&data)?);
-            self.html
-                .replace(
-                    "__ASSETS_PREFIX__",
-                    &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-                )
-                .replace("__INDEX_DATA__", &index_data)
-        };
-        res.headers_mut()
-            .typed_insert(ContentLength(output.len() as u64));
-        res.headers_mut()
-            .typed_insert(CacheControl::new().with_no_cache());
-        res.headers_mut().insert(
-            "x-content-type-options",
-            HeaderValue::from_static("nosniff"),
-        );
-        if head_only {
-            return Ok(());
+            false
         }
-        *res.body_mut() = body_full(output);
-        Ok(())
     }
 
-    fn auth_reject(&self, res: &mut Response) -> Result<()> {
-        set_webdav_headers(res);
-
-        www_authenticate(res, &self.args)?;
-        *res.status_mut() = StatusCode::UNAUTHORIZED;
-        Ok(())
+    fn is_public_asset_path(&self, req_path: &str) -> bool {
+        req_path
+            .strip_prefix(&self.assets_prefix)
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "index.js"
+                        | "index.css"
+                        | "favicon.ico"
+                        | "modules/api.js"
+                        | "modules/app.js"
+                        | "modules/dom.js"
+                        | "modules/listing.js"
+                        | "modules/operations.js"
+                        | "modules/path.js"
+                        | "modules/upload.js"
+                )
+            })
     }
 
     async fn guard_root_contained(&self, path: &Path) -> bool {
-        if self.args.allow_symlink {
-            return false;
-        }
         let mut check_path = path.to_path_buf();
-        while !fs::try_exists(&check_path).await.unwrap_or_default() {
-            match check_path.parent() {
-                Some(parent) => check_path = parent.to_path_buf(),
-                None => return true,
+        loop {
+            match self.rooted_fs.metadata(&check_path).await {
+                Ok(_) => return false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    match check_path.parent() {
+                        Some(parent) if check_path != self.args.serve_path => {
+                            check_path = parent.to_path_buf();
+                        }
+                        _ => return true,
+                    }
+                }
+                Err(_) => return true,
             }
         }
-        !self.is_root_contained(check_path.as_path()).await
-    }
-
-    async fn is_root_contained(&self, path: &Path) -> bool {
-        fs::canonicalize(path)
-            .await
-            .ok()
-            .map(|v| v.starts_with(&self.args.serve_path))
-            .unwrap_or_default()
-    }
-
-    fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
-        let headers = req.headers();
-        let dest_path = match self
-            .extract_destination_header(headers)
-            .and_then(|dest| self.resolve_path(&dest))
-        {
-            Some(dest) => dest,
-            None => {
-                status_bad_request(res, "Invalid Destination");
-                return None;
-            }
-        };
-
-        let authorization = headers.get(AUTHORIZATION);
-        let guard = self
-            .args
-            .auth
-            .guard(&dest_path, req.method(), authorization, None, false);
-
-        match guard {
-            (_, Some(_)) => {}
-            _ => {
-                status_forbid(res);
-                return None;
-            }
-        };
-
-        let dest = match self.join_path(&dest_path) {
-            Some(dest) => dest,
-            None => {
-                *res.status_mut() = StatusCode::BAD_REQUEST;
-                return None;
-            }
-        };
-
-        Some(dest)
-    }
-
-    fn extract_destination_header(&self, headers: &HeaderMap<HeaderValue>) -> Option<String> {
-        let dest = headers.get("Destination")?.to_str().ok()?;
-        let uri: Uri = dest.parse().ok()?;
-        Some(uri.path().to_string())
     }
 
     fn resolve_path(&self, path: &str) -> Option<String> {
         let path = decode_uri(path)?;
         let path = path.trim_matches('/');
         let mut parts = vec![];
-        for comp in Path::new(path).components() {
-            if let Component::Normal(v) = comp {
-                let v = v.to_string_lossy();
-                if cfg!(windows) {
-                    let chars: Vec<char> = v.chars().collect();
-                    if chars.len() == 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
-                        return None;
-                    }
+        for component in Path::new(path).components() {
+            if let Component::Normal(value) = component {
+                let value = value.to_string_lossy();
+                if is_upload_temp_name(&value) {
+                    return None;
                 }
-                parts.push(v);
+                parts.push(value);
             } else {
                 return None;
             }
@@ -1444,254 +717,45 @@ impl Server {
         }
         new_path
             .strip_prefix(&format!("{path_prefix}/"))
-            .map(|v| v.trim_matches('/').to_string())
+            .map(|value| value.trim_matches('/').to_string())
     }
 
     fn join_path(&self, path: &str) -> Option<PathBuf> {
         if path.is_empty() {
             return Some(self.args.serve_path.clone());
         }
-        let path = if cfg!(windows) {
-            path.replace('/', "\\")
-        } else {
-            path.to_string()
-        };
         Some(self.args.serve_path.join(path))
     }
 
-    async fn list_dir(
-        &self,
-        entry_path: &Path,
-        base_path: &Path,
-        access_paths: AccessPaths,
-    ) -> Result<Vec<PathItem>> {
-        let mut paths: Vec<PathItem> = vec![];
-        if access_paths.perm().indexonly() {
-            for name in access_paths.child_names() {
-                let entry_path = entry_path.join(name);
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
-            }
-        } else {
-            let mut rd = fs::read_dir(entry_path).await?;
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
-            }
-        }
-        Ok(paths)
+    pub(super) fn is_managed_root(&self, path: &Path) -> bool {
+        path == self.args.serve_path
     }
 
-    async fn add_pathitem(&self, paths: &mut Vec<PathItem>, base_path: &Path, entry_path: &Path) {
-        let base_name = get_file_name(entry_path);
-        if let Ok(Some(item)) = self.to_pathitem(entry_path, base_path).await {
-            if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
-                return;
-            }
-            paths.push(item);
-        }
-    }
-
-    async fn to_pathitem<P: AsRef<Path>>(&self, path: P, base_path: P) -> Result<Option<PathItem>> {
-        let path = path.as_ref();
-        let (meta, meta2) = tokio::join!(fs::metadata(&path), fs::symlink_metadata(&path));
-        let (meta, meta2) = (meta?, meta2?);
-        let is_symlink = meta2.is_symlink();
-        if !self.args.allow_symlink && is_symlink && !self.is_root_contained(path).await {
-            return Ok(None);
-        }
-        let is_dir = meta.is_dir();
-        let path_type = match (is_symlink, is_dir) {
-            (true, true) => PathType::SymlinkDir,
-            (false, true) => PathType::Dir,
-            (true, false) => PathType::SymlinkFile,
-            (false, false) => PathType::File,
-        };
-        let mtime = match meta.modified().ok().or_else(|| meta.created().ok()) {
-            Some(v) => to_timestamp(&v),
-            None => 0,
-        };
-        let size = match path_type {
-            PathType::Dir | PathType::SymlinkDir => {
-                let mut count = 0;
-                let mut entries = tokio::fs::read_dir(&path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let entry_path = entry.path();
-                    let base_name = get_file_name(&entry_path);
-                    let is_dir = entry
-                        .file_type()
-                        .await
-                        .map(|v| v.is_dir())
-                        .unwrap_or_default();
-                    if is_hidden(&self.args.hidden, base_name, is_dir) {
-                        continue;
-                    }
-                    count += 1;
-                    if count >= MAX_SUBPATHS_COUNT {
-                        break;
-                    }
-                }
-                count
-            }
-            PathType::File | PathType::SymlinkFile => meta.len(),
-        };
-        let rel_path = path.strip_prefix(base_path)?;
-        let name = normalize_path(rel_path);
-        Ok(Some(PathItem {
-            path_type,
-            name,
-            mtime,
-            size,
-        }))
+    pub(super) fn is_reserved_internal_component(&self, component: &str) -> bool {
+        component == "__dufs__" || self.assets_prefix.strip_suffix('/') == Some(component)
     }
 }
 
-#[derive(Debug, Serialize, PartialEq)]
-pub enum DataKind {
-    Index,
-    Edit,
-    View,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IndexData {
-    pub href: String,
-    pub kind: DataKind,
-    pub uri_prefix: String,
-    pub allow_upload: bool,
-    pub allow_delete: bool,
-    pub allow_search: bool,
-    pub allow_archive: bool,
-    pub dir_exists: bool,
-    pub auth: bool,
-    pub user: Option<String>,
-    pub paths: Vec<PathItem>,
-}
-
-#[derive(Debug, Serialize, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PathItem {
-    pub path_type: PathType,
-    pub name: String,
-    pub mtime: u64,
-    pub size: u64,
-}
-
-impl PathItem {
-    pub fn is_dir(&self) -> bool {
-        self.path_type == PathType::Dir || self.path_type == PathType::SymlinkDir
+fn embedded_assets_prefix() -> String {
+    let mut digest = Sha256::new();
+    for (name, contents) in [
+        ("index.js", INDEX_JS.as_bytes()),
+        ("index.css", INDEX_CSS.as_bytes()),
+        ("favicon.ico", FAVICON_ICO),
+        ("modules/api.js", MODULE_API_JS.as_bytes()),
+        ("modules/app.js", MODULE_APP_JS.as_bytes()),
+        ("modules/dom.js", MODULE_DOM_JS.as_bytes()),
+        ("modules/listing.js", MODULE_LISTING_JS.as_bytes()),
+        ("modules/operations.js", MODULE_OPERATIONS_JS.as_bytes()),
+        ("modules/path.js", MODULE_PATH_JS.as_bytes()),
+        ("modules/upload.js", MODULE_UPLOAD_JS.as_bytes()),
+    ] {
+        digest.update((name.len() as u64).to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update((contents.len() as u64).to_be_bytes());
+        digest.update(contents);
     }
-
-    pub fn to_dav_xml(&self, prefix: &str) -> String {
-        let mtime = match Utc.timestamp_millis_opt(self.mtime as i64) {
-            LocalResult::Single(v) => format!("{}", v.format("%a, %d %b %Y %H:%M:%S GMT")),
-            _ => String::new(),
-        };
-        let mut href = encode_uri(&format!("{}{}", prefix, &self.name));
-        if self.is_dir() && !href.ends_with('/') {
-            href.push('/');
-        }
-        let displayname = escape_str_pcdata(self.base_name());
-        match self.path_type {
-            PathType::Dir | PathType::SymlinkDir => format!(
-                r#"<D:response>
-<D:href>{href}</D:href>
-<D:propstat>
-<D:prop>
-<D:displayname>{displayname}</D:displayname>
-<D:getlastmodified>{mtime}</D:getlastmodified>
-<D:resourcetype><D:collection/></D:resourcetype>
-</D:prop>
-<D:status>HTTP/1.1 200 OK</D:status>
-</D:propstat>
-</D:response>"#
-            ),
-            PathType::File | PathType::SymlinkFile => format!(
-                r#"<D:response>
-<D:href>{href}</D:href>
-<D:propstat>
-<D:prop>
-<D:displayname>{displayname}</D:displayname>
-<D:getcontentlength>{}</D:getcontentlength>
-<D:getlastmodified>{mtime}</D:getlastmodified>
-<D:resourcetype></D:resourcetype>
-</D:prop>
-<D:status>HTTP/1.1 200 OK</D:status>
-</D:propstat>
-</D:response>"#,
-                self.size
-            ),
-        }
-    }
-
-    pub fn base_name(&self) -> &str {
-        self.name.split('/').next_back().unwrap_or_default()
-    }
-
-    pub fn sort_by_name(&self, other: &Self) -> Ordering {
-        match self.path_type.cmp(&other.path_type) {
-            Ordering::Equal => {
-                alphanumeric_sort::compare_str(self.name.to_lowercase(), other.name.to_lowercase())
-            }
-            v => v,
-        }
-    }
-
-    pub fn sort_by_mtime(&self, other: &Self) -> Ordering {
-        match self.path_type.cmp(&other.path_type) {
-            Ordering::Equal => self.mtime.cmp(&other.mtime),
-            v => v,
-        }
-    }
-
-    pub fn sort_by_size(&self, other: &Self) -> Ordering {
-        match self.path_type.cmp(&other.path_type) {
-            Ordering::Equal => self.size.cmp(&other.size),
-            v => v,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Clone, Copy, Eq, PartialEq)]
-pub enum PathType {
-    Dir,
-    SymlinkDir,
-    File,
-    SymlinkFile,
-}
-
-impl PathType {
-    pub fn is_dir(&self) -> bool {
-        matches!(self, Self::Dir | Self::SymlinkDir)
-    }
-}
-
-impl Ord for PathType {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let to_value = |t: &Self| -> u8 {
-            if matches!(t, Self::Dir | Self::SymlinkDir) {
-                0
-            } else {
-                1
-            }
-        };
-        to_value(self).cmp(&to_value(other))
-    }
-}
-impl PartialOrd for PathType {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct EditData {
-    href: String,
-    kind: DataKind,
-    uri_prefix: String,
-    allow_upload: bool,
-    allow_delete: bool,
-    auth: bool,
-    user: Option<String>,
-    editable: bool,
+    format!("__dufs_assets_{}/", hex::encode(digest.finalize()))
 }
 
 fn to_timestamp(time: &SystemTime) -> u64 {
@@ -1700,111 +764,15 @@ fn to_timestamp(time: &SystemTime) -> u64 {
         .as_millis() as u64
 }
 
-fn normalize_path<P: AsRef<Path>>(path: P) -> String {
-    let path = path.as_ref().to_str().unwrap_or_default();
-    if cfg!(windows) {
-        path.replace('\\', "/")
-    } else {
-        path.to_string()
-    }
-}
-
-async fn ensure_path_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if fs::symlink_metadata(parent).await.is_err() {
-            fs::create_dir_all(&parent).await?;
-        }
-    }
-    Ok(())
-}
-
-fn add_cors(res: &mut Response) {
-    res.headers_mut()
-        .typed_insert(AccessControlAllowOrigin::ANY);
-    res.headers_mut()
-        .typed_insert(AccessControlAllowCredentials);
-    res.headers_mut().insert(
-        "Access-Control-Allow-Methods",
-        HeaderValue::from_static("*"),
-    );
-    res.headers_mut().insert(
-        "Access-Control-Allow-Headers",
-        HeaderValue::from_static("Authorization,*"),
-    );
-    res.headers_mut().insert(
-        "Access-Control-Expose-Headers",
-        HeaderValue::from_static("Authorization,*"),
-    );
-}
-
-fn res_multistatus(res: &mut Response, content: &str) {
-    *res.status_mut() = StatusCode::MULTI_STATUS;
-    res.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static("application/xml; charset=utf-8"),
-    );
-    *res.body_mut() = body_full(format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<D:multistatus xmlns:D="DAV:">
-{content}
-</D:multistatus>"#,
-    ));
-}
-
-async fn zip_dir<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    dir: &Path,
-    access_paths: AccessPaths,
-    hidden: &[String],
-    compression: Compression,
-    follow_symlinks: bool,
-    serve_path: PathBuf,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let hidden = Arc::new(hidden.to_vec());
-    let zip_paths = tokio::task::spawn(collect_dir_entries(
-        access_paths,
-        running,
-        dir.to_path_buf(),
-        hidden,
-        follow_symlinks,
-        serve_path,
-        move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
-    ))
-    .await?;
-    let mut zip = ZipWriter::new(&mut *writer).with_level(compression);
-    for zip_path in zip_paths.into_iter() {
-        let filename = match zip_path
-            .strip_prefix(dir)
-            .ok()
-            .and_then(|v| v.to_str())
-            .map(|v| v.replace(MAIN_SEPARATOR, "/"))
-        {
-            Some(v) => v,
-            None => continue,
-        };
-        let options = WriterOptions::from_path(&zip_path).await?;
-        let mut file = File::open(&zip_path).await?;
-        let mut entry = zip.append_file(&filename, options).await?;
-        io::copy(&mut file, &mut entry).await?;
-        entry.close().await?;
-    }
-    zip.finalize().await?;
-    Ok(())
-}
-
-fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
-    let mtime = meta.modified().ok().or_else(|| meta.created().ok())?;
-    let timestamp = to_timestamp(&mtime);
-    let size = meta.len();
-    let etag = format!(r#""{timestamp}-{size}""#).parse::<ETag>().ok()?;
-    let last_modified = LastModified::from(mtime);
-    Some((etag, last_modified))
-}
-
 fn status_forbid(res: &mut Response) {
     *res.status_mut() = StatusCode::FORBIDDEN;
     *res.body_mut() = body_full("Forbidden");
+}
+
+fn status_csrf_forbid(res: &mut Response) {
+    status_forbid(res);
+    res.headers_mut()
+        .insert(AUTH_ERROR_HEADER, HeaderValue::from_static(CSRF_AUTH_ERROR));
 }
 
 fn status_not_found(res: &mut Response) {
@@ -1817,180 +785,179 @@ fn status_no_content(res: &mut Response) {
 }
 
 fn status_bad_request(res: &mut Response, body: &str) {
-    *res.status_mut() = StatusCode::BAD_REQUEST;
-    if !body.is_empty() {
-        *res.body_mut() = body_full(body.to_string());
+    status_error(res, StatusCode::BAD_REQUEST, body);
+}
+
+fn status_error(res: &mut Response, status: StatusCode, body: &str) {
+    apply_app_error(res, &AppError::public(status, body));
+}
+
+fn apply_app_error(res: &mut Response, error: &AppError) {
+    *res.status_mut() = error.status();
+    if !error.public_message().is_empty() {
+        *res.body_mut() = body_full(error.public_message().to_string());
     }
 }
 
-fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
-    let kind = if inline { "inline" } else { "attachment" };
+fn set_private_no_store(res: &mut Response) {
+    res.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+}
+
+#[derive(Clone, Copy)]
+enum ContentDispositionFallback {
+    File,
+    Archive,
+}
+
+fn set_content_disposition(
+    res: &mut Response,
+    filename: &str,
+    fallback: ContentDispositionFallback,
+) -> Result<()> {
+    let fallback_filename = match fallback {
+        ContentDispositionFallback::File => "download",
+        ContentDispositionFallback::Archive => "archive.zip",
+    };
     let filename: String = filename
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_control() && ch != '\t' {
+        .map(|character| {
+            if character.is_control() {
                 ' '
             } else {
-                ch
+                character
             }
         })
         .collect();
-    let value = if filename.is_ascii() {
-        HeaderValue::from_str(&format!("{kind}; filename=\"{filename}\"",))?
-    } else {
-        HeaderValue::from_str(&format!(
-            "{kind}; filename=\"{}\"; filename*=UTF-8''{}",
-            filename,
-            encode_uri(&filename),
-        ))?
-    };
+    let value = HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback_filename}\"; filename*=UTF-8''{}",
+        encode_content_disposition_filename(&filename),
+    ))?;
     res.headers_mut().insert(CONTENT_DISPOSITION, value);
     Ok(())
 }
 
-fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
-    hidden.iter().any(|v| {
-        if is_dir {
-            if let Some(x) = v.strip_suffix('/') {
-                return glob(x, file_name);
-            }
-        }
-        glob(v, file_name)
-    })
-}
+fn encode_content_disposition_filename(filename: &str) -> String {
+    use std::fmt::Write;
 
-fn set_webdav_headers(res: &mut Response) {
-    res.headers_mut().insert(
-        "Allow",
-        HeaderValue::from_static(
-            "GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE,CHECKAUTH,LOGOUT",
-        ),
-    );
-    res.headers_mut()
-        .insert("DAV", HeaderValue::from_static("1, 2, 3"));
-}
-
-async fn get_content_type(path: &Path) -> Result<String> {
-    let mut buffer: Vec<u8> = vec![];
-    fs::File::open(path)
-        .await?
-        .take(1024)
-        .read_to_end(&mut buffer)
-        .await?;
-    let mime = mime_guess::from_path(path).first();
-    let is_text = content_inspector::inspect(&buffer).is_text();
-    let content_type = if is_text {
-        let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
-        detector.feed(&buffer, buffer.len() < 1024);
-        let enc = detector.guess(None, chardetng::Utf8Detection::Allow);
-        let charset = format!("; charset={}", enc.name());
-        match mime {
-            Some(m) => format!("{m}{charset}"),
-            None => format!("text/plain{charset}"),
+    let mut encoded = String::with_capacity(filename.len());
+    for byte in filename.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
         }
-    } else {
-        match mime {
-            Some(m) => m.to_string(),
-            None => "application/octet-stream".into(),
-        }
-    };
-    Ok(content_type)
-}
-
-fn parse_upload_offset(headers: &HeaderMap<HeaderValue>, size: u64) -> Result<Option<u64>> {
-    let value = match headers.get("x-update-range") {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let err = || anyhow!("Invalid X-Update-Range Header");
-    let value = value.to_str().map_err(|_| err())?;
-    if value == "append" {
-        return Ok(Some(size));
     }
-    // use the first range
-    let ranges = parse_range(value, size).ok_or_else(err)?;
-    let (start, _) = ranges.first().ok_or_else(err)?;
-    Ok(Some(*start))
-}
-
-async fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-
-    loop {
-        let bytes_read = file.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    let result = hasher.finalize();
-    Ok(hex::encode(result))
+    encoded
 }
 
 fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
     query_params
         .get(name)
-        .map(|v| v.is_empty())
+        .map(|value| value.is_empty())
         .unwrap_or_default()
 }
 
-async fn collect_dir_entries<F>(
-    access_paths: AccessPaths,
-    running: Arc<AtomicBool>,
-    path: PathBuf,
-    hidden: Arc<Vec<String>>,
-    follow_symlinks: bool,
-    serve_path: PathBuf,
-    include_entry: F,
-) -> Vec<PathBuf>
-where
-    F: Fn(&DirEntry) -> bool,
-{
-    let mut paths: Vec<PathBuf> = vec![];
-    for dir in access_paths.entry_paths(&path) {
-        let mut it = WalkDir::new(&dir).follow_links(true).into_iter();
-        it.next();
-        while let Some(entry) = it.next() {
-            if !running.load(atomic::Ordering::SeqCst) {
-                break;
-            }
-            let entry = match entry {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let entry_path = entry.path();
-            let base_name = get_file_name(entry_path);
-            let is_dir = entry.file_type().is_dir();
-            if is_hidden(&hidden, base_name, is_dir) {
-                if is_dir {
-                    it.skip_current_dir();
-                }
-                continue;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
-            if !follow_symlinks
-                && !fs::canonicalize(entry_path)
-                    .await
-                    .ok()
-                    .map(|v| v.starts_with(&serve_path))
-                    .unwrap_or_default()
-            {
-                // We walked outside the server's root. This could only have
-                // happened if we followed a symlink, and hence we only allow it
-                // if allow_symlink is enabled, otherwise we skip this entry.
-                if is_dir {
-                    it.skip_current_dir();
-                }
-                continue;
-            }
-            if !include_entry(&entry) {
-                continue;
-            }
-            paths.push(entry_path.to_path_buf());
-        }
+    #[test]
+    fn server_init_rejects_a_non_directory_root() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let file = temp.path().join("shared.txt");
+        std::fs::write(&file, "contents").unwrap();
+        let args = Args {
+            serve_path: file,
+            ..Args::default()
+        };
+        let error = match Server::init(
+            args,
+            Arc::new(AtomicBool::new(true)),
+            TaskTracker::new(),
+            TaskTracker::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        ) {
+            Ok(_) => panic!("a regular file must not be accepted as the shared root"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not a directory"),
+            "unexpected error: {error:#}"
+        );
     }
-    paths
+
+    #[tokio::test]
+    async fn tracked_mutation_keeps_its_path_lease_after_waiter_cancellation() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let args = Args {
+            serve_path: temp.path().to_path_buf(),
+            ..Args::default()
+        };
+        let work_tasks = TaskTracker::new();
+        let commit_tasks = TaskTracker::new();
+        let server = Arc::new(
+            Server::init(
+                args,
+                Arc::new(AtomicBool::new(true)),
+                work_tasks,
+                commit_tasks.clone(),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .unwrap(),
+        );
+        let target = temp.path().join("directory/file.txt");
+        let ancestor = temp.path().join("directory");
+        let path_lease = server.path_coordinator.acquire([&target]).await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        let waiter = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .run_commit(async move {
+                        let _path_lease = path_lease;
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                server.path_coordinator.acquire([&ancestor]),
+            )
+            .await
+            .is_err(),
+            "cancelling the HTTP waiter released a live mutation lease"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server.path_coordinator.acquire([&ancestor]),
+        )
+        .await
+        .expect("tracked mutation did not release its lease after completion");
+        commit_tasks.close();
+        tokio::time::timeout(Duration::from_secs(1), commit_tasks.wait())
+            .await
+            .expect("tracked mutation task did not finish");
+    }
 }

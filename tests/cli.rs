@@ -3,9 +3,8 @@
 mod fixtures;
 
 use assert_cmd::prelude::*;
-use clap::ValueEnum;
-use clap_complete::Shell;
 use fixtures::Error;
+use predicates::str::contains;
 use std::process::Command;
 
 #[test]
@@ -20,16 +19,23 @@ fn help_shows() -> Result<(), Error> {
 }
 
 #[test]
-/// Print completions and exit.
-fn print_completions() -> Result<(), Error> {
-    // let shell_enums = EnumValueParser::<Shell>::new();
-    for shell in Shell::value_variants() {
-        Command::new(assert_cmd::cargo::cargo_bin!())
-            .arg("--completions")
-            .arg(shell.to_string())
-            .assert()
-            .success();
-    }
+fn account_is_required_to_start() -> Result<(), Error> {
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .assert()
+        .failure()
+        .stderr(contains("At least one account is required"));
 
+    Ok(())
+}
+
+#[test]
+fn unknown_option_is_rejected() -> Result<(), Error> {
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg("--definitely-unknown-option")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "unexpected argument '--definitely-unknown-option'",
+        ));
     Ok(())
 }

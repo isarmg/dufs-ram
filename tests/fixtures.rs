@@ -1,17 +1,58 @@
 use assert_fs::fixture::TempDir;
 use assert_fs::prelude::*;
-use port_check::free_local_port;
-use reqwest::Url;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use indexmap::IndexSet;
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
+use reqwest::{IntoUrl, Method, Url};
 use rstest::fixture;
+use serde_json::Value;
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use uuid::Uuid;
 
 #[allow(dead_code)]
 pub type Error = Box<dyn std::error::Error>;
 
 #[allow(dead_code)]
 pub const BIN_FILE: &str = "😀.bin";
+pub const TEST_USER: &str = "test-user";
+pub const TEST_PASSWORD: &str = "test-password";
+pub const TEST_ACCOUNT: &str = "test-user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+#[allow(dead_code)]
+pub const USER_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+#[allow(dead_code)]
+pub const ADMIN_ACCOUNT: &str = "admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
+const CSRF_HEADER: &str = "x-dufs-csrf-token";
+
+#[allow(dead_code)]
+pub fn with_new_upload_headers(request: RequestBuilder, upload_length: u64) -> RequestBuilder {
+    with_upload_headers(request, Uuid::new_v4(), upload_length)
+}
+
+#[allow(dead_code)]
+pub fn with_upload_headers(
+    request: RequestBuilder,
+    upload_id: Uuid,
+    upload_length: u64,
+) -> RequestBuilder {
+    request
+        .header("X-Dufs-Upload-Id", upload_id.to_string())
+        .header("X-Dufs-Upload-Length", upload_length)
+}
+
+#[allow(dead_code)]
+pub fn with_resume_upload_headers(
+    request: RequestBuilder,
+    upload_id: Uuid,
+    upload_length: u64,
+    upload_offset: u64,
+) -> RequestBuilder {
+    with_upload_headers(request, upload_id, upload_length)
+        .header("X-Dufs-Upload-Offset", upload_offset)
+}
 
 /// File names for testing purpose
 #[allow(dead_code)]
@@ -19,7 +60,6 @@ pub static FILES: &[&str] = &[
     "test.txt",
     "test.html",
     "index.html",
-    #[cfg(not(target_os = "windows"))]
     "file\n1.txt",
     BIN_FILE,
 ];
@@ -36,13 +76,9 @@ pub static DIR_NO_INDEX: &str = "dir-no-index/";
 #[allow(dead_code)]
 pub static DIR_GIT: &str = ".git/";
 
-/// Directory names for testings assets override
-#[allow(dead_code)]
-pub static DIR_ASSETS: &str = "dir-assets/";
-
 /// Directory names for testing purpose
 #[allow(dead_code)]
-pub static DIRECTORIES: &[&str] = &["dir1/", "dir2/", "dir3/", DIR_NO_INDEX, DIR_GIT, DIR_ASSETS];
+pub static DIRECTORIES: &[&str] = &["dir1/", "dir2/", "dir3/", DIR_NO_INDEX, DIR_GIT];
 
 /// Test fixture which creates a temporary directory with a few files and directories inside.
 /// The directories also contain files.
@@ -61,27 +97,20 @@ pub fn tmpdir() -> TempDir {
         }
     }
     for directory in DIRECTORIES {
-        if *directory == DIR_ASSETS {
-            tmpdir
-                .child(format!("{}{}", directory, "index.html"))
-                .write_str("__ASSETS_PREFIX__index.js;<template id=\"index-data\">__INDEX_DATA__</template>")
-                .unwrap();
-        } else {
-            for file in FILES {
-                if *directory == DIR_NO_INDEX && *file == "index.html" {
-                    continue;
-                }
-                if *file == BIN_FILE {
-                    tmpdir
-                        .child(format!("{directory}{file}"))
-                        .write_binary(b"bin\0\x00123")
-                        .unwrap();
-                } else {
-                    tmpdir
-                        .child(format!("{directory}{file}"))
-                        .write_str(&format!("This is {directory}{file}"))
-                        .unwrap();
-                }
+        for file in FILES {
+            if *directory == DIR_NO_INDEX && *file == "index.html" {
+                continue;
+            }
+            if *file == BIN_FILE {
+                tmpdir
+                    .child(format!("{directory}{file}"))
+                    .write_binary(b"bin\0\x00123")
+                    .unwrap();
+            } else {
+                tmpdir
+                    .child(format!("{directory}{file}"))
+                    .write_str(&format!("This is {directory}{file}"))
+                    .unwrap();
             }
         }
     }
@@ -110,13 +139,6 @@ pub fn tmpdir() -> TempDir {
     tmpdir
 }
 
-/// Get a free port.
-#[fixture]
-#[allow(dead_code)]
-pub fn port() -> u16 {
-    free_local_port().expect("Couldn't find a free local port")
-}
-
 /// Run dufs as a server; Start with a temporary directory, a free port and some
 /// optional arguments then wait for a while for the server setup to complete.
 #[fixture]
@@ -126,35 +148,75 @@ where
     I: IntoIterator + Clone,
     I::Item: AsRef<std::ffi::OsStr>,
 {
-    let port = port();
     let tmpdir = tmpdir();
-    let child = Command::new(assert_cmd::cargo::cargo_bin!())
+    let uri_prefix = extract_uri_prefix(args.clone());
+    let has_auth = args.clone().into_iter().any(|value| {
+        matches!(
+            value.as_ref().to_str(),
+            Some("--auth") | Some("-a") | Some("--config") | Some("-c")
+        )
+    });
+    let has_min_free_space = args.clone().into_iter().any(|value| {
+        value.as_ref().to_str().is_some_and(|value| {
+            value == "--min-free-space" || value.starts_with("--min-free-space=")
+        })
+    });
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
+    command
         .arg(tmpdir.path())
         .arg("-p")
-        .arg(port.to_string())
-        .args(args.clone())
-        .stdout(Stdio::null())
+        .arg("0")
+        .args(args.clone());
+    if !has_auth {
+        command.args(["--auth", TEST_ACCOUNT]);
+    }
+    if !has_min_free_space {
+        command.args(["--min-free-space", "0"]);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
         .spawn()
         .expect("Couldn't run test binary");
-    let is_tls = args
-        .into_iter()
-        .any(|x| x.as_ref().to_str().unwrap().contains("tls"));
-
-    wait_for_port(port);
-    TestServer::new(port, tmpdir, child, is_tls)
+    let port = read_bound_url(&mut child)
+        .expect("Couldn't read dynamically assigned test port")
+        .port()
+        .expect("Dynamically assigned URL has no port");
+    let mut server = TestServer::new(port, tmpdir, child, uri_prefix, !has_auth);
+    if !has_auth {
+        server
+            .refresh_default_session()
+            .expect("Couldn't create default authenticated test session");
+    }
+    server
 }
 
-/// Wait a max of 2s for the port to become available.
-pub fn wait_for_port(port: u16) {
-    let start_wait = Instant::now();
-
-    while !port_check::is_port_reachable(format!("localhost:{port}")) {
-        sleep(Duration::from_millis(250));
-
-        if start_wait.elapsed().as_secs() > 2 {
-            panic!("timeout waiting for port {port}");
+fn extract_uri_prefix<I>(args: I) -> String
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    let mut args = args.into_iter();
+    loop {
+        let Some(value) = args.next() else {
+            break;
+        };
+        let value = value.as_ref().to_string_lossy().into_owned();
+        let prefix = if value == "--path-prefix" {
+            args.next()
+                .map(|value| value.as_ref().to_string_lossy().into_owned())
+        } else {
+            value.strip_prefix("--path-prefix=").map(ToOwned::to_owned)
+        };
+        if let Some(prefix) = prefix {
+            let prefix = prefix.trim_matches('/');
+            return if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}/")
+            };
         }
     }
+    String::new()
 }
 
 #[allow(dead_code)]
@@ -162,23 +224,252 @@ pub struct TestServer {
     port: u16,
     tmpdir: TempDir,
     child: Child,
-    is_tls: bool,
+    uri_prefix: String,
+    use_default_auth: bool,
+    client: Client,
+    default_session: Option<TestSession>,
+    stdout_drain: Option<JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct TestSession {
+    cookie: String,
+    csrf_token: String,
+}
+
+#[allow(dead_code)]
+impl TestSession {
+    pub fn cookie(&self) -> &str {
+        &self.cookie
+    }
+
+    pub fn csrf_token(&self) -> &str {
+        &self.csrf_token
+    }
 }
 
 #[allow(dead_code)]
 impl TestServer {
-    pub fn new(port: u16, tmpdir: TempDir, child: Child, is_tls: bool) -> Self {
+    pub fn new(
+        port: u16,
+        tmpdir: TempDir,
+        mut child: Child,
+        uri_prefix: String,
+        use_default_auth: bool,
+    ) -> Self {
+        let client = Client::builder()
+            .build()
+            .expect("Couldn't create test HTTP client");
+        let stdout_drain = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            })
+        });
         Self {
             port,
             tmpdir,
             child,
-            is_tls,
+            uri_prefix,
+            use_default_auth,
+            client,
+            default_session: None,
+            stdout_drain,
         }
     }
 
     pub fn url(&self) -> Url {
-        let protocol = if self.is_tls { "https" } else { "http" };
-        Url::parse(&format!("{}://localhost:{}", protocol, self.port)).unwrap()
+        Url::parse(&format!("http://localhost:{}/", self.port)).unwrap()
+    }
+
+    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+        self.request_with(
+            self.default_session
+                .as_ref()
+                .expect("Default authenticated test session is unavailable"),
+            method,
+            url,
+        )
+    }
+
+    pub fn request_with<U: IntoUrl>(
+        &self,
+        session: &TestSession,
+        method: Method,
+        url: U,
+    ) -> RequestBuilder {
+        let is_unsafe = matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        );
+        let mut request = self
+            .client
+            .request(method, url)
+            .header(COOKIE, &session.cookie);
+        if is_unsafe {
+            request = request.header(CSRF_HEADER, &session.csrf_token);
+        }
+        request
+    }
+
+    pub fn raw_request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+        self.client.request(method, url)
+    }
+
+    pub fn get<U: IntoUrl>(&self, url: U) -> Result<Response, reqwest::Error> {
+        self.request(Method::GET, url).send()
+    }
+
+    pub fn get_with<U: IntoUrl>(
+        &self,
+        session: &TestSession,
+        url: U,
+    ) -> Result<Response, reqwest::Error> {
+        self.request_with(session, Method::GET, url).send()
+    }
+
+    pub fn paths_from_page(&self, response: Response) -> Result<IndexSet<String>, Error> {
+        let session = self
+            .default_session
+            .as_ref()
+            .ok_or("Default authenticated test session is unavailable")?;
+        self.paths_from_page_with(session, response)
+    }
+
+    pub fn paths_from_page_with(
+        &self,
+        session: &TestSession,
+        response: Response,
+    ) -> Result<IndexSet<String>, Error> {
+        let page_url = response.url().clone();
+        if !response.status().is_success() {
+            return Err(format!("Directory page returned {}", response.status()).into());
+        }
+        let page_data = extract_index_data(&response.text()?)
+            .ok_or("Authenticated page is missing index data")?;
+        let logical_path = page_data
+            .get("href")
+            .and_then(Value::as_str)
+            .ok_or("Authenticated page is missing its logical path")?;
+        let page_parameters: Vec<(String, String)> = page_url
+            .query_pairs()
+            .filter(|(key, _)| matches!(key.as_ref(), "q" | "sort" | "order"))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        let mut cursor: Option<String> = None;
+        let mut paths = IndexSet::new();
+
+        loop {
+            let mut list_url = self
+                .url()
+                .join(&format!("{}__dufs__/api/list", self.uri_prefix))?;
+            {
+                let mut query = list_url.query_pairs_mut();
+                query
+                    .append_pair("path", logical_path)
+                    .append_pair("limit", "500");
+                for (key, value) in &page_parameters {
+                    query.append_pair(key, value);
+                }
+                if let Some(cursor) = &cursor {
+                    query.append_pair("cursor", cursor);
+                }
+            }
+            let list_response = self.get_with(session, list_url)?;
+            if !list_response.status().is_success() {
+                let status = list_response.status();
+                let body = list_response.text().unwrap_or_default();
+                return Err(format!("List API returned {status}: {body}").into());
+            }
+            let data: Value = serde_json::from_str(&list_response.text()?)?;
+            for item in data
+                .get("paths")
+                .and_then(Value::as_array)
+                .ok_or("List API response is missing paths")?
+            {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("List item is missing a name")?;
+                let path_type = item
+                    .get("path_type")
+                    .and_then(Value::as_str)
+                    .ok_or("List item is missing a path type")?;
+                if path_type.ends_with("Dir") {
+                    paths.insert(format!("{name}/"));
+                } else {
+                    paths.insert(name.to_owned());
+                }
+            }
+            cursor = data
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(paths)
+    }
+
+    pub fn list_api(
+        &self,
+        logical_path: &str,
+        parameters: &[(&str, &str)],
+    ) -> Result<Response, Error> {
+        let mut list_url = self
+            .url()
+            .join(&format!("{}__dufs__/api/list", self.uri_prefix))?;
+        {
+            let mut query = list_url.query_pairs_mut();
+            query.append_pair("path", logical_path);
+            for (key, value) in parameters {
+                query.append_pair(key, value);
+            }
+        }
+        Ok(self.get(list_url)?)
+    }
+
+    pub fn login(&self, username: &str, password: &str) -> Result<TestSession, Error> {
+        let login_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let login_url = self
+            .url()
+            .join(&format!("{}__dufs__/login", self.uri_prefix))?;
+        let form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("username", username)
+            .append_pair("password", password)
+            .finish();
+        let response = login_client
+            .post(login_url)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form)
+            .send()?;
+        if !response.status().is_success() && !response.status().is_redirection() {
+            return Err(format!("Login failed with status {}", response.status()).into());
+        }
+        let cookie = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| value.split(';').next())
+            .find(|value| value.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+            .ok_or("Login response is missing the session cookie")?
+            .to_string();
+
+        let page_url = self.url().join(&self.uri_prefix)?;
+        let page = self
+            .client
+            .get(page_url)
+            .header(COOKIE, &cookie)
+            .send()?
+            .error_for_status()?;
+        let csrf_token = extract_csrf_token(&page.text()?)
+            .ok_or("Authenticated page is missing the CSRF token")?;
+
+        Ok(TestSession { cookie, csrf_token })
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -188,11 +479,99 @@ impl TestServer {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    pub fn restart_with_default_auth(&mut self) {
+        assert!(self.use_default_auth);
+        self.child.kill().expect("Couldn't kill test server");
+        self.child.wait().expect("Couldn't wait for test server");
+        if let Some(stdout_drain) = self.stdout_drain.take() {
+            let _ = stdout_drain.join();
+        }
+
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
+        command
+            .arg(self.tmpdir.path())
+            .arg("-p")
+            .arg("0")
+            .args(["--auth", TEST_ACCOUNT])
+            .args(["--min-free-space", "0"]);
+        self.child = command
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Couldn't restart test binary");
+        self.port = read_bound_url(&mut self.child)
+            .expect("Couldn't read dynamically assigned restart port")
+            .port()
+            .expect("Dynamically assigned restart URL has no port");
+        self.stdout_drain = self.child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            })
+        });
+        self.refresh_default_session()
+            .expect("Couldn't recreate default authenticated test session");
+    }
+
+    fn refresh_default_session(&mut self) -> Result<(), Error> {
+        self.default_session = Some(self.login(TEST_USER, TEST_PASSWORD)?);
+        Ok(())
+    }
+}
+
+fn extract_csrf_token(content: &str) -> Option<String> {
+    extract_index_data(content)?
+        .get("csrf_token")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn extract_index_data(content: &str) -> Option<Value> {
+    let start_tag = "<template id=\"index-data\">";
+    let start = content.find(start_tag)? + start_tag.len();
+    let end = start + content[start..].find("</template>")?;
+    let decoded = STANDARD.decode(&content[start..end]).ok()?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.child.kill().expect("Couldn't kill test server");
-        self.child.wait().unwrap();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(stdout_drain) = self.stdout_drain.take() {
+            let _ = stdout_drain.join();
+        }
     }
+}
+
+#[allow(dead_code)]
+pub fn read_bound_url(child: &mut Child) -> Result<Url, Error> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("Test server did not expose startup output")?;
+    let url = loop {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            if stdout.read(&mut byte)? == 0 {
+                return Err("Test server exited before reporting its listen address".into());
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        let line = std::str::from_utf8(&line)?;
+        let Some(url_start) = line.find("http") else {
+            continue;
+        };
+        let url = Url::parse(line[url_start..].trim())?;
+        if url.port().is_some() {
+            break url;
+        }
+    };
+    child.stdout = Some(stdout);
+    Ok(url)
 }

@@ -1,441 +1,418 @@
-# Dufs
+# Dufs 浏览器文件管理器
 
-[![CI](https://github.com/sigoden/dufs/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/dufs/actions/workflows/ci.yaml)
-[![Crates](https://img.shields.io/crates/v/dufs.svg)](https://crates.io/crates/dufs)
-[![Docker Pulls](https://img.shields.io/docker/pulls/sigoden/dufs)](https://hub.docker.com/r/sigoden/dufs)
+Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单个 Linux 可执行文件后，即可通过 Edge、Firefox 等现代桌面浏览器浏览和管理指定目录，不需要单独部署前端服务。
 
-Dufs is a distinctive utility file server that supports static serving, uploading, searching, accessing control, webdav...
+本项目面向个人或受控局域网环境。一台系统只运行一个 Dufs 实例，并由该实例管理一个共享根目录。账号只决定能否登录；创建账号后即拥有整个共享根的完整文件管理权限。
 
-![demo](https://user-images.githubusercontent.com/4012553/220513063-ff0f186b-ac54-4682-9af4-47a9781dee0d.png)
+## 支持范围
 
-## Features
+- 浏览目录并按名称、修改时间或大小排序；
+- 下载文件、单段 Range 断点下载和目录 ZIP；
+- 通过文件选择器上传文件，通过文件夹选择器上传目录；
+- 显示上传速度、进度和预计剩余时间；
+- 当前页面内的失败任务可校验服务端持久化检查点并继续上传；
+- 新建文件和目录，移动、重命名及删除文件或目录；
+- 从当前目录开始按文件名递归搜索；
+- Argon2id 密码、中文登录页、服务端会话和 CSRF 防护；
+- 隐藏指定名称、资源预算和异步访问日志；
+- 编译内置的原生 HTML、CSS、JavaScript 管理页面。
 
-- Serve static files
-- Download folder as zip file
-- Upload files and folders (Drag & Drop)
-- Create/Edit/Search files
-- Resumable/partial uploads/downloads
-- Access control
-- Support https
-- Support webdav
-- Easy to use with curl
+本项目仅支持 Linux 服务端和现代桌面浏览器，不提供匿名访问、账号分级权限、手机 Web、WebDAV、无 JavaScript 客户端、拖放上传、在线预览或编辑、静态网站托管、运行时页面资源覆盖、Unix socket、CORS 或环境变量配置。
 
-## Install
+## 文档分工
 
-### With cargo
+- [项目工作流程与流程树](docs/project-workflow.md)：说明当前代码的启动、认证、浏览、上传、下载、持久化和停机流程；
+- [十项优化 TODO 与完成记录](docs/browser-only-optimization-review.md)：本轮十项质量优化的实现与验证依据；
+- [本地变更记录](CHANGELOG.md)：记录从 0.46.0 起已经完成的改动及更早版本历史。
 
-```
-cargo install dufs
-```
+本项目只使用本地 Git，不发布到 GitHub。
 
-### With docker
+## 环境要求
 
-```
-docker run -v `pwd`:/data -p 5000:5000 --rm sigoden/dufs /data -A
-```
+- 64 位 Linux，且内核必须提供 `openat2`；不支持时程序会拒绝启动；
+- Rust、rustc 和 Cargo 1.97.1，源码使用 Rust 2024 edition；
+- 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
+- Node.js 18 或更高版本仅用于运行前端自动化测试。
 
-### With [Homebrew](https://brew.sh)
+`build.rs` 会在编译期拒绝非 Linux 目标。`Cargo.lock` 中出现上游依赖的其他平台条件包属于 Cargo 的完整依赖图，不表示本项目支持这些平台。
 
-```
-brew install dufs
-```
-
-### Binaries on macOS, Linux, Windows
-
-Download from [Github Releases](https://github.com/sigoden/dufs/releases), unzip and add dufs to your $PATH.
-
-## CLI
-
-```
-Dufs is a distinctive utility file server - https://github.com/sigoden/dufs
-
-Usage: dufs [OPTIONS] [serve-path]
-
-Arguments:
-  [serve-path]  Specific path to serve [default: .]
-
-Options:
-  -c, --config <file>        Specify configuration file
-  -b, --bind <addrs>         Specify bind address or unix socket
-  -p, --port <port>          Specify port to listen on [default: 5000]
-      --path-prefix <path>   Specify a path prefix
-      --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
-  -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
-  -A, --allow-all            Allow all operations
-      --allow-upload         Allow upload files/folders
-      --allow-delete         Allow delete files/folders
-      --allow-search         Allow search files/folders
-      --allow-symlink        Allow symlink to files/folders outside root directory
-      --allow-archive        Allow download folders as archive file
-      --allow-hash           Allow ?hash query to get file sha256 hash
-      --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
-      --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
-      --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
-      --render-spa           Serve SPA(Single Page Application)
-      --assets <path>        Set the path to the assets directory for overriding the built-in assets
-      --log-format <format>  Customize http log format
-      --log-file <file>      Specify the file to save logs to, other than stdout/stderr
-      --compress <level>     Set zip compress level [default: low] [possible values: none, low, medium, high]
-      --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
-      --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
-      --tls-key <path>       Path to the SSL/TLS certificate's private key
-  -h, --help                 Print help
-  -V, --version              Print version
-```
-
-## Examples
-
-Serve current working directory in read-only mode
-
-```
-dufs
-```
-
-Allow all operations like upload/delete/search/create/edit...
-
-```
-dufs -A
-```
-
-Only allow upload operation
-
-```
-dufs --allow-upload
-```
-
-Serve a specific directory
-
-```
-dufs Downloads
-```
-
-Serve a single file
-
-```
-dufs linux-distro.iso
-```
-
-Serve a single-page application like react/vue
-
-```
-dufs --render-spa
-```
-
-Serve a static website with index.html
-
-```
-dufs --render-index
-```
-
-Require username/password
-
-```
-dufs -a admin:123@/:rw
-```
-
-Listen on specific host:ip 
-
-```
-dufs -b 127.0.0.1 -p 80
-```
-
-Listen on unix socket
-```
-dufs -b /tmp/dufs.socket
-```
-
-Use https
-
-```
-dufs --tls-cert my.crt --tls-key my.key
-```
-
-## API
-
-Upload a file
+## 编译
 
 ```sh
-curl -T path-to-file http://127.0.0.1:5000/new-path/path-to-file
+cargo build --release
 ```
 
-Download a file
-```sh
-curl http://127.0.0.1:5000/path-to-file           # download the file
-curl http://127.0.0.1:5000/path-to-file?hash      # retrieve the sha256 hash of the file
+生成的可执行文件位于：
+
+```text
+target/release/dufs
 ```
 
-Download a folder as zip file
-
-```sh
-curl -o path-to-folder.zip http://127.0.0.1:5000/path-to-folder?zip
-```
-
-Delete a file/folder
+也可以直接从当前本地源码安装：
 
 ```sh
-curl -X DELETE http://127.0.0.1:5000/path-to-file-or-folder
+cargo install --path .
 ```
 
-Create a directory
+## 快速开始
+
+先生成密码哈希：
 
 ```sh
-curl -X MKCOL http://127.0.0.1:5000/path-to-folder
+./target/release/dufs hash-password
 ```
 
-Move the file/folder to the new path
+再把下面的 `$argon2id$…` 替换为命令输出的完整 PHC 字符串：
 
 ```sh
-curl -X MOVE http://127.0.0.1:5000/path -H "Destination: http://127.0.0.1:5000/new-path"
+./target/release/dufs \
+  -p 5000 \
+  -a 'admin:$argon2id$…' \
+  /需要管理的目录
 ```
 
-List/search directory contents
+未指定 `--bind` 时，Dufs 默认监听 `0.0.0.0:5000`，即本机全部 IPv4 网络接口。需要 IPv6 时可显式使用 `--bind ::`；网关与 Dufs 位于同一台主机时，建议显式使用 `--bind 127.0.0.1`。
+
+浏览器会话 Cookie 带有 `Secure` 属性，因此浏览器入口必须使用 HTTPS。通常应在浏览器中打开网关提供的地址：
+
+```text
+https://files.example.com/
+```
+
+服务至少需要一个账号；没有通过命令行或 YAML 配置账号时会拒绝启动。登录后无需开启其他能力开关，即可使用全部文件管理功能。
+
+## 账号与登录
+
+账号格式为：
+
+```text
+用户名:$argon2id$...
+```
+
+配置多个账号时重复使用 `--auth`：
 
 ```sh
-curl http://127.0.0.1:5000?q=Dockerfile           # search for files, similar to `find -name Dockerfile`
-curl http://127.0.0.1:5000?simple                 # output names only, similar to `ls -1`
-curl http://127.0.0.1:5000?json                   # output paths in json format
+./target/release/dufs \
+  -b 127.0.0.1 \
+  -a 'admin:$argon2id$…' \
+  -a 'user:$argon2id$…' \
+  /需要管理的目录
 ```
 
-With authorization (Both basic or digest auth works)
+使用要求：
 
-```sh
-curl http://127.0.0.1:5000/file --user user:pass                 # basic auth
-curl http://127.0.0.1:5000/file --user user:pass --digest        # digest auth
+- 密码必须是 `dufs hash-password` 生成的完整 Argon2id PHC 字符串；
+- 哈希包含 `$`，在 Shell 中应使用单引号；
+- 重复用户名和非 Argon2id 格式会阻止启动；
+- 每个账号均可浏览、上传、覆盖、移动、删除及搜索整个共享根；
+- 登录成功后使用服务端内存会话；空闲 30 分钟或创建满 12 小时后失效；
+- 程序重启会清空会话，浏览器需要重新登录；
+- 登录、注销和文件写入均受同源及 CSRF 检查保护。
+
+## 浏览器文件管理
+
+### 浏览、下载与搜索
+
+- 点击目录名进入下一级目录；
+- 点击文件名或下载按钮下载文件；
+- 点击目录下载按钮生成并下载 ZIP；
+- 点击表头按名称、修改时间或大小排序；
+- 搜索框从当前目录开始递归匹配文件名。
+
+普通文件始终作为附件下载，不提供在线预览或编辑。服务只支持单段 Range，多段 Range 返回 `416`。目录列表、搜索和 ZIP 只接受 UTF-8 文件名；遇到非 UTF-8 Linux 文件名时整个操作会失败，需要先在系统侧重命名。
+
+目录页只返回骨架，文件项通过受认证的分页 API 每次最多加载 500 项，默认 200 项；翻页期间由 Dufs 引起的目录项新增、删除或替换会要求从第一页重新加载。目录游标不监控 shell、virtiofs 宿主机等外部进程对现有子文件进行的原地内容或 metadata 修改。目录 ZIP 会先在服务端私有临时文件中完整生成，成功后才开始响应，因此生成失败不会向浏览器返回截断的成功归档。ZIP 的源文件总量按实际读取字节计算，临时归档另有独立输出上限，并在每次写入前保护最低剩余磁盘空间。
+
+### 上传与续传
+
+- “上传”可选择一个或多个文件；
+- “文件夹上传”会保留所选目录中的相对路径，但不会创建空目录；
+- 页面显示每个任务的速度、进度、预计剩余时间和最终结果；
+- 当前页面内上传失败后，“重试”会先核对同一上传任务的服务端检查点，再从已持久化偏移继续；
+- 页面刷新后不会自动恢复旧任务，也不会读取 `localStorage` 续传记录；重新选择文件会创建全新上传 ID，避免仅凭文件名、大小和时间戳把不同内容拼接在一起；
+- 拖入文件只会被阻止触发浏览器导航，不会开始上传。
+
+服务端不会直接改写最终文件。只有完成文件同步、同文件系统原子发布和目标父目录同步后才返回成功；因此在受支持的 Linux 本地文件系统及存储正确兑现同步请求的前提下，成功响应表示文件已经按崩溃持久化语义提交。强制断电、介质损坏、错误实现同步语义的存储以及后续位腐败仍需要可靠存储和备份处理。
+
+上传协议、检查点、内部暂存、任务取消和目录同步的完整步骤见[项目工作流程](docs/project-workflow.md#9-持久化上传与断点续传)。
+
+### 新建、移动与删除
+
+- 可以新建空文件和目录；
+- 移动与重命名共用一个操作；
+- 不允许覆盖时使用原子不替换语义，并发出现同名目标会返回冲突；
+- 共享根目录本身不能删除；
+- 删除会先持久化移除原名称，再异步回收磁盘空间；
+- 内部删除暂存项不是回收站，不提供恢复或撤销功能。
+
+解析后仍位于共享根内的相对符号链接可以使用。绝对符号链接和指向根外的符号链接会被隐藏并拒绝访问。需要管理其他磁盘或 virtiofs 导出目录时，应先将其挂载到共享根内。
+
+### 文件系统大小写说明
+
+Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存名称。共享根建议使用未启用目录 casefold（`+F`）的 ext4；使用 virtiofs 时，宿主导出目录也应能区分仅大小写不同的名称。若底层目录不区分大小写，`Foo` 与 `foo` 可能指向同一对象；本项目不会检测、拒绝或兼容这种挂载，也不会为此增加特殊代码。
+
+## 命令行参数
+
+```text
+用法：dufs [选项] [共享目录]
 ```
 
-Resumable downloads
+| 参数 | 说明 |
+| --- | --- |
+| `[serve-path]` | 要管理的现有目录，默认当前目录；非目录会拒绝启动 |
+| `-c, --config <file>` | YAML 配置文件 |
+| `-b, --bind <ips>` | 监听一个或多个 IPv4/IPv6 地址，默认 `0.0.0.0` |
+| `-p, --port <port>` | 监听端口，默认 `5000` |
+| `--path-prefix <path>` | URL 路径前缀 |
+| `--hidden <value>` | 隐藏匹配的文件或目录名 |
+| `-a, --auth <account>` | 添加一个拥有完整共享目录权限的账号 |
+| `--log-format <format>` | 自定义 HTTP 访问日志格式 |
+| `--log-file <file>` | 将日志写入文件 |
+| `--compress <level>` | ZIP 压缩级别：`none/low/medium/high` |
+| `--max-upload-size <bytes>` | 单文件最大声明长度，默认 100 GiB |
+| `--upload-idle-timeout <seconds>` | 上传正文最大空闲时间，默认 60 秒 |
+| `--upload-total-timeout <seconds>` | 单次上传总时限，默认 24 小时 |
+| `--max-concurrent-uploads <count>` | 同时上传数，默认 4 |
+| `--min-free-space <bytes>` | 上传和 ZIP 临时文件写入期间必须保留的可用空间，默认 1 GiB |
+| `--max-connections <count>` | 活跃 TCP 连接上限，默认 256 |
+| `--max-search-entries <count>` | 单次搜索最多检查的目录项，默认 10000 |
+| `--max-zip-entries <count>` | 单次 ZIP 遍历最多检查的目录项，默认 10000 |
+| `--max-zip-uncompressed-size <bytes>` | ZIP 源文件未压缩总量上限，默认 10 GiB |
+| `--max-zip-output-size <bytes>` | 单个 ZIP 临时归档的实际输出上限，默认 10 GiB |
+| `--max-concurrent-searches <count>` | 同时执行的列表或搜索数，默认 2 |
+| `--max-concurrent-zips <count>` | 同时生成或向客户端发送的目录 ZIP 数，默认 1 |
+| `--request-timeout <seconds>` | 普通请求处理并生成响应头的时限，默认 300 秒；不包含响应头发出后的文件流传输 |
+| `-h, --help` | 显示帮助 |
+| `-V, --version` | 显示版本 |
 
-```sh
-curl -C- -o file http://127.0.0.1:5000/file
-```
+`--bind` 只接受 IP 地址，可以重复使用或用逗号分隔；主机名、文件路径和 Unix socket 路径会被拒绝。命令行参数覆盖 YAML 中的值。
 
-Resumable uploads
+`--request-timeout` 在响应头生成完成时结束计时。普通文件、单段 Range 和已经生成完成的 ZIP 正文传输不受该计时器限制；它们仍受活跃连接上限约束，目录 ZIP 还会一直占用 ZIP 并发槽位，直到正文发送完成、失败或被客户端取消。
 
-```sh
-upload_offset=$(curl -I -s http://127.0.0.1:5000/file | tr -d '\r' | sed -n 's/content-length: //p')
-dd skip=$upload_offset if=file status=none ibs=1 | \
-  curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
-```
+上传和 ZIP 通过按 Linux `st_dev` 分桶的共享记账保护 `--min-free-space`：同一文件系统上的两类操作联合计算预留，不同文件系统互不影响。该保证覆盖 Dufs 进程内部并发；外部进程、virtiofs 宿主机或存储侧变化仍可能竞争空间，生产配置应保留额外余量。
 
-Health checks
-
-```sh
-curl http://127.0.0.1:5000/__dufs__/health
-```
-
-<details>
-<summary><h2>Advanced Topics</h2></summary>
-
-### Access Control
-
-Dufs supports account based access control. You can control who can do what on which path with `--auth`/`-a`.
-
-```
-dufs -a admin:admin@/:rw -a guest:guest@/
-dufs -a user:pass@/:rw,/dir1 -a @/
-```
-
-1. Use `@` to separate the account and paths. No account means anonymous user.
-2. Use `:` to separate the username and password of the account.
-3. Use `,` to separate paths.
-4. Use path suffix `:rw`/`:ro` set permissions: `read-write`/`read-only`. `:ro` can be omitted.
-
-- `-a admin:admin@/:rw`: `admin` has complete permissions for all paths.
-- `-a guest:guest@/`: `guest` has read-only permissions for all paths.
-- `-a user:pass@/:rw,/dir1`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`.
-- `-a @/`: All paths is publicly accessible, everyone can view/download it.
-
-**Auth permissions are restricted by dufs global permissions.** If dufs does not enable upload permissions via `--allow-upload`, then the account will not have upload permissions even if it is granted `read-write`(`:rw`) permissions.
-
-#### Hashed Password
-
-DUFS supports the use of sha-512 hashed password.
-
-Create hashed password:
-
-```sh
-$ openssl passwd -6 123456 # or `mkpasswd -m sha-512 123456`
-$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/
-```
-
-Use hashed password:
-
-```sh
-dufs -a 'admin:$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/@/:rw'
-```
-> The hashed password contains `$6`, which can expand to a variable in some shells, so you have to use **single quotes** to wrap it.
-
-Two important things for hashed passwords:
-
-1. Dufs only supports sha-512 hashed passwords, so ensure that the password string always starts with `$6$`.
-2. Digest authentication does not function properly with hashed passwords.
-
-
-### Hide Paths
-
-Dufs supports hiding paths from directory listings via option `--hidden <glob>,...`.
-
-```
-dufs --hidden .git,.DS_Store,tmp
-```
-
-> The glob used in --hidden only matches file and directory names, not paths. So `--hidden dir1/file` is invalid.
-
-```sh
-dufs --hidden '.*'                          # hidden dotfiles
-dufs --hidden '*/'                          # hidden all folders
-dufs --hidden '*.log,*.lock'                # hidden by exts
-dufs --hidden '*.log' --hidden '*.lock'
-```
-
-### Log Format
-
-Dufs supports customize http log format with option `--log-format`.
-
-The log format can use following variables.
-
-| variable     | description                                                               |
-| ------------ | ------------------------------------------------------------------------- |
-| $remote_addr | client address                                                            |
-| $remote_user | user name supplied with authentication                                    |
-| $request     | full original request line                                                |
-| $status      | response status                                                           |
-| $http_       | arbitrary request header field. examples: $http_user_agent, $http_referer |
-
-
-The default log format is `'$time_iso8601 $log_level - $remote_addr "$request" $status`.
-```
-2022-08-06T06:59:31+08:00 INFO - 127.0.0.1 "GET /" 200
-```
-
-A json log format is also supported.
-```
-dufs --log-format '{"time":"$time_local","addr":"$remote_addr","uri":"$request_uri", "method":"$request_method","status":$status}'
-
-{"time":"2022-08-06T06:59:31+08:00","addr":"127.0.0.1","uri":"/", "method":"GET","status":200}
-```
-
-Disable http log
-```
-dufs --log-format=''
-```
-
-Log user-agent
-```
-dufs --log-format '$remote_addr "$request" $status $http_user_agent'
-```
-```
-2022-08-06T06:53:55+08:00 INFO - 127.0.0.1 "GET /" 200 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36
-```
-
-Log remote-user
-```
-dufs --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admin -a /folder1@user1:pass1
-```
-```
-2022-08-06T07:04:37+08:00 INFO - 127.0.0.1 admin "GET /" 200
-```
-
-## Environment variables
-
-All options can be set using environment variables prefixed with `DUFS_`.
-
-```
-[serve-path]                DUFS_SERVE_PATH="."
-    --config <file>         DUFS_CONFIG=config.yaml
--b, --bind <addrs>          DUFS_BIND=0.0.0.0
--p, --port <port>           DUFS_PORT=5000
-    --path-prefix <path>    DUFS_PATH_PREFIX=/dufs
-    --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
--a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
--A, --allow-all             DUFS_ALLOW_ALL=true
-    --allow-upload          DUFS_ALLOW_UPLOAD=true
-    --allow-delete          DUFS_ALLOW_DELETE=true
-    --allow-search          DUFS_ALLOW_SEARCH=true
-    --allow-symlink         DUFS_ALLOW_SYMLINK=true
-    --allow-archive         DUFS_ALLOW_ARCHIVE=true
-    --allow-hash            DUFS_ALLOW_HASH=true
-    --enable-cors           DUFS_ENABLE_CORS=true
-    --render-index          DUFS_RENDER_INDEX=true
-    --render-try-index      DUFS_RENDER_TRY_INDEX=true
-    --render-spa            DUFS_RENDER_SPA=true
-    --assets <path>         DUFS_ASSETS=./assets
-    --log-format <format>   DUFS_LOG_FORMAT=""
-    --log-file <file>       DUFS_LOG_FILE=./dufs.log
-    --compress <compress>   DUFS_COMPRESS=low
-    --tls-cert <path>       DUFS_TLS_CERT=cert.pem
-    --tls-key <path>        DUFS_TLS_KEY=key.pem
-```
-
-## Configuration File
-
-You can specify and use the configuration file by selecting the option `--config <path-to-config.yaml>`.
-
-The following are the configuration items:
+## YAML 配置
 
 ```yaml
-serve-path: '.'
-bind: 0.0.0.0
+serve-path: /需要管理的目录
+bind:
+  - 127.0.0.1
 port: 5000
-path-prefix: /dufs
+path-prefix: files
 hidden:
-  - tmp
-  - '*.log'
+  - .git
+  - .DS_Store
+  - '*.tmp'
   - '*.lock'
 auth:
-  - admin:admin@/:rw
-  - user:pass@/src:rw,/share
-  - '@/'  # According to the YAML spec, quoting is required.
-allow-all: false
-allow-upload: true
-allow-delete: true
-allow-search: true
-allow-symlink: true
-allow-archive: true
-allow-hash: true
-enable-cors: true
-render-index: true
-render-try-index: true
-render-spa: true
-assets: ./assets/
-log-format: '$remote_addr "$request" $status $http_user_agent'
+  - 'admin:$argon2id$…'
+log-format: '$time_iso8601 $remote_addr "$request" $status'
 log-file: ./dufs.log
 compress: low
-tls-cert: tests/data/cert.pem
-tls-key: tests/data/key_pkcs1.pem
+max-upload-size: 107374182400
+upload-idle-timeout: 60
+upload-total-timeout: 86400
+max-concurrent-uploads: 4
+min-free-space: 1073741824
+max-connections: 256
+max-search-entries: 10000
+max-zip-entries: 10000
+max-zip-uncompressed-size: 10737418240
+max-zip-output-size: 10737418240
+max-concurrent-searches: 2
+max-concurrent-zips: 1
+request-timeout: 300
 ```
 
-### Customize UI
+启动：
 
-Dufs allows users to customize the UI with your own assets.
-
-```
-dufs --assets my-assets-dir/
+```sh
+./target/release/dufs --config ./dufs.yaml
 ```
 
-> If you only need to make slight adjustments to the current UI, you copy dufs's [assets](https://github.com/sigoden/dufs/tree/main/assets) directory and modify it accordingly. The current UI doesn't use any frameworks, just plain HTML/JS/CSS. As long as you have some basic knowledge of web development, it shouldn't be difficult to modify.
+设置 `path-prefix: files` 后，浏览器地址为：
 
-Your assets folder must contains a `index.html` file.
+```text
+https://files.example.com/files/
+```
 
-`index.html` can use the following placeholder variables to retrieve internal data.
+YAML 会拒绝未知字段。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
 
-- `__INDEX_DATA__`: directory listing data
-- `__ASSETS_PREFIX__`: assets url prefix
+## 网关与反向代理
 
-> A customized 404.html page is also supported.
+推荐部署拓扑：
 
-Here are some Third-party customize UI project:
+```text
+Edge / Firefox
+      │ HTTPS
+      ▼
+网关或反向代理
+      │ 内网 TCP
+      ▼
+Dufs
+      │
+      ▼
+共享目录
+```
 
-- https://github.com/TransparentLC/dufs-material-assets
-- https://github.com/cercky/dufs_web
-- https://github.com/52funny/dufs-tabler-web
+默认的 `0.0.0.0` 适合需要通过服务器 IPv4 地址接入的部署，但会让所有本机 IPv4 接口接受连接。应使用主机防火墙只允许网关访问该端口。若网关与 Dufs 同机，可把暴露面收窄到回环地址：
 
-</details>
+```sh
+./target/release/dufs \
+  -b 127.0.0.1 \
+  -p 5000 \
+  -a 'admin:$argon2id$…' \
+  /需要管理的目录
+```
 
-## License
+网关配置要求：
 
-Copyright (c) 2022-2024 dufs-developers.
+- 浏览器只访问网关提供的 HTTPS 地址，不能绕过网关直连后端；
+- Dufs 后端只提供 HTTP；HTTPS 证书、TLS 协议和公网安全策略全部由网关负责；
+- 保留原始 `Host`，并正确转发路径前缀，否则同源检查会失败；
+- 不缓存登录、认证文件、Range、ZIP、上传、API 或错误响应；
+- 保留上游的 `Cache-Control: private, no-store`；
+- 按可信的真实客户端 IP 限制登录速率；
+- 强制把 HTTP 入口重定向到 HTTPS，并在确认域名只提供 HTTPS 后启用 HSTS；
+- 最好使用独立主机名，不与不可信应用共享同一主机名。
 
-dufs is made available under the terms of either the MIT License or the Apache License 2.0, at your option.
+本项目不再提供内置 TLS。若网关不在同一主机，必须使用隔离私网、主机防火墙或等效 ACL，避免其他设备绕过 HTTPS 网关直接访问后端端口。
 
-See the LICENSE-APACHE and LICENSE-MIT files for license details.
+## 隐藏规则
+
+```sh
+./target/release/dufs \
+  -a 'admin:$argon2id$…' \
+  --hidden '.git,.DS_Store,*.log,*.lock' \
+  /需要管理的目录
+```
+
+隐藏规则只匹配文件名或目录名，不匹配完整路径。隐藏仅影响目录列表和搜索，不是访问控制；需要隔离的内容不应放入共享根。
+
+## 访问日志
+
+常用变量：
+
+| 变量 | 含义 |
+| --- | --- |
+| `$remote_addr` | 与 Dufs 建立 TCP 连接的客户端地址；经网关时通常是网关地址 |
+| `$remote_user` | 已成功认证的用户名；未认证或认证失败时为 `-` |
+| `$request` | 完整请求行 |
+| `$status` | HTTP 状态码 |
+| `$http_...` | 请求头，例如 `$http_user_agent` |
+
+Authorization、Proxy-Authorization、Cookie 和 CSRF 请求头会在自定义日志变量中脱敏。连接处理错误会记录 TCP peer、错误类别和系统错误码，便于定位网关 `502`、超时和协议问题。
+
+示例：
+
+```sh
+./target/release/dufs \
+  -a 'admin:$argon2id$…' \
+  --log-format '$time_iso8601 $remote_addr $remote_user "$request" $status' \
+  --log-file ./dufs.log \
+  /需要管理的目录
+```
+
+设置 `--log-format=''` 可以关闭 HTTP 访问日志。
+
+## 停止服务与 systemd
+
+首次收到 SIGINT 或 SIGTERM 时，Dufs 会停止接受新连接，并给予普通任务 30 秒宽限；随后取消可取消任务，同时继续等待上传及已经开始的文件系统提交安全收尾。第二次停止信号和 SIGKILL 会立即越过等待，不能保证正在处理的写入已经落盘。
+
+systemd 的停止超时必须大于 30 秒，并为最慢的存储同步和大目录清理留出余量：
+
+```ini
+[Service]
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+```
+
+`45s` 只是起点，应按实际目录规模和存储性能调大。
+
+## 内置页面
+
+`assets/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。资源内容变化会生成新的摘要 URL，只有已知版本化资源使用长期缓存。
+
+生产构建不需要 Node.js 或前端打包步骤；Node.js 只用于 Playwright 测试。
+
+## 本地检查
+
+确认工具链：
+
+```sh
+rustc --version
+cargo --version
+```
+
+Rust 检查：
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo audit
+```
+
+首次准备前端测试：
+
+```sh
+npm ci
+npm run test:frontend:install
+```
+
+运行桌面浏览器自动化测试：
+
+```sh
+npm run test:frontend
+npm audit --audit-level=high
+```
+
+当前 Playwright 必需矩阵覆盖 Chromium 和 Firefox；已安装 Microsoft Edge 时可执行 `npm run test:frontend:edge`。测试通过本地 HTTPS 网关转发到 Dufs 的 HTTP 动态端口，与生产部署边界一致。`tests/data/key_pkcs8.pem` 是公开、固定且仅供 localhost 自动化使用的测试私钥，绝不能作为生产网关密钥部署。
+
+完整本地检查可使用：
+
+```sh
+./scripts/check.sh
+```
+
+提交前还应执行：
+
+```sh
+git diff --check
+git status --short
+```
+
+本项目只提交到本地 Git。创建版本时应先确认工作树完整、检查全部通过，再创建与 Cargo 版本一致的本地 tag。
+
+## 目录结构
+
+```text
+.
+├── assets/                         # 编译内置的浏览器页面源码
+├── docs/
+│   ├── project-workflow.md         # 当前实现流程与 Mermaid 流程树
+│   └── browser-only-optimization-review.md
+├── src/
+│   ├── main.rs                     # 启动、监听和连接生命周期
+│   ├── args.rs                     # 命令行与 YAML 配置
+│   ├── auth.rs                     # 账号、会话与 CSRF
+│   ├── server.rs                   # 服务入口与公共路由
+│   └── server/
+│       ├── browser_api.rs          # 新建目录、移动和重命名
+│       ├── disk_space.rs           # 按文件系统联合计算上传与 ZIP 空间
+│       ├── download.rs             # 文件下载、MIME 与 Range
+│       ├── listing.rs              # 目录、搜索与 ZIP
+│       ├── path_coordinator.rs      # 进程内路径写租约
+│       ├── rooted_fs.rs            # 共享根 fd 与 Linux 文件操作
+│       ├── session.rs              # 登录、注销与写请求校验
+│       ├── storage.rs              # 可注入的持久化提交边界
+│       └── upload.rs               # 上传、检查点与维护
+├── tests/
+│   ├── frontend/                   # 按职责拆分的 Playwright 测试
+│   └── *.rs                        # Rust 集成测试
+├── Cargo.toml
+├── Cargo.lock
+├── package.json
+├── playwright.config.js
+└── rust-toolchain.toml
+```

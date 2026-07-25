@@ -1,16 +1,15 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use indexmap::IndexSet;
 use serde_json::Value;
 
 #[macro_export]
 macro_rules! assert_resp_paths {
-    ($resp:ident) => {
-        assert_resp_paths!($resp, self::fixtures::FILES)
+    ($server:ident, $resp:ident) => {
+        assert_resp_paths!($server, $resp, self::fixtures::FILES)
     };
-    ($resp:ident, $files:expr) => {
+    ($server:ident, $resp:ident, $files:expr_2021) => {
         assert_eq!($resp.status(), 200);
-        let body = $resp.text()?;
-        let paths = self::utils::retrieve_index_paths(&body);
+        let paths = $server.paths_from_page($resp)?;
         assert!(!paths.is_empty());
         for file in $files {
             assert!(paths.contains(&file.to_string()));
@@ -18,17 +17,10 @@ macro_rules! assert_resp_paths {
     };
 }
 
-#[macro_export]
-macro_rules! fetch {
-    ($method:literal, $url:expr) => {
-        reqwest::blocking::Client::new().request(reqwest::Method::from_bytes($method)?, $url)
-    };
-}
-
 #[allow(dead_code)]
 pub fn retrieve_index_paths(content: &str) -> IndexSet<String> {
     let value = retrieve_json(content).unwrap();
-    let paths = value
+    value
         .get("paths")
         .unwrap()
         .as_array()
@@ -43,21 +35,12 @@ pub fn retrieve_index_paths(content: &str) -> IndexSet<String> {
                 Some(name.to_owned())
             }
         })
-        .collect();
-    paths
-}
-
-#[allow(dead_code)]
-pub fn retrieve_edit_file(content: &str) -> Option<bool> {
-    let value = retrieve_json(content).unwrap();
-    let value = value.get("editable").unwrap();
-    Some(value.as_bool().unwrap())
+        .collect()
 }
 
 #[allow(dead_code)]
 pub fn encode_uri(v: &str) -> String {
-    let parts: Vec<_> = v.split('/').map(urlencoding::encode).collect();
-    parts.join("/")
+    dufs::utils::encode_uri(v)
 }
 
 #[allow(dead_code)]

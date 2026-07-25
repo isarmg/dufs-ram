@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>登录</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Source Han Sans SC", "Source Han Sans CN", "Noto Sans CJK SC",
+        "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI",
+        "Microsoft YaHei", "Segoe UI", system-ui, -apple-system, sans-serif;
+      --bg: #f5f6f3;
+      --surface-strong: #fafbf8;
+      --text: #202a33;
+      --muted: #60707c;
+      --primary: #245b75;
+      --danger: #a73d46;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input {
+      font: inherit;
+      line-height: inherit;
+    }
+
+    .login-screen {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      min-height: 100dvh;
+      padding: 24px;
+      overflow-y: auto;
+    }
+
+    .content-card {
+      /*
+       * 3:2 内容块的横向半径取卡宽 1/18，纵向半径取卡高 1/12。
+       * 两者最终得到相同的像素半径，形成正圆四分之一圆角。
+       */
+      --content-card-radius-x: 5.5556%;
+      --content-card-radius-y: 8.3333%;
+      --content-card-row-height: calc(100cqh / 6);
+      --content-card-font-size: calc(var(--content-card-row-height) * .5);
+      --content-card-glyph-half: calc(var(--content-card-font-size) * .5);
+      --content-card-text-start: calc(
+        var(--content-card-radius-x) - var(--content-card-glyph-half)
+      );
+      position: relative;
+      width: min(380px, 100%);
+      aspect-ratio: 3 / 2;
+      overflow: hidden;
+      container-type: size;
+      color: var(--text);
+      background: var(--surface-strong);
+      border: 0;
+      border-radius: var(--content-card-radius-x) / var(--content-card-radius-y);
+    }
+
+    .card-inner {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: repeat(6, minmax(0, 1fr));
+      grid-auto-rows: 0;
+      min-width: 0;
+      min-height: 0;
+      padding-inline: var(--content-card-text-start);
+      font-size: var(--content-card-font-size);
+      line-height: 1.2;
+    }
+
+    .card-row {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      column-gap: 2ch;
+      align-items: center;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .card-row-label {
+      display: inline-flex;
+      align-items: center;
+      flex-shrink: 0;
+      gap: 1ch;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .card-row-content {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      overflow: hidden;
+      gap: 4px;
+    }
+
+    .input-row,
+    .error-row {
+      grid-template-columns: minmax(0, 1fr);
+      column-gap: 0;
+    }
+
+    .login-input {
+      width: 100%;
+      min-width: 0;
+      padding: 0;
+      color: var(--text);
+      background: transparent;
+      border: 0;
+      border-bottom: 1px solid transparent;
+      outline: 0;
+    }
+
+    .login-input:focus {
+      border-bottom-color: var(--primary);
+    }
+
+    .login-label-icon {
+      display: inline-grid;
+      place-items: center;
+      width: 1em;
+      height: 1em;
+      flex: 0 0 1em;
+      border: 1px solid currentcolor;
+      border-radius: .25em;
+    }
+
+    .login-label-icon svg {
+      width: .65em;
+      height: .65em;
+      fill: none;
+      stroke: currentcolor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.75;
+    }
+
+    .login-error {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--danger);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .card-actions {
+      display: flex;
+      align-items: center;
+      width: 100%;
+    }
+
+    .card-action-button {
+      min-width: 0;
+      min-height: 0;
+      padding: 0;
+      color: var(--primary);
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      cursor: pointer;
+      font-weight: 400;
+    }
+
+    .card-action-button:hover,
+    .card-action-button:focus-visible {
+      color: var(--text);
+      outline: 0;
+      text-decoration: underline;
+    }
+
+    .hidden {
+      visibility: hidden;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #151a1d;
+        --surface-strong: #252c31;
+        --text: #edf2f4;
+        --muted: #a4b0b7;
+        --primary: #5fa8c8;
+        --danger: #ff8a92;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="login-screen">
+    <form class="content-card login-card" method="post" action="__LOGIN_ACTION__" aria-label="登录文件管理器"
+      novalidate>
+      <div class="card-inner">
+        <div class="card-row">
+          <label class="card-row-label" for="username">
+            <span class="login-label-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            </span>
+            账号
+          </label>
+          <div class="card-row-content"></div>
+        </div>
+        <div class="card-row input-row">
+          <div class="card-row-content">
+            <input class="login-input" id="username" name="username" type="text" maxlength="128"
+              autocomplete="username" aria-label="账号" required autofocus>
+          </div>
+        </div>
+        <div class="card-row">
+          <label class="card-row-label" for="password">
+            <span class="login-label-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect width="18" height="11" x="3" y="11" rx="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+              </svg>
+            </span>
+            密码
+          </label>
+          <div class="card-row-content"></div>
+        </div>
+        <div class="card-row input-row">
+          <div class="card-row-content">
+            <input class="login-input" id="password" name="password" type="password" maxlength="1024"
+              autocomplete="current-password" aria-label="密码" required>
+          </div>
+        </div>
+        <div class="card-row error-row __ERROR_CLASS__" role="alert">
+          <div class="card-row-content">
+            <span class="login-error">__ERROR_MESSAGE__</span>
+          </div>
+        </div>
+        <div class="card-row">
+          <span class="card-row-label">
+            <span class="login-label-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m10 17 5-5-5-5"></path>
+                <path d="M15 12H3"></path>
+                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
+              </svg>
+            </span>
+            操作
+          </span>
+          <div class="card-row-content">
+            <div class="card-actions">
+              <button class="card-action-button primary" type="submit">登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </form>
+  </main>
+</body>
+
+</html>

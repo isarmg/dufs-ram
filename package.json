@@ -1,0 +1,19 @@
+{
+  "name": "dufs-browser-tests",
+  "private": true,
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test:frontend": "cargo build --locked --quiet && node tests/frontend/run.mjs",
+    "test:frontend:headed": "cargo build --locked --quiet && node tests/frontend/run.mjs --headed",
+    "test:frontend:edge": "cargo build --locked --quiet && node tests/frontend/run.mjs --edge --project=edge",
+    "test:frontend:install": "playwright install chromium firefox"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}
