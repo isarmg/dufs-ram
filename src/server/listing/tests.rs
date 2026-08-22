@@ -163,6 +163,7 @@ fn list_snapshot_cursor_is_authenticated_and_expires() {
         name: name.to_string(),
         mtime: 0,
         size: 0,
+        revision: TargetRevision::from_bytes([0; 32]),
     };
     let paths = vec![item("a"), item("b"), item("c")];
     let weight = list_snapshot_weight(&binding, &paths, paths.capacity());
@@ -312,6 +313,7 @@ fn isolated_list_snapshot_caches_do_not_share_entries_or_capacity() {
         name: name.to_string(),
         mtime: 0,
         size: 0,
+        revision: TargetRevision::from_bytes([0; 32]),
     };
     let binding = |owner: [u8; 32]| ListSnapshotBinding {
         owner,
@@ -382,6 +384,7 @@ fn direct_list_snapshot_scan_enforces_entry_and_time_budgets() {
         root.path(),
         ListSnapshotOptions {
             serve_path: root.path(),
+            revision_owner: OwnerId::persistent("alice"),
             max_entries: 1,
             max_bytes: MAX_CACHED_LIST_SNAPSHOT_BYTES_PER_OWNER,
             sort: "name",
@@ -403,6 +406,7 @@ fn direct_list_snapshot_scan_enforces_entry_and_time_budgets() {
         root.path(),
         ListSnapshotOptions {
             serve_path: root.path(),
+            revision_owner: OwnerId::persistent("alice"),
             max_entries: 8,
             max_bytes: MAX_CACHED_LIST_SNAPSHOT_BYTES_PER_OWNER,
             sort: "name",
@@ -497,6 +501,7 @@ fn path_sort_maps_cancellation_and_deadline_to_existing_statuses() {
         name: name.to_owned(),
         mtime: 0,
         size: 0,
+        revision: TargetRevision::from_bytes([0; 32]),
     };
     let path = Path::new("/srv/share");
 
@@ -548,6 +553,7 @@ fn direct_list_snapshot_rejects_long_names_before_inserting_over_budget_items() 
         root.path(),
         ListSnapshotOptions {
             serve_path: root.path(),
+            revision_owner: OwnerId::persistent("alice"),
             max_entries: 8,
             max_bytes: 1,
             sort: "name",
@@ -590,7 +596,9 @@ async fn recursive_search_collection_enforces_allocated_byte_budget() {
             permit: None,
         },
         |_, _| Ok(true),
-        move |entry| pathitem_from_rooted_entry(entry, &base_path, &serve_path),
+        move |entry| {
+            pathitem_from_rooted_entry(entry, &base_path, &serve_path, OwnerId::persistent("alice"))
+        },
         path_item_heap_bytes,
         Some(CollectionByteBudget {
             max_bytes: 1,

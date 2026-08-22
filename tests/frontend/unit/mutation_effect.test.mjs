@@ -61,6 +61,21 @@ test("mutation invalidation distinguishes committed, unknown, and rejected write
     }),
     MUTATION_EFFECT.NOT_COMMITTED,
   );
+  for (const code of [
+    "delete_target_changed",
+    "source_changed",
+    "destination_changed",
+  ]) {
+    const stale = new RequestError("stale listing revision", {
+      status: 412,
+      code,
+      operationState: "failed",
+    });
+    assert.equal(
+      trackedMutationEffect({ kind: "failed", error: stale, status: null }),
+      MUTATION_EFFECT.REFRESH_REQUIRED,
+    );
+  }
   const preDispatch = new RequestError("cancelled before dispatch", {
     outcomeUnknown: false,
   });

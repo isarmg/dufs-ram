@@ -577,7 +577,7 @@ Extended Attribute，Linux 文件扩展属性。覆盖重放时必须限制特�
 
 ### 为什么不直接相信路径字符串？
 
-字符串检查无法阻止检查后符号链接或目录项被替换。真正操作必须从根 FD 按内核约束解析，并按具体操作检查类型或 identity；外部 writer 不受进程内 PathCoordinator 控制，普通 Move/Rename 也没有上传/删除那样的最终 source identity CAS。
+字符串检查无法阻止检查后符号链接或目录项被替换。真正操作必须从根 FD 按内核约束解析，并按具体操作检查类型或 identity；外部 writer 不受进程内 PathCoordinator 控制。当前列表 revision 会由 DELETE 的 `If-Match`、Move/Rename 的 `source_revision`（覆盖时再加 `destination_revision`）带回，RootedFs 在紧邻 rename 时复核完整身份，但最后 `statat → renameat2` 的微窗仍要求部署侧排除其他 writer。
 
 ### 为什么 Move 和 Rename 不合成一个按钮？
 

@@ -9,9 +9,25 @@ const HEALTH_CHECK_RESPONSE: &str = r#"{"status":"OK"}"#;
 const READINESS_CHECK_PATH: &str = "__dufs__/ready";
 const READINESS_CHECK_RESPONSE: &str = r#"{"status":"ready"}"#;
 
+fn assert_no_store(response: &reqwest::blocking::Response) {
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .expect("health responses must define Cache-Control")
+        .to_str()
+        .expect("Cache-Control must be ASCII");
+    assert!(
+        cache_control
+            .split(',')
+            .any(|directive| directive.trim().eq_ignore_ascii_case("no-store")),
+        "Cache-Control must contain no-store, got {cache_control:?}"
+    );
+}
+
 #[rstest]
 fn normal_health(server: TestServer) -> Result<(), Error> {
     let resp = server.get(format!("{}{HEALTH_CHECK_PATH}", server.url()))?;
+    assert_no_store(&resp);
     assert_eq!(resp.text()?, HEALTH_CHECK_RESPONSE);
     Ok(())
 }
@@ -31,6 +47,7 @@ fn auth_health(#[with(&["--auth", USER_ACCOUNT])] server: TestServer) -> Result<
 
     let session = server.login("user", TEST_PASSWORD)?;
     let resp = server.get_with(&session, &ready_url)?;
+    assert_no_store(&resp);
     assert_eq!(resp.text()?, READINESS_CHECK_RESPONSE);
     Ok(())
 }

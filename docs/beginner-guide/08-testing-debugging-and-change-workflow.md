@@ -71,13 +71,13 @@ npx playwright install-deps chromium firefox
 覆盖率和完整门禁还需要额外 Cargo 工具：
 
 ```sh
-cargo install cargo-audit --locked
+cargo install cargo-audit --version 0.22.2 --locked
 cargo install cargo-llvm-cov --version 0.8.6 --locked
 ```
 
 日常修改并不要求每次都运行覆盖率或依赖审计。先安装它们，是为了准备最终工程级检查。
 
-首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；`cargo audit` 还要取得 RustSec 数据，`npm audit` 要访问 npm registry。离线执行前必须预热或提供相应缓存/镜像，且预先安装与仓库版本相容的 Chromium、Firefox；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
+首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；`cargo audit` 还要取得 RustSec 数据，`npm audit` 要访问 npm registry。正式发布只允许 cargo-audit 0.22.2；宿主 RustSec DB 也必须来自 canonical origin、HEAD 与 FETCH_HEAD revision 一致并在 7 天内验证过上游，才能离线复用。过期或缺失会强制隔离联网刷新，断网即失败关闭。离线执行前必须预热或提供相应缓存/镜像，且预先安装与仓库版本相容的 Chromium、Firefox；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
 
 所有 npm 脚本及锁定版本都可以在 [package.json](../../package.json) 和 [package-lock.json](../../package-lock.json) 中找到。生产前端没有 Node 打包步骤；这里安装的是检查和测试工具，不是服务器运行依赖。
 

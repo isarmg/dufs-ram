@@ -22,6 +22,15 @@ function protocolHeaders(request, state, offset = null, storedLength = null) {
   };
 }
 
+function discardProtocolHeaders(uploadId, length, offset = length) {
+  return {
+    "X-Dufs-Upload-Id": uploadId,
+    "X-Dufs-Upload-Length": String(length),
+    "X-Dufs-Upload-Offset": String(offset),
+    "X-Dufs-Operation-State": "rejected",
+  };
+}
+
 function problemDetails(status, code, detail, recovery = "", extensions = {}) {
   return JSON.stringify({
     type: `urn:dufs:problem:${code}`,
@@ -473,6 +482,15 @@ test("服务器拒绝复用旧元数据 stage 时丢弃并以新 ID 完整 PUT",
   const requests = [];
   const discards = [];
   let logicalPath = "";
+  const contents = Buffer.from("stage can become a create");
+  let releaseDiscard;
+  let markDiscardStarted;
+  const discardGate = new Promise(resolve => {
+    releaseDiscard = resolve;
+  });
+  const discardStarted = new Promise(resolve => {
+    markDiscardStarted = resolve;
+  });
   await page.route("**/__dufs__/api/upload/preflight", async route => {
     const { paths } = JSON.parse(route.request().postData() || "{}");
     expect(paths).toHaveLength(1);
@@ -492,8 +510,15 @@ test("服务器拒绝复用旧元数据 stage 时丢弃并以新 ID 完整 PUT",
     });
   });
   await page.route("**/__dufs__/api/upload/discard", async route => {
-    discards.push(JSON.parse(route.request().postData() || "{}"));
-    await route.fulfill({ status: 204, body: "" });
+    const payload = JSON.parse(route.request().postData() || "{}");
+    discards.push(payload);
+    markDiscardStarted();
+    await discardGate;
+    await route.fulfill({
+      status: 204,
+      headers: discardProtocolHeaders(payload.upload_id, contents.length),
+      body: "",
+    });
   });
   await page.route("**/target-gone-after-stage.txt", async route => {
     const request = route.request();
@@ -527,7 +552,6 @@ test("服务器拒绝复用旧元数据 stage 时丢弃并以新 ID 完整 PUT",
     });
   });
 
-  const contents = Buffer.from("stage can become a create");
   await selectFiles(page, "#file", [{
     name: "target-gone-after-stage.txt",
     buffer: contents,
@@ -537,6 +561,14 @@ test("服务器拒绝复用旧元数据 stage 时丢弃并以新 ID 完整 PUT",
     exact: true,
   });
   await initial.getByRole("button", { name: "Overwrite", exact: true }).click();
+  await discardStarted;
+  const cleanupStatus = page.locator("#uploadStatus0");
+  await expect(cleanupStatus).toHaveAttribute(
+    "aria-label",
+    "target-gone-after-stage.txt: cleaning up staged upload",
+  );
+  await expect(cleanupStatus.getByRole("button")).toHaveCount(0);
+  releaseDiscard();
   await expect(page.locator(".upload-status")).toHaveAttribute(
     "aria-label",
     "target-gone-after-stage.txt: upload complete",
@@ -1036,6 +1068,67 @@ test("同页重试读取非零检查点并只 PATCH 剩余内容", async ({
   ).toBe("AAAABBBB");
 });
 
+test("状态查询发现完整 running 检查点时用空 PATCH 重入提交", async ({
+  appPage: page,
+}) => {
+  const requests = [];
+  await page.route("**/resume-full-checkpoint.txt", route => {
+    const request = route.request();
+    requests.push({
+      method: request.method(),
+      offset: request.headers()["x-dufs-upload-offset"] || null,
+      bodyLength: request.postDataBuffer()?.length || 0,
+    });
+    if (request.method() === "PUT") {
+      return route.fulfill({
+        status: 408,
+        contentType: "application/problem+json",
+        headers: protocolHeaders(request, "unknown", "length"),
+        body: problemDetails(
+          408,
+          "upload_outcome_unknown",
+          "Upload result is unknown",
+          "query_upload",
+        ),
+      });
+    }
+    if (request.method() === "HEAD") {
+      return route.fulfill({
+        status: 200,
+        headers: protocolHeaders(request, "running", 8, 8),
+        body: "",
+      });
+    }
+    expect(request.method()).toBe("PATCH");
+    return route.fulfill({
+      status: 204,
+      headers: protocolHeaders(request, "committed", "length"),
+      body: "",
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "resume-full-checkpoint.txt",
+    buffer: Buffer.from("AAAABBBB"),
+    lastModified: 1_722_000_000_303,
+  }]);
+  const query = page.getByRole("button", {
+    name: "Check upload status resume-full-checkpoint.txt",
+  });
+  await expect(query).toBeVisible();
+  await query.click();
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "resume-full-checkpoint.txt: upload complete",
+  );
+  await expect(page.locator("#upload0 .cell-name a")).toBeFocused();
+  expect(requests).toEqual([
+    { method: "PUT", offset: null, bodyLength: 8 },
+    { method: "HEAD", offset: null, bodyLength: 0 },
+    { method: "PATCH", offset: "8", bodyLength: 0 },
+  ]);
+});
+
 test("上传槽占用时重试会排队而不是静默失效", async ({
   appPage: page,
 }) => {
@@ -1174,6 +1267,7 @@ test("取消只读续传状态查询不会误报提交结果未知", async ({
     name: "Cancel resume status check for cancel-resume-check.txt",
   });
   await expect(cancel).toBeVisible();
+  await expect(cancel).toBeFocused();
   await cancel.click();
   releaseStatus();
 
@@ -1261,11 +1355,15 @@ test("上传进度更新保留取消按钮焦点且发送后的取消保守标�
     name: "Stop waiting for upload cancel-focus.txt",
   });
   await expect(stopWaiting).toBeVisible();
+  await expect(stopWaiting).toBeFocused();
   await stopWaiting.click();
   releaseRequest();
   await expect(page.locator(".upload-unknown")).toContainText(
     "server result is unknown",
   );
+  await expect(page.getByRole("button", {
+    name: "Check upload status cancel-focus.txt",
+  })).toBeFocused();
 });
 
 test("正文发送后停止空闲计时并将提交确认超时标记为结果未知", async ({
@@ -1760,6 +1858,7 @@ test("等待中的上传可取消且不会阻塞后续重新选择", async ({
   await page.getByRole("button", {
     name: "Cancel queued upload cancel-queued-second.txt",
   }).click();
+  await expect(page.locator("#upload1 .cell-name a")).toBeFocused();
   await expect(page.locator("#uploadStatus1")).toHaveAttribute(
     "aria-label",
     "cancel-queued-second.txt: upload cancelled",

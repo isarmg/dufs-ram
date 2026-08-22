@@ -2,7 +2,7 @@
 mod fixtures;
 
 use chrono::{DateTime, Duration};
-use fixtures::{Error, TestServer, server, with_new_upload_headers};
+use fixtures::{Error, TestServer, preflight_upload_target, server, with_new_upload_headers};
 use reqwest::StatusCode;
 use reqwest::header::{
     CACHE_CONTROL, ETAG, HeaderMap, HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH,
@@ -287,9 +287,13 @@ fn non_download_and_error_responses_are_private_and_never_stored(
     .send()?;
     assert_eq!(created.status(), StatusCode::CREATED);
     assert_private_no_store(created.headers())?;
+    let delete_revision = preflight_upload_target(&server, "/cache-policy.txt")?
+        .revision
+        .ok_or("cache delete target has no revision")?;
 
     let deleted = server
         .request(reqwest::Method::DELETE, &upload_url)
+        .header("If-Match", format!("\"{delete_revision}\""))
         .send()?;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     assert_private_no_store(deleted.headers())?;

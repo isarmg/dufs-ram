@@ -11,7 +11,7 @@ export const TARGET_REVISION_HEADER = "X-Dufs-Target-Revision";
 export const TARGET_REPLACEABLE_HEADER = "X-Dufs-Target-Replaceable";
 
 /** @typedef {"running" | "awaiting-confirmation" | "committed" | "rejected" | "not-seen" | "not-started" | "unknown"} UploadProtocolState */
-/** @typedef {"fresh" | "resume" | "checkpoint"} UploadRequestPhase */
+/** @typedef {"fresh" | "resume" | "checkpoint" | "discard"} UploadRequestPhase */
 /** @typedef {"absent" | "optional" | "required"} FieldPresence */
 /** @typedef {{ length: FieldPresence, offset: FieldPresence }} UploadStateRule */
 /** @typedef {{ uploadId: string, state: UploadProtocolState, length: number | null, offset: number | null }} BoundUploadProtocol */
@@ -44,6 +44,15 @@ const CHECKPOINT_UPLOAD_STATUSES = Object.freeze({
   "not-started": Object.freeze([]),
   unknown: Object.freeze([500, 503]),
 });
+const DISCARD_UPLOAD_STATUSES = Object.freeze({
+  running: Object.freeze([]),
+  "awaiting-confirmation": Object.freeze([]),
+  committed: Object.freeze([]),
+  rejected: Object.freeze([204]),
+  "not-seen": Object.freeze([]),
+  "not-started": Object.freeze([]),
+  unknown: Object.freeze([]),
+});
 
 /** @type {Readonly<Record<UploadRequestPhase, Readonly<Record<UploadProtocolState, readonly number[]>>>>} */
 export const UPLOAD_RESPONSE_STATUS_MATRIX = Object.freeze({
@@ -56,6 +65,7 @@ export const UPLOAD_RESPONSE_STATUS_MATRIX = Object.freeze({
     committed: RESUME_UPLOAD_SUCCESS_STATUSES,
   }),
   checkpoint: CHECKPOINT_UPLOAD_STATUSES,
+  discard: DISCARD_UPLOAD_STATUSES,
 });
 
 const ABSENT = "absent";
@@ -149,7 +159,12 @@ export function classifyUploadResponse(options) {
     UPLOAD_RESPONSE_STATUS_MATRIX[phase][protocol.state];
   if (
     !acceptedStatuses.includes(status) ||
-    (protocol.state === "committed" && protocol.offset !== expectedLength)
+    (protocol.state === "committed" && protocol.offset !== expectedLength) ||
+    (
+      phase === "discard" &&
+      protocol.state === "rejected" &&
+      protocol.offset === null
+    )
   ) {
     return uploadClassification("invalid", protocol, true);
   }

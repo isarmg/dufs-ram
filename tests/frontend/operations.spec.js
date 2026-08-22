@@ -15,6 +15,51 @@ const {
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+function discardProtocolHeaders(uploadId, length, offset = length) {
+  return {
+    "X-Dufs-Upload-Id": uploadId,
+    "X-Dufs-Upload-Length": String(length),
+    "X-Dufs-Upload-Offset": String(offset),
+    "X-Dufs-Operation-State": "rejected",
+  };
+}
+
+function fulfillCreatedItemPreflight(route) {
+  const { paths } = route.request().postDataJSON();
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      targets: paths.map(path => ({
+        path,
+        exists: true,
+        revision: "d".repeat(64),
+        replaceable: true,
+      })),
+    }),
+  });
+}
+
+function fulfillTrackedFailure(route, status, code, detail, headers = {}) {
+  const operationId = route.request().headers()["x-dufs-operation-id"];
+  return route.fulfill({
+    status,
+    contentType: "application/problem+json",
+    headers: {
+      "X-Dufs-Operation-Id": operationId,
+      "X-Dufs-Operation-State": "failed",
+      ...headers,
+    },
+    body: JSON.stringify({
+      type: `urn:dufs:problem:${code}`,
+      title: "Precondition failed",
+      status,
+      detail,
+      code,
+    }),
+  });
+}
+
 function inlineNameInput(page) {
   return page.locator(".inline-name-input");
 }
@@ -627,6 +672,10 @@ test("立即新建空文件异常 2xx 只用同一 upload ID 做一次 HEAD 确�
   page.on("request", request => {
     if (request.resourceType() === "document") documentRequests++;
   });
+  await page.route(
+    "**/__dufs__/api/upload/preflight",
+    fulfillCreatedItemPreflight,
+  );
   await page.route("**/newfile", async route => {
     const request = route.request();
     if (request.method() === "HEAD") {
@@ -704,6 +753,7 @@ test("新建文件夹立即创建 newfolder 并进入原位编辑", async ({
   expect(renameResponse.request().postDataJSON()).toEqual({
     source: `${root}/newfolder`,
     name: "created-by-browser",
+    source_revision: expect.stringMatching(/^[0-9a-f]{64}$/),
     overwrite: false,
   });
   await expect(input).toHaveCount(0);
@@ -856,6 +906,10 @@ test("空文件 awaiting-confirmation 冲突先 discard 成功再递增", async 
 }) => {
   const puts = [];
   const discards = [];
+  await page.route(
+    "**/__dufs__/api/upload/preflight",
+    fulfillCreatedItemPreflight,
+  );
   await page.route("**/newfile*", route => {
     const request = route.request();
     if (request.method() !== "PUT") return route.continue();
@@ -898,8 +952,13 @@ test("空文件 awaiting-confirmation 冲突先 discard 成功再递增", async 
     });
   });
   await page.route("**/__dufs__/api/upload/discard", route => {
-    discards.push(route.request().postDataJSON());
-    return route.fulfill({ status: 204, body: "" });
+    const payload = route.request().postDataJSON();
+    discards.push(payload);
+    return route.fulfill({
+      status: 204,
+      headers: discardProtocolHeaders(payload.upload_id, 0),
+      body: "",
+    });
   });
 
   await page.getByRole("button", { name: "New empty file" }).click();
@@ -923,6 +982,10 @@ test("空文件 rejected 冲突无需 discard 即可用新 ID 尝试下一候选
 }) => {
   const puts = [];
   let discards = 0;
+  await page.route(
+    "**/__dufs__/api/upload/preflight",
+    fulfillCreatedItemPreflight,
+  );
   await page.route("**/newfile*", route => {
     const request = route.request();
     if (request.method() !== "PUT") return route.continue();
@@ -962,7 +1025,12 @@ test("空文件 rejected 冲突无需 discard 即可用新 ID 尝试下一候选
   });
   await page.route("**/__dufs__/api/upload/discard", route => {
     discards++;
-    return route.fulfill({ status: 204, body: "" });
+    const payload = route.request().postDataJSON();
+    return route.fulfill({
+      status: 204,
+      headers: discardProtocolHeaders(payload.upload_id, 0),
+      body: "",
+    });
   });
 
   await page.getByRole("button", { name: "New empty file" }).click();
@@ -1112,6 +1180,7 @@ test("使用独立重命名接口并刷新当前目录", async ({ appPage: page 
   expect(response.request().postDataJSON()).toEqual({
     source,
     name: "renamed-by-browser.txt",
+    source_revision: expect.stringMatching(/^[0-9a-f]{64}$/),
     overwrite: false,
   });
   await expect(page).toHaveURL(directoryUrl);
@@ -1335,6 +1404,7 @@ test("使用独立移动接口保留名称并进入目标目录", async ({
   expect(response.request().postDataJSON()).toEqual({
     source,
     directory,
+    source_revision: expect.stringMatching(/^[0-9a-f]{64}$/),
     overwrite: false,
   });
   await expect.poll(() => currentDirectoryPath(page)).toBe(directory);
@@ -1350,6 +1420,7 @@ test("重命名目标存在时只有确认后才显式覆盖", async ({
   const source = currentLogicalChild(page, "overwrite-source.txt");
   const destination = currentLogicalChild(page, "overwrite-target.txt");
   const targetUrl = currentUrl(page, "overwrite-target.txt");
+  let targetRevision = "";
   await page.route("**/__dufs__/api/rename", async route => {
     const request = route.request().postDataJSON();
     if (
@@ -1357,22 +1428,9 @@ test("重命名目标存在时只有确认后才显式覆盖", async ({
       request.name === "overwrite-target.txt" &&
       request.overwrite === false
     ) {
-      await route.fulfill({
-        status: 409,
-        contentType: "application/problem+json",
-        headers: {
-          "X-Dufs-Operation-Id":
-            route.request().headers()["x-dufs-operation-id"],
-          "X-Dufs-Operation-State": "failed",
-        },
-        body: JSON.stringify({
-          type: "urn:dufs:problem:destination_exists",
-          title: "Conflict",
-          status: 409,
-          code: "destination_exists",
-          detail: "The target name is occupied",
-        }),
-      });
+      const response = await route.fetch();
+      targetRevision = response.headers()["x-dufs-target-revision"] || "";
+      await route.fulfill({ response });
       return;
     }
     await route.continue();
@@ -1399,13 +1457,157 @@ test("重命名目标存在时只有确认后才显式覆盖", async ({
   await overwriteDialog.getByRole("button", { name: "Overwrite" }).click();
   await expect.poll(() => responses.length).toBe(2);
   expect(responses.map(response => response.status())).toEqual([409, 204]);
+  expect(targetRevision).toMatch(/^[0-9a-f]{64}$/);
+  const sourceRevision = responses[0].request().postDataJSON().source_revision;
+  expect(sourceRevision).toMatch(/^[0-9a-f]{64}$/);
   expect(responses.map(response => response.request().postDataJSON())).toEqual([
-    { source, name: "overwrite-target.txt", overwrite: false },
-    { source, name: "overwrite-target.txt", overwrite: true },
+    {
+      source,
+      name: "overwrite-target.txt",
+      source_revision: sourceRevision,
+      overwrite: false,
+    },
+    {
+      source,
+      name: "overwrite-target.txt",
+      source_revision: sourceRevision,
+      overwrite: true,
+      destination_revision: targetRevision,
+    },
   ]);
   const contentResponse = await context.request.get(targetUrl);
   expect(contentResponse.status()).toBe(200);
   expect(await contentResponse.text()).toBe("replacement content");
+});
+
+test("重命名冲突缺少目标 revision 时拒绝覆盖确认", async ({
+  appPage: page,
+}) => {
+  let renameRequests = 0;
+  await page.route("**/__dufs__/api/rename", route => {
+    renameRequests++;
+    const operationId = route.request().headers()["x-dufs-operation-id"];
+    return route.fulfill({
+      status: 409,
+      contentType: "application/problem+json",
+      headers: {
+        "X-Dufs-Operation-Id": operationId,
+        "X-Dufs-Operation-State": "failed",
+      },
+      body: JSON.stringify({
+        type: "urn:dufs:problem:destination_exists",
+        title: "Conflict",
+        status: 409,
+        detail: "The target name is occupied",
+        code: "destination_exists",
+      }),
+    });
+  });
+
+  await rowByName(page, "overwrite-source.txt")
+    .getByRole("button", { name: "Rename overwrite-source.txt" })
+    .click();
+  const input = inlineNameInput(page);
+  await input.fill("overwrite-target.txt");
+  await input.press("Enter");
+
+  await expect(actionDialog(page, "Rename failed")).toContainText(
+    "The target name is occupied",
+  );
+  await expect(actionDialog(page, "Overwrite destination?")).toBeHidden();
+  expect(renameRequests).toBe(1);
+});
+
+test("重命名源 revision 过期时关闭编辑器并刷新列表", async ({
+  appPage: page,
+}) => {
+  let listRequests = 0;
+  let renameRequests = 0;
+  page.on("request", request => {
+    if (new URL(request.url()).pathname.endsWith("/__dufs__/api/list")) {
+      listRequests++;
+    }
+  });
+  await page.route("**/__dufs__/api/rename", route => {
+    renameRequests++;
+    return fulfillTrackedFailure(
+      route,
+      412,
+      "source_changed",
+      "The source changed after the list was loaded",
+      { "X-Dufs-Source-Revision": "e".repeat(64) },
+    );
+  });
+
+  await rowByName(page, "rename-me.txt")
+    .getByRole("button", { name: "Rename rename-me.txt" })
+    .click();
+  const input = inlineNameInput(page);
+  await input.fill("stale-source.txt");
+  await input.press("Enter");
+  const errorDialog = actionDialog(page, "Rename failed");
+  await expect(errorDialog).toContainText(
+    "The source changed after the list was loaded",
+  );
+  expect(listRequests).toBe(0);
+  await errorDialog.getByRole("button", { name: "Close" }).click();
+
+  await expect.poll(() => listRequests).toBeGreaterThan(0);
+  await expect(inlineNameInput(page)).toHaveCount(0);
+  await expect(rowByName(page, "rename-me.txt")).toBeVisible();
+  expect(renameRequests).toBe(1);
+});
+
+test("覆盖确认后目标 revision 过期时不重试并刷新列表", async ({
+  appPage: page,
+}) => {
+  let listRequests = 0;
+  let renameRequests = 0;
+  page.on("request", request => {
+    if (new URL(request.url()).pathname.endsWith("/__dufs__/api/list")) {
+      listRequests++;
+    }
+  });
+  await page.route("**/__dufs__/api/rename", route => {
+    renameRequests++;
+    if (renameRequests === 1) {
+      return fulfillTrackedFailure(
+        route,
+        409,
+        "destination_exists",
+        "The destination exists",
+        { "X-Dufs-Target-Revision": "a".repeat(64) },
+      );
+    }
+    return fulfillTrackedFailure(
+      route,
+      412,
+      "destination_changed",
+      "The destination changed after confirmation",
+      { "X-Dufs-Target-Revision": "b".repeat(64) },
+    );
+  });
+
+  await rowByName(page, "overwrite-source.txt")
+    .getByRole("button", { name: "Rename overwrite-source.txt" })
+    .click();
+  const input = inlineNameInput(page);
+  await input.fill("overwrite-target.txt");
+  await input.press("Enter");
+  await actionDialog(page, "Overwrite destination?")
+    .getByRole("button", { name: "Overwrite" })
+    .click();
+  const errorDialog = actionDialog(page, "Rename failed");
+  await expect(errorDialog).toContainText(
+    "The destination changed after confirmation",
+  );
+  expect(listRequests).toBe(0);
+  await errorDialog.getByRole("button", { name: "Close" }).click();
+
+  await expect.poll(() => listRequests).toBeGreaterThan(0);
+  await expect(inlineNameInput(page)).toHaveCount(0);
+  await expect(rowByName(page, "overwrite-source.txt")).toBeVisible();
+  expect(renameRequests).toBe(2);
 });
 
 test("重命名结果 unknown 时不采纳正文冲突码发起覆盖", async ({
@@ -1510,6 +1712,46 @@ test("删除失败时显示错误并保留目录行", async ({ appPage: page }) 
     exact: true,
   })).toHaveCount(0);
   await errorDialog.getByRole("button", { name: "Close" }).click();
+});
+
+test("删除目标 revision 过期时不删除并刷新列表", async ({
+  appPage: page,
+}) => {
+  let deleteRequests = 0;
+  let listRequests = 0;
+  page.on("request", request => {
+    if (new URL(request.url()).pathname.endsWith("/__dufs__/api/list")) {
+      listRequests++;
+    }
+  });
+  await page.route("**/delete-me.txt", route => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deleteRequests++;
+    return fulfillTrackedFailure(
+      route,
+      412,
+      "delete_target_changed",
+      "The delete target changed after the list was loaded",
+      { "X-Dufs-Source-Revision": "f".repeat(64) },
+    );
+  });
+
+  await rowByName(page, "delete-me.txt")
+    .getByRole("button", { name: "Delete delete-me.txt" })
+    .click();
+  await actionDialog(page, "Delete item")
+    .getByRole("button", { name: "Delete" })
+    .click();
+  const errorDialog = actionDialog(page, "Delete failed");
+  await expect(errorDialog).toContainText(
+    "The delete target changed after the list was loaded",
+  );
+  expect(listRequests).toBe(0);
+  await errorDialog.getByRole("button", { name: "Close" }).click();
+
+  await expect.poll(() => listRequests).toBeGreaterThan(0);
+  await expect(rowByName(page, "delete-me.txt")).toBeVisible();
+  expect(deleteRequests).toBe(1);
 });
 
 test("会话轮换后的 CSRF 响应直接刷新且不查询未登记操作", async ({
@@ -1707,7 +1949,11 @@ test("删除成功后更新已加载数量并移动焦点", async ({ appPage: pa
   await actionDialog(page, "Delete item")
     .getByRole("button", { name: "Delete" })
     .click();
-  expect((await responsePromise).status()).toBe(204);
+  const response = await responsePromise;
+  expect(response.status()).toBe(204);
+  expect(response.request().headers()["if-match"]).toMatch(
+    /^"[0-9a-f]{64}"$/,
+  );
   await expect(rowByName(page, "delete-me.txt")).toHaveCount(0);
   await expect(status).toHaveText(`All ${beforeCount - 1} items loaded`);
   expect(

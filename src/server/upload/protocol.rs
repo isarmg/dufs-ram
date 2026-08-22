@@ -4,6 +4,7 @@ use crate::utils::{decode_hex_to_slice, encode_hex};
 use anyhow::{Result, anyhow};
 use headers::HeaderMap;
 use hyper::header::HeaderValue;
+use serde::{Serialize, Serializer};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -12,7 +13,7 @@ pub(super) const UPLOAD_ID_HEADER: &str = "x-dufs-upload-id";
 pub(super) const UPLOAD_LENGTH_HEADER: &str = "x-dufs-upload-length";
 pub(super) const UPLOAD_OFFSET_HEADER: &str = "x-dufs-upload-offset";
 pub(super) const UPLOAD_OVERWRITE_HEADER: &str = "x-dufs-upload-overwrite";
-pub(super) const TARGET_REVISION_HEADER: &str = "x-dufs-target-revision";
+pub(in crate::server) const TARGET_REVISION_HEADER: &str = "x-dufs-target-revision";
 pub(super) const TARGET_REPLACEABLE_HEADER: &str = "x-dufs-target-replaceable";
 const OPERATION_STATE_HEADER: &str = "x-dufs-operation-state";
 
@@ -26,15 +27,15 @@ pub(in crate::server) struct UploadOptions {
     pub(in crate::server) path_lease: PathLease,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::server) struct TargetRevision([u8; 32]);
 
 impl TargetRevision {
-    pub(super) const fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(in crate::server) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(super) const fn into_bytes(self) -> [u8; 32] {
+    pub(in crate::server) const fn into_bytes(self) -> [u8; 32] {
         self.0
     }
 
@@ -42,7 +43,7 @@ impl TargetRevision {
         encode_hex(self.0)
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(in crate::server) fn parse(value: &str) -> Option<Self> {
         let mut revision = [0_u8; 32];
         (value.len() == 64
             && value
@@ -50,6 +51,15 @@ impl TargetRevision {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             && decode_hex_to_slice(value, &mut revision))
         .then_some(Self(revision))
+    }
+}
+
+impl Serialize for TargetRevision {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.encode())
     }
 }
 

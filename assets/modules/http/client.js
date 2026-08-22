@@ -1,5 +1,6 @@
 import {
   OPERATION_STATE_HEADER,
+  TARGET_REVISION_HEADER,
   UPLOAD_ID_HEADER,
   classifyUploadResponse,
 } from "../upload/protocol.js";
@@ -24,6 +25,7 @@ export const RESULT_UNKNOWN_MESSAGE =
   "The result is unknown; refresh the folder to verify what happened before trying again.";
 export const REQUEST_TIMEOUT_MS = 30 * 1000;
 export const OPERATION_ID_HEADER = "X-Dufs-Operation-Id";
+export const SOURCE_REVISION_HEADER = "X-Dufs-Source-Revision";
 export { OPERATION_STATE_HEADER };
 
 const ERROR_MESSAGE_LIMIT = 1024;
@@ -101,6 +103,8 @@ const OPERATION_ID_PATTERN =
  * @property {number | null} [uploadLength]
  * @property {number | null} [uploadOffset]
  * @property {Readonly<UploadMetadata> | null} [upload]
+ * @property {string} [sourceRevision]
+ * @property {string} [targetRevision]
  */
 
 /**
@@ -146,6 +150,8 @@ export class RequestError extends Error {
     this.uploadLength = options.uploadLength ?? null;
     this.uploadOffset = options.uploadOffset ?? null;
     this.upload = options.upload || null;
+    this.sourceRevision = options.sourceRevision || "";
+    this.targetRevision = options.targetRevision || "";
   }
 }
 
@@ -280,6 +286,55 @@ export async function assertResponse(response, onUnauthorized) {
       outcomeUnknown,
       operationId: operationId || detail.operation?.id || "",
       operationState: operationState || detail.operation?.state || "",
+    },
+  );
+}
+
+/**
+ * Accept only the terminal envelope emitted after a staged upload is
+ * discarded. Cleanup is successful only when the response is bound to the
+ * expected upload and includes the server's durable offset.
+ *
+ * @param {Response} response
+ * @param {string} expectedUploadId
+ * @param {number} expectedLength
+ * @param {(() => void) | undefined} [onUnauthorized]
+ * @returns {Promise<Response>}
+ */
+export async function assertDiscardUploadResponse(
+  response,
+  expectedUploadId,
+  expectedLength,
+  onUnauthorized,
+) {
+  const classification = classifyUploadResponse({
+    phase: "discard",
+    status: response.status,
+    headers: response.headers,
+    expectedUploadId,
+    expectedLength,
+  });
+  if (["authentication", "csrf"].includes(classification.kind)) {
+    return assertResponse(response, onUnauthorized);
+  }
+  if (
+    classification.kind === "rejected" &&
+    Number.isSafeInteger(classification.protocol?.offset)
+  ) {
+    return response;
+  }
+  throw new RequestError(
+    `Invalid staged-upload cleanup result. ${RESULT_UNKNOWN_MESSAGE}`,
+    {
+      status: response.status,
+      code: "invalid_discard_result",
+      kind: "protocol",
+      outcomeUnknown: true,
+      operationId: expectedUploadId,
+      operationState: "unknown",
+      uploadId: expectedUploadId,
+      uploadState: "unknown",
+      uploadLength: expectedLength,
     },
   );
 }
@@ -447,7 +502,20 @@ function requestErrorMetadata(detail, headers) {
     uploadLength: detail.upload?.length ?? null,
     uploadOffset: detail.upload?.offset ?? null,
     upload: detail.upload,
+    sourceRevision: normalizeRevisionHeader(
+      headers?.get(SOURCE_REVISION_HEADER),
+    ),
+    targetRevision: normalizeRevisionHeader(
+      headers?.get(TARGET_REVISION_HEADER),
+    ),
   };
+}
+
+/** @param {string | null | undefined} value */
+function normalizeRevisionHeader(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+    ? value
+    : "";
 }
 
 /**

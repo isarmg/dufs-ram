@@ -4,8 +4,8 @@
 
 当前产品边界如下：
 
-- 部署约定为每个共享根仅运行一个 Dufs 实例；进程会在长期持有的共享根目录 fd 上取得非阻塞独占 `flock`，同机第二实例若指向同一根会在启动时失败；
-- 服务端仅支持 64 位 Linux；`build.rs` 在 Cargo 构建阶段拒绝其他目标，运行内核还必须提供 `openat2`；
+- 部署约定为每个共享根仅运行一个 Dufs 实例；进程会在长期持有的共享根目录 fd 上取得非阻塞独占 `flock`，同机第二实例若指向同一根会在启动时失败；advisory lock 不阻止其他程序写入，一致性保证要求共享根由 Dufs 独占写入，人工修改只能停服执行；
+- `build.rs` 拒绝非 Linux 和非 64 位目标；自动 CI、部署样例与正式制品验收只以 `x86_64-unknown-linux-gnu` 为基线，其他 64 位架构在补齐等价矩阵前是未验证的 best effort；运行内核还必须提供 `openat2`；
 - 本地构建使用 `rust-toolchain.toml` 精确固定的 Rust/rustc/Cargo 1.97.1，源码采用 Rust 2024 edition；
 - 必须通过账号和密码认证，不存在匿名业务访问；
 - 每个有效账号拥有整个共享目录的浏览和文件管理能力；
@@ -258,6 +258,8 @@ sequenceDiagram
     B-->>U: 浏览、上传、移动、删除等操作
 ```
 
+每个可操作列表项还携带绑定当前 owner、规范路径和完整文件身份的不透明 `revision`。浏览器必须把该 token 随 DELETE、Move 或 Rename 带回，不能从文件名、时间或下载 ETag 自行构造。
+
 ```text
 IndexData
 ├─ href：当前目录的逻辑路径
@@ -346,13 +348,13 @@ flowchart TD
 | GET/HEAD | 文件 | 要求会话；同一打开句柄生成附件响应和弱 ETag，支持无 `If-Range` 的单段 Range |
 | GET/HEAD | 版本化内置资源 | 要求会话；已知摘要资源成功时允许公共长期缓存，HEAD 保留 GET 头并省略正文 |
 | POST | `/__dufs__/api/mkdir` | 要求会话、CSRF、同源校验和 Operation ID；JSON 新建目录 |
-| POST | `/__dufs__/api/move` | 要求会话、CSRF、同源校验和 Operation ID；JSON `{ source, directory, overwrite }`，移动到已经存在的目标目录并保留原名称 |
-| POST | `/__dufs__/api/rename` | 要求会话、CSRF、同源校验和 Operation ID；JSON `{ source, name, overwrite }`，只在原父目录内修改为单段名称 |
+| POST | `/__dufs__/api/move` | 要求会话、CSRF、同源校验和 Operation ID；JSON `{ source, directory, overwrite, source_revision, destination_revision? }`，移动到已经存在的目标目录并保留原名称；覆盖时 destination revision 必填 |
+| POST | `/__dufs__/api/rename` | 要求会话、CSRF、同源校验和 Operation ID；JSON `{ source, name, overwrite, source_revision, destination_revision? }`，只在原父目录内修改为单段名称；覆盖时 destination revision 必填 |
 | POST | `/__dufs__/api/upload/preflight` | 要求会话、CSRF 和同源校验；最多 512 个绝对逻辑路径，返回按原顺序绑定的存在、可替换和不透明 revision 结果 |
 | POST | `/__dufs__/api/upload/discard` | 要求会话、CSRF 和同源校验；JSON `{ path, upload_id }`，只丢弃同账号、同路径、同 ID 的 `AwaitingConfirmation` stage |
 | PUT | 文件路径 | 要求会话、CSRF、同源校验以及 `X-Dufs-Upload-Id`、`X-Dufs-Upload-Length`、`X-Dufs-Upload-Overwrite`；默认/`false` 为原子不替换，`true` 还必须携带 target revision |
 | PATCH | 文件路径 | 要求会话、CSRF、同源校验以及 `X-Dufs-Upload-Id`、`X-Dufs-Upload-Length`、`X-Dufs-Upload-Offset`和覆盖策略；从精确检查点续传，或以满 offset 的空正文条件发布已保留 stage |
-| DELETE | 文件或目录 | 要求会话、CSRF、同源校验和 Operation ID；原子移入隐藏 trash、同步后返回，后台有界回收空间 |
+| DELETE | 文件或目录 | 要求会话、CSRF、同源校验、Operation ID 及携带列表 revision 的 `If-Match`；提交前复核完整身份，原子移入隐藏 trash、同步后返回，后台有界回收空间 |
 
 启动时只接受现有目录作为共享根。以 `__dufs__` 或当前摘要 assets 前缀开头的内部请求只接受唯一规范形式：不允许尾斜杠、重复斜杠、编码后的路径分隔符或对 unreserved 字符的多余百分号编码。原始路径只解析一次，外层 timeout/operation 分类、访问日志和实际 handler 共用同一结果；普通共享文件和目录的合法尾斜杠语义不受此约束。目录中的普通文件通过统一方法分派进入 `GET`/`HEAD` 附件下载，未知 HTTP 方法返回 `405 Method Not Allowed`；各方法受限端点同时返回与实际允许集合一致的 `Allow`，例如 health/ready 为 `GET, HEAD`、operation 状态为 `GET`。普通文件或其他非目录对象不能作为共享根启动服务。
 
@@ -513,7 +515,7 @@ flowchart TD
 
 浏览器为每一项分别显示 Rename 和 Move 按钮。Rename 直接把名称单元格切换为只接受单段新名称的行内输入，Move 对话框只接受目标目录；前端不能借 Move 改名，也不能借 Rename 跨目录。第一次收到可信终态的稳定 `destination_exists` 和 `409` 后，才打开具有可访问标题的页面内原生 `<dialog>` 询问用户是否覆盖；Escape 取消覆盖后回到行内名称输入或对应的 Move 按钮，用户确认后才重新发送 `overwrite: true`。传输结果未知时绝不自动发起覆盖请求。
 
-`overwrite: false` 的两种 relocation 都通过 rustix 调用 Linux `renameat2(RENAME_NOREPLACE)`。前置 metadata 检查只用于尽早返回已知冲突和检查类型，不再承担“不覆盖”保证；即使目标随后出现，最终原子调用也会保留目标并返回 `409`。Linux 文件系统不支持该原语时会返回错误并失败关闭，不会降级为普通 rename。`overwrite: true` 使用父目录 fd 上的 Linux `renameat` 原子替换目标。若两个不同名称其实是同一 dev/inode 的硬链接，POSIX rename 可能成为无变化的成功 no-op；服务会在预检和受跟踪 commit 内再次从父目录 fd 复核，并返回稳定的 `409 source_equals_destination`，不会误报 `204`。
+两种 relocation 都要求列表提供的 `source_revision`；token 绑定 owner、源路径和完整源 identity。`overwrite: false` 通过 rustix 调用 Linux `renameat2(RENAME_NOREPLACE)`，即使目标随后出现，最终原子调用也会保留目标并返回 `409`；Linux 文件系统不支持该原语时失败关闭，不降级为普通 rename。`overwrite: true` 还要求绑定最终目标路径和完整目标 identity 的 `destination_revision`，随后使用父目录 fd 上的 Linux `renameat` 原子替换。RootedFs 在紧邻系统调用时复核 source，并按模式复核 destination revision 或 no-replace 条件；若不同名称其实是同一 dev/inode 的硬链接，返回稳定的 `409 source_equals_destination`，不会误报 `204`。最后一次 `statat` 与 `renameat2/renameat` 仍有相邻系统调用微窗，因此共享根必须排除外部 writer。
 
 源和目标先作为一个租约集合交给路径协调器，规范化、排序并一次取得；反向移动不会因加锁顺序不同死锁。最终父目录从长期持有的共享根 fd 通过 `openat2` 打开，rename 只接收父目录 fd 和最后一个文件名，不再按绝对字符串路径重新解析，也不会在提交时重建已经消失的目标目录。成功 rename 后同步源和目标父目录 fd，全部成功才返回 `204`；同一父目录只同步一次。
 
@@ -713,7 +715,7 @@ fresh PUT 先从最近存在的祖先目录 fd 读取 `st_dev`/`fstatvfs`，把�
 
 新 DELETE 不再把内存 channel 当作可靠性边界。服务在 rename 前先向 `purge_jobs` 写入 `Prepared`，记录账号、根内相对目标/trash 路径与源 dev/inode/类型；通过身份复核的 rename 和父目录 `fsync` 成功后才转为 `Ready`。outbox 容量为全局 4096、每账号 1024，满载会在移除可见名称前返回 `503 purge_backlog_full`。内存 channel 只传递可合并的 wake 信号，worker 也会定时轮询 SQLite，丢失 wake 不会丢 job。
 
-worker 原子把到期 `Ready` 改为 `Claimed`，重新打开 trash 后复核记录的 dev/inode/类型，每片最多处理 256 个条目或 25 ms。未完成项在进程内 round-robin；I/O 失败则把 job 持久化返回 `Ready`，attempt 计数递增并从 100 ms 指数退避到最长 30 秒，不再因固定失败次数丢弃 job。若 defer/complete 的 state-store 命令失败，当前 worker 有界保留该 job；再次执行前先回读数据库，只有仍为 `Claimed` 才继续，若前次命令实际已提交则直接丢弃本地副本。重启时 `Claimed` 全部恢复为可立即重试的 `Ready`；独立 reconciler 每秒重试 `Prepared`，在取得目标/trash 路径租约后对比已记录 inode：匹配 trash 意味着 rename 已发生并可转 `Ready`，匹配原目标意味着 rename 未消费该对象并可删除 intent，其他情况保守保留双方与 job。
+worker 原子把到期 `Ready` 改为 `Claimed`，重新打开 trash 后复核记录的 dev/inode/类型，每片最多处理 256 个条目或 25 ms。未完成项在进程内 round-robin；I/O 失败则把 job 持久化返回 `Ready`，attempt 计数递增并从 100 ms 指数退避到最长 30 秒，不再因固定失败次数丢弃 job。若 defer/complete 的 state-store 命令失败，当前 worker 有界保留该 job；再次执行前先回读数据库，只有仍为 `Claimed` 才继续，若前次命令实际已提交则直接丢弃本地副本。重启时 `Claimed` 全部恢复为可立即重试的 `Ready`；独立 reconciler 每秒重试 `Prepared`，在取得目标/trash 路径租约后对比已记录 inode：匹配 trash 意味着 rename 已发生并可转 `Ready`，匹配原目标意味着 rename 未消费该对象并可删除 intent。内部 trash 的身份与记录不一致时，服务会把现有对象原子改名为 `.dufs-quarantine-<uuid>.hold` 并释放相应 intent/job；它永不自动清理，必须停服核对日志和对象后人工移除。
 
 根内低频扫描只把跨 SQLite/文件系统提交缝隙中未记账的 orphan trash 交给有界内存兜底通道；通道满时保留 trash，下一轮重新发现。新 DELETE 的正常恢复由 outbox 驱动，不等待小时级扫描。分片递归删除仍只保存根内相对路径和 `readdir` cursor；遍历到 EOF 但最终 `unlinkat(..., REMOVEDIR)` 返回 `ENOTEMPTY` 时，会丢弃过期 EOF 并从 cursor 0 重扫并发新增项。分片 cursor 本身不写 SQLite，进程重启可从已持久化 trash 根重新遍历。
 
@@ -811,7 +813,7 @@ flowchart TD
 
 删除路由在文件类型判断前使用与内部浏览器 API 共用的根目录守卫；即使认证和 CSRF 均有效，只要目标等于规范化的 `serve_path` 就返回 `403`。域名根路径、编码等价路径和越界符号链接均有回归测试。
 
-普通子对象删除先在 state store 中写入 `Prepared` purge job，再在同一父目录内把预检时记录的同一 dev/inode/类型原子移动到 `.dufs-upload-delete-<UUID>.trash`。父目录同步成功后 job 才转为 `Ready` 并返回 `204`。因此文件或整个目录树会一次从原业务名称下消失；目标路径租约覆盖其后代，子树上传、move、mkdir 或另一个 delete 必须等待可见删除提交完成。outbox 全局最多 4096 项、每账号最多 1024 项，满载在 rename 前返回 `503`，不先消费可见目标。
+普通子对象删除要求 `If-Match` 携带当前列表 revision；服务在创建 purge intent 前验证 token 的 owner、规范路径和完整 identity，并在紧邻 rename 时再次复核。随后先在 state store 中写入 `Prepared` purge job，再在同一父目录内把同一对象原子移动到 `.dufs-upload-delete-<UUID>.trash`。父目录同步成功后 job 才转为 `Ready` 并返回 `204`。因此文件或整个目录树会一次从原业务名称下消失；目标路径租约覆盖其后代，子树上传、move、mkdir 或另一个 delete 必须等待可见删除提交完成。outbox 全局最多 4096 项、每账号最多 1024 项，满载在 rename 前返回 `503`，不先消费可见目标。
 
 返回 `204` 后的递归清理只负责释放隐藏暂存项占用的空间，不改变已经提交的可见删除结果。worker 原子 claim 到期 `Ready` job，按已记录 inode 重开 trash；失败时持久化回 `Ready` 并退避，不因固定次数丢弃。状态转换瞬时失败时会有界保留并回读确认本地 claim，重启则把遗留 `Claimed` 恢复为 `Ready`；独立 reconciler 在启动和运行期持续检查尚为 `Prepared` 的记录，在目标/trash 租约下只在能证明 rename 已发生时转 `Ready`，能证明原对象仍在时删除 intent，其他情况保留对象和 job。小时级维护扫描只回收未记账 orphan trash。
 
@@ -978,6 +980,8 @@ JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法
 正式发布脚本只接受干净且由匹配 Cargo 版本的 tag 精确指向的 HEAD。它先从摘要锁定 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中用 `env -i`、固定 PATH/工具链和独立 HOME、Cargo home/target、npm cache、XDG/tmp 强制运行完整检查。Cargo 依赖先 vendor 后 offline；npm 播种器只从 lockfile 的 HTTPS URL 与 SHA-512 integrity 接受宿主 cache 内容并重新散列，随后 prefer-offline，缺失包与 npm audit 仍可能联网；可用宿主 RustSec DB 会以 `--no-hardlinks` 私有 clone 配合 `cargo audit --no-fetch`。门禁后用独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，丢弃质量树，再从 commit fresh extract 进行签名构建。检查后、签名前和发布前继续反复确认 exact source。source revision 只接受完整 40 或 64 位小写十六进制 object ID；签名 key 只允许 Ed25519、Ed448、RSA ≥3072 bit 或 `prime256v1`/`secp384r1`/`secp521r1` ECDSA，弱/未知/非签名算法在产生可发布签名前失败关闭，所有关键 Shell 子命令显式传播失败而不依赖 `errexit` 上下文。
 
 源预检、隔离快照和全部解包树拒绝 symlink、submodule 与特殊文件；构建/打包两份 archive 还复核 commit、tree、mode、额外路径与 SHA-256。固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化 SBOM。`THIRD_PARTY_LICENSES.txt` 从 vendored 可达非开发依赖生成：每个包必须声明非空 SPDX `license` 表达式，metadata `license_file` 只用于收集上游正文，不能替代表达式或作为许可证分类 fallback。表达式按 `WITH > AND > OR` 解析真实 SPDX AST，只接受审核 identifier/exception 并要求存在完整 permissive 分支；`license_file` 和包根所有 LICENSE/COPYING/NOTICE 候选都必须是依赖自身真实目录与 vendor 根内的 no-follow、非空 UTF-8 普通文件，项目许可证不作 fallback，正文按 SHA-256 去重。固定 Rust 1.97.1 sysroot 的 `COPYRIGHT-library.html` 还必须匹配审核 SHA-256 `0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed`，以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 入包；未知工具链没有审核摘要则拒绝发布。包内 `BUILD-ENVIRONMENT.txt` 记录完整源码 SHA、版本、epoch、target 和本次实际工具版本，用于复现诊断但不把宿主链误报为全量钉扎。该清单、SBOM、项目双许可证和两类 notice 都进入包内 checksum；SBOM 规范化不替代完整 CycloneDX schema 验证。
+
+这里的支持边界要分成两层：`build.rs` 允许 64 位 Linux 进入编译，但自动 CI、部署样例和正式制品验收只以 `x86_64-unknown-linux-gnu` 为基线，其他架构在补齐等价矩阵前属于未验证的 best effort。部署门对 systemd 使用占位 `ExecStart` 做静态验证，真实 nginx 只连接 mock upstream；它没有启动生产 systemd+Dufs+nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是部署要求。依赖审计在 lockfile/manifest 的 push、PR、每周计划及人工触发时运行；发布门固定要求 cargo-audit 0.22.2，只把 canonical origin、HEAD=FETCH_HEAD 且 7 天内验证过上游的 RustSec DB 视为“可用”，否则隔离联网刷新并在离线时失败关闭。`BUILD-ENVIRONMENT.txt` 使用 v2 格式记录 cargo-audit 版本、advisory DB revision 和 fetch epoch。包内先完成文档检查，`SHA256SUMS` 再作为最后内容变更生成并只读复核。仓库有意没有自动 GitHub Release 工作流；`0.48.0` 尚未发布，精确 `v0.48.0` tag 应只在最终源码与发布准备完成后创建。
 
 Playwright 为隔离浏览器测试而使用的端口、证书和密钥环境变量只由 Node 测试进程读取；每个测试在测试共享根下创建随机唯一子目录。Node 测试网关只呈现一个客户端地址，因此浏览器用例固定为单 worker 串行执行，避免无关用例的登录并发争抢生产全局/来源令牌桶；失败时仍进行一次诊断重试。配置同时启用 `failOnFlakyTests: true`，所以首轮失败、重试通过仍会使质量门失败，重试只用于保留诊断 trace。覆盖多次 Argon2 登录、注销和 Cookie 重放的复合认证场景单独标记为 slow test，扩展的只是该 Playwright 场景总预算，不改变登录正文、计算 admission 或其他产品 deadline。Node 在外部测试端口提供 HTTPS，并把请求代理到 Dufs 动态回环 HTTP 端口。仓库中的固定测试私钥是公开的 localhost 测试材料，绝不能部署为生产网关密钥。Dufs 二进制仍只通过显式命令行参数启动，因此这些变量不属于生产配置入口。
 

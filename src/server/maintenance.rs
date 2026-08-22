@@ -630,6 +630,13 @@ where
                     }
                     return Ok(true);
                 };
+                // Quarantine is a fail-safe terminal location for an internal
+                // trash entry whose identity could not be reconciled. It is
+                // intentionally hidden and never eligible for automatic TTL
+                // cleanup; an operator must inspect and remove it explicitly.
+                if internal_name == InternalEntryName::Quarantine {
+                    return Ok(true);
+                }
                 let is_trash = internal_name == InternalEntryName::DeleteTrash;
                 if is_dir && !is_trash {
                     warn!(

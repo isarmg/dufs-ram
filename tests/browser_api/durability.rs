@@ -114,6 +114,9 @@ fn sqlite_delete_outbox_purges_trash_and_replays_after_restart() -> Result<(), E
         std::fs::write(target.join(format!("{index:04}.txt")), b"delete")?;
     }
     let operation_id = Uuid::new_v4();
+    let revision = preflight_upload_target(&server, "/durable-delete")?
+        .revision
+        .ok_or("durable delete target has no revision")?;
 
     {
         let context = browser_context(&server, "")?;
@@ -121,6 +124,7 @@ fn sqlite_delete_outbox_purges_trash_and_replays_after_restart() -> Result<(), E
             .request(Method::DELETE, server.url().join("durable-delete/")?)
             .header(CSRF_HEADER, &context.csrf_token)
             .header("X-Dufs-Operation-Id", operation_id.to_string())
+            .header("If-Match", format!("\"{revision}\""))
             .send()?;
         assert_eq!(response.status(), 204);
         assert_eq!(
@@ -165,6 +169,7 @@ fn sqlite_delete_outbox_purges_trash_and_replays_after_restart() -> Result<(), E
         .request(Method::DELETE, server.url().join("durable-delete/")?)
         .header(CSRF_HEADER, &context.csrf_token)
         .header("X-Dufs-Operation-Id", operation_id.to_string())
+        .header("If-Match", format!("\"{revision}\""))
         .send()?;
     assert_eq!(replay.status(), 204);
     assert_eq!(

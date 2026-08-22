@@ -2,7 +2,7 @@
 
 Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单个 Linux 可执行文件后，即可通过 Edge、Firefox 等现代桌面浏览器浏览和管理指定目录，不需要单独部署前端服务。
 
-本项目面向个人或受控局域网环境。推荐部署约定是一台系统只运行一个 Dufs 进程，并由该进程管理一个共享根目录；代码强制保证的锁粒度则是“每个共享根唯一实例”：程序会在共享根目录 FD 上取得非阻塞独占锁，指向同一根的第二实例会启动失败，不同根目录之间不会互相加锁。账号只决定能否登录；创建账号后即拥有整个共享根的完整文件管理权限。
+本项目面向个人或受控局域网环境。推荐部署约定是一台系统只运行一个 Dufs 进程，并由该进程管理一个共享根目录；代码强制保证的锁粒度则是“每个共享根唯一实例”：程序会在共享根目录 FD 上取得非阻塞独占锁，指向同一根的第二实例会启动失败，不同根目录之间不会互相加锁。该 advisory lock 不能阻止 shell、宿主机或其他程序写入；本文描述的一致性保证要求共享根由 Dufs 和停服后的受控运维流程独占写入。账号只决定能否登录；创建账号后即拥有整个共享根的完整文件管理权限。
 
 ## 支持范围
 
@@ -30,20 +30,21 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - [安全策略](SECURITY.md)：说明支持边界、私密报告要求和事件响应信息；
 - [本地变更记录](CHANGELOG.md)：记录从 0.46.0 起已经完成的改动及更早版本历史。
 
-当前 checkout 未配置 Git remote 或托管 release；仓库包含只读 GitHub Actions 门禁定义，推送到 GitHub 后会分层运行静态检查、Node 最低版本兼容检查、Rust 检查、质量检查和 Chromium/Firefox 矩阵，但不会签名、发布或取得写权限。正式制品仍使用本地 Git 和 `scripts/package-release.sh`，从与 Cargo 版本一致的精确 tag 生成带 Git SHA、checksum、CycloneDX SBOM、`BUILD-ENVIRONMENT.txt` 构建环境记录和签名的可验证发布目录。输出目录经所有者/权限校验后以 FD 锁定，stage 创建、构建、清理、最终 rename 和目录同步都从该 FD 派生；全部制品先在同文件系统私有 stage 中验证并同步，在支持 Linux `RENAME_NOREPLACE` 的发布文件系统上再由一次 no-clobber 目录 rename 原子公开。Rust/Node 依赖仍来自锁文件指定的包仓库；首次构建、`npm ci` 和发布脚本的依赖 vendoring 需要可用仓库或已经填充的本地缓存，完成 vendoring 后的隔离 release 构建才强制离线。
+本 fork 托管在 `https://github.com/isarmg/dufs-ram`。仓库有只读 GitHub Actions 门禁，但有意不提供自动 GitHub Release 工作流：远程任务不会签名、创建 tag、发布 release 或取得仓库写权限。`0.48.0` 当前是尚未发布的源码版本，缺少精确 `v0.48.0` tag 是有意状态；只有源码、审查和发布准备全部完成后才应创建与 Cargo 版本一致且精确指向目标 commit 的 tag。正式制品仍使用本地 Git 和 `scripts/package-release.sh` 生成带 Git SHA、checksum、CycloneDX SBOM、`BUILD-ENVIRONMENT.txt` 构建环境记录和签名的可验证发布目录。输出目录经所有者/权限校验后以 FD 锁定，stage 创建、构建、清理、最终 rename 和目录同步都从该 FD 派生；全部制品先在同文件系统私有 stage 中验证并同步，在支持 Linux `RENAME_NOREPLACE` 的发布文件系统上再由一次 no-clobber 目录 rename 原子公开。Rust/Node 依赖仍来自锁文件指定的包仓库；首次构建、`npm ci` 和发布脚本的依赖 vendoring 需要可用仓库或已经填充的本地缓存，完成 vendoring 后的隔离 release 构建才强制离线。
 
-发布包完整保留仓库的 `docs/` 层次，并携带教程本地链接所引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置；这些支持材料用于离线阅读与核对，不是运行 Dufs 的额外依赖。除 `SHA256SUMS` 自身外，包内全部普通文件都进入该清单；打包和 `--self-test` 会用包内的文档检查器验证所有本地链接。根目录的 `CODE_REVIEW_REPORT.md` 只作为旧包名兼容副本，规范位置仍是 `docs/history/code-review-report.md`。
+发布包完整保留仓库的 `docs/` 层次，并携带教程本地链接所引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置；这些支持材料用于离线阅读与核对，不是运行 Dufs 的额外依赖。打包和 `--self-test` 会先用包内文档检查器验证所有本地链接，再把除 `SHA256SUMS` 自身外的全部普通文件写入清单；此后只做只读覆盖校验，使 checksum 成为包内最后一次内容变更。根目录的 `CODE_REVIEW_REPORT.md` 只作为旧包名兼容副本，规范位置仍是 `docs/history/code-review-report.md`。
 
 ## 环境要求
 
-- 64 位 Linux，且内核必须提供 `openat2`；不支持时程序会拒绝启动；
+- 自动 CI、部署样例和正式制品的验证基线是 `x86_64-unknown-linux-gnu`；`build.rs` 也允许其他 64 位 Linux 源码构建，但 aarch64 等目标在加入等价 CI/部署矩阵前只属于未验证的 best effort；
+- 运行内核必须提供 `openat2`；不支持时程序会拒绝启动，二进制还必须匹配 CPU、libc 和动态加载器 ABI；
 - Rust、rustc 和 Cargo 1.97.1，源码使用 Rust 2024 edition；
 - 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
 - Node.js 18 或更高版本用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
 - 本地开发门在安装 ShellCheck 时执行 `--severity=warning`，缺失时明确跳过而不会联网安装；远程 CI 按 SHA-256 固定并强制使用 ShellCheck 0.11.0，正式发布也要求 ShellCheck 可用；
-- 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.97.1 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
+- 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、`cargo-audit 0.22.2`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.97.1 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
 
-`build.rs` 会在编译期拒绝非 Linux 目标。`Cargo.lock` 中出现上游依赖的其他平台条件包属于 Cargo 的完整依赖图，不表示本项目支持这些平台。
+`build.rs` 会在编译期拒绝非 Linux 或非 64 位目标，但这个编译边界不等于每个 64 位架构都经过支持矩阵验证。`Cargo.lock` 中出现上游依赖的其他平台条件包属于 Cargo 的完整依赖图，也不表示本项目支持这些平台。
 
 ## 编译
 
@@ -185,6 +186,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 - 删除会先持久化移除原名称，再异步回收磁盘空间；
 - DELETE 在改名前先向 state store 写入 `Prepared` outbox 记录，其中保存账号、根内相对目标/trash 路径及源 dev/inode/类型；随后只有通过身份复核的同父目录 rename 和父目录 `fsync` 成功，才把 job 改为 `Ready` 并返回 `204`。purge outbox 容量为全局 4096、每账号 1024，满载在可见删除前以 `503 purge_backlog_full` 拒绝；
 - 单 worker 从 outbox 原子 claim 到 `Claimed`，每次最多处理 256 个条目或 25 ms；未完成项在进程内轮转，I/O 失败则持久化返回 `Ready` 并从 100 ms 开始指数退避，最长 30 秒，不再因固定失败次数丢弃 job。若 SQLite 状态转换瞬时失败，worker 会有界保留该 claim，回读确认它仍为 `Claimed` 后再继续，避免把“提交成功但回复丢失”误当作待重做；重启会把遗留 `Claimed` 恢复为 `Ready`。独立 reconciler 在启动和运行期持续检查 `Prepared`，按已记录 inode 对比原路径和 trash，判定 rename 未发生、已发生或仍有歧义，绝不删除身份不匹配的路径；
+- 一旦发现内部 trash 的身份与持久记录不一致，服务会把该对象原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold` 并释放相应 purge 记录；quarantine 永不参与自动清理。运维人员必须先停止 Dufs，核对日志和对象内容/归属后再手工移除，不能把它当作普通 orphan trash；
 - 启动及每小时的低频根内扫描只为未记账或其他 orphan trash 提供兜底；新 DELETE 的正常可靠性不再依赖扫描重新捕获。分片遍历仍只保存根内路径和 cursor，读到 EOF 后删目录若返回 `ENOTEMPTY` 会从 cursor 0 重扫，FD 数量不随嵌套深度增长；
 - 内部删除暂存项不是回收站，不提供恢复或撤销功能。
 
@@ -434,7 +436,7 @@ cargo audit --version
 若尚未安装依赖审计工具和门禁固定版本的覆盖率工具：
 
 ```sh
-cargo install cargo-audit --locked
+cargo install cargo-audit --version 0.22.2 --locked
 cargo install cargo-llvm-cov --version 0.8.6 --locked
 ```
 
@@ -478,9 +480,9 @@ npm audit --audit-level=high
 ./scripts/check.sh
 ```
 
-该门禁还会用生产解析器校验 YAML 示例、验证 systemd/nginx 语法并对真实 nginx 做隔离行为测试、执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测、强制 Rust 行覆盖率基线，并以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点；围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、升级和回滚步骤见[生产运维文档](docs/operations.md)。
+该门禁还会用生产解析器校验 YAML 示例，以占位可执行文件做 systemd 静态验证，并让真实 nginx 对 mock upstream 执行隔离行为测试；它不启动真实 systemd unit 与 Dufs/nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是发布/部署必做项。门禁还执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测、强制 Rust 行覆盖率基线，并以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点；围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、升级和回滚步骤见[生产运维文档](docs/operations.md)。
 
-`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。静态层固定 Node 24.8.0、TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；兼容层复验声明的 Node 18 下限；Rust 层固定 1.97.1；质量层运行 70% 行覆盖率、真实 nginx 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。独立依赖审计工作流只在 lockfile/manifest PR、每周计划或人工触发时联网运行 RustSec 与 npm audit，避免给无关 PR 增加审计数据库网络噪声。runner 使用 `ubuntu-24.04` 标签，并在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。远程门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
+`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。静态层固定 Node 24.8.0、TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；兼容层复验声明的 Node 18 下限；Rust 层固定 1.97.1；质量层运行 70% 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。runner 使用 `ubuntu-24.04` 标签，并在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。远程门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
 
 质量层把覆盖率、部署、发布脚本自测和 release binary smoke 作为独立步骤；只要各自前置条件成功且工作流未被取消，前一项实质检查失败不会跳过后面的独立检查，使一次运行尽量同时报告全部根因且避免缺少工具产生级联报错。
 
@@ -491,13 +493,13 @@ git diff --check
 git status --short
 ```
 
-创建版本时应先确认工作树干净，再用发布脚本从与 Cargo 版本一致、精确指向 `HEAD` 的 Git tag 构建。脚本不会直接在可变 checkout 中跑发布门禁：它先从摘要锁定的 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中以 `env -i`、固定工具路径/工具链及独立 HOME、Cargo home/target、npm cache 和临时目录强制执行完整 `scripts/check.sh`。Cargo 依赖先 vendor 后离线使用；npm 播种器只从 `package-lock.json` 的 HTTPS URL 与 SHA-512 integrity 接受并重新散列宿主 cache 内容，随后使用私有 cache 与 `prefer-offline`，缺失包和 `npm audit` 仍可能需要网络。若宿主已有 RustSec 数据库，则以 `--no-hardlinks` 复制到私有目录并用 `cargo audit --no-fetch`；否则审计可在隔离目录中正常取得数据库。门禁后通过独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，再丢弃整棵质量树，从同一 commit 全新解包用于签名构建。
+创建版本时应先确认工作树干净，再用发布脚本从与 Cargo 版本一致、精确指向 `HEAD` 的 Git tag 构建。脚本不会直接在可变 checkout 中跑发布门禁：它先从摘要锁定的 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中以 `env -i`、固定工具路径/工具链及独立 HOME、Cargo home/target、npm cache 和临时目录强制执行完整 `scripts/check.sh`。Cargo 依赖先 vendor 后离线使用；npm 播种器只从 `package-lock.json` 的 HTTPS URL 与 SHA-512 integrity 接受并重新散列宿主 cache 内容，随后使用私有 cache 与 `prefer-offline`，缺失包和 `npm audit` 仍可能需要网络。发布门固定要求 cargo-audit 0.22.2。宿主 RustSec Git 数据库只有在 origin 是官方仓库、HEAD 与 FETCH_HEAD revision 一致且最近 7 天验证过上游时才会以 `--no-hardlinks` 复制并用 `--no-fetch` 离线审计；过期或不存在时强制在隔离 Cargo home 中联网刷新，网络不可用即失败关闭。门禁后通过独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，再丢弃整棵质量树，从同一 commit 全新解包用于签名构建。
 
 源树预检、隔离快照和每次解包检查会拒绝 symlink、submodule 及任何非普通文件/目录条目。脚本还会拒绝 Git replace refs、legacy grafts 和仓库私有 attributes；façade 只使用摘要锁定的最小 local config，所有 Git 命令清空 system/global 配置并禁用额外 attributes/replace。检查后、签名前和发布前都会重新确认 commit/tag/版本及原 checkout 的干净状态；前后两份源码 archive 还会复核 commit、tree、mode、额外路径和 SHA-256。
 
 发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。每个第三方包都必须声明非空 SPDX `license` 表达式；`license_file` 只能提供上游正文，不能替代缺失的表达式或充当分类 fallback。表达式按 `WITH > AND > OR` 的真实 SPDX AST 解析，只接受审核清单内的 identifier/exception，并要求存在完整 permissive 选择：`OR` 任一分支可选，`AND` 两侧都必须满足；只有明确列出的 Cargo 遗留写法会映射为 `OR`。生成器收集依赖声明的 `license_file` 及包根下全部常规 LICENSE/COPYING/NOTICE 文件；每个候选必须是该 vendored 包自身目录内的 no-follow 普通文件，并通过 UTF-8、非 NUL、非空与路径边界校验。项目 `LICENSE-MIT`/`LICENSE-APACHE` 不会替代缺失的上游文本；正文按 SHA-256 去重。
 
-固定 Rust 1.97.1 sysroot 的 `share/doc/rust/COPYRIGHT-library.html` 还必须是 sysroot 内的 no-follow 普通文件，并精确匹配已审核 SHA-256 `0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed`；未知工具链没有审核摘要时发布失败。它以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 进入包内。`BUILD-ENVIRONMENT.txt` 记录完整源码 SHA、版本、`SOURCE_DATE_EPOCH`、host target，以及本次实际使用或依赖的 Bash、Rust、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本；它用于复现与差异诊断，不表示这些宿主工具已全部由仓库钉死。该清单、标准库 notice、项目双许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`；SBOM 规范化会移除本地构建路径并给 Dufs 组件绑定完整源提交，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID，但这不替代完整 CycloneDX schema 校验。签名私钥只在所有构建、SBOM、notice、归档和 checksum 工作完成后短暂打开，并只接受 Ed25519、Ed448、RSA ≥3072 bit 或审核曲线 `prime256v1`/`secp384r1`/`secp521r1`；弱 RSA、DSA、未审核 EC 曲线及非签名算法会失败关闭。生产发布仍应把构建和签名放在不同账号、主机或 HSM 信任域中，因为同一 UID 的恶意构建代码不可能仅靠 Shell FD 管理得到彻底隔离。不要把未经签名的临时二进制与正式制品混用。
+固定 Rust 1.97.1 sysroot 的 `share/doc/rust/COPYRIGHT-library.html` 还必须是 sysroot 内的 no-follow 普通文件，并精确匹配已审核 SHA-256 `0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed`；未知工具链没有审核摘要时发布失败。它以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 进入包内。`BUILD-ENVIRONMENT.txt` 使用 `dufs-build-environment-v2` 格式，记录完整源码 SHA、版本、`SOURCE_DATE_EPOCH`、host target、本次实际使用的 cargo-audit、RustSec advisory DB revision/最近 fetch epoch，以及 Bash、Rust、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本；它用于复现与差异诊断，不表示这些宿主工具已全部由仓库钉死。该清单、标准库 notice、项目双许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`；SBOM 规范化会移除本地构建路径并给 Dufs 组件绑定完整源提交，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID，但这不替代完整 CycloneDX schema 校验。签名私钥只在所有构建、SBOM、notice、归档和 checksum 工作完成后短暂打开，并只接受 Ed25519、Ed448、RSA ≥3072 bit 或审核曲线 `prime256v1`/`secp384r1`/`secp521r1`；弱 RSA、DSA、未审核 EC 曲线及非签名算法会失败关闭。生产发布仍应把构建和签名放在不同账号、主机或 HSM 信任域中，因为同一 UID 的恶意构建代码不可能仅靠 Shell FD 管理得到彻底隔离。不要把未经签名的临时二进制与正式制品混用。
 
 ## 目录结构
 

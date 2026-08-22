@@ -6,7 +6,7 @@
 
 构建源码需要：
 
-- 目标平台是 64 位 Linux；
+- 目标平台是 64 位 Linux；仓库自动验证的基线是 `x86_64-unknown-linux-gnu`，aarch64 等目标在补齐等价 CI/部署矩阵前不属于正式验证范围；
 - Rust、rustc、Cargo 1.97.1；
 - 源码使用 Rust 2024 edition；
 - 与目标 ABI 匹配的 C 编译器、链接器和 binutils；项目通过 `rusqlite` 的 bundled feature 编译 SQLite C 源码。

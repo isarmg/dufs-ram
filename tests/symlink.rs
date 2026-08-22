@@ -100,7 +100,13 @@ fn dangling_and_looping_symlinks_are_listed_and_manageable(
 
     let dangling_url = server.url().join("dangling-link")?;
     assert_eq!(server.get(dangling_url.clone())?.status(), 404);
-    let deleted = server.request(Method::DELETE, dangling_url).send()?;
+    let dangling_revision = preflight_upload_target(&server, "/dangling-link")?
+        .revision
+        .ok_or("dangling symlink has no revision")?;
+    let deleted = server
+        .request(Method::DELETE, dangling_url)
+        .header("If-Match", format!("\"{dangling_revision}\""))
+        .send()?;
     assert_eq!(deleted.status(), 204);
     assert!(std::fs::symlink_metadata(&dangling).is_err());
 

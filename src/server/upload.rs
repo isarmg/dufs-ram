@@ -50,12 +50,12 @@ mod target;
 mod transfer;
 
 use protocol::{
-    RESUMABLE_UPLOAD_MIN_SIZE, TARGET_REPLACEABLE_HEADER, TARGET_REVISION_HEADER, UPLOAD_ID_HEADER,
-    UPLOAD_OFFSET_HEADER,
+    RESUMABLE_UPLOAD_MIN_SIZE, TARGET_REPLACEABLE_HEADER, UPLOAD_ID_HEADER, UPLOAD_OFFSET_HEADER,
 };
 pub(super) use protocol::{
-    TargetRevision, UploadMode, UploadOptions, UploadOverwritePolicy, apply_upload_record_headers,
-    parse_upload_id, parse_upload_length, parse_upload_offset, parse_upload_overwrite,
+    TARGET_REVISION_HEADER, TargetRevision, UploadMode, UploadOptions, UploadOverwritePolicy,
+    apply_upload_record_headers, parse_upload_id, parse_upload_length, parse_upload_offset,
+    parse_upload_overwrite,
 };
 pub(super) use record::UploadRecordStore;
 use record::{
@@ -63,6 +63,7 @@ use record::{
     UploadRecordStoreError, rollback_upload_ancestors,
 };
 use target::apply_target_inspection_headers;
+pub(in crate::server) use target::target_revision;
 
 #[cfg(test)]
 use super::internal_names::{

@@ -119,12 +119,23 @@ impl PurgeQueue {
 }
 
 impl Server {
+    #[cfg(test)]
     pub(in crate::server) async fn prepare_purge(
         &self,
         owner: &str,
         target: &Path,
     ) -> Result<PreparePurge> {
         let source_identity = self.content.rooted_fs.delete_identity(target).await?;
+        self.prepare_purge_with_identity(owner, target, source_identity)
+            .await
+    }
+
+    pub(in crate::server) async fn prepare_purge_with_identity(
+        &self,
+        owner: &str,
+        target: &Path,
+        source_identity: DeleteIdentity,
+    ) -> Result<PreparePurge> {
         let target_path = self.content.rooted_fs.state_relative_path(target)?;
         let owner = OwnerId::persistent(owner).into_bytes();
 
@@ -339,12 +350,13 @@ impl Server {
             Ok(Some(entry)) if purge_identity_matches(entry.identity(), &job) => {
                 Ok(Some(PurgeWork { job, entry }))
             }
-            Ok(Some(_)) => {
+            Ok(Some(entry)) => {
+                drop(entry);
                 let error = std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "trash entry identity changed before durable purge",
                 );
-                match self.defer_purge_job(&job, &error).await {
+                match self.quarantine_claimed_purge_job(&job, &error).await {
                     Ok(()) => Ok(None),
                     Err(source) => Err(ClaimedPurgeFailure::new(job, source)),
                 }
@@ -357,10 +369,17 @@ impl Server {
                 }
                 Err(source) => Err(ClaimedPurgeFailure::new(job, source)),
             },
-            Err(error) => match self.defer_purge_job(&job, &error).await {
-                Ok(()) => Ok(None),
-                Err(source) => Err(ClaimedPurgeFailure::new(job, source)),
-            },
+            Err(error) => {
+                let result = if error.kind() == std::io::ErrorKind::InvalidData {
+                    self.quarantine_claimed_purge_job(&job, &error).await
+                } else {
+                    self.defer_purge_job(&job, &error).await
+                };
+                match result {
+                    Ok(()) => Ok(None),
+                    Err(source) => Err(ClaimedPurgeFailure::new(job, source)),
+                }
+            }
         }
     }
 
@@ -392,13 +411,49 @@ impl Server {
                 PurgeWorkResult::Pending(work)
             }
             Err(error) => {
-                let (_, source) = error.into_parts();
-                match self.defer_purge_job(&work.job, &source).await {
+                let (entry, source) = error.into_parts();
+                drop(entry);
+                let result = if source.kind() == std::io::ErrorKind::InvalidData {
+                    self.quarantine_claimed_purge_job(&work.job, &source).await
+                } else {
+                    self.defer_purge_job(&work.job, &source).await
+                };
+                match result {
                     Ok(()) => PurgeWorkResult::Complete,
                     Err(error) => PurgeWorkResult::Retry(ClaimedPurgeFailure::new(work.job, error)),
                 }
             }
         }
+    }
+
+    async fn quarantine_claimed_purge_job(
+        &self,
+        job: &StoredPurgeJob,
+        source: &std::io::Error,
+    ) -> Result<()> {
+        let trash = self.content.rooted_fs.resolve_state_path(&job.trash_path)?;
+        let quarantined = self
+            .content
+            .rooted_fs
+            .quarantine_internal_trash(&trash)
+            .await?;
+        match quarantined {
+            Some(quarantined) => warn!(
+                "Quarantined an identity-ambiguous claimed trash entry and stopped automatic purge job_id={} quarantine={} error={source:#}",
+                Uuid::from_bytes(job.key.id),
+                quarantined.display()
+            ),
+            None => warn!(
+                "Identity-ambiguous claimed trash entry disappeared before quarantine; completing its purge intent without touching another path job_id={} error={source:#}",
+                Uuid::from_bytes(job.key.id)
+            ),
+        }
+        if !self.state.state_store.complete_purge_job(job.key).await? {
+            return Err(anyhow!(
+                "claimed purge job was lost before quarantine completion"
+            ));
+        }
+        Ok(())
     }
 
     async fn defer_purge_job(&self, job: &StoredPurgeJob, source: &std::io::Error) -> Result<()> {
@@ -468,20 +523,39 @@ impl Server {
             self.notify_purge_worker();
             return Ok(());
         }
+        if trash_identity.is_some() {
+            let quarantined = self
+                .content
+                .rooted_fs
+                .quarantine_internal_trash(&trash)
+                .await?;
+            if let Some(quarantined) = quarantined {
+                warn!(
+                    "Quarantined an identity-ambiguous internal trash entry for manual inspection job_id={} quarantine={}",
+                    Uuid::from_bytes(job.key.id),
+                    quarantined.display()
+                );
+            }
+        }
         if target_identity.is_some_and(|identity| purge_identity_matches(identity, &job)) {
             // The checked rename did not consume the recorded source. Any
-            // occupant at the random trash path is unrelated and must never be
-            // removed by this job.
+            // occupant at the random trash path was quarantined above and must
+            // never become an orphan-trash deletion candidate.
             self.state.state_store.remove_purge_job(job.key).await?;
             return Ok(());
         }
 
         warn!(
-            "Prepared purge intent is ambiguous; preserving both paths job_id={} target={} trash={}",
+            "Prepared purge intent is ambiguous; preserving the target and releasing the quarantined intent job_id={} target={} trash={}",
             Uuid::from_bytes(job.key.id),
             target.display(),
             trash.display()
         );
+        // Neither current name proves that the recorded source still exists.
+        // The target is never touched, and any unrelated trash occupant has
+        // already moved to a permanent quarantine name. Removing the intent
+        // frees its path barrier and bounded state-store capacity safely.
+        self.state.state_store.remove_purge_job(job.key).await?;
         Ok(())
     }
 

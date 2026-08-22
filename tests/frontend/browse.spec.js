@@ -1,6 +1,7 @@
 const { currentUrl, expect, login, test } = require("./fixtures");
 
 const dangerousName = `危险 <img src=x onerror=alert(1)> & "'.txt`;
+const listingRevision = "a".repeat(64);
 
 test("危险文件名始终作为纯文本节点显示", async ({ appPage: page }) => {
   const link = page.getByRole("link", { name: dangerousName, exact: true });
@@ -54,14 +55,14 @@ test("目录 API 每页最多加载 200 项并可继续追加", async ({ page },
       body: JSON.stringify(cursor === null
         ? {
           paths: [
-            { path_type: "Dir", name: "existing-folder", mtime: 0, size: 0 },
-            { path_type: "File", name: "page-one.txt", mtime: 0, size: 1 },
+            { path_type: "Dir", name: "existing-folder", mtime: 0, size: 0, revision: listingRevision },
+            { path_type: "File", name: "page-one.txt", mtime: 0, size: 1, revision: listingRevision },
           ],
           next_cursor: "opaque-next",
         }
         : {
           paths: [
-            { path_type: "File", name: "page-two.txt", mtime: 0, size: 2 },
+            { path_type: "File", name: "page-two.txt", mtime: 0, size: 2, revision: listingRevision },
           ],
           next_cursor: null,
         }),
@@ -101,6 +102,7 @@ test("目录请求超时后中止并提供可重试状态", async ({ appPage: pa
             name: "first-page.txt",
             mtime: 0,
             size: 1,
+            revision: listingRevision,
           }],
           next_cursor: "timeout-page",
         }),
@@ -202,8 +204,8 @@ test("目录页在整页校验失败时不提交部分 DOM", async ({ appPage: p
     contentType: "application/json",
     body: JSON.stringify({
       paths: [
-        { path_type: "File", name: "valid-before-error.txt", mtime: 0, size: 1 },
-        { path_type: "File", name: "../invalid.txt", mtime: 0, size: 1 },
+        { path_type: "File", name: "valid-before-error.txt", mtime: 0, size: 1, revision: listingRevision },
+        { path_type: "File", name: "../invalid.txt", mtime: 0, size: 1, revision: listingRevision },
       ],
       next_cursor: null,
     }),
@@ -231,6 +233,7 @@ test("目录页拒绝重复游标且保留上一页", async ({ appPage: page }) 
           name: calls === 1 ? "cursor-page-one.txt" : "cursor-page-two.txt",
           mtime: 0,
           size: 1,
+          revision: listingRevision,
         }],
         next_cursor: "repeated-cursor",
       }),
@@ -261,6 +264,7 @@ test("大量目录项使用可访问窗口限制 DOM 数量", async ({ appPage: 
       name: `window-${current * 200 + offset}.txt`,
       mtime: 0,
       size: offset,
+      revision: listingRevision,
     }));
     return route.fulfill({
       status: 200,

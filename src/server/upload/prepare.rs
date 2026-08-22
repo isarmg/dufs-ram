@@ -202,22 +202,6 @@ impl Server {
                     )?;
                     return Ok(None);
                 }
-                UploadRecordState::Running if record.durable_offset == record.upload_length => {
-                    apply_upload_problem(
-                        res,
-                        UploadErrorContext::new(
-                            upload_id,
-                            UploadPublicState::Running,
-                            Some(record.upload_length),
-                            Some(record.durable_offset),
-                        ),
-                        StatusCode::CONFLICT,
-                        ErrorCode::UPLOAD_IN_PROGRESS,
-                        "Upload ID is awaiting terminal confirmation; query its status",
-                        RecoveryAdvice::QueryUpload,
-                    )?;
-                    return Ok(None);
-                }
                 UploadRecordState::Running => {}
                 UploadRecordState::AwaitingConfirmation
                     if !resume || upload_offset != Some(record.upload_length) =>

@@ -6,8 +6,8 @@ rust-version = "1.97.1"
 description = "A Linux browser file manager"
 authors = ["sigoden <sigoden@gmail.com>", "dufs developers"]
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/sigoden/dufs"
-repository = "https://github.com/sigoden/dufs"
+homepage = "https://github.com/isarmg/dufs-ram"
+repository = "https://github.com/isarmg/dufs-ram"
 publish = false
 build = "build.rs"
 

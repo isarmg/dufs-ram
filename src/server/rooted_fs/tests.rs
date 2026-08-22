@@ -763,6 +763,34 @@ async fn checked_trash_move_rejects_a_replaced_source_identity() {
 }
 
 #[tokio::test]
+async fn checked_trash_move_rejects_an_in_place_revision_change() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("changed-before-delete.txt");
+    std::fs::write(&target, "original").unwrap();
+    let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&target, permissions).unwrap();
+    let expected_revision = rooted.replacement_identity(&target).await.unwrap();
+    let expected_delete = expected_revision.delete_identity().unwrap();
+
+    let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+    permissions.set_mode(0o640);
+    std::fs::set_permissions(&target, permissions).unwrap();
+
+    let outcome = rooted
+        .move_to_trash_with_expected_identity_outcome(
+            &target,
+            Uuid::new_v4(),
+            expected_delete,
+            Some(expected_revision),
+        )
+        .await;
+    assert!(matches!(outcome, CheckedTrashMove::TargetChanged));
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+}
+
+#[tokio::test]
 async fn checked_trash_move_proves_a_noreplace_collision_was_not_moved() {
     let temp = assert_fs::TempDir::new().unwrap();
     let rooted = RootedFs::new(temp.path()).unwrap();
@@ -774,7 +802,7 @@ async fn checked_trash_move_proves_a_noreplace_collision_was_not_moved() {
     std::fs::write(&trash, "unrelated occupant").unwrap();
 
     let outcome = rooted
-        .move_to_trash_with_expected_identity_outcome(&target, trash_id, expected)
+        .move_to_trash_with_expected_identity_outcome(&target, trash_id, expected, None)
         .await;
     let CheckedTrashMove::NotMoved(error) = outcome else {
         panic!("a verified NOREPLACE collision must be classified as not moved");
@@ -917,7 +945,7 @@ async fn trash_purge_is_incremental_and_honors_cancellation() {
 }
 
 #[tokio::test]
-async fn trash_purge_error_returns_the_job_for_retry() {
+async fn trash_purge_identity_error_returns_the_entry_without_deleting_replacement() {
     let temp = assert_fs::TempDir::new().unwrap();
     let rooted = RootedFs::new(temp.path()).unwrap();
     let directory = temp.path().join("directory");
@@ -938,15 +966,49 @@ async fn trash_purge_error_returns_the_job_for_retry() {
         Err(error) => error,
     };
     let (trash, source) = error.into_parts();
-    assert!(matches!(
-        source.kind(),
-        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::Other
-    ));
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_to_string(&trash_path).unwrap(),
+        "temporary obstruction"
+    );
 
     std::fs::remove_file(&trash_path).unwrap();
     std::fs::rename(&displaced, &trash_path).unwrap();
     trash.purge_all_blocking().unwrap();
     assert!(!trash_path.exists());
+}
+
+#[tokio::test]
+async fn nested_directory_replacement_is_detected_before_unlink() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    let child = directory.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("original.txt"), "original").unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    assert!(
+        !trash
+            .purge_slice_blocking(1, Instant::now() + Duration::from_secs(1), None)
+            .unwrap()
+    );
+
+    let child = trash_path.join("child");
+    let displaced = temp.path().join("displaced-original-child");
+    std::fs::rename(&child, &displaced).unwrap();
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(child.join("preserve.txt"), "external replacement").unwrap();
+
+    let error = trash
+        .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_to_string(child.join("preserve.txt")).unwrap(),
+        "external replacement"
+    );
 }
 
 #[tokio::test]

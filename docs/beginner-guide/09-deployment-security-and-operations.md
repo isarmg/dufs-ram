@@ -232,7 +232,7 @@ nginx -t
 ./scripts/check-deployment.sh
 ```
 
-它不只做语法检查，还用 mock upstream 验证 nginx 的 Host、代理头、登录路由、重定向和重试边界。
+它不只做语法检查，还用真实 nginx 和 mock upstream 验证 Host、代理头、登录路由、重定向和重试边界；systemd 校验则把 `ExecStart` 换成占位可执行文件。这个脚本不会启动生产 systemd unit 与真实 Dufs/nginx 组合，所以不能替代下面的数据副本和 HTTPS 冒烟。
 
 启动：
 
@@ -385,6 +385,8 @@ rollback journal 模式下，不要在活跃事务中只复制 `state.sqlite3` �
 ### 不要过滤内部项
 
 共享根里的上传 stage 和删除 trash 平时对用户隐藏，但备份工具若单独排除它们，恢复时可能让数据库控制状态找不到对应对象。备份应对整个受控时间点保持一致。
+
+当内部 trash 的实际身份与持久记录不一致时，Dufs 会把它改名为 `.dufs-quarantine-<uuid>.hold`。该名称永不由 maintenance 或 orphan 扫描自动清理，也必须进入备份。发现它时先停止 Dufs，结合日志和状态库检查对象内容、owner 与来源；确认处置结论后再手工移除，不能在服务运行中把它当普通临时文件批量删除。
 
 ## 9.14 恢复比“备份命令成功”更重要
 
