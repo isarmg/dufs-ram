@@ -6,6 +6,7 @@
 
 ### 变更
 
+- 新增受版本标签触发的 GitHub 便捷二进制发布工作流：只接受与 Cargo 版本和 workflow commit 精确一致的 `v<version>` tag，等待同一提交的完整只读 CI 成功后，用固定 Rust 工具链构建嵌入完整 Git SHA 的 `x86_64-unknown-linux-gnu` 二进制并生成 SHA-256。工作流先在草稿 Release 中核对资产再公开，拒绝覆盖同名 Release，不创建或移动 tag，也不接触本地正式发布私钥；文档明确区分该无独立签名的直接下载制品与含 SBOM、许可证、构建环境记录及独立公钥签名的本地正式发布包。
 - 将 New folder / New empty file 改为 Windows 式立即创建和行内命名：分别从 `newfolder` / `newfile` 开始，只有服务端原子证明重名时才以新 Operation/Upload ID 尝试 `(2)`、`(3)` 等后缀；成功后在名称列选中文字直接编辑。Rename 按钮也改为原位编辑，Enter、Tab 或合法失焦提交，Escape 取消编辑但不删除已经创建的默认项；文件默认只选中最后一个扩展名前的主体。单一编辑器继续受 1000 行 DOM 窗口约束，路径 mutation 使用稳定名称而非会因置顶而变化的索引。零字节 PUT 的晚到冲突若留下 `awaiting-confirmation` stage，必须先以同一路径/ID 得到明确 discard `204` 才能换候选；unknown、清理不可信或上传状态不绑定时立即停止，不会产生第二个可能重复的文件。
 - 将移动与重命名从页面到后端协议完整拆分：每个目录项分别显示 Rename 与 Move 按钮；`POST /__dufs__/api/rename` 只接受单段 `name` 并保留父目录，`POST /__dufs__/api/move` 只接受已存在的 `directory` 并保留原名称。两条协议独立校验和报告状态，但复用路径租约、原子 rename、显式覆盖确认、Operation ID 幂等与结果未知处理；Move 不再隐式创建缺失的目标目录。
 - 移除目录 ZIP 下载：删除页面级和目录行上的归档入口、ZIP 规划/生成/磁盘预留实现、专属并发与容量配置、相关测试，以及 `async-deflate-zip` 和 `unicode-normalization` 直接依赖。任何存在 `zip` 查询 key 的目录 GET/HEAD（包括 `?zip` 和 `?zip=1`）在兼容窗内稳定返回 `410 directory_archive_unsupported`，防止旧客户端把 HTML 列表误当归档；HEAD 不发送正文。本节下方的 ZIP 修复条目保留为移除前的实施历史，不再描述最终工作树功能。
