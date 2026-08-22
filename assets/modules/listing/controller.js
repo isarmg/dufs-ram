@@ -14,7 +14,7 @@ import { childUrl, isValidLogicalPath } from "../shared/path.js";
 
 const LIST_PAGE_LIMIT = 200;
 const MAX_CURSOR_LENGTH = 1024;
-const MAX_RENDERED_ITEMS = 1000;
+const MAX_RENDERED_ITEMS = LIST_PAGE_LIMIT;
 const PATH_TYPES = new Set(["Dir", "SymlinkDir", "File", "SymlinkFile"]);
 
 /** @typedef {(typeof MUTATION_EFFECT)[keyof typeof MUTATION_EFFECT]} MutationEffect */
@@ -487,9 +487,9 @@ export function createDirectoryListing(options) {
 
   /**
    * Add a known-committed item ahead of the current server snapshot. Rendering
-   * still goes through the same 1,000-row window, so the transient editor can
-   * never create an extra unbounded DOM row. A stale row with the same name is
-   * replaced rather than duplicated.
+   * stays inside the bounded row window, so the transient editor can never
+   * create an extra DOM row. A stale row with the same name is replaced rather
+   * than duplicated.
    *
    * @param {ListingItem} file
    * @returns {number}
@@ -499,6 +499,18 @@ export function createDirectoryListing(options) {
     activeEditor = null;
     table.classList.remove("has-inline-editor");
     const staleIndex = items.findIndex(candidate => candidate?.name === item.name);
+    const renderedRows = Array.from(tableBody.rows);
+    const renderedRowIndices = renderedRows.map(
+      row => Number(row.id.match(/^addPath(\d+)$/)?.[1] ?? Number.NaN),
+    );
+    const canPrepend = staleIndex < 0 && renderedStart === 0 &&
+      new Set(renderedRowIndices).size === renderedRowIndices.length &&
+      renderedRowIndices.every((index, position) =>
+        Number.isSafeInteger(index) &&
+        index >= renderedStart &&
+        index < renderedEnd &&
+        pathRowUsesIndex(renderedRows[position], index)
+      );
     if (staleIndex >= 0) {
       items.splice(staleIndex, 1);
       visibleCount = Math.max(0, visibleCount - 1);
@@ -509,7 +521,28 @@ export function createDirectoryListing(options) {
     loadedNames.add(item.name);
     loaded = true;
     invalidate(MUTATION_EFFECT.COMMITTED);
-    renderWindow(0);
+    if (canPrepend) {
+      renderedEnd = Math.min(items.length, MAX_RENDERED_ITEMS);
+      const indexedRows = renderedRows.map((row, position) => ({
+        row,
+        previousIndex: renderedRowIndices[position],
+      }));
+      indexedRows.sort((left, right) =>
+        right.previousIndex - left.previousIndex
+      );
+      for (const { row, previousIndex } of indexedRows) {
+        const nextIndex = previousIndex + 1;
+        if (nextIndex >= renderedEnd) {
+          row.remove();
+        } else {
+          reindexPathRow(row, nextIndex);
+        }
+      }
+      tableBody.prepend(createPathRow(item, 0));
+      renderedVisibleCount = tableBody.rows.length;
+    } else {
+      renderWindow(0);
+    }
     updateVisibility();
     return 0;
   }
@@ -818,6 +851,37 @@ export function createDirectoryListing(options) {
    */
   function addPath(file, index, destination = tableBody) {
     destination.append(createPathRow(file, index));
+  }
+
+  /**
+   * @param {HTMLTableRowElement} row
+   * @param {number} index
+   */
+  function reindexPathRow(row, index) {
+    row.id = `addPath${index}`;
+    for (const button of row.querySelectorAll(
+      "button[data-action][data-index]",
+    )) {
+      const action = button.getAttribute("data-action");
+      if (!action) continue;
+      button.id = `${action}Btn${index}`;
+      button.setAttribute("data-index", String(index));
+    }
+  }
+
+  /**
+   * @param {HTMLTableRowElement} row
+   * @param {number} index
+   */
+  function pathRowUsesIndex(row, index) {
+    const buttons = row.querySelectorAll("button[data-action][data-index]");
+    if (buttons.length !== 3) return false;
+    return Array.from(buttons).every(button => {
+      const action = button.getAttribute("data-action");
+      return action !== null &&
+        button.id === `${action}Btn${index}` &&
+        button.getAttribute("data-index") === String(index);
+    });
   }
 
   /**
