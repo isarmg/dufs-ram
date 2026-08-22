@@ -110,10 +110,10 @@ impl RequestProfile {
     }
 }
 
-/// Tracks the cancellation boundary for a request carrying an idempotency key.
-/// A request is only "unknown" once a detached commit task can outlive its HTTP
-/// waiter; body parsing, authentication, reservation, and admission timeouts
-/// are all retryable.
+/// Tracks the cancellation boundary for a mutation request. Tracked operations
+/// become uncertain when their detached commit starts. Uploads atomically race
+/// their first mutation against the HTTP deadline, so a timeout can only claim
+/// `not-started` after it has closed that boundary.
 #[derive(Clone, Debug, Default)]
 pub(in crate::server) struct MutationProgress(Arc<AtomicU8>);
 
@@ -121,6 +121,7 @@ impl MutationProgress {
     const PREFLIGHT: u8 = 0;
     const RESERVED: u8 = 1;
     const DETACHED_COMMIT: u8 = 2;
+    const CANCELLED_BEFORE_UPLOAD_MUTATION: u8 = 3;
 
     pub(in crate::server) fn mark_reserved(&self) {
         let _ = self.0.compare_exchange(
@@ -133,6 +134,36 @@ impl MutationProgress {
 
     pub(in crate::server) fn mark_detached_commit(&self) {
         self.0.store(Self::DETACHED_COMMIT, Ordering::Release);
+    }
+
+    /// Atomically cross the upload mutation boundary. A concurrent request
+    /// timeout may close that boundary first; callers must stop without
+    /// mutating when this returns false.
+    pub(in crate::server) fn begin_upload_mutation(&self) -> bool {
+        match self.0.compare_exchange(
+            Self::PREFLIGHT,
+            Self::DETACHED_COMMIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(Self::DETACHED_COMMIT) => true,
+            Err(Self::CANCELLED_BEFORE_UPLOAD_MUTATION | Self::RESERVED) => false,
+            Err(_) => false,
+        }
+    }
+
+    /// Close the upload mutation boundary before returning a definite timeout.
+    /// If a task already crossed it, its outcome must remain unknown.
+    pub(in crate::server) fn cancel_upload_before_mutation(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PREFLIGHT,
+                Self::CANCELLED_BEFORE_UPLOAD_MUTATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub(in crate::server) fn outcome_can_be_unknown(&self) -> bool {
@@ -152,5 +183,22 @@ mod tests {
         assert!(!progress.outcome_can_be_unknown());
         progress.mark_detached_commit();
         assert!(progress.outcome_can_be_unknown());
+    }
+
+    #[test]
+    fn upload_timeout_and_mutation_boundary_are_atomic() {
+        let cancelled = MutationProgress::default();
+        assert!(cancelled.cancel_upload_before_mutation());
+        assert!(!cancelled.begin_upload_mutation());
+        assert!(!cancelled.outcome_can_be_unknown());
+
+        let mutating = MutationProgress::default();
+        assert!(mutating.begin_upload_mutation());
+        assert!(!mutating.cancel_upload_before_mutation());
+        assert!(mutating.outcome_can_be_unknown());
+        assert!(
+            mutating.begin_upload_mutation(),
+            "the boundary is idempotent"
+        );
     }
 }

@@ -1,7 +1,8 @@
 use super::{
     failure::{
         UploadTimeout, finish_precommit_space_failure, finish_timed_out_upload,
-        upload_deadline_expired, wait_for_maintenance_claim_change,
+        upload_deadline_expired, upload_deadline_expired_before_mutation,
+        wait_for_maintenance_claim_change,
     },
     target::{inspect_target_identity, target_revision},
     *,
@@ -95,6 +96,7 @@ impl Server {
             overwrite,
             deadline,
             path_lease,
+            mutation,
         } = options;
         let resume = mode.is_resume();
         let upload_offset = mode.offset();
@@ -104,10 +106,12 @@ impl Server {
             UPLOAD_ID_HEADER,
             HeaderValue::from_str(&upload_id.to_string())?,
         );
-        if upload_deadline_expired(
+        if upload_deadline_expired_before_mutation(
             deadline,
             res,
             upload_id,
+            upload_length,
+            upload_offset,
             "Upload deadline exceeded during preparation",
         )? {
             return Ok(None);
@@ -284,10 +288,12 @@ impl Server {
                         return Ok(None);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                        upload_deadline_expired(
+                        upload_deadline_expired_before_mutation(
                             deadline,
                             res,
                             upload_id,
+                            upload_length,
+                            upload_offset,
                             "Upload deadline exceeded during preparation",
                         )?;
                         return Ok(None);
@@ -299,10 +305,12 @@ impl Server {
             None
         };
         if resume
-            && upload_deadline_expired(
+            && upload_deadline_expired_before_mutation(
                 deadline,
                 res,
                 upload_id,
+                upload_length,
+                upload_offset,
                 "Upload deadline exceeded during preparation",
             )?
         {
@@ -430,10 +438,12 @@ impl Server {
                 (target.identity, target.metadata)
             }
         };
-        if upload_deadline_expired(
+        if upload_deadline_expired_before_mutation(
             deadline,
             res,
             upload_id,
+            upload_length,
+            upload_offset,
             "Upload deadline exceeded while inspecting the target",
         )? {
             return Ok(None);
@@ -454,10 +464,12 @@ impl Server {
         } else {
             None
         };
-        if upload_deadline_expired(
+        if upload_deadline_expired_before_mutation(
             deadline,
             res,
             upload_id,
+            upload_length,
+            upload_offset,
             "Upload deadline exceeded while preparing the checkpoint",
         )? {
             return Ok(None);
@@ -564,15 +576,27 @@ impl Server {
                 return Ok(None);
             };
             pre_reserved_space = Some(space_lease);
-            if upload_deadline_expired(
+            if upload_deadline_expired_before_mutation(
                 deadline,
                 res,
                 upload_id,
+                upload_length,
+                upload_offset,
                 "Upload deadline exceeded while reserving disk space",
             )? {
                 return Ok(None);
             }
 
+            if !begin_upload_mutation_or_reject(
+                &mutation,
+                res,
+                upload_id,
+                upload_length,
+                upload_offset,
+                "Upload timed out before creating its staging namespace",
+            )? {
+                return Ok(None);
+            }
             let created = self.content.rooted_fs.ensure_parent(&upload_path).await?;
             created_ancestors = Some(created);
             active_upload_files = match self.track_active_upload_files(&upload_path, deadline).await
@@ -741,11 +765,41 @@ impl Server {
                     return Ok(None);
                 };
                 let metadata = file.metadata().await?;
+                file.seek(SeekFrom::Start(offset)).await?;
+                if upload_deadline_expired_before_mutation(
+                    deadline,
+                    res,
+                    upload_id,
+                    upload_length,
+                    Some(offset),
+                    "Upload deadline exceeded before resuming the staging file",
+                )? {
+                    return Ok(None);
+                }
                 if metadata.len() > offset {
+                    if !begin_upload_mutation_or_reject(
+                        &mutation,
+                        res,
+                        upload_id,
+                        upload_length,
+                        Some(offset),
+                        "Upload timed out before truncating its staging file",
+                    )? {
+                        return Ok(None);
+                    }
                     file.set_len(offset).await?;
                 }
-                file.seek(SeekFrom::Start(offset)).await?;
                 if checkpoint.target_revision != requested_revision {
+                    if !begin_upload_mutation_or_reject(
+                        &mutation,
+                        res,
+                        upload_id,
+                        upload_length,
+                        Some(offset),
+                        "Upload timed out before updating its resumable state",
+                    )? {
+                        return Ok(None);
+                    }
                     let record = UploadRecordContext::new(
                         owner_id,
                         upload_id,
@@ -773,6 +827,17 @@ impl Server {
                 (file, StatusCode::NO_CONTENT)
             }
         };
+        if Instant::now() >= deadline && resume && !mutation.outcome_can_be_unknown() {
+            upload_deadline_expired_before_mutation(
+                deadline,
+                res,
+                upload_id,
+                upload_length,
+                upload_offset,
+                "Upload deadline exceeded while preparing the staging file",
+            )?;
+            return Ok(None);
+        }
         if Instant::now() >= deadline {
             finish_timed_out_upload(
                 &self.state.upload_records,
@@ -849,6 +914,16 @@ impl Server {
         {
             Ok(true) => {}
             Ok(false) | Err(_) => {
+                if !begin_upload_mutation_or_reject(
+                    &mutation,
+                    res,
+                    upload_id,
+                    upload_length,
+                    upload_offset,
+                    "Upload timed out before finalizing a disk-space failure",
+                )? {
+                    return Ok(None);
+                }
                 finish_precommit_space_failure(
                     &self.state.upload_records,
                     file,
@@ -867,6 +942,17 @@ impl Server {
                 return Ok(None);
             }
         }
+        if Instant::now() >= deadline && resume && !mutation.outcome_can_be_unknown() {
+            upload_deadline_expired_before_mutation(
+                deadline,
+                res,
+                upload_id,
+                upload_length,
+                upload_offset,
+                "Upload deadline exceeded while reserving disk space",
+            )?;
+            return Ok(None);
+        }
         if Instant::now() >= deadline {
             finish_timed_out_upload(
                 &self.state.upload_records,
@@ -883,6 +969,17 @@ impl Server {
                 },
             )
             .await?;
+            return Ok(None);
+        }
+
+        if !begin_upload_mutation_or_reject(
+            &mutation,
+            res,
+            upload_id,
+            upload_length,
+            upload_offset,
+            "Upload timed out before transferring its request body",
+        )? {
             return Ok(None);
         }
 
@@ -905,6 +1002,33 @@ impl Server {
             _active_upload_files: active_upload_files,
         }))
     }
+}
+
+fn begin_upload_mutation_or_reject(
+    mutation: &crate::server::router::MutationProgress,
+    res: &mut Response,
+    upload_id: Uuid,
+    upload_length: u64,
+    upload_offset: Option<u64>,
+    message: &'static str,
+) -> Result<bool> {
+    if mutation.begin_upload_mutation() {
+        return Ok(true);
+    }
+    apply_upload_problem(
+        res,
+        UploadErrorContext::new(
+            upload_id,
+            UploadPublicState::NotStarted,
+            Some(upload_length),
+            upload_offset,
+        ),
+        StatusCode::REQUEST_TIMEOUT,
+        ErrorCode::REQUEST_TIMEOUT,
+        message,
+        RecoveryAdvice::Retry,
+    )?;
+    Ok(false)
 }
 
 pub(super) async fn create_upload_temp(rooted_fs: &RootedFs, path: &Path) -> Result<fs::File> {

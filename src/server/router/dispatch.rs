@@ -1084,6 +1084,7 @@ impl<'a> RequestDispatcher<'a> {
                 .path_lease
                 .take()
                 .expect("upload acquired a path lease"),
+            mutation: self.mutation.clone(),
         };
         let request = self.take_request();
         self.response = self

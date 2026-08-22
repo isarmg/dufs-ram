@@ -482,6 +482,7 @@ impl Server {
         let upload_id = options.upload_id;
         let upload_length = options.upload_length;
         let upload_offset = options.mode.offset();
+        let mutation = options.mutation.clone();
         let mut task = self.lifecycle.commit_tasks.spawn(async move {
             let _upload_permit = upload_permit;
             let mut response = Response::default();
@@ -496,6 +497,24 @@ impl Server {
         match timeout_at(deadline, &mut task).await {
             Ok(result) => result?,
             Err(_) => {
+                if mutation.cancel_upload_before_mutation() {
+                    task.abort();
+                    let mut response = Response::default();
+                    upload::apply_upload_problem(
+                        &mut response,
+                        upload::UploadErrorContext::new(
+                            upload_id,
+                            UploadPublicState::NotStarted,
+                            Some(upload_length),
+                            upload_offset,
+                        ),
+                        StatusCode::REQUEST_TIMEOUT,
+                        ErrorCode::REQUEST_TIMEOUT,
+                        "Upload deadline exceeded before any upload mutation",
+                        RecoveryAdvice::Retry,
+                    )?;
+                    return Ok(response);
+                }
                 let mut response = Response::default();
                 upload::apply_upload_problem(
                     &mut response,

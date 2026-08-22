@@ -355,3 +355,68 @@ pub(super) fn upload_deadline_expired(
     apply_upload_unknown(res, upload_id, message)?;
     Ok(true)
 }
+
+pub(super) fn upload_deadline_expired_before_mutation(
+    deadline: Instant,
+    res: &mut Response,
+    upload_id: Uuid,
+    upload_length: u64,
+    upload_offset: Option<u64>,
+    message: &'static str,
+) -> Result<bool> {
+    if Instant::now() < deadline {
+        return Ok(false);
+    }
+    apply_upload_problem(
+        res,
+        UploadErrorContext::new(
+            upload_id,
+            UploadPublicState::NotStarted,
+            Some(upload_length),
+            upload_offset,
+        ),
+        StatusCode::REQUEST_TIMEOUT,
+        ErrorCode::REQUEST_TIMEOUT,
+        message,
+        RecoveryAdvice::Retry,
+    )?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    #[tokio::test]
+    async fn pre_mutation_deadline_is_not_reported_as_unknown() {
+        let upload_id = Uuid::new_v4();
+        let mut response = Response::default();
+
+        assert!(
+            upload_deadline_expired_before_mutation(
+                Instant::now() - Duration::from_millis(1),
+                &mut response,
+                upload_id,
+                17,
+                Some(4),
+                "Upload timed out during a read-only check",
+            )
+            .unwrap()
+        );
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.headers()["x-dufs-operation-state"], "not-started");
+        assert_eq!(
+            response.headers()["x-dufs-upload-id"],
+            upload_id.to_string()
+        );
+        assert_eq!(response.headers()["x-dufs-upload-length"], "17");
+        assert_eq!(response.headers()["x-dufs-upload-offset"], "4");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["code"], "request_timeout");
+        assert_eq!(problem["recovery"], "retry");
+        assert_eq!(problem["upload_state"], "not-started");
+    }
+}
