@@ -800,7 +800,7 @@ impl StateStore {
     }
 
     #[cfg(test)]
-    pub(super) fn saturate_command_queue_for_test(&self) -> Result<SyncSender<()>> {
+    pub(super) fn block_actor_for_test(&self) -> Result<SyncSender<()>> {
         let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
         self.send(Command::Block {
@@ -810,6 +810,12 @@ impl StateStore {
         entered_receiver
             .recv_timeout(Duration::from_secs(1))
             .context("State store did not enter the test block")?;
+        Ok(release_sender)
+    }
+
+    #[cfg(test)]
+    pub(super) fn saturate_command_queue_for_test(&self) -> Result<SyncSender<()>> {
+        let release_sender = self.block_actor_for_test()?;
         loop {
             match self.inner.channels.commands.try_send(Command::Wake) {
                 Ok(()) => {}

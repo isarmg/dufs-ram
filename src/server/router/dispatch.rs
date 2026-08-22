@@ -1008,13 +1008,17 @@ impl<'a> RequestDispatcher<'a> {
     ) -> Result<()> {
         let upload = headers.upload.expect("PUT headers were parsed");
         debug_assert_eq!(upload.mode, UploadMode::Fresh);
-        match self
-            .server
-            .has_persisted_path_descendant(target.path.as_path())
-            .await
+        match timeout_at(
+            target
+                .upload_deadline
+                .expect("upload has an upload deadline"),
+            self.server
+                .has_persisted_path_descendant(target.path.as_path()),
+        )
+        .await
         {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(Ok(false)) => {}
+            Ok(Ok(true)) => {
                 return self.render_upload_rejection(
                     upload,
                     StatusCode::CONFLICT,
@@ -1023,7 +1027,7 @@ impl<'a> RequestDispatcher<'a> {
                     RecoveryAdvice::RefreshTarget,
                 );
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 log::error!("Failed to inspect durable state before upload error={error:#}");
                 return self.render_upload_rejection(
                     upload,
@@ -1031,6 +1035,15 @@ impl<'a> RequestDispatcher<'a> {
                     ErrorCode::UPLOAD_STATE_UNAVAILABLE,
                     "Upload safety state is temporarily unavailable",
                     RecoveryAdvice::RetryAfterSeconds(1),
+                );
+            }
+            Err(_) => {
+                return self.render_upload_rejection(
+                    upload,
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::REQUEST_TIMEOUT,
+                    "Upload timed out while inspecting durable safety state",
+                    RecoveryAdvice::Retry,
                 );
             }
         }
@@ -1248,9 +1261,37 @@ fn apply_tracked_delete_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Args, auth::AuthConfig};
+    use futures_util::poll;
     use http_body_util::BodyExt as _;
     use hyper::header::CONTENT_TYPE;
     use serde_json::json;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        task::Poll,
+    };
+    use uuid::Uuid;
+
+    const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+
+    fn upload_test_server(root: &Path) -> (Arc<Server>, assert_fs::TempDir) {
+        let state_dir = assert_fs::TempDir::new().unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = Server::init_with_lifecycle(
+            Args {
+                serve_path: root.to_path_buf(),
+                state_dir: Some(state_dir.path().to_path_buf()),
+                auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+                max_concurrent_uploads: 1,
+                ..Args::default()
+            },
+            super::super::super::ServerLifecycle::new(),
+        )
+        .unwrap();
+        (Arc::new(server), state_dir)
+    }
 
     #[test]
     fn every_zip_query_value_selects_the_retired_archive_route() {
@@ -1297,5 +1338,138 @@ mod tests {
                 .to_bytes()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_upload_state_check_obeys_deadline_and_releases_admission() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let (server, _state_dir) = upload_test_server(root.path());
+        let release_actor = server.state.state_store.block_actor_for_test().unwrap();
+        let route_path = server
+            .content
+            .path_policy
+            .parse_route("/deadline.bin")
+            .unwrap();
+        let target_path = server
+            .content
+            .path_policy
+            .parse_browser_target("/deadline.bin")
+            .unwrap();
+        let upload_id = Uuid::new_v4();
+        let upload = UploadRequest {
+            id: upload_id,
+            length: 7,
+            mode: UploadMode::Fresh,
+            overwrite: UploadOverwritePolicy::NoReplace,
+        };
+        let mut target = PreparedTarget {
+            path: target_path.clone(),
+            is_miss: true,
+            miss_is_hidden: false,
+            is_dir: false,
+            is_file: false,
+            delete_operation: None,
+            path_lease: Some(
+                server
+                    .content
+                    .path_coordinator
+                    .acquire([target_path.as_path()])
+                    .await,
+            ),
+            upload_permit: Some(
+                server
+                    .admission
+                    .upload_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
+            upload_deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        let mut context = RequestContext::for_test(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let mut dispatcher = RequestDispatcher {
+            server: server.clone(),
+            request: None,
+            route_path,
+            internal_api_request: true,
+            mutation: MutationProgress::default(),
+            context: &mut context,
+            method: Method::PUT,
+            uri: Uri::from_static("/deadline.bin"),
+            headers: HeaderMap::new(),
+            request_path: "/deadline.bin".to_owned(),
+            query_params: HashMap::new(),
+            response: Response::default(),
+        };
+        let session = SessionInfo {
+            user: "user".to_owned(),
+            csrf_token: String::new(),
+        };
+
+        let mut dispatch = Box::pin(dispatcher.dispatch_fresh_upload(
+            &mut target,
+            MutationHeaders {
+                upload: Some(upload),
+                ..MutationHeaders::default()
+            },
+            &session,
+        ));
+        assert!(
+            matches!(poll!(dispatch.as_mut()), Poll::Pending),
+            "the durable-state query did not wait behind the blocked actor"
+        );
+        dispatch.as_mut().await.unwrap();
+        drop(dispatch);
+        let response = std::mem::take(&mut dispatcher.response);
+        drop(dispatcher);
+        drop(target);
+
+        let replacement_permit = server
+            .admission
+            .upload_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("the timed-out upload retained its global permit");
+        let replacement_lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .content
+                .path_coordinator
+                .acquire([target_path.as_path()]),
+        )
+        .await
+        .expect("the timed-out upload retained its path lease");
+
+        release_actor.send(()).unwrap();
+        server.state.state_store.probe_readiness().await.unwrap();
+        drop(replacement_lease);
+        drop(replacement_permit);
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            response.headers()["x-dufs-upload-id"].to_str().unwrap(),
+            upload_id.to_string()
+        );
+        assert_eq!(response.headers()["x-dufs-upload-length"], "7");
+        assert_eq!(response.headers()["x-dufs-operation-state"], "not-started");
+        assert!(!response.headers().contains_key("x-dufs-upload-offset"));
+        assert!(!response.headers().contains_key("retry-after"));
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({
+                "type": "urn:dufs:problem:request_timeout",
+                "title": "Request Timeout",
+                "status": 408,
+                "detail": "Upload timed out while inspecting durable safety state",
+                "code": "request_timeout",
+                "recovery": "retry",
+                "upload_id": upload_id.to_string(),
+                "upload_state": "not-started",
+                "upload_length": 7
+            })
+        );
+        assert!(!root.path().join("deadline.bin").exists());
     }
 }
