@@ -36,6 +36,14 @@ const REVISION_REFRESH_CODES = Object.freeze([
   "source_changed",
   "destination_changed",
 ]);
+/** @type {Readonly<Record<string, number>>} */
+const ERROR_CODE_STATUS = Object.freeze({
+  path_exists: 409,
+  destination_exists: 409,
+  delete_target_changed: 412,
+  source_changed: 412,
+  destination_changed: 412,
+});
 
 /** @typedef {"succeeded" | "retry" | "refresh" | "unknown" | "authentication"} InlineRenameResult */
 
@@ -638,11 +646,21 @@ function defaultCandidate(base, attempt) {
  * @param {string} code
  */
 function isDefiniteTrackedConflict(result, code) {
+  const expectedStatus = ERROR_CODE_STATUS[code];
+  if (!expectedStatus) return false;
   if (result.kind !== "failed") return false;
-  if (result.status?.kind === "failed") return result.status.code === code;
+  if (result.status?.kind === "failed") {
+    return result.status.code === code &&
+      result.status.status === expectedStatus;
+  }
   return result.status === null &&
     result.error instanceof RequestError &&
     result.error.code === code &&
+    result.error.status === expectedStatus &&
+    (
+      !result.error.problemStatus ||
+      result.error.problemStatus === expectedStatus
+    ) &&
     !result.error.outcomeUnknown &&
     (
       !result.error.operationState ||
@@ -671,6 +689,11 @@ function trackedConflictRevision(result, code, field) {
 function isDefiniteFreshUploadConflict(error) {
   return error instanceof RequestError &&
     error.code === "destination_exists" &&
+    error.status === ERROR_CODE_STATUS.destination_exists &&
+    (
+      !error.problemStatus ||
+      error.problemStatus === ERROR_CODE_STATUS.destination_exists
+    ) &&
     !error.outcomeUnknown &&
     ["not-started", "rejected"].includes(
       error.uploadState || error.operationState,
