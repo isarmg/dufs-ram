@@ -302,6 +302,7 @@ export function createUploadManager(options) {
       this.logicalPath = logicalChildPath(data.href, this.name);
       this.targetRevision = targetRevision;
       this.missingTargetRetryUsed = false;
+      this.targetChangeInvalidated = false;
       this.batchId = batchId;
       this.uploadId = crypto.randomUUID();
       this.uploadOffset = 0;
@@ -485,6 +486,7 @@ export function createUploadManager(options) {
         name => request.getResponseHeader(name),
         this.file.size,
       );
+      if (targetChange) this.invalidateTargetChange();
       if (targetChange?.kind === "missing") {
         this.retryMissingTarget(
           classification.kind === "awaiting-confirmation",
@@ -540,6 +542,12 @@ export function createUploadManager(options) {
         detail.recovery === "query_upload" ? "query_upload" : "",
         responseRetryAfter(request, detail.retryAfter),
       );
+    }
+
+    invalidateTargetChange() {
+      if (this.state !== "running" || this.targetChangeInvalidated) return;
+      this.targetChangeInvalidated = true;
+      onMutation(MUTATION_EFFECT.REFRESH_REQUIRED);
     }
 
     /** @param {string} revision @param {boolean} staged */

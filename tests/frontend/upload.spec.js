@@ -270,6 +270,76 @@ test("预检后且 PUT 前目标变化时再次确认并只采用服务器新 re
   });
 });
 
+test("可信普通冲突选择 Skip 时使列表失效且不覆盖", async ({
+  appPage: page,
+}) => {
+  const changedRevision = "8".repeat(64);
+  const target = currentUrl(page, "download-me.txt");
+  const putRequests = [];
+  await page.route("**/download-me.txt", async route => {
+    const request = route.request();
+    if (request.method() !== "PUT") {
+      await route.continue();
+      return;
+    }
+    putRequests.push({
+      overwrite: request.headers()["x-dufs-upload-overwrite"],
+      revision: request.headers()["x-dufs-target-revision"] || null,
+    });
+    await route.fulfill({
+      status: 409,
+      contentType: "application/problem+json",
+      headers: {
+        ...protocolHeaders(request, "not-started"),
+        "X-Dufs-Target-Revision": changedRevision,
+        "X-Dufs-Target-Replaceable": "true",
+      },
+      body: problemDetails(
+        409,
+        "destination_exists",
+        "Destination changed after preflight",
+        "refresh_target",
+      ),
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "download-me.txt",
+    buffer: Buffer.from("must not replace the destination"),
+  }]);
+  const initial = page.getByRole("dialog", {
+    name: "Existing upload destinations",
+    exact: true,
+  });
+  await initial.getByRole("button", { name: "Overwrite", exact: true }).click();
+
+  const changed = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await expect(changed).toBeVisible();
+  await changed.getByRole("button", { name: "Skip file", exact: true }).click();
+
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "download-me.txt: skipped because the destination exists",
+  );
+  await expect(page.getByRole("button", {
+    name: "Refresh",
+    exact: true,
+  })).toBeVisible();
+  await expect(page.locator(".list-status")).toContainText(
+    "The folder snapshot is stale",
+  );
+  expect(putRequests).toHaveLength(1);
+  expect(putRequests[0].overwrite).toBe("true");
+  expect(putRequests[0].revision).toMatch(/^[0-9a-f]{64}$/);
+  expect(putRequests[0].revision).not.toBe(changedRevision);
+  expect(
+    await page.evaluate(async url => (await fetch(url)).text(), target),
+  ).toBe("downloaded by browser test");
+});
+
 test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", async ({
   appPage: page,
 }) => {
@@ -280,6 +350,8 @@ test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", asyn
     requests.push({
       method: request.method(),
       uploadId: request.headers()["x-dufs-upload-id"],
+      overwrite: request.headers()["x-dufs-upload-overwrite"],
+      revision: request.headers()["x-dufs-target-revision"] || null,
       length: request.headers()["x-dufs-upload-length"],
       offset: request.headers()["x-dufs-upload-offset"] || null,
       overwrite: request.headers()["x-dufs-upload-overwrite"],
@@ -345,6 +417,97 @@ test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", asyn
     revision,
     bodyLength: 0,
   });
+});
+
+test("可信暂存冲突丢弃后 Skip 时使列表失效且不覆盖", async ({
+  appPage: page,
+}) => {
+  const revision = "9".repeat(64);
+  const contents = Buffer.from("staged data must be discarded");
+  const requests = [];
+  const discards = [];
+  let logicalPath = "";
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    const { paths } = JSON.parse(route.request().postData() || "{}");
+    expect(paths).toHaveLength(1);
+    [logicalPath] = paths;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        targets: [{
+          path: logicalPath,
+          exists: false,
+          revision: null,
+          replaceable: true,
+        }],
+      }),
+    });
+  });
+  await page.route("**/__dufs__/api/upload/discard", async route => {
+    const payload = JSON.parse(route.request().postData() || "{}");
+    discards.push(payload);
+    await route.fulfill({
+      status: 204,
+      headers: discardProtocolHeaders(payload.upload_id, contents.length),
+      body: "",
+    });
+  });
+  await page.route("**/staged-skip-target.txt", async route => {
+    const request = route.request();
+    requests.push({
+      method: request.method(),
+      uploadId: request.headers()["x-dufs-upload-id"],
+    });
+    await route.fulfill({
+      status: 409,
+      contentType: "application/problem+json",
+      headers: {
+        ...protocolHeaders(request, "awaiting-confirmation", "length"),
+        "X-Dufs-Target-Revision": revision,
+        "X-Dufs-Target-Replaceable": "true",
+      },
+      body: problemDetails(
+        409,
+        "destination_exists",
+        "Destination appeared while uploading",
+        "refresh_target",
+      ),
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "staged-skip-target.txt",
+    buffer: contents,
+  }]);
+  const changed = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await expect(changed).toContainText("uploaded data is staged");
+  await changed.getByRole("button", { name: "Skip file", exact: true }).click();
+
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "staged-skip-target.txt: skipped because the destination exists",
+  );
+  await expect(page.getByRole("button", {
+    name: "Refresh",
+    exact: true,
+  })).toBeVisible();
+  await expect(page.locator(".list-status")).toContainText(
+    "The folder snapshot is stale",
+  );
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({
+    method: "PUT",
+    overwrite: "false",
+    revision: null,
+  });
+  expect(discards).toEqual([{
+    path: logicalPath,
+    upload_id: requests[0].uploadId,
+  }]);
 });
 
 test("缺少可信 revision 的冲突响应进入 unknown 且绝不弹覆盖确认", async ({
