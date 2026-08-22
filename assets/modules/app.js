@@ -2,19 +2,11 @@ import { createActionDialogs } from "./operations/dialogs.js";
 import { createFileOperations } from "./operations/file_operations.js";
 import { createDirectoryListing } from "./listing/controller.js";
 import { createElement, createIcon, errorMessage } from "./shared/dom.js";
+import { parseIndexData } from "./shared/index_data.js";
 import { currentPageUrl } from "./shared/path.js";
 import { createUploadManager } from "./upload/manager.js";
 
-/**
- * @typedef {{
- *   href: string,
- *   dir_exists: boolean,
- *   user: string,
- *   csrf_token: string,
- * }} IndexData
- */
-
-/** @type {IndexData} */
+/** @type {ReturnType<typeof parseIndexData>} */
 let data;
 /** @type {ReturnType<typeof createDirectoryListing>} */
 let directoryListing;
@@ -53,9 +45,9 @@ async function initialize() {
     document.getElementById("index-data")
   );
   if (!indexData) throw new Error("Page data is missing");
-  data = /** @type {IndexData} */ (
-    JSON.parse(decodeBase64(indexData.content.textContent))
-  );
+  /** @type {unknown} */
+  const rawData = JSON.parse(decodeBase64(indexData.content.textContent));
+  data = parseIndexData(rawData);
   addBreadcrumb(data.href);
   document.title = `${data.href} - Dufs File Manager`;
 
