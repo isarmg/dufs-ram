@@ -974,6 +974,11 @@ async fn trash_purge_identity_error_returns_the_entry_without_deleting_replaceme
 
     std::fs::remove_file(&trash_path).unwrap();
     std::fs::rename(&displaced, &trash_path).unwrap();
+    drop(trash);
+    let trash = rooted
+        .capture_any_entry_for_purge_blocking(&trash_path)
+        .unwrap()
+        .expect("orphan maintenance must recapture the restored trash revision");
     trash.purge_all_blocking().unwrap();
     assert!(!trash_path.exists());
 }
@@ -1008,6 +1013,96 @@ async fn nested_directory_replacement_is_detected_before_unlink() {
     assert_eq!(
         std::fs::read_to_string(child.join("preserve.txt")).unwrap(),
         "external replacement"
+    );
+}
+
+#[tokio::test]
+async fn pending_child_unlink_anchor_prevents_inode_reuse_and_preserves_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    let child = directory.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let original = std::fs::symlink_metadata(&child).unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.pause_after_pending_unlink_once_for_test();
+    assert!(
+        !trash
+            .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None,)
+            .unwrap()
+    );
+    assert!(trash.pending_unlink.is_some());
+
+    let child = trash_path.join("child");
+    std::fs::remove_dir(&child).unwrap();
+    for _ in 0..256 {
+        std::fs::create_dir(&child).unwrap();
+        let replacement = std::fs::symlink_metadata(&child).unwrap();
+        assert_ne!(
+            (replacement.dev(), replacement.ino()),
+            (original.dev(), original.ino()),
+            "the pending purge frame must keep the removed inode pinned"
+        );
+        std::fs::remove_dir(&child).unwrap();
+    }
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(child.join("preserve.txt"), "external replacement").unwrap();
+
+    let error = trash
+        .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_to_string(child.join("preserve.txt")).unwrap(),
+        "external replacement"
+    );
+}
+
+#[tokio::test]
+async fn pending_child_unlink_rejects_an_entry_added_after_the_final_identity_check() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir_all(directory.join("child")).unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.inject_entry_before_directory_unlink_once_for_test();
+
+    let error = trash
+        .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        trash_path
+            .join("child/.dufs-test-concurrent-entry")
+            .exists(),
+        "a child entry created after EOF must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn root_unlink_rejects_an_entry_added_after_the_final_identity_check() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.inject_entry_before_directory_unlink_once_for_test();
+
+    let error = trash
+        .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        trash_path.join(".dufs-test-concurrent-entry").exists(),
+        "a root entry created after EOF must be preserved"
     );
 }
 
@@ -1077,7 +1172,7 @@ async fn deep_purge_reopen_progress_is_resumable_and_slice_bounded() {
 }
 
 #[tokio::test]
-async fn root_purge_reopens_after_entry_appears_beyond_retained_eof() {
+async fn root_purge_preserves_an_entry_appearing_beyond_retained_eof() {
     let temp = assert_fs::TempDir::new().unwrap();
     let rooted = RootedFs::new(temp.path()).unwrap();
     let directory = temp.path().join("directory");
@@ -1091,12 +1186,9 @@ async fn root_purge_reopens_after_entry_appears_beyond_retained_eof() {
     let error = trash
         .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
         .unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(Errno::NOTEMPTY.raw_os_error()));
-    assert!(
-        trash.purge_resume.is_none(),
-        "an EOF directory stream must not survive a root NOTEMPTY retry"
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_to_string(trash_path.join("late-entry")).unwrap(),
+        "content"
     );
-
-    trash.purge_all_blocking().unwrap();
-    assert!(!trash_path.exists());
 }

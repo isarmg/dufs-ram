@@ -247,6 +247,7 @@ pub(in crate::server) struct StoredPurgeJob {
     pub(in crate::server) target_path: PathBuf,
     pub(in crate::server) trash_path: PathBuf,
     pub(in crate::server) source_identity: StoredFileIdentity,
+    pub(in crate::server) trash_revision: Option<[u8; 32]>,
     pub(in crate::server) is_directory: bool,
     pub(in crate::server) state: StoredPurgeState,
     pub(in crate::server) attempts: u32,
@@ -263,6 +264,10 @@ impl StoredPurgeJob {
         ensure!(
             self.state == StoredPurgeState::Prepared,
             "A new purge job must start in the prepared state"
+        );
+        ensure!(
+            self.trash_revision.is_none(),
+            "A new purge job cannot have a trash revision"
         );
         ensure!(self.attempts == 0, "A new purge job cannot have attempts");
         Ok(())

@@ -59,6 +59,7 @@ fn purge(owner: u8, id: u8) -> StoredPurgeJob {
             device: u64::from(owner),
             inode: u64::from(id),
         },
+        trash_revision: None,
         is_directory: false,
         state: StoredPurgeState::Prepared,
         attempts: 0,
@@ -525,10 +526,21 @@ async fn purge_jobs_are_idempotent_bounded_and_owner_scoped() -> Result<()> {
         vec![first.clone(), second.clone()]
     );
 
-    assert!(store.mark_purge_job_ready(first.key).await?);
-    assert!(store.mark_purge_job_ready(first.key).await?);
+    let first_revision = [7; 32];
+    assert!(
+        store
+            .mark_purge_job_ready(first.key, first_revision)
+            .await?
+    );
+    assert!(
+        store
+            .mark_purge_job_ready(first.key, first_revision)
+            .await?
+    );
+    assert!(!store.mark_purge_job_ready(first.key, [8; 32]).await?);
     let mut ready = first.clone();
     ready.state = StoredPurgeState::Ready;
+    ready.trash_revision = Some(first_revision);
     assert_eq!(store.purge_jobs(8).await?, vec![ready, second.clone()]);
     let mut claimed = store
         .claim_due_purge_job()
@@ -586,7 +598,7 @@ async fn state_blocking_paths_are_complete_and_keyset_paginated() -> Result<()> 
         store.prepare_purge_job(claimed.clone()).await?,
         StorePurgeJob::Inserted
     );
-    assert!(store.mark_purge_job_ready(claimed.key).await?);
+    assert!(store.mark_purge_job_ready(claimed.key, [9; 32]).await?);
     assert_eq!(
         store
             .claim_due_purge_job()
@@ -600,7 +612,7 @@ async fn state_blocking_paths_are_complete_and_keyset_paginated() -> Result<()> 
         store.prepare_purge_job(ready.clone()).await?,
         StorePurgeJob::Inserted
     );
-    assert!(store.mark_purge_job_ready(ready.key).await?);
+    assert!(store.mark_purge_job_ready(ready.key, [10; 32]).await?);
 
     let mut cursor = None;
     let mut paths = Vec::new();
@@ -692,7 +704,12 @@ async fn upload_and_purge_state_survive_restart_with_unix_path_bytes() -> Result
         store.prepare_purge_job(prepared.clone()).await?,
         StorePurgeJob::Inserted
     );
-    assert!(store.mark_purge_job_ready(prepared.key).await?);
+    let trash_revision = [11; 32];
+    assert!(
+        store
+            .mark_purge_job_ready(prepared.key, trash_revision)
+            .await?
+    );
     let claimed = store
         .claim_due_purge_job()
         .await?
@@ -708,6 +725,7 @@ async fn upload_and_purge_state_survive_restart_with_unix_path_bytes() -> Result
         Some(committing)
     );
     let mut recovered = prepared;
+    recovered.trash_revision = Some(trash_revision);
     recovered.state = StoredPurgeState::Ready;
     assert_eq!(
         reopened.purge_job(recovered.key).await?,
@@ -767,7 +785,8 @@ async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> 
                 updated_at_ms, expires_at_ms
            FROM upload_sessions_v3_source;
          DROP TABLE upload_sessions_v3_source;
-         CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);",
+         CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
+         ALTER TABLE purge_jobs DROP COLUMN trash_revision;",
     )?;
     connection.pragma_update(None, "user_version", 2_i32)?;
     drop(connection);
@@ -777,7 +796,10 @@ async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> 
         migrated.upload_session(session.key).await?,
         Some(session.clone())
     );
-    assert_eq!(migrated.inspect_pragmas().await?.user_version, 3);
+    assert_eq!(
+        migrated.inspect_pragmas().await?.user_version,
+        i64::from(SCHEMA_VERSION)
+    );
 
     session.target_revision = Some([0x5a; 32]);
     assert_eq!(
@@ -800,6 +822,37 @@ async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> 
     let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
     assert_eq!(reopened.upload_session(session.key).await?, Some(session));
     reopened.shutdown_for_test();
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_purge_rows_migrate_with_an_untrusted_null_trash_revision() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(227, 229);
+    let mut job = purge(12, 13);
+
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        store.prepare_purge_job(job.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(job.key, [0x6b; 32]).await?);
+    store.shutdown_for_test();
+
+    let connection = Connection::open(&path)?;
+    connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?;
+    connection.pragma_update(None, "user_version", 3_i32)?;
+    drop(connection);
+
+    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    job.state = StoredPurgeState::Ready;
+    assert_eq!(migrated.purge_job(job.key).await?, Some(job));
+    assert_eq!(
+        migrated.inspect_pragmas().await?.user_version,
+        i64::from(SCHEMA_VERSION)
+    );
+    migrated.shutdown_for_test();
     Ok(())
 }
 
@@ -869,8 +922,8 @@ fn rejects_v1_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
         "unexpected error: {message}"
     );
     assert!(
-        message.contains("requires schema version 3")
-            && message.contains("migration only from schema version 2"),
+        message.contains("requires schema version 4")
+            && message.contains("migration only from schema versions 2 and 3"),
         "unexpected error: {message}"
     );
 

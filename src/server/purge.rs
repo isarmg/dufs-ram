@@ -155,6 +155,7 @@ impl Server {
                     device: source_identity.device,
                     inode: source_identity.inode,
                 },
+                trash_revision: None,
                 is_directory: source_identity.is_directory,
                 state: StoredPurgeState::Prepared,
                 attempts: 0,
@@ -341,10 +342,20 @@ impl Server {
             Ok(path) => path,
             Err(source) => return Err(ClaimedPurgeFailure::new(job, source)),
         };
+        let Some(trash_revision) = job.trash_revision else {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "durable purge job has no committed trash revision",
+            );
+            return match self.quarantine_claimed_purge_job(&job, &error).await {
+                Ok(()) => Ok(None),
+                Err(source) => Err(ClaimedPurgeFailure::new(job, source)),
+            };
+        };
         match self
             .content
             .rooted_fs
-            .capture_entry_for_purge(&trash_path, job.is_directory)
+            .capture_entry_for_purge_with_revision(&trash_path, job.is_directory, trash_revision)
             .await
         {
             Ok(Some(entry)) if purge_identity_matches(entry.identity(), &job) => {
@@ -516,13 +527,6 @@ impl Server {
             return Ok(());
         }
         let trash_identity = delete_identity_if_present(&self.content.rooted_fs, &trash).await?;
-        let target_identity = delete_identity_if_present(&self.content.rooted_fs, &target).await?;
-
-        if trash_identity.is_some_and(|identity| purge_identity_matches(identity, &job)) {
-            self.state.state_store.mark_purge_job_ready(job.key).await?;
-            self.notify_purge_worker();
-            return Ok(());
-        }
         if trash_identity.is_some() {
             let quarantined = self
                 .content
@@ -537,24 +541,17 @@ impl Server {
                 );
             }
         }
-        if target_identity.is_some_and(|identity| purge_identity_matches(identity, &job)) {
-            // The checked rename did not consume the recorded source. Any
-            // occupant at the random trash path was quarantined above and must
-            // never become an orphan-trash deletion candidate.
-            self.state.state_store.remove_purge_job(job.key).await?;
-            return Ok(());
-        }
 
         warn!(
-            "Prepared purge intent is ambiguous; preserving the target and releasing the quarantined intent job_id={} target={} trash={}",
+            "Prepared purge intent has no committed trash revision; preserving the target and releasing the quarantined intent job_id={} target={} trash={}",
             Uuid::from_bytes(job.key.id),
             target.display(),
             trash.display()
         );
-        // Neither current name proves that the recorded source still exists.
-        // The target is never touched, and any unrelated trash occupant has
-        // already moved to a permanent quarantine name. Removing the intent
-        // frees its path barrier and bounded state-store capacity safely.
+        // Prepared rows predate the atomic revision write. Neither the weak
+        // source identity nor the current target name proves that a trash
+        // occupant survived the checked rename, so any occupant is quarantined
+        // and the target is never touched.
         self.state.state_store.remove_purge_job(job.key).await?;
         Ok(())
     }

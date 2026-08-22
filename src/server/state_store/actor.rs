@@ -155,8 +155,12 @@ impl StoreWorker {
                 } => {
                     let _ = reply.send(self.state_blocking_paths(after, limit));
                 }
-                Command::MarkPurgeJobReady { key, reply } => {
-                    let _ = reply.send(self.mark_purge_job_ready(key));
+                Command::MarkPurgeJobReady {
+                    key,
+                    trash_revision,
+                    reply,
+                } => {
+                    let _ = reply.send(self.mark_purge_job_ready(key, trash_revision));
                 }
                 Command::ClaimDuePurgeJob { reply } => {
                     let _ = reply.send(self.claim_due_purge_job());

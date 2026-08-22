@@ -157,6 +157,13 @@ impl ReplacementTargetIdentity {
             }
         }
     }
+
+    pub(super) fn purge_revision(self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"dufs-purge-trash-revision-v1\0");
+        self.update_revision_digest(&mut digest);
+        digest.finalize().into()
+    }
 }
 
 #[derive(Debug)]
@@ -1363,6 +1370,48 @@ impl RootedFs {
                 {
                     return CheckedTrashMove::TargetChanged;
                 }
+                let root_anchor = match openat(
+                    &parent.fd,
+                    &parent.name,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(anchor) => anchor,
+                    Err(Errno::NOENT | Errno::NOTDIR) => {
+                        return CheckedTrashMove::TargetChanged;
+                    }
+                    Err(error) => {
+                        return CheckedTrashMove::NotMoved(std::io::Error::from(error));
+                    }
+                };
+                let opened_revision_identity = match fstat(&root_anchor) {
+                    Ok(metadata) => ReplacementTargetIdentity::Existing(
+                        replacement_target_identity(&metadata),
+                    ),
+                    Err(error) => {
+                        return CheckedTrashMove::NotMoved(std::io::Error::from(error));
+                    }
+                };
+                let named_revision_identity = match statat(
+                    &parent.fd,
+                    &parent.name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(metadata) => ReplacementTargetIdentity::Existing(
+                        replacement_target_identity(&metadata),
+                    ),
+                    Err(Errno::NOENT | Errno::NOTDIR) => {
+                        return CheckedTrashMove::TargetChanged;
+                    }
+                    Err(error) => {
+                        return CheckedTrashMove::NotMoved(std::io::Error::from(error));
+                    }
+                };
+                if opened_revision_identity != actual_revision_identity
+                    || named_revision_identity != opened_revision_identity
+                {
+                    return CheckedTrashMove::TargetChanged;
+                }
                 if let Err(error) = renameat_with(
                     &parent.fd,
                     &parent.name,
@@ -1378,8 +1427,20 @@ impl RootedFs {
                         std::io::Error::from(error),
                     );
                 }
-                let moved_identity = match statat(&parent.fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(metadata) => delete_identity_from_stat(&metadata),
+                let anchored_metadata = match fstat(&root_anchor) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let _ = fsync(&parent.fd);
+                        return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "renamed trash anchor could not be verified at the commit boundary: {error}"
+                            ),
+                        ));
+                    }
+                };
+                let moved_metadata = match statat(&parent.fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => metadata,
                     Err(error) => {
                         let _ = fsync(&parent.fd);
                         return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
@@ -1390,6 +1451,13 @@ impl RootedFs {
                         ));
                     }
                 };
+                let moved_identity = delete_identity_from_stat(&moved_metadata);
+                let anchored_revision_identity = ReplacementTargetIdentity::Existing(
+                    replacement_target_identity(&anchored_metadata),
+                );
+                let moved_revision_identity = ReplacementTargetIdentity::Existing(
+                    replacement_target_identity(&moved_metadata),
+                );
                 if moved_identity != expected {
                     let _ = fsync(&parent.fd);
                     return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
@@ -1397,6 +1465,14 @@ impl RootedFs {
                         "renamed trash entry identity changed at the commit boundary",
                     ));
                 }
+                if moved_revision_identity != anchored_revision_identity {
+                    let _ = fsync(&parent.fd);
+                    return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "renamed trash entry no longer matches its pinned commit identity",
+                    ));
+                }
+                let trash_revision = anchored_revision_identity.purge_revision();
                 if let Err(error) = fsync(&parent.fd) {
                     return CheckedTrashMove::DurabilityUnknown(std::io::Error::from(error));
                 }
@@ -1404,6 +1480,8 @@ impl RootedFs {
                     File::from(parent.fd),
                     name,
                     moved_identity,
+                    root_anchor,
+                    trash_revision,
                 ))
             })
             .await
@@ -1438,6 +1516,24 @@ impl RootedFs {
                     "delete target identity changed before the commit boundary",
                 ));
             }
+            let root_anchor = openat(
+                &parent.fd,
+                &parent.name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let opened_identity = ReplacementTargetIdentity::Existing(replacement_target_identity(
+                &fstat(&root_anchor).map_err(std::io::Error::from)?,
+            ));
+            if opened_identity
+                != ReplacementTargetIdentity::Existing(replacement_target_identity(&metadata))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "delete target identity changed while pinning it",
+                ));
+            }
             renameat_with(
                 &parent.fd,
                 &parent.name,
@@ -1446,8 +1542,27 @@ impl RootedFs {
                 RenameFlags::NOREPLACE,
             )
             .map_err(std::io::Error::from)?;
+            let moved_metadata = statat(&parent.fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(std::io::Error::from)?;
+            let anchored_identity = ReplacementTargetIdentity::Existing(
+                replacement_target_identity(&fstat(&root_anchor).map_err(std::io::Error::from)?),
+            );
+            if ReplacementTargetIdentity::Existing(replacement_target_identity(&moved_metadata))
+                != anchored_identity
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "renamed trash entry no longer matches its pinned commit identity",
+                ));
+            }
             fsync(&parent.fd).map_err(std::io::Error::from)?;
-            Ok(TrashEntry::new(File::from(parent.fd), name, actual))
+            Ok(TrashEntry::new(
+                File::from(parent.fd),
+                name,
+                actual,
+                root_anchor,
+                anchored_identity.purge_revision(),
+            ))
         })
         .await
     }
@@ -1530,7 +1645,7 @@ impl RootedFs {
         path: &Path,
         expected_directory: bool,
     ) -> std::io::Result<Option<TrashEntry>> {
-        self.capture_entry_for_purge_with_type_blocking(path, Some(expected_directory))
+        self.capture_entry_for_purge_with_type_blocking(path, Some(expected_directory), None)
     }
 
     pub(super) async fn capture_entry_for_purge(
@@ -1541,7 +1656,25 @@ impl RootedFs {
         let this = self.clone();
         let path = path.to_path_buf();
         run_blocking(move || {
-            this.capture_entry_for_purge_with_type_blocking(&path, Some(expected_directory))
+            this.capture_entry_for_purge_with_type_blocking(&path, Some(expected_directory), None)
+        })
+        .await
+    }
+
+    pub(super) async fn capture_entry_for_purge_with_revision(
+        &self,
+        path: &Path,
+        expected_directory: bool,
+        expected_revision: [u8; 32],
+    ) -> std::io::Result<Option<TrashEntry>> {
+        let this = self.clone();
+        let path = path.to_path_buf();
+        run_blocking(move || {
+            this.capture_entry_for_purge_with_type_blocking(
+                &path,
+                Some(expected_directory),
+                Some(expected_revision),
+            )
         })
         .await
     }
@@ -1554,13 +1687,14 @@ impl RootedFs {
         &self,
         path: &Path,
     ) -> std::io::Result<Option<TrashEntry>> {
-        self.capture_entry_for_purge_with_type_blocking(path, None)
+        self.capture_entry_for_purge_with_type_blocking(path, None, None)
     }
 
     fn capture_entry_for_purge_with_type_blocking(
         &self,
         path: &Path,
         expected_directory: Option<bool>,
+        expected_revision: Option<[u8; 32]>,
     ) -> std::io::Result<Option<TrashEntry>> {
         let parent = match self.open_parent_blocking(path, false) {
             Ok(parent) => parent,
@@ -1574,22 +1708,52 @@ impl RootedFs {
             }
             Err(error) => return Err(error),
         };
-        let metadata = match statat(&parent.fd, &parent.name, AtFlags::SYMLINK_NOFOLLOW) {
+        let root_anchor = match openat(
+            &parent.fd,
+            &parent.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(anchor) => anchor,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(std::io::Error::from(error)),
+        };
+        let opened_metadata = fstat(&root_anchor).map_err(std::io::Error::from)?;
+        let named_metadata = match statat(&parent.fd, &parent.name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(metadata) => metadata,
             Err(Errno::NOENT) => return Ok(None),
             Err(error) => return Err(std::io::Error::from(error)),
         };
-        let identity = delete_identity_from_stat(&metadata);
+        let opened_revision_identity =
+            ReplacementTargetIdentity::Existing(replacement_target_identity(&opened_metadata));
+        let named_revision_identity =
+            ReplacementTargetIdentity::Existing(replacement_target_identity(&named_metadata));
+        if opened_revision_identity != named_revision_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "purge candidate identity changed while pinning it",
+            ));
+        }
+        let identity = delete_identity_from_stat(&opened_metadata);
         if expected_directory.is_some_and(|expected| identity.is_directory != expected) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "purge candidate changed type during maintenance discovery",
             ));
         }
+        let trash_revision = opened_revision_identity.purge_revision();
+        if expected_revision.is_some_and(|expected| trash_revision != expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "purge candidate revision does not match the durable trash revision",
+            ));
+        }
         Ok(Some(TrashEntry::new(
             File::from(parent.fd),
             parent.name,
             identity,
+            root_anchor,
+            trash_revision,
         )))
     }
 
