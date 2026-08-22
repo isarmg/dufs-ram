@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use headers::HeaderMap;
 use hyper::header::HeaderValue;
 use serde::{Serialize, Serializer};
+use std::fmt;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -68,6 +69,23 @@ pub(in crate::server) enum UploadOverwritePolicy {
     NoReplace,
     IfUnchanged(TargetRevision),
 }
+
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::server) enum UploadOverwriteParseError {
+    UploadOverwrite(String),
+    TargetRevision(String),
+}
+
+impl fmt::Display for UploadOverwriteParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let detail = match self {
+            Self::UploadOverwrite(detail) | Self::TargetRevision(detail) => detail,
+        };
+        formatter.write_str(detail)
+    }
+}
+
+impl std::error::Error for UploadOverwriteParseError {}
 
 impl UploadOverwritePolicy {
     pub(super) const fn revision(self) -> Option<TargetRevision> {
@@ -202,38 +220,40 @@ pub(in crate::server) fn parse_upload_offset(
 
 pub(in crate::server) fn parse_upload_overwrite(
     headers: &HeaderMap<HeaderValue>,
-) -> Result<UploadOverwritePolicy> {
-    let overwrite = unique_upload_header(headers, UPLOAD_OVERWRITE_HEADER)?;
-    let revision = unique_upload_header(headers, TARGET_REVISION_HEADER)?;
+) -> std::result::Result<UploadOverwritePolicy, UploadOverwriteParseError> {
+    let overwrite = unique_upload_header(headers, UPLOAD_OVERWRITE_HEADER)
+        .map_err(|error| UploadOverwriteParseError::UploadOverwrite(error.to_string()))?;
+    let revision = unique_upload_header(headers, TARGET_REVISION_HEADER)
+        .map_err(|error| UploadOverwriteParseError::TargetRevision(error.to_string()))?;
     match overwrite.map(HeaderValue::as_bytes) {
         None | Some(b"false") => {
             if revision.is_some() {
-                return Err(anyhow!(
+                return Err(UploadOverwriteParseError::TargetRevision(format!(
                     "The {TARGET_REVISION_HEADER} header requires {UPLOAD_OVERWRITE_HEADER}: true"
-                ));
+                )));
             }
             Ok(UploadOverwritePolicy::NoReplace)
         }
         Some(b"true") => {
             let revision = revision.ok_or_else(|| {
-                anyhow!(
+                UploadOverwriteParseError::TargetRevision(format!(
                     "The {TARGET_REVISION_HEADER} header is required when {UPLOAD_OVERWRITE_HEADER} is true"
-                )
+                ))
             })?;
             let revision = revision
                 .to_str()
                 .ok()
                 .and_then(TargetRevision::parse)
                 .ok_or_else(|| {
-                    anyhow!(
+                    UploadOverwriteParseError::TargetRevision(format!(
                         "Invalid {TARGET_REVISION_HEADER} header: expected 64 lowercase hexadecimal characters"
-                    )
+                    ))
                 })?;
             Ok(UploadOverwritePolicy::IfUnchanged(revision))
         }
-        Some(_) => Err(anyhow!(
+        Some(_) => Err(UploadOverwriteParseError::UploadOverwrite(format!(
             "Invalid {UPLOAD_OVERWRITE_HEADER} header: expected true or false"
-        )),
+        ))),
     }
 }
 
@@ -339,7 +359,10 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(UPLOAD_OVERWRITE_HEADER, HeaderValue::from_static("true"));
-        assert!(parse_upload_overwrite(&headers).is_err());
+        assert!(matches!(
+            parse_upload_overwrite(&headers),
+            Err(UploadOverwriteParseError::TargetRevision(_))
+        ));
 
         headers.insert(
             TARGET_REVISION_HEADER,
@@ -358,12 +381,25 @@ mod tests {
                 "00112233445566778899AABBccddeeff00112233445566778899aabbccddeeff",
             ),
         );
-        assert!(parse_upload_overwrite(&headers).is_err());
+        assert!(matches!(
+            parse_upload_overwrite(&headers),
+            Err(UploadOverwriteParseError::TargetRevision(_))
+        ));
 
         headers.insert(UPLOAD_OVERWRITE_HEADER, HeaderValue::from_static("false"));
         assert!(
-            parse_upload_overwrite(&headers).is_err(),
+            matches!(
+                parse_upload_overwrite(&headers),
+                Err(UploadOverwriteParseError::TargetRevision(_))
+            ),
             "a revision must never be silently ignored in no-replace mode"
         );
+
+        headers.remove(TARGET_REVISION_HEADER);
+        headers.insert(UPLOAD_OVERWRITE_HEADER, HeaderValue::from_static("TRUE"));
+        assert!(matches!(
+            parse_upload_overwrite(&headers),
+            Err(UploadOverwriteParseError::UploadOverwrite(_))
+        ));
     }
 }
