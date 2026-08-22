@@ -820,6 +820,126 @@ test("多个合法批次合计超过全局上限时不创建额外上传行", as
   })).toBeHidden();
 });
 
+test("终态历史淘汰聚焦行时把焦点移到相邻结果或历史摘要", async ({
+  appPage: page,
+}) => {
+  let releaseSecond;
+  let markSecondStarted;
+  const secondGate = new Promise(resolve => {
+    releaseSecond = resolve;
+  });
+  const secondStarted = new Promise(resolve => {
+    markSecondStarted = resolve;
+  });
+  await page.route("**/focus-history-*.txt", async route => {
+    if (new URL(route.request().url()).pathname.endsWith(
+      "/focus-history-second.txt",
+    )) {
+      markSecondStarted();
+      await secondGate;
+    }
+    await route.fulfill({
+      status: 201,
+      headers: protocolHeaders(route.request(), "committed", "length"),
+      body: "",
+    });
+  });
+
+  await page.evaluate(async () => {
+    const entrypoint = document.querySelector('script[type="module"]').src;
+    const { createUploadManager } = await import(
+      new URL("modules/upload/manager.js", entrypoint).href
+    );
+    const encoded = document.querySelector("#index-data").content.textContent;
+    const binary = atob(encoded.trim());
+    const bytes = Uint8Array.from(
+      binary,
+      character => character.charCodeAt(0),
+    );
+    const data = JSON.parse(new TextDecoder().decode(bytes));
+
+    const fixture = document.createElement("section");
+    fixture.id = "focus-history-fixture";
+    const queueMessage = document.createElement("div");
+    const emptyFolder = document.createElement("div");
+    const table = document.createElement("table");
+    const historyStatus = table.createCaption();
+    historyStatus.className = "upload-history-status hidden";
+    table.createTHead().insertRow().insertCell().textContent = "Uploads";
+    fixture.append(queueMessage, emptyFolder, table);
+    document.body.append(fixture);
+
+    window.__dufsFocusHistoryManager = createUploadManager({
+      data,
+      dialogs: {
+        showMessage: async () => undefined,
+        chooseAction: async () => {
+          throw new Error("unexpected upload confirmation");
+        },
+      },
+      uploadersTable: table,
+      queueMessage,
+      historyStatus,
+      emptyFolder,
+      onMutation: () => {},
+      onUnauthorized: () => {
+        throw new Error("unexpected authentication failure");
+      },
+      maxConcurrentUploads: 1,
+      maxTerminalRows: 1,
+    });
+  });
+
+  const addFile = name => page.evaluate(async fileName => {
+    await window.__dufsFocusHistoryManager.addFiles([
+      new File([fileName], fileName, { type: "text/plain" }),
+    ]);
+  }, name);
+  const fixture = page.locator("#focus-history-fixture");
+  await addFile("focus-history-first.txt");
+  await expect(fixture.locator("#uploadStatus0")).toHaveAttribute(
+    "aria-label",
+    "focus-history-first.txt: upload complete",
+  );
+  await fixture.getByRole("link", {
+    name: "focus-history-first.txt",
+  }).focus();
+
+  await addFile("focus-history-second.txt");
+  await secondStarted;
+  await fixture.locator("#upload1 .cell-name a").evaluate(link => {
+    window.__dufsDetachedFocusHistoryLink = link;
+    link.remove();
+  });
+  releaseSecond();
+  const historyStatus = fixture.locator(".upload-history-status");
+  await expect(fixture.locator("#upload0")).toHaveCount(0);
+  await expect(historyStatus).toBeFocused();
+  await expect(historyStatus).toHaveText(
+    "1 older upload result hidden; showing the most recent 1.",
+  );
+  await page.getByRole("button", { name: "Upload files", exact: true }).focus();
+  await expect(historyStatus).not.toHaveAttribute("tabindex");
+
+  await fixture.locator("#upload1 .cell-name").evaluate(cell => {
+    cell.append(window.__dufsDetachedFocusHistoryLink);
+    delete window.__dufsDetachedFocusHistoryLink;
+  });
+  const second = fixture.getByRole("link", {
+    name: "focus-history-second.txt",
+  });
+  await second.focus();
+
+  await addFile("focus-history-third.txt");
+  await expect(fixture.locator("#upload1")).toHaveCount(0);
+  await expect(fixture.getByRole("link", {
+    name: "focus-history-third.txt",
+  })).toBeFocused();
+  await expect(historyStatus).toHaveText(
+    "2 older upload results hidden; showing the most recent 1.",
+  );
+});
+
 test("待处理队列已满时保留失败上传的可恢复终态", async ({
   appPage: page,
 }) => {

@@ -176,11 +176,22 @@ export function createUploadManager(options) {
   let queueState = "running";
   /** @type {Promise<void>} */
   let enqueueTail = Promise.resolve();
+  let restoreHistoryFocusAfterRender = false;
   const terminalHistory = createBoundedHistory(
     maxTerminalRows,
     /** @param {TerminalUploadRow} entry */ entry => {
+      const restoreFocus = entry.row.contains(document.activeElement);
+      const adjacentNameLink = restoreFocus
+        ? adjacentUploadNameLink(entry.row)
+        : null;
       entry.dispose?.();
       entry.row.remove();
+      if (!restoreFocus) return;
+      if (adjacentNameLink?.isConnected) {
+        adjacentNameLink.focus({ preventScroll: true });
+      } else {
+        restoreHistoryFocusAfterRender = true;
+      }
     },
   );
 
@@ -224,6 +235,16 @@ export function createUploadManager(options) {
         `showing the most recent ${terminalHistory.size}.`
       : "";
     historyStatus.classList.toggle("hidden", hiddenCount === 0);
+    if (restoreHistoryFocusAfterRender) {
+      restoreHistoryFocusAfterRender = false;
+      historyStatus.tabIndex = -1;
+      historyStatus.focus({ preventScroll: true });
+      historyStatus.addEventListener(
+        "blur",
+        () => historyStatus.removeAttribute("tabindex"),
+        { once: true },
+      );
+    }
   }
 
   /** @param {number} [additionalRows] */
@@ -1675,6 +1696,19 @@ function normalizeTerminalRowLimit(value) {
     throw new TypeError("Upload terminal row limit must be a positive integer");
   }
   return value;
+}
+
+/**
+ * @param {HTMLTableRowElement} row
+ * @returns {HTMLAnchorElement | null}
+ */
+function adjacentUploadNameLink(row) {
+  for (const sibling of [row.nextElementSibling, row.previousElementSibling]) {
+    if (!(sibling instanceof HTMLTableRowElement)) continue;
+    const link = sibling.querySelector(".cell-name a");
+    if (link instanceof HTMLAnchorElement) return link;
+  }
+  return null;
 }
 
 function yieldToBrowser() {
