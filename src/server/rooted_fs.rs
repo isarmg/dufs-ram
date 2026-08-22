@@ -54,6 +54,8 @@ struct RootedFsInner {
     root_path: PathBuf,
     resolve: ResolveFlags,
     ancestor_creation: Mutex<()>,
+    #[cfg(test)]
+    before_missing_rename: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct OpenedParent {
@@ -183,6 +185,18 @@ pub(super) enum CheckedRelocationOutcome {
     SameFile,
 }
 
+enum CheckedMissingRename {
+    Renamed,
+    DestinationExists,
+    PublishedIdentityUnknown(std::io::Error),
+}
+
+enum PreparedCheckedReplace {
+    Renamed(OpenedParent, OpenedParent, bool),
+    Rejected,
+    PublishedIdentityUnknown(std::io::Error),
+}
+
 #[derive(Debug)]
 pub(super) struct ReplacementTarget {
     pub(super) identity: ReplacementTargetIdentity,
@@ -296,8 +310,38 @@ impl RootedFs {
                 root_path: root_path.to_path_buf(),
                 resolve,
                 ancestor_creation: Mutex::new(()),
+                #[cfg(test)]
+                before_missing_rename: Mutex::new(None),
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_before_missing_rename_once(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self
+            .inner
+            .before_missing_rename
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "a missing-rename hook is already installed"
+        );
+    }
+
+    fn run_before_missing_rename_hook(&self) {
+        #[cfg(test)]
+        let hook = self
+            .inner
+            .before_missing_rename
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(super) fn root_handle(&self) -> &File {
@@ -1014,9 +1058,12 @@ impl RootedFs {
         }
     }
 
-    /// Relocate a directory entry only while the object identities observed by
-    /// the browser API still match. The final comparisons and rename share one
-    /// blocking closure so external writers cannot exploit an await boundary.
+    /// Relocate a directory entry after rechecking the identities observed by
+    /// the browser API. Missing destinations use `NOREPLACE` plus a pinned
+    /// source post-check; this prevents a late target from being overwritten
+    /// and refuses to report success if a different source object was moved.
+    /// Existing-target replacement remains a check followed by ordinary
+    /// rename, not a strict directory-entry CAS against external writers.
     pub(super) async fn rename_if_unchanged(
         &self,
         source: &Path,
@@ -1082,13 +1129,14 @@ impl RootedFs {
                 Err(error) => return Err(std::io::Error::from(error)),
             };
 
-            if let Some(expected_destination) = expected_destination {
-                if current_destination != expected_destination {
+            if let Some(ReplacementTargetIdentity::Existing(destination_identity)) =
+                expected_destination
+            {
+                if current_destination != ReplacementTargetIdentity::Existing(destination_identity)
+                {
                     return Ok(CheckedRelocationOutcome::DestinationChanged);
                 }
-                if let ReplacementTargetIdentity::Existing(destination_identity) =
-                    current_destination
-                    && source_stat.st_dev == destination_identity.device
+                if source_stat.st_dev == destination_identity.device
                     && source_stat.st_ino == destination_identity.inode
                 {
                     return Ok(CheckedRelocationOutcome::SameFile);
@@ -1096,18 +1144,54 @@ impl RootedFs {
                 renameat(&source.fd, &source.name, &destination.fd, &destination.name)
                     .map_err(std::io::Error::from)?;
             } else {
-                match renameat_with(
+                let destination_changed = expected_destination.is_some();
+                if current_destination != ReplacementTargetIdentity::Missing {
+                    return Ok(if destination_changed {
+                        CheckedRelocationOutcome::DestinationChanged
+                    } else {
+                        CheckedRelocationOutcome::DestinationExists
+                    });
+                }
+                let source_anchor = match openat(
                     &source.fd,
                     &source.name,
-                    &destination.fd,
-                    &destination.name,
-                    RenameFlags::NOREPLACE,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
                 ) {
-                    Ok(()) => {}
-                    Err(Errno::EXIST) => {
-                        return Ok(CheckedRelocationOutcome::DestinationExists);
+                    Ok(anchor) => anchor,
+                    Err(Errno::NOENT | Errno::NOTDIR) => {
+                        return Ok(CheckedRelocationOutcome::SourceChanged);
                     }
                     Err(error) => return Err(std::io::Error::from(error)),
+                };
+                let anchored_source = fstat(&source_anchor).map_err(std::io::Error::from)?;
+                if ReplacementTargetIdentity::Existing(replacement_target_identity(
+                    &anchored_source,
+                )) != expected_source
+                {
+                    return Ok(CheckedRelocationOutcome::SourceChanged);
+                }
+
+                this.run_before_missing_rename_hook();
+                match rename_missing_and_verify(
+                    &source.fd,
+                    &source.name,
+                    &source_anchor,
+                    &destination.fd,
+                    &destination.name,
+                )? {
+                    CheckedMissingRename::Renamed => {}
+                    CheckedMissingRename::DestinationExists => {
+                        return Ok(if destination_changed {
+                            CheckedRelocationOutcome::DestinationChanged
+                        } else {
+                            CheckedRelocationOutcome::DestinationExists
+                        });
+                    }
+                    CheckedMissingRename::PublishedIdentityUnknown(error) => {
+                        let _ = sync_renamed_parents(&source.fd, &destination.fd, same_parent);
+                        return Err(error);
+                    }
                 }
             }
             sync_renamed_parents(&source.fd, &destination.fd, same_parent)?;
@@ -1116,8 +1200,11 @@ impl RootedFs {
         .await
     }
 
-    /// Publish an already-opened staging file only if both directory entries
-    /// still name the objects inspected earlier in the upload transaction.
+    /// Publish an already-opened staging file after rechecking both directory
+    /// entries. A target expected to be missing is committed with `NOREPLACE`
+    /// and the resulting name is checked against the open staging descriptor.
+    /// Existing-target replacement remains a check followed by ordinary
+    /// rename, not a strict directory-entry CAS against external writers.
     pub(super) async fn rename_replace_if_unchanged(
         &self,
         source: &Path,
@@ -1141,57 +1228,90 @@ impl RootedFs {
                     .ancestor_creation
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let prepared =
-                    (|| -> std::io::Result<Option<(OpenedParent, OpenedParent, bool)>> {
-                        let source = this.open_parent_blocking(&source, false)?;
-                        let destination = this.open_parent_blocking(&destination, false)?;
-                        let same_parent = opened_directories_match(&source.fd, &destination.fd)?;
+                let prepared = (|| -> std::io::Result<PreparedCheckedReplace> {
+                    let source = this.open_parent_blocking(&source, false)?;
+                    let destination = this.open_parent_blocking(&destination, false)?;
+                    let same_parent = opened_directories_match(&source.fd, &destination.fd)?;
 
-                        let opened_source_stat =
-                            fstat(&opened_source).map_err(std::io::Error::from)?;
-                        let named_source_stat =
-                            match statat(&source.fd, &source.name, AtFlags::SYMLINK_NOFOLLOW) {
-                                Ok(stat) => stat,
-                                Err(Errno::NOENT) => return Ok(None),
-                                Err(error) => return Err(std::io::Error::from(error)),
-                            };
-                        let opened_source_identity =
-                            replacement_target_identity(&opened_source_stat);
-                        let named_source_identity = replacement_target_identity(&named_source_stat);
-                        if opened_source_identity != named_source_identity
-                            || opened_source_identity.file_type != FileType::RegularFile
-                            || opened_source_identity.links != 1
-                        {
-                            return Ok(None);
-                        }
-
-                        let current_destination = match statat(
-                            &destination.fd,
-                            &destination.name,
-                            AtFlags::SYMLINK_NOFOLLOW,
-                        ) {
-                            Ok(stat) => Some(replacement_target_identity(&stat)),
-                            Err(Errno::NOENT) => None,
+                    let opened_source_stat = fstat(&opened_source).map_err(std::io::Error::from)?;
+                    let named_source_stat =
+                        match statat(&source.fd, &source.name, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(stat) => stat,
+                            Err(Errno::NOENT) => return Ok(PreparedCheckedReplace::Rejected),
                             Err(error) => return Err(std::io::Error::from(error)),
                         };
-                        let destination_is_unchanged = match expected_destination {
-                            ReplacementTargetIdentity::Missing => current_destination.is_none(),
-                            ReplacementTargetIdentity::Existing(expected) => {
-                                current_destination == Some(expected)
-                            }
-                        };
-                        if !destination_is_unchanged {
-                            return Ok(None);
-                        }
+                    let opened_source_identity = replacement_target_identity(&opened_source_stat);
+                    let named_source_identity = replacement_target_identity(&named_source_stat);
+                    if opened_source_identity != named_source_identity
+                        || opened_source_identity.file_type != FileType::RegularFile
+                        || opened_source_identity.links != 1
+                    {
+                        return Ok(PreparedCheckedReplace::Rejected);
+                    }
 
-                        renameat(&source.fd, &source.name, &destination.fd, &destination.name)
-                            .map_err(std::io::Error::from)?;
-                        Ok(Some((source, destination, same_parent)))
-                    })();
+                    let current_destination = match statat(
+                        &destination.fd,
+                        &destination.name,
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(stat) => Some(replacement_target_identity(&stat)),
+                        Err(Errno::NOENT) => None,
+                        Err(error) => return Err(std::io::Error::from(error)),
+                    };
+                    match expected_destination {
+                        ReplacementTargetIdentity::Missing => {
+                            if current_destination.is_some() {
+                                return Ok(PreparedCheckedReplace::Rejected);
+                            }
+                            this.run_before_missing_rename_hook();
+                            match rename_missing_and_verify(
+                                &source.fd,
+                                &source.name,
+                                &opened_source,
+                                &destination.fd,
+                                &destination.name,
+                            )? {
+                                CheckedMissingRename::Renamed => {}
+                                CheckedMissingRename::DestinationExists => {
+                                    return Ok(PreparedCheckedReplace::Rejected);
+                                }
+                                CheckedMissingRename::PublishedIdentityUnknown(error) => {
+                                    let _ = sync_renamed_parents(
+                                        &source.fd,
+                                        &destination.fd,
+                                        same_parent,
+                                    );
+                                    return Ok(PreparedCheckedReplace::PublishedIdentityUnknown(
+                                        error,
+                                    ));
+                                }
+                            }
+                        }
+                        ReplacementTargetIdentity::Existing(expected) => {
+                            if current_destination != Some(expected) {
+                                return Ok(PreparedCheckedReplace::Rejected);
+                            }
+                            renameat(&source.fd, &source.name, &destination.fd, &destination.name)
+                                .map_err(std::io::Error::from)?;
+                        }
+                    }
+                    Ok(PreparedCheckedReplace::Renamed(
+                        source,
+                        destination,
+                        same_parent,
+                    ))
+                })();
 
                 let (source, destination, same_parent) = match prepared {
-                    Ok(Some(parents)) => parents,
-                    Ok(None) => return ReplaceAndSyncOutcome::Rejected,
+                    Ok(PreparedCheckedReplace::Renamed(source, destination, same_parent)) => {
+                        (source, destination, same_parent)
+                    }
+                    Ok(PreparedCheckedReplace::Rejected) => {
+                        return ReplaceAndSyncOutcome::Rejected;
+                    }
+                    Ok(PreparedCheckedReplace::PublishedIdentityUnknown(error)) => {
+                        return ReplaceAndSyncOutcome::PublishedDurabilityUnknown(error);
+                    }
                     Err(error) => return ReplaceAndSyncOutcome::NotPublished(error),
                 };
                 if let Err(error) = sync_renamed_parents(&source.fd, &destination.fd, same_parent) {
@@ -2061,6 +2181,73 @@ fn delete_identity_at<F: AsFd>(
         Err(Errno::NOENT) => Ok(None),
         Err(error) => Err(std::io::Error::from(error)),
     }
+}
+
+/// Move into a destination that was observed missing without ever replacing a
+/// late external occupant. A successful rename is still not a kernel CAS on
+/// the source pathname, so prove that the destination now names the pinned
+/// source object before reporting success. Failure after the rename is
+/// deliberately classified as uncertain: moving or deleting either pathname
+/// at that point could affect an object installed by an external writer.
+fn rename_missing_and_verify<S, A, D>(
+    source_parent: &S,
+    source_name: &OsString,
+    source_anchor: &A,
+    destination_parent: &D,
+    destination_name: &OsString,
+) -> std::io::Result<CheckedMissingRename>
+where
+    S: AsFd,
+    A: AsFd,
+    D: AsFd,
+{
+    match renameat_with(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => return Ok(CheckedMissingRename::DestinationExists),
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+
+    let anchored_source = match fstat(source_anchor) {
+        Ok(stat) => replacement_target_identity(&stat),
+        Err(error) => {
+            return Ok(CheckedMissingRename::PublishedIdentityUnknown(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("renamed source anchor could not be verified: {error}"),
+                ),
+            ));
+        }
+    };
+    let named_destination = match statat(
+        destination_parent,
+        destination_name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => replacement_target_identity(&stat),
+        Err(error) => {
+            return Ok(CheckedMissingRename::PublishedIdentityUnknown(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("renamed destination could not be verified: {error}"),
+                ),
+            ));
+        }
+    };
+    if anchored_source != named_destination {
+        return Ok(CheckedMissingRename::PublishedIdentityUnknown(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "renamed destination no longer matches the pinned source identity",
+            ),
+        ));
+    }
+    Ok(CheckedMissingRename::Renamed)
 }
 
 fn replacement_target_identity(stat: &rustix::fs::Stat) -> ExistingReplacementTarget {

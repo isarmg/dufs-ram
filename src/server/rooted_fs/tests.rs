@@ -150,6 +150,95 @@ async fn checked_replace_rejects_a_substituted_staging_path() {
 }
 
 #[tokio::test]
+async fn missing_replace_never_overwrites_a_target_created_at_the_rename_boundary() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let stage = temp.path().join("stage");
+    let target = temp.path().join("target");
+    let (mut stage_file, _) = rooted.create_private_new(&stage).await.unwrap();
+    stage_file.write_all(b"uploaded").await.unwrap();
+    stage_file.flush().await.unwrap();
+
+    let competing_target = target.clone();
+    rooted.inject_before_missing_rename_once(move || {
+        std::fs::write(competing_target, b"external").unwrap();
+    });
+
+    assert!(matches!(
+        rooted
+            .rename_replace_if_unchanged(
+                &stage,
+                &stage_file,
+                &target,
+                ReplacementTargetIdentity::Missing,
+            )
+            .await,
+        ReplaceAndSyncOutcome::Rejected
+    ));
+    assert_eq!(std::fs::read(&stage).unwrap(), b"uploaded");
+    assert_eq!(std::fs::read(&target).unwrap(), b"external");
+}
+
+#[tokio::test]
+async fn missing_replace_publishes_the_pinned_stage_when_both_names_stay_stable() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let stage = temp.path().join("stage");
+    let target = temp.path().join("target");
+    let (mut stage_file, _) = rooted.create_private_new(&stage).await.unwrap();
+    stage_file.write_all(b"uploaded").await.unwrap();
+    stage_file.flush().await.unwrap();
+
+    assert!(matches!(
+        rooted
+            .rename_replace_if_unchanged(
+                &stage,
+                &stage_file,
+                &target,
+                ReplacementTargetIdentity::Missing,
+            )
+            .await,
+        ReplaceAndSyncOutcome::Published
+    ));
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&target).unwrap(), b"uploaded");
+}
+
+#[tokio::test]
+async fn missing_replace_reports_unknown_when_the_renamed_source_is_not_the_pinned_file() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let stage = temp.path().join("stage");
+    let displaced_stage = temp.path().join("displaced-stage");
+    let target = temp.path().join("target");
+    let (mut stage_file, _) = rooted.create_private_new(&stage).await.unwrap();
+    stage_file.write_all(b"uploaded").await.unwrap();
+    stage_file.flush().await.unwrap();
+
+    let replaced_stage = stage.clone();
+    let preserved_stage = displaced_stage.clone();
+    rooted.inject_before_missing_rename_once(move || {
+        std::fs::rename(&replaced_stage, &preserved_stage).unwrap();
+        std::fs::write(&replaced_stage, b"external").unwrap();
+    });
+
+    assert!(matches!(
+        rooted
+            .rename_replace_if_unchanged(
+                &stage,
+                &stage_file,
+                &target,
+                ReplacementTargetIdentity::Missing,
+            )
+            .await,
+        ReplaceAndSyncOutcome::PublishedDurabilityUnknown(_)
+    ));
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&displaced_stage).unwrap(), b"uploaded");
+    assert_eq!(std::fs::read(&target).unwrap(), b"external");
+}
+
+#[tokio::test]
 async fn checked_replace_rejects_target_identity_changes() {
     use std::os::unix::fs::symlink;
 
