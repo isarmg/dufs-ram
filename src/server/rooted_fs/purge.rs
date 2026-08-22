@@ -33,7 +33,7 @@ pub(in crate::server) struct TrashEntry {
     trash_revision: [u8; 32],
     pub(super) purge_stack: Vec<PurgeDirectory>,
     pub(super) purge_resume: Option<PurgeResume>,
-    pub(super) pending_unlink: Option<PurgeDirectory>,
+    pub(super) pending_unlink: Option<Box<PurgeDirectory>>,
     #[cfg(test)]
     pause_after_pending_unlink: bool,
     #[cfg(test)]
@@ -373,7 +373,7 @@ impl TrashEntry {
                         }
                         completed.pending_anchor = None;
                         let parent_depth = self.purge_stack.len();
-                        self.purge_stack.push(completed);
+                        self.purge_stack.push(*completed);
                         self.retain_purge_directory(parent, parent_depth)?;
                         return Err(std::io::Error::from(error));
                     }
@@ -412,7 +412,7 @@ impl TrashEntry {
                 if !self.purge_stack.is_empty() {
                     completed.pending_anchor = pending_anchor;
                     drop(directory.take());
-                    self.pending_unlink = Some(completed);
+                    self.pending_unlink = Some(Box::new(completed));
                     directory = self.open_current_purge_directory(
                         &mut examined,
                         max_entries,
