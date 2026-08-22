@@ -544,7 +544,7 @@ async fn remove_expired_upload_record(
     stage_removed: bool,
 ) -> Result<Option<bool>> {
     Ok(state_store
-        .remove_upload_session(expired.key)
+        .remove_expired_upload_session_if_matches(expired.clone())
         .await?
         .then_some(stage_removed))
 }
