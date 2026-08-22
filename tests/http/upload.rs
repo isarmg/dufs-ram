@@ -671,6 +671,42 @@ fn staged_existing_target_metadata_cannot_be_reused_as_a_create(
     );
     assert!(!stage.path().exists());
 
+    let discard_retry = server
+        .request(
+            reqwest::Method::POST,
+            server.url().join("__dufs__/api/upload/discard")?,
+        )
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "path": logical_path,
+                "upload_id": upload_id.to_string()
+            })
+            .to_string(),
+        )
+        .send()?;
+    assert_eq!(discard_retry.status(), 204);
+    assert_eq!(
+        discard_retry.headers().get("x-dufs-upload-id").unwrap(),
+        upload_id.to_string().as_str()
+    );
+    assert_eq!(
+        discard_retry.headers().get("x-dufs-upload-length").unwrap(),
+        "6"
+    );
+    assert_eq!(
+        discard_retry.headers().get("x-dufs-upload-offset").unwrap(),
+        "6"
+    );
+    assert_eq!(
+        discard_retry
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "rejected"
+    );
+    assert!(!stage.path().exists());
+
     let rejected = server
         .request(
             reqwest::Method::HEAD,

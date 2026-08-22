@@ -2,8 +2,8 @@ use super::super::{
     identity::OwnerId,
     rooted_fs::{CreatedAncestors, DeleteIdentity, RootedFs, TrashPurgeProgress},
     state_store::{
-        StateStore, StoreUploadSession, StoredFileIdentity, StoredUploadSession, StoredUploadState,
-        UploadSessionKey,
+        RejectUploadSession, StateStore, StoreUploadSession, StoredFileIdentity,
+        StoredUploadSession, StoredUploadState, UploadSessionKey,
     },
     storage::sync_file_to_storage,
 };
@@ -34,6 +34,27 @@ pub(super) enum UploadRecordLookup {
     NotSeen,
     ForeignOwner,
     Found(UploadCheckpoint),
+}
+
+#[derive(Debug)]
+pub(super) enum UploadDiscardLookup {
+    NotSeen,
+    ForeignOwner,
+    StateConflict(UploadCheckpoint),
+    Rejected(RejectedUploadRecord),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RejectedUploadRecord {
+    pub(super) upload_length: u64,
+    pub(super) durable_offset: u64,
+    stage_identity: Option<StoredFileIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageCleanupOutcome {
+    RemovedOrAbsent,
+    ReplacementPreserved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,6 +357,61 @@ impl UploadRecordStore {
             .await
     }
 
+    /// Atomically changes only the existing, exactly bound upload row from
+    /// awaiting confirmation to rejected. The update never inserts or deletes
+    /// a row and returns the retained stage identity for idempotent cleanup.
+    pub(super) async fn reject_for_discard(
+        &self,
+        owner_id: OwnerId,
+        upload_id: Uuid,
+        target_path: &Path,
+        stage_path: &Path,
+    ) -> Result<UploadDiscardLookup> {
+        let key = upload_session_key(owner_id, upload_id);
+        let (target_relative, stage_relative) =
+            self.validated_relative_paths(upload_id, target_path, stage_path)?;
+        let result = self
+            .state_store
+            .reject_upload_session(key, target_relative, stage_relative, self.ttl)
+            .await?;
+        Ok(match result {
+            RejectUploadSession::NotFound => UploadDiscardLookup::NotSeen,
+            RejectUploadSession::BindingConflict => UploadDiscardLookup::ForeignOwner,
+            RejectUploadSession::StateConflict(session) => {
+                UploadDiscardLookup::StateConflict(upload_checkpoint(&session))
+            }
+            RejectUploadSession::Rejected(session) => {
+                UploadDiscardLookup::Rejected(RejectedUploadRecord {
+                    upload_length: session.upload_length,
+                    durable_offset: session.durable_offset,
+                    stage_identity: session.stage_identity,
+                })
+            }
+        })
+    }
+
+    /// Idempotently removes the stage owned by a durable rejected session.
+    ///
+    /// The rejected row remains the authority for both retries and the inode
+    /// identity check. A missing or mismatched row is never permission to
+    /// unlink the shared stage pathname.
+    pub(super) async fn cleanup_rejected_stage(
+        &self,
+        stage_path: &Path,
+        record: RejectedUploadRecord,
+    ) -> Result<()> {
+        let Some(identity) = record.stage_identity else {
+            // Legacy rejected rows may predate durable stage identities. No
+            // pathname is safe to unlink without that capability.
+            return Ok(());
+        };
+        match self.remove_file_if_identity(stage_path, identity).await? {
+            StageCleanupOutcome::RemovedOrAbsent | StageCleanupOutcome::ReplacementPreserved => {
+                Ok(())
+            }
+        }
+    }
+
     /// Removes storage artifacts first and the database ambiguity barrier
     /// last. A cancellation or database failure therefore cannot make an
     /// incompletely removed stage look like a fresh owner+UUID session.
@@ -359,8 +435,11 @@ impl UploadRecordStore {
         if session.target_path != target_relative || session.stage_path != stage_relative {
             return Err(UploadRecordStoreError::Conflict.into());
         }
-        if let Some(identity) = session.stage_identity {
-            self.remove_file_if_identity(stage_path, identity).await?;
+        if let Some(identity) = session.stage_identity
+            && self.remove_file_if_identity(stage_path, identity).await?
+                == StageCleanupOutcome::ReplacementPreserved
+        {
+            return Err(UploadRecordStoreError::Conflict.into());
         }
         if !self
             .state_store
@@ -385,14 +464,21 @@ impl UploadRecordStore {
             metadata.file_type().is_file() && metadata.nlink() == 1,
             "Unrecorded upload stage is not a private regular file"
         );
-        self.remove_file_if_identity(
-            stage_path,
-            StoredFileIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
-        )
-        .await
+        match self
+            .remove_file_if_identity(
+                stage_path,
+                StoredFileIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+            )
+            .await?
+        {
+            StageCleanupOutcome::RemovedOrAbsent => Ok(()),
+            StageCleanupOutcome::ReplacementPreserved => {
+                Err(UploadRecordStoreError::Conflict.into())
+            }
+        }
     }
 
     pub(super) async fn reset_and_ancestors(
@@ -601,9 +687,9 @@ impl UploadRecordStore {
         &self,
         path: &Path,
         expected: StoredFileIdentity,
-    ) -> Result<()> {
+    ) -> Result<StageCleanupOutcome> {
         let Some(entry) = self.rooted_fs.capture_entry_for_purge(path, false).await? else {
-            return Ok(());
+            return Ok(StageCleanupOutcome::RemovedOrAbsent);
         };
         let actual = entry.identity();
         if actual
@@ -613,13 +699,13 @@ impl UploadRecordStore {
                 is_directory: false,
             })
         {
-            return Err(UploadRecordStoreError::Conflict.into());
+            return Ok(StageCleanupOutcome::ReplacementPreserved);
         }
         match entry
             .purge_slice(1, Duration::from_secs(1), CancellationToken::new())
             .await
         {
-            Ok(TrashPurgeProgress::Complete) => Ok(()),
+            Ok(TrashPurgeProgress::Complete) => Ok(StageCleanupOutcome::RemovedOrAbsent),
             Ok(TrashPurgeProgress::Pending(_)) => Err(anyhow!(
                 "Upload cleanup did not finish its single-file purge"
             )),
@@ -643,6 +729,23 @@ fn upload_session_key(owner_id: OwnerId, upload_id: Uuid) -> UploadSessionKey {
     }
 }
 
+fn upload_checkpoint(session: &StoredUploadSession) -> UploadCheckpoint {
+    UploadCheckpoint {
+        upload_length: session.upload_length,
+        durable_offset: session.durable_offset,
+        target_revision: session.target_revision,
+        state: match session.state {
+            StoredUploadState::Committed => UploadRecordState::Committed,
+            StoredUploadState::Rejected => UploadRecordState::Rejected,
+            StoredUploadState::Running => UploadRecordState::Running,
+            StoredUploadState::AwaitingConfirmation => UploadRecordState::AwaitingConfirmation,
+            StoredUploadState::CommitStarted | StoredUploadState::Unknown => {
+                UploadRecordState::Unknown
+            }
+        },
+    }
+}
+
 pub(super) async fn rollback_upload_ancestors(
     rooted_fs: &RootedFs,
     created_ancestors: &mut Option<CreatedAncestors>,
@@ -656,6 +759,8 @@ pub(super) async fn rollback_upload_ancestors(
 #[cfg(test)]
 mod record_store_tests {
     use super::*;
+    use futures_util::poll;
+    use std::task::Poll;
 
     const TEST_TTL: Duration = Duration::from_secs(60);
 
@@ -672,6 +777,34 @@ mod record_store_tests {
     async fn create_stage(rooted_fs: &RootedFs, stage: &Path, contents: &[u8]) -> fs::File {
         let (mut file, _) = rooted_fs.create_private_new(stage).await.unwrap();
         file.write_all(contents).await.unwrap();
+        file
+    }
+
+    async fn create_awaiting_stage(
+        records: &UploadRecordStore,
+        rooted_fs: &RootedFs,
+        owner: OwnerId,
+        upload_id: Uuid,
+        target: &Path,
+        stage: &Path,
+        contents: &[u8],
+    ) -> fs::File {
+        let mut file = create_stage(rooted_fs, stage, contents).await;
+        let context =
+            UploadRecordContext::new(owner, upload_id, target, stage, contents.len() as u64)
+                .with_target_revision(Some([7; 32]));
+        records
+            .persist_initial_checkpoint(&mut file, context, contents.len() as u64)
+            .await
+            .unwrap();
+        records
+            .persist_commit_started(&mut file, context)
+            .await
+            .unwrap();
+        records
+            .persist_awaiting_confirmation(&mut file, context)
+            .await
+            .unwrap();
         file
     }
 
@@ -1019,5 +1152,194 @@ mod record_store_tests {
         );
         assert_eq!(std::fs::read(&stage).unwrap(), b"replacement");
         assert_eq!(std::fs::read(&parked).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn rejected_stage_cleanup_resumes_after_cancelled_state_delivery() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("discard-cancellation-owner");
+        let upload_id = Uuid::new_v4();
+        let (target, stage) = upload_paths(temp.path(), "cancelled-discard.bin", upload_id);
+        let file = create_awaiting_stage(
+            &records,
+            &rooted_fs,
+            owner,
+            upload_id,
+            &target,
+            &stage,
+            b"complete",
+        )
+        .await;
+        let before = state_store
+            .upload_session(upload_session_key(owner, upload_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let release_actor = state_store.block_actor_for_test().unwrap();
+        let mut reject = Box::pin(records.reject_for_discard(owner, upload_id, &target, &stage));
+        assert!(
+            matches!(poll!(reject.as_mut()), Poll::Pending),
+            "the reject command did not wait behind the blocked actor"
+        );
+        drop(reject);
+        release_actor.send(()).unwrap();
+        state_store.probe_readiness().await.unwrap();
+
+        let after = state_store
+            .upload_session(upload_session_key(owner, upload_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = before;
+        expected.state = StoredUploadState::Rejected;
+        assert_eq!(after, expected);
+        assert!(stage.exists());
+
+        state_store.set_query_only(true).await.unwrap();
+        let record = match records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .unwrap()
+        {
+            UploadDiscardLookup::Rejected(record) => record,
+            _ => panic!("the cancelled rejection was not idempotently replayed"),
+        };
+        records
+            .cleanup_rejected_stage(&stage, record)
+            .await
+            .unwrap();
+        assert!(!stage.exists());
+        state_store.set_query_only(false).await.unwrap();
+
+        let record = match records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .unwrap()
+        {
+            UploadDiscardLookup::Rejected(record) => record,
+            _ => panic!("the completed discard was not idempotently replayed"),
+        };
+        records
+            .cleanup_rejected_stage(&stage, record)
+            .await
+            .unwrap();
+        drop(file);
+    }
+
+    #[tokio::test]
+    async fn rejected_stage_cleanup_preserves_a_replacement_and_still_completes() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), temporary_store(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("discard-replacement-owner");
+        let upload_id = Uuid::new_v4();
+        let (target, stage) = upload_paths(temp.path(), "replaced-discard.bin", upload_id);
+        let original = create_awaiting_stage(
+            &records,
+            &rooted_fs,
+            owner,
+            upload_id,
+            &target,
+            &stage,
+            b"original",
+        )
+        .await;
+        let record = match records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .unwrap()
+        {
+            UploadDiscardLookup::Rejected(record) => record,
+            _ => panic!("the awaiting upload was not rejected"),
+        };
+        let replacement =
+            replace_stage_with_distinct_inode(&rooted_fs, &stage, &original, b"replacement").await;
+        records
+            .cleanup_rejected_stage(&stage, record)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&stage).unwrap(), b"replacement");
+        let retry = match records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .unwrap()
+        {
+            UploadDiscardLookup::Rejected(record) => record,
+            _ => panic!("the rejected upload was not idempotently replayed"),
+        };
+        records.cleanup_rejected_stage(&stage, retry).await.unwrap();
+        assert_eq!(std::fs::read(&stage).unwrap(), b"replacement");
+        assert_eq!(
+            found(
+                records
+                    .lookup(owner, upload_id, &target, &stage)
+                    .await
+                    .unwrap()
+            )
+            .state,
+            UploadRecordState::Rejected
+        );
+        drop(original);
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn rejected_stage_transition_fails_closed_on_sqlite_write_failure() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("discard-database-owner");
+        let upload_id = Uuid::new_v4();
+        let (target, stage) = upload_paths(temp.path(), "failed-discard.bin", upload_id);
+        let file = create_awaiting_stage(
+            &records,
+            &rooted_fs,
+            owner,
+            upload_id,
+            &target,
+            &stage,
+            b"complete",
+        )
+        .await;
+
+        state_store.set_query_only(true).await.unwrap();
+        records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .expect_err("query-only SQLite must reject the terminal transition");
+        state_store.set_query_only(false).await.unwrap();
+        assert_eq!(
+            found(
+                records
+                    .lookup(owner, upload_id, &target, &stage)
+                    .await
+                    .unwrap()
+            )
+            .state,
+            UploadRecordState::AwaitingConfirmation
+        );
+        assert_eq!(std::fs::read(&stage).unwrap(), b"complete");
+
+        let record = match records
+            .reject_for_discard(owner, upload_id, &target, &stage)
+            .await
+            .unwrap()
+        {
+            UploadDiscardLookup::Rejected(record) => record,
+            _ => panic!("the retry did not reject the awaiting upload"),
+        };
+        records
+            .cleanup_rejected_stage(&stage, record)
+            .await
+            .unwrap();
+        assert!(!stage.exists());
+        drop(file);
     }
 }

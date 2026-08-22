@@ -59,8 +59,8 @@ pub(super) use protocol::{
 };
 pub(super) use record::UploadRecordStore;
 use record::{
-    UploadCheckpoint, UploadRecordContext, UploadRecordLookup, UploadRecordState,
-    UploadRecordStoreError, rollback_upload_ancestors,
+    UploadCheckpoint, UploadDiscardLookup, UploadRecordContext, UploadRecordLookup,
+    UploadRecordState, UploadRecordStoreError, rollback_upload_ancestors,
 };
 use target::apply_target_inspection_headers;
 pub(in crate::server) use target::target_revision;
@@ -355,14 +355,26 @@ impl Server {
         let _path_lease = self.content.path_coordinator.acquire([path]).await;
         let owner_id = OwnerId::persistent(owner);
         let upload_path = upload_temp_path(path, upload_id)?;
-        let record = match self
+        let decision = match self
             .state
             .upload_records
-            .lookup(owner_id, upload_id, path, &upload_path)
-            .await?
+            .reject_for_discard(owner_id, upload_id, path, &upload_path)
+            .await
         {
-            UploadRecordLookup::Found(record) => record,
-            UploadRecordLookup::NotSeen | UploadRecordLookup::ForeignOwner => {
+            Ok(decision) => decision,
+            Err(error) => {
+                if apply_upload_record_store_problem(
+                    res,
+                    UploadErrorContext::new(upload_id, UploadPublicState::Unknown, None, None),
+                    &error,
+                )? {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+        let record = match decision {
+            UploadDiscardLookup::NotSeen | UploadDiscardLookup::ForeignOwner => {
                 apply_upload_problem(
                     res,
                     UploadErrorContext::new(upload_id, UploadPublicState::NotSeen, None, None),
@@ -373,67 +385,65 @@ impl Server {
                 )?;
                 return Ok(());
             }
+            UploadDiscardLookup::StateConflict(record) => {
+                let state = match record.state {
+                    UploadRecordState::Running => UploadPublicState::Running,
+                    UploadRecordState::Committed => UploadPublicState::Committed,
+                    UploadRecordState::Unknown => UploadPublicState::Unknown,
+                    UploadRecordState::Rejected | UploadRecordState::AwaitingConfirmation => {
+                        unreachable!()
+                    }
+                };
+                apply_upload_problem(
+                    res,
+                    UploadErrorContext::new(
+                        upload_id,
+                        state,
+                        Some(record.upload_length),
+                        Some(record.durable_offset),
+                    ),
+                    StatusCode::CONFLICT,
+                    ErrorCode::UPLOAD_STATE_CONFLICT,
+                    "Only an upload awaiting overwrite confirmation can be discarded",
+                    RecoveryAdvice::QueryUpload,
+                )?;
+                return Ok(());
+            }
+            UploadDiscardLookup::Rejected(record) => record,
         };
-        if record.state == UploadRecordState::Rejected {
-            *res.status_mut() = StatusCode::NO_CONTENT;
-            apply_upload_record_headers(
-                res,
-                upload_id,
-                Some(record.upload_length),
-                Some(record.durable_offset),
-                UploadPublicState::Rejected,
-            )?;
-            return Ok(());
-        }
-        if record.state != UploadRecordState::AwaitingConfirmation {
-            let state = match record.state {
-                UploadRecordState::Running => UploadPublicState::Running,
-                UploadRecordState::Committed => UploadPublicState::Committed,
-                UploadRecordState::Unknown => UploadPublicState::Unknown,
-                UploadRecordState::Rejected | UploadRecordState::AwaitingConfirmation => {
-                    unreachable!()
-                }
-            };
+
+        if let Err(error) = self
+            .state
+            .upload_records
+            .cleanup_rejected_stage(&upload_path, record)
+            .await
+        {
+            log::error!(
+                "Failed to clean a rejected upload stage target={} upload_id={} error={error:#}",
+                path.display(),
+                upload_id
+            );
             apply_upload_problem(
                 res,
                 UploadErrorContext::new(
                     upload_id,
-                    state,
+                    UploadPublicState::Rejected,
                     Some(record.upload_length),
                     Some(record.durable_offset),
                 ),
-                StatusCode::CONFLICT,
-                ErrorCode::UPLOAD_STATE_CONFLICT,
-                "Only an upload awaiting overwrite confirmation can be discarded",
-                RecoveryAdvice::QueryUpload,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::UPLOAD_STAGE_INVALID,
+                "Upload is rejected, but staged data cleanup did not finish; retry discard",
+                RecoveryAdvice::Retry,
             )?;
             return Ok(());
         }
-
-        self.state
-            .upload_records
-            .reset(owner_id, upload_id, path, &upload_path)
-            .await?;
-        self.state
-            .upload_records
-            .persist_terminal(
-                UploadRecordContext::new(
-                    owner_id,
-                    upload_id,
-                    path,
-                    &upload_path,
-                    record.upload_length,
-                ),
-                record.upload_length,
-                UploadRecordState::Rejected,
-            )
-            .await?;
         *res.status_mut() = StatusCode::NO_CONTENT;
         apply_upload_record_headers(
             res,
             upload_id,
             Some(record.upload_length),
-            Some(record.upload_length),
+            Some(record.durable_offset),
             UploadPublicState::Rejected,
         )?;
         Ok(())

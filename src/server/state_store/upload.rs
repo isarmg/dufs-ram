@@ -124,6 +124,67 @@ impl StoreWorker {
         )
     }
 
+    pub(super) fn reject_upload_session(
+        &mut self,
+        key: UploadSessionKey,
+        target_path: &Path,
+        stage_path: &Path,
+        ttl_ms: i64,
+    ) -> Result<RejectUploadSession> {
+        let Some(session) = load_upload_session(&self.connection, key)? else {
+            return Ok(RejectUploadSession::NotFound);
+        };
+        if session.target_path != target_path || session.stage_path != stage_path {
+            return Ok(RejectUploadSession::BindingConflict);
+        }
+        if session.state == StoredUploadState::Rejected {
+            return Ok(RejectUploadSession::Rejected(session));
+        }
+        if session.state != StoredUploadState::AwaitingConfirmation {
+            return Ok(RejectUploadSession::StateConflict(session));
+        }
+
+        let now = now_ms()?;
+        let expires_at = expiration_time(now, ttl_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut session) = load_upload_session(&transaction, key)? else {
+            transaction.commit()?;
+            return Ok(RejectUploadSession::NotFound);
+        };
+        if session.target_path != target_path || session.stage_path != stage_path {
+            transaction.commit()?;
+            return Ok(RejectUploadSession::BindingConflict);
+        }
+        if session.state == StoredUploadState::Rejected {
+            transaction.commit()?;
+            return Ok(RejectUploadSession::Rejected(session));
+        }
+        if session.state != StoredUploadState::AwaitingConfirmation {
+            transaction.commit()?;
+            return Ok(RejectUploadSession::StateConflict(session));
+        }
+        let updated = transaction.execute(
+            "UPDATE upload_sessions
+                SET state = ?1, updated_at_ms = ?2, expires_at_ms = ?3
+              WHERE owner_digest = ?4 AND upload_id = ?5
+                AND state = ?6",
+            params![
+                UPLOAD_REJECTED,
+                now,
+                expires_at,
+                key.owner.as_slice(),
+                key.id.as_slice(),
+                UPLOAD_AWAITING_CONFIRMATION,
+            ],
+        )?;
+        ensure!(updated == 1, "Upload rejection lost its locked session row");
+        session.state = StoredUploadState::Rejected;
+        transaction.commit()?;
+        Ok(RejectUploadSession::Rejected(session))
+    }
+
     pub(super) fn remove_upload_session_if_matches(
         &mut self,
         expected: &StoredUploadSession,
