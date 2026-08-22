@@ -113,12 +113,8 @@ impl Server {
                             StatusCode::SERVICE_UNAVAILABLE,
                             TrackedOperationError::PurgeStateUnavailable,
                         );
-                        if let Some(operation) = operation.take()
-                            && let Err(store_error) = operation.complete(outcome).await
-                        {
-                            error!(
-                                "Failed to persist known delete rejection error={store_error:#}"
-                            );
+                        if let Some(operation) = operation.take() {
+                            operation.complete(outcome).await?;
                         }
                         return Ok(DeleteCommitOutcome::Rejected(outcome));
                     }
@@ -256,5 +252,133 @@ impl Server {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Args,
+        auth::AuthConfig,
+        server::{
+            ServerLifecycle,
+            operation_registry::{BeginOperation, OperationFingerprint, OperationStatus},
+        },
+    };
+    use rusqlite::Connection;
+    use std::os::unix::fs::PermissionsExt;
+
+    const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+
+    fn server(root: &Path) -> (Arc<Server>, assert_fs::TempDir) {
+        let state_dir = assert_fs::TempDir::new().unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = Server::init_with_lifecycle(
+            Args {
+                serve_path: root.to_path_buf(),
+                state_dir: Some(state_dir.path().to_path_buf()),
+                auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+                ..Args::default()
+            },
+            ServerLifecycle::new(),
+        )
+        .unwrap();
+        (Arc::new(server), state_dir)
+    }
+
+    #[tokio::test]
+    async fn purge_prepare_and_rejection_write_failures_do_not_report_a_known_outcome() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let (server, state_dir) = server(root.path());
+        let owner = "user";
+        let path = root.path().join("kept.txt");
+        std::fs::write(&path, "kept").unwrap();
+        let expected_revision_identity = server
+            .content
+            .rooted_fs
+            .replacement_identity(&path)
+            .await
+            .unwrap();
+        let expected_delete_identity = expected_revision_identity.delete_identity().unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        let BeginOperation::Started(operation) = server
+            .state
+            .operation_registry
+            .begin(
+                owner,
+                operation_id,
+                OperationFingerprint::new(&[b"DELETE rejection persistence test"]),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("test operation was not admitted");
+        };
+
+        let connection = Connection::open(state_dir.path().join("state.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_purge_insert
+                   BEFORE INSERT ON purge_jobs
+                   BEGIN
+                     SELECT RAISE(ABORT, 'injected purge preparation failure');
+                   END;
+                 CREATE TRIGGER fail_operation_update
+                   BEFORE UPDATE ON operations
+                   BEGIN
+                     SELECT RAISE(ABORT, 'injected operation completion failure');
+                   END;",
+            )
+            .unwrap();
+
+        let mutation = MutationProgress::default();
+        mutation.mark_reserved();
+        let path_lease = server
+            .content
+            .path_coordinator
+            .acquire([path.as_path()])
+            .await;
+        let mut response = Response::default();
+        let error = server
+            .handle_delete(
+                DeleteRequest {
+                    owner,
+                    path: &path,
+                    expected_revision_identity,
+                    expected_delete_identity,
+                    mutation: mutation.clone(),
+                    path_lease,
+                    operation: (operation_id, operation),
+                },
+                &mut response,
+            )
+            .await
+            .expect_err("an unrecorded DELETE outcome must remain uncertain");
+
+        assert!(
+            format!("{error:#}").contains("injected operation completion failure"),
+            "unexpected error: {error:#}"
+        );
+        assert!(mutation.outcome_can_be_unknown());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER fail_purge_insert;
+                 DROP TRIGGER fail_operation_update;",
+            )
+            .unwrap();
+        server.state.state_store.probe_readiness().await.unwrap();
+        assert!(matches!(
+            server
+                .state
+                .operation_registry
+                .status(owner, operation_id)
+                .await
+                .unwrap(),
+            OperationStatus::NotFound
+        ));
     }
 }
