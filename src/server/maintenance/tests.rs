@@ -44,6 +44,7 @@ mod sqlite_cleanup_tests {
     use super::*;
     use crate::server::{
         identity::OwnerId,
+        internal_names::quarantine_name,
         state_store::{
             PurgeJobKey, StorePurgeJob, StoreUploadSession, StoredPurgeJob, StoredPurgeState,
             UploadSessionKey,
@@ -612,6 +613,66 @@ mod sqlite_cleanup_tests {
                 .count(),
             2,
             "both the displaced original and the replacement must remain quarantined"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recaptured_orphan_with_nested_isolation_quarantines_the_whole_root() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let target = temp.path().join("interrupted-orphan");
+        std::fs::create_dir(&target)?;
+        std::fs::write(target.join("victim.bin"), b"externally replaced occupant")?;
+        let trash = rooted_fs.move_to_trash(&target).await?;
+        let old_trash_path = temp.path().join(&trash.name);
+        let nested_quarantine_name = quarantine_name(Uuid::new_v4());
+        let nested_quarantine = old_trash_path.join(&nested_quarantine_name);
+        std::fs::rename(old_trash_path.join("victim.bin"), &nested_quarantine)?;
+        drop(trash);
+
+        let mut recaptured = None;
+        let state = MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO);
+        let (_, _, scheduled, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            state,
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60),
+                upload_ttl: Duration::ZERO,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            |entry| {
+                recaptured = Some(entry);
+                Ok(())
+            },
+        );
+        assert!(complete);
+        assert_eq!(scheduled, vec![old_trash_path.clone()]);
+
+        let recaptured = recaptured.expect("the orphan scan must recapture old trash");
+        let error = match recaptured
+            .purge_slice(16, Duration::from_secs(1), CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an interrupted nested isolation must stop automatic purge"),
+        };
+        let (quarantined, source) = error.into_parts();
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!old_trash_path.exists());
+        assert_eq!(
+            classify_internal_name(quarantined.name.to_str().unwrap()),
+            Some(InternalEntryName::Quarantine)
+        );
+        let quarantined_root = temp.path().join(&quarantined.name);
+        assert_eq!(
+            std::fs::read(quarantined_root.join(nested_quarantine_name))?,
+            b"externally replaced occupant"
         );
         Ok(())
     }

@@ -551,6 +551,12 @@ impl TrashEntry {
                     .cursor = next_cursor;
                 continue;
             }
+            if is_quarantine_entry_name(&name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trash tree contains an isolated entry from an interrupted purge",
+                ));
+            }
             examined += 1;
             let directory_fd = directory
                 .as_ref()
