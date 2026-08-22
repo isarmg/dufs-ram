@@ -169,7 +169,12 @@ export function createUploadManager(options) {
   let pendingRows = 0;
   let nextIndex = 0;
   let nextBatchId = 0;
-  /** @type {Map<number, Set<Uploader>>} */
+  /** @type {Map<number, {
+   *   members: Set<Uploader>,
+   *   enqueueComplete: boolean,
+   *   cancelRequested: boolean,
+   *   remainingEntries: number,
+   * }>} */
   const batches = new Map();
   let cancellingBatch = false;
   /** @type {"running" | "paused-auth" | "paused-unknown"} */
@@ -222,8 +227,10 @@ export function createUploadManager(options) {
     knownTargets.delete(uploader.name);
     uploader.terminalHistoryEntry = entry;
     const batch = batches.get(uploader.batchId);
-    batch?.delete(uploader);
-    if (batch?.size === 0) batches.delete(uploader.batchId);
+    batch?.members.delete(uploader);
+    if (batch?.enqueueComplete && batch.members.size === 0) {
+      batches.delete(uploader.batchId);
+    }
     terminalHistory.add(entry);
     renderHistoryStatus();
   }
@@ -803,10 +810,11 @@ export function createUploadManager(options) {
     cancelRemainingBatch() {
       const batch = batches.get(this.batchId);
       if (!batch) return;
-      let cancelled = 0;
+      let cancelled = batch.cancelRequested ? 0 : batch.remainingEntries;
+      batch.cancelRequested = true;
       cancellingBatch = true;
       try {
-        for (const uploader of [...batch]) {
+        for (const uploader of [...batch.members]) {
           if (uploader === this || uploader.state !== "queued") continue;
           uploader.cancel();
           cancelled++;
@@ -1450,8 +1458,12 @@ export function createUploadManager(options) {
     pendingRows += uploadEntries.length;
 
     const batchId = nextBatchId++;
-    /** @type {Set<Uploader>} */
-    const batch = new Set();
+    const batch = {
+      members: new Set(),
+      enqueueComplete: false,
+      cancelRequested: false,
+      remainingEntries: uploadEntries.length,
+    };
     batches.set(batchId, batch);
 
     const notices = [];
@@ -1474,19 +1486,28 @@ export function createUploadManager(options) {
     }
 
     let processed = 0;
-    for (const entry of uploadEntries) {
-      const uploader = new Uploader(
-        entry.file,
-        entry.name,
-        entry.revision,
-        batchId,
-      );
-      uploader.pendingAccounted = true;
-      knownTargets.add(entry.name);
-      batch.add(uploader);
-      uploader.enqueue();
-      processed++;
-      if (processed % ENQUEUE_BATCH_SIZE === 0) await yieldToBrowser();
+    try {
+      for (const entry of uploadEntries) {
+        if (batch.cancelRequested) break;
+        const uploader = new Uploader(
+          entry.file,
+          entry.name,
+          entry.revision,
+          batchId,
+        );
+        uploader.pendingAccounted = true;
+        knownTargets.add(entry.name);
+        batch.members.add(uploader);
+        uploader.enqueue();
+        batch.remainingEntries--;
+        processed++;
+        if (processed % ENQUEUE_BATCH_SIZE === 0) await yieldToBrowser();
+      }
+    } finally {
+      pendingRows = Math.max(0, pendingRows - batch.remainingEntries);
+      batch.remainingEntries = 0;
+      batch.enqueueComplete = true;
+      if (batch.members.size === 0) batches.delete(batchId);
     }
   }
 

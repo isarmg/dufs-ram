@@ -113,6 +113,106 @@ test("预检发现的批量冲突只确认一次且确认前不发送 PUT", asyn
   await expect(dialog).toBeHidden();
 });
 
+test("大批次提交时取消会覆盖尚未创建 DOM 行的尾部文件", async ({
+  appPage: page,
+}) => {
+  const fileNames = Array.from(
+    { length: 51 },
+    (_, index) => `cancel-batch-${String(index).padStart(2, "0")}.txt`,
+  );
+  const putNames = [];
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    const { paths } = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        targets: paths.map(path => ({
+          path,
+          exists: false,
+          revision: null,
+          replaceable: true,
+        })),
+      }),
+    });
+  });
+  await page.route("**/cancel-batch-*.txt", async route => {
+    const request = route.request();
+    const name = new URL(request.url()).pathname.split("/").pop();
+    putNames.push(name);
+    if (name === fileNames[0]) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/problem+json",
+        headers: {
+          ...protocolHeaders(request, "not-started"),
+          "X-Dufs-Target-Revision": "5".repeat(64),
+          "X-Dufs-Target-Replaceable": "true",
+        },
+        body: problemDetails(
+          409,
+          "destination_exists",
+          "Destination appeared while the batch was entering the DOM",
+          "refresh_target",
+        ),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 201,
+      headers: protocolHeaders(request, "committed", "length"),
+      body: "",
+    });
+  });
+
+  // Hold the first enqueue yield after 50 rows. The first upload may resolve
+  // and offer Cancel remaining while the 51st logical batch entry has not yet
+  // been represented by an Uploader or DOM row.
+  await page.evaluate(() => {
+    const requestFrame = window.requestAnimationFrame.bind(window);
+    window.__dufsBatchFrameReady = false;
+    window.__dufsBatchFrameSettled = false;
+    window.requestAnimationFrame = callback => {
+      window.__dufsBatchFrameReady = true;
+      window.__dufsReleaseBatchFrame = () => {
+        window.requestAnimationFrame = requestFrame;
+        requestFrame(timestamp => {
+          callback(timestamp);
+          window.setTimeout(() => {
+            window.__dufsBatchFrameSettled = true;
+          }, 0);
+        });
+      };
+      return 2_147_483_647;
+    };
+  });
+
+  await selectFiles(page, "#file", fileNames.map(name => ({
+    name,
+    buffer: Buffer.from(name),
+  })));
+  await page.waitForFunction(() => window.__dufsBatchFrameReady === true);
+  const changed = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await expect(changed).toBeVisible();
+  await changed.getByRole("button", {
+    name: "Cancel remaining",
+    exact: true,
+  }).click();
+  await page.evaluate(() => window.__dufsReleaseBatchFrame());
+  await page.waitForFunction(() => window.__dufsBatchFrameSettled === true);
+
+  await expect(page.locator(".upload-status")).toHaveCount(50);
+  await expect(page.locator('.upload-status[aria-label$="upload cancelled"]'))
+    .toHaveCount(49);
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "Cancelled 50 remaining queued uploads",
+  );
+  expect(putNames).toEqual([fileNames[0]]);
+});
+
 test("目录选择中的嵌套目标即使不在当前 DOM 也由预检识别", async ({
   appPage: page,
 }) => {
