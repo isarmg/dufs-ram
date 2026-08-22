@@ -820,6 +820,68 @@ test("文件夹默认名仅在可信冲突后递增且每个候选使用新操�
   expect(new Set(requests.map(request => request.operationId)).size).toBe(3);
 });
 
+test("job 中错误状态的 path_exists 不得递增文件夹默认名", async ({
+  appPage: page,
+}) => {
+  const requests = [];
+  let statusQueries = 0;
+  await page.route("**/__dufs__/api/mkdir", route => {
+    requests.push(route.request().postDataJSON());
+    if (requests.length > 1) {
+      return fulfillTrackedFailure(
+        route,
+        500,
+        "unexpected_second_attempt",
+        "A second candidate must not be attempted",
+      );
+    }
+    const operationId = route.request().headers()["x-dufs-operation-id"];
+    return route.fulfill({
+      status: 500,
+      contentType: "application/problem+json",
+      headers: {
+        "X-Dufs-Operation-Id": operationId,
+        "X-Dufs-Operation-State": "unknown",
+      },
+      body: JSON.stringify({
+        type: "urn:dufs:problem:outcome_uncertain",
+        title: "Internal server error",
+        status: 500,
+        code: "outcome_uncertain",
+        detail: "The create result must be reconciled",
+        recovery: "query_job",
+      }),
+    });
+  });
+  await page.route("**/__dufs__/api/jobs/*", route => {
+    statusQueries++;
+    const operationId = new URL(route.request().url()).pathname.split("/").pop();
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: {
+        "X-Dufs-Operation-Id": operationId,
+        "X-Dufs-Operation-State": "failed",
+      },
+      body: JSON.stringify({
+        job_id: operationId,
+        state: "failed",
+        http_status: 500,
+        code: "path_exists",
+        detail: "The server failed without proving a name conflict",
+      }),
+    });
+  });
+
+  await page.getByRole("button", { name: "New folder" }).click();
+  await expect(actionDialog(page, "Create folder failed")).toBeVisible();
+  expect(requests).toEqual([
+    { path: `${currentDirectoryPath(page)}/newfolder` },
+  ]);
+  expect(statusQueries).toBe(1);
+  await expect(inlineNameInput(page)).toHaveCount(0);
+});
+
 test("两种新建共享单一 pending，快速连点不会并发创建或覆盖编辑器", async ({
   appPage: page,
 }) => {
@@ -1043,6 +1105,52 @@ test("空文件 rejected 冲突无需 discard 即可用新 ID 尝试下一候选
   expect(puts[1].uploadId).toMatch(UUID_V4_PATTERN);
   expect(puts[1].uploadId).not.toBe(puts[0].uploadId);
   expect(discards).toBe(0);
+});
+
+test("HTTP 500 的 destination_exists 不得递增空文件默认名", async ({
+  appPage: page,
+}) => {
+  const puts = [];
+  let discards = 0;
+  await page.route("**/newfile*", route => {
+    const request = route.request();
+    if (request.method() !== "PUT") return route.continue();
+    const uploadId = request.headers()["x-dufs-upload-id"];
+    puts.push(decodeURIComponent(new URL(request.url()).pathname));
+    const firstAttempt = puts.length === 1;
+    const status = firstAttempt ? 500 : 507;
+    const code = firstAttempt
+      ? "destination_exists"
+      : "unexpected_second_attempt";
+    return route.fulfill({
+      status,
+      contentType: "application/problem+json",
+      headers: {
+        "X-Dufs-Upload-Id": uploadId,
+        "X-Dufs-Upload-Length": "0",
+        "X-Dufs-Operation-State": "rejected",
+      },
+      body: JSON.stringify({
+        type: `urn:dufs:problem:${code}`,
+        title: "Upload rejected",
+        status,
+        code,
+        detail: firstAttempt
+          ? "The server failed without proving a destination conflict"
+          : "A second candidate must not be attempted",
+      }),
+    });
+  });
+  await page.route("**/__dufs__/api/upload/discard", route => {
+    discards++;
+    return route.fulfill({ status: 500, body: "unexpected discard" });
+  });
+
+  await page.getByRole("button", { name: "New empty file" }).click();
+  await expect(actionDialog(page, "Create file failed")).toBeVisible();
+  expect(puts).toEqual([`${currentDirectoryPath(page)}/newfile`]);
+  expect(discards).toBe(0);
+  await expect(inlineNameInput(page)).toHaveCount(0);
 });
 
 test("新建文件夹 outcome unknown 时不尝试下一个候选名", async ({
@@ -1513,6 +1621,45 @@ test("重命名冲突缺少目标 revision 时拒绝覆盖确认", async ({
 
   await expect(actionDialog(page, "Rename failed")).toContainText(
     "The target name is occupied",
+  );
+  await expect(actionDialog(page, "Overwrite destination?")).toBeHidden();
+  expect(renameRequests).toBe(1);
+});
+
+test("HTTP 500 的 destination_exists 不得授权重命名覆盖", async ({
+  appPage: page,
+}) => {
+  let renameRequests = 0;
+  await page.route("**/__dufs__/api/rename", route => {
+    renameRequests++;
+    const operationId = route.request().headers()["x-dufs-operation-id"];
+    return route.fulfill({
+      status: 500,
+      contentType: "application/problem+json",
+      headers: {
+        "X-Dufs-Operation-Id": operationId,
+        "X-Dufs-Operation-State": "failed",
+        "X-Dufs-Target-Revision": "a".repeat(64),
+      },
+      body: JSON.stringify({
+        type: "urn:dufs:problem:destination_exists",
+        title: "Internal server error",
+        status: 500,
+        detail: "The server failed without proving a destination conflict",
+        code: "destination_exists",
+      }),
+    });
+  });
+
+  await rowByName(page, "overwrite-source.txt")
+    .getByRole("button", { name: "Rename overwrite-source.txt" })
+    .click();
+  const input = inlineNameInput(page);
+  await input.fill("overwrite-target.txt");
+  await input.press("Enter");
+
+  await expect(actionDialog(page, "Rename failed")).toContainText(
+    "The server failed without proving a destination conflict",
   );
   await expect(actionDialog(page, "Overwrite destination?")).toBeHidden();
   expect(renameRequests).toBe(1);

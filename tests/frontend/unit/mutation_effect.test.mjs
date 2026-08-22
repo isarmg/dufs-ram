@@ -75,7 +75,55 @@ test("mutation invalidation distinguishes committed, unknown, and rejected write
       trackedMutationEffect({ kind: "failed", error: stale, status: null }),
       MUTATION_EFFECT.REFRESH_REQUIRED,
     );
+
+    const wrongStatus = new RequestError("mislabelled server error", {
+      status: 500,
+      problemStatus: 500,
+      code,
+      operationState: "failed",
+    });
+    assert.equal(
+      trackedMutationEffect({
+        kind: "failed",
+        error: wrongStatus,
+        status: null,
+      }),
+      MUTATION_EFFECT.NOT_COMMITTED,
+    );
+    assert.equal(
+      trackedMutationEffect({
+        kind: "failed",
+        error: unknown,
+        status: {
+          kind: "failed",
+          jobId: uploadId,
+          state: "failed",
+          status: 500,
+          code,
+          message: "mislabelled server error",
+          authenticationFailed: false,
+        },
+      }),
+      MUTATION_EFFECT.NOT_COMMITTED,
+    );
   }
+  const contradictoryProblemStatus = new RequestError(
+    "contradictory problem status",
+    {
+      status: 412,
+      problemStatus: 500,
+      code: "source_changed",
+      operationState: "failed",
+    },
+  );
+  assert.equal(
+    trackedMutationEffect({
+      kind: "failed",
+      error: contradictoryProblemStatus,
+      status: null,
+    }),
+    MUTATION_EFFECT.NOT_COMMITTED,
+  );
   const preDispatch = new RequestError("cancelled before dispatch", {
     outcomeUnknown: false,
   });
