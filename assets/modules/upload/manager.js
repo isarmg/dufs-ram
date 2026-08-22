@@ -323,7 +323,6 @@ export function createUploadManager(options) {
       this.logicalPath = logicalChildPath(data.href, this.name);
       this.targetRevision = targetRevision;
       this.missingTargetRetryUsed = false;
-      this.targetChangeInvalidated = false;
       this.batchId = batchId;
       this.uploadId = crypto.randomUUID();
       this.uploadOffset = 0;
@@ -566,8 +565,7 @@ export function createUploadManager(options) {
     }
 
     invalidateTargetChange() {
-      if (this.state !== "running" || this.targetChangeInvalidated) return;
-      this.targetChangeInvalidated = true;
+      if (this.state !== "running") return;
       onMutation(MUTATION_EFFECT.REFRESH_REQUIRED);
     }
 
