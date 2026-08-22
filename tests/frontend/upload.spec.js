@@ -170,17 +170,18 @@ test("大批次提交时取消会覆盖尚未创建 DOM 行的尾部文件", asy
   // been represented by an Uploader or DOM row.
   await page.evaluate(() => {
     const requestFrame = window.requestAnimationFrame.bind(window);
+    let captured = false;
     window.__dufsBatchFrameReady = false;
     window.__dufsBatchFrameSettled = false;
     window.requestAnimationFrame = callback => {
+      if (captured) return requestFrame(callback);
+      captured = true;
       window.__dufsBatchFrameReady = true;
       window.__dufsReleaseBatchFrame = () => {
         window.requestAnimationFrame = requestFrame;
-        requestFrame(timestamp => {
-          callback(timestamp);
-          window.setTimeout(() => {
-            window.__dufsBatchFrameSettled = true;
-          }, 0);
+        callback(window.performance.now());
+        window.queueMicrotask(() => {
+          window.__dufsBatchFrameSettled = true;
         });
       };
       return 2_147_483_647;
@@ -207,15 +208,17 @@ test("大批次提交时取消会覆盖尚未创建 DOM 行的尾部文件", asy
     name: "Cancel remaining",
     exact: true,
   }).click();
+  // Clicking closes the dialog before the awaiting upload necessarily resumes.
+  // Observe the cancellation side effect before releasing the held enqueue.
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "Cancelled 50 remaining queued uploads",
+  );
   await page.evaluate(() => window.__dufsReleaseBatchFrame());
   await page.waitForFunction(() => window.__dufsBatchFrameSettled === true);
 
   await expect(page.locator(".upload-status")).toHaveCount(50);
   await expect(page.locator('.upload-status[aria-label$="upload cancelled"]'))
     .toHaveCount(49);
-  await expect(page.locator(".upload-queue-message")).toContainText(
-    "Cancelled 50 remaining queued uploads",
-  );
   expect(putNames).toEqual([fileNames[0]]);
 });
 
