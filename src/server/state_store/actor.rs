@@ -133,8 +133,11 @@ impl StoreWorker {
                 Command::ListExpiredUploadSessions { limit, reply } => {
                     let _ = reply.send(self.expired_upload_sessions(limit));
                 }
-                Command::RemoveUploadSession { key, reply } => {
-                    let _ = reply.send(self.remove_upload_session(key));
+                Command::RemoveUploadSessionIfMatches { expected, reply } => {
+                    let _ = reply.send(self.remove_upload_session_if_matches(&expected));
+                }
+                Command::RemoveExpiredUploadSessionIfMatches { expected, reply } => {
+                    let _ = reply.send(self.remove_expired_upload_session_if_matches(&expected));
                 }
                 Command::PreparePurgeJob { job, reply } => {
                     let _ = reply.send(self.prepare_purge_job(&job));

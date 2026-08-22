@@ -59,10 +59,7 @@ impl StoreWorker {
                 (StoreUploadSession::Inserted, proposed.clone())
             }
             Some(existing) => match merge_upload_session(&existing, proposed) {
-                Some(stored) if stored == existing => {
-                    transaction.commit()?;
-                    return Ok(StoreUploadSession::Unchanged);
-                }
+                Some(stored) if stored == existing => (StoreUploadSession::Unchanged, stored),
                 Some(stored) => (StoreUploadSession::Updated, stored),
                 None => {
                     transaction.commit()?;
@@ -127,11 +124,49 @@ impl StoreWorker {
         )
     }
 
-    pub(super) fn remove_upload_session(&mut self, key: UploadSessionKey) -> Result<bool> {
-        Ok(self.connection.execute(
+    pub(super) fn remove_upload_session_if_matches(
+        &mut self,
+        expected: &StoredUploadSession,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if load_upload_session(&transaction, expected.key)?.as_ref() != Some(expected) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let removed = transaction.execute(
             "DELETE FROM upload_sessions WHERE owner_digest = ?1 AND upload_id = ?2",
-            params![key.owner.as_slice(), key.id.as_slice()],
-        )? == 1)
+            params![expected.key.owner.as_slice(), expected.key.id.as_slice()],
+        )?;
+        ensure!(removed == 1, "Upload removal lost its locked session row");
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(super) fn remove_expired_upload_session_if_matches(
+        &mut self,
+        expected: &StoredUploadSession,
+    ) -> Result<bool> {
+        let now = now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if load_upload_session(&transaction, expected.key)?.as_ref() != Some(expected) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let removed = transaction.execute(
+            "DELETE FROM upload_sessions
+              WHERE owner_digest = ?1 AND upload_id = ?2 AND expires_at_ms <= ?3",
+            params![
+                expected.key.owner.as_slice(),
+                expected.key.id.as_slice(),
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(removed == 1)
     }
 }
 

@@ -278,8 +278,12 @@ enum Command {
         limit: i64,
         reply: oneshot::Sender<Result<Vec<StoredUploadSession>>>,
     },
-    RemoveUploadSession {
-        key: UploadSessionKey,
+    RemoveUploadSessionIfMatches {
+        expected: StoredUploadSession,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    RemoveExpiredUploadSessionIfMatches {
+        expected: StoredUploadSession,
         reply: oneshot::Sender<Result<bool>>,
     },
     PreparePurgeJob {
@@ -632,9 +636,23 @@ impl StateStore {
         self.receive(receiver).await
     }
 
-    pub(super) async fn remove_upload_session(&self, key: UploadSessionKey) -> Result<bool> {
+    pub(super) async fn remove_upload_session_if_matches(
+        &self,
+        expected: StoredUploadSession,
+    ) -> Result<bool> {
+        expected.validate()?;
         let (reply, receiver) = oneshot::channel();
-        self.send(Command::RemoveUploadSession { key, reply })?;
+        self.send(Command::RemoveUploadSessionIfMatches { expected, reply })?;
+        self.receive(receiver).await
+    }
+
+    pub(super) async fn remove_expired_upload_session_if_matches(
+        &self,
+        expected: StoredUploadSession,
+    ) -> Result<bool> {
+        expected.validate()?;
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::RemoveExpiredUploadSessionIfMatches { expected, reply })?;
         self.receive(receiver).await
     }
 

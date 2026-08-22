@@ -362,7 +362,13 @@ impl UploadRecordStore {
         if let Some(identity) = session.stage_identity {
             self.remove_file_if_identity(stage_path, identity).await?;
         }
-        self.state_store.remove_upload_session(key).await?;
+        if !self
+            .state_store
+            .remove_upload_session_if_matches(session)
+            .await?
+        {
+            return Err(UploadRecordStoreError::Conflict.into());
+        }
         Ok(())
     }
 

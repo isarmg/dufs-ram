@@ -477,8 +477,79 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
         owner: [3; 32],
         id: [3; 16],
     };
-    assert!(store.remove_upload_session(replacement_key).await?);
-    assert!(!store.remove_upload_session(replacement_key).await?);
+    let replacement = store
+        .upload_session(replacement_key)
+        .await?
+        .expect("the capacity replacement session is missing");
+    assert!(
+        store
+            .remove_upload_session_if_matches(replacement.clone())
+            .await?
+    );
+    assert!(!store.remove_upload_session_if_matches(replacement).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
+    let original = upload(9, 9, 0);
+    assert_eq!(
+        store.save_upload_session(original.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+
+    let mut newer = original.clone();
+    newer.durable_offset = 4;
+    newer.stage_identity = Some(StoredFileIdentity {
+        device: 41,
+        inode: 42,
+    });
+    assert_eq!(
+        store.save_upload_session(newer.clone(), TTL).await?,
+        StoreUploadSession::Updated
+    );
+    assert!(
+        !store.remove_upload_session_if_matches(original).await?,
+        "a stale maintenance snapshot removed a newer upload row"
+    );
+    assert_eq!(store.upload_session(newer.key).await?, Some(newer.clone()));
+    assert!(
+        store
+            .remove_upload_session_if_matches(newer.clone())
+            .await?
+    );
+    assert_eq!(store.upload_session(newer.key).await?, None);
+
+    let refreshed = upload(10, 10, 0);
+    assert_eq!(
+        store
+            .save_upload_session(refreshed.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Inserted
+    );
+    let expired_snapshot = store
+        .expired_upload_sessions(8)
+        .await?
+        .into_iter()
+        .find(|session| session.key == refreshed.key)
+        .expect("the zero-TTL upload was not visible to maintenance");
+    assert_eq!(expired_snapshot, refreshed);
+    assert_eq!(
+        store.save_upload_session(refreshed.clone(), TTL).await?,
+        StoreUploadSession::Unchanged
+    );
+    assert!(
+        !store
+            .remove_expired_upload_session_if_matches(expired_snapshot)
+            .await?,
+        "an old expiry scan removed the same business snapshot after its TTL was refreshed"
+    );
+    assert_eq!(
+        store.upload_session(refreshed.key).await?,
+        Some(refreshed.clone())
+    );
+    assert!(store.remove_upload_session_if_matches(refreshed).await?);
     Ok(())
 }
 
