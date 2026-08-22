@@ -340,6 +340,97 @@ test("可信普通冲突选择 Skip 时使列表失效且不覆盖", async ({
   ).toBe("downloaded by browser test");
 });
 
+test("刷新后再次收到可信上传冲突时会重新使列表失效", async ({
+  appPage: page,
+}) => {
+  const revisions = ["7".repeat(64), "6".repeat(64)];
+  const requests = [];
+  let releaseSecond;
+  let markSecondStarted;
+  const secondGate = new Promise(resolve => {
+    releaseSecond = resolve;
+  });
+  const secondStarted = new Promise(resolve => {
+    markSecondStarted = resolve;
+  });
+  await page.route("**/download-me.txt", async route => {
+    const request = route.request();
+    if (request.method() !== "PUT") {
+      await route.continue();
+      return;
+    }
+    const requestIndex = requests.length;
+    requests.push({
+      overwrite: request.headers()["x-dufs-upload-overwrite"],
+      revision: request.headers()["x-dufs-target-revision"] || null,
+    });
+    if (requestIndex === 1) {
+      markSecondStarted();
+      await secondGate;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/problem+json",
+      headers: {
+        ...protocolHeaders(request, "not-started"),
+        "X-Dufs-Target-Revision": revisions[requestIndex],
+        "X-Dufs-Target-Replaceable": "true",
+      },
+      body: problemDetails(
+        409,
+        "destination_exists",
+        "Destination changed after the last observation",
+        "refresh_target",
+      ),
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "download-me.txt",
+    buffer: Buffer.from("must not replace either observed destination"),
+  }]);
+  await page.getByRole("dialog", {
+    name: "Existing upload destinations",
+    exact: true,
+  }).getByRole("button", { name: "Overwrite", exact: true }).click();
+
+  const changed = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await expect(changed).toBeVisible();
+  await changed.getByRole("button", { name: "Overwrite", exact: true }).click();
+  await secondStarted;
+
+  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  await expect(refresh).toBeVisible();
+  await refresh.click();
+  await expect(refresh).toBeHidden();
+  await expect(page.locator(".list-status")).not.toContainText(
+    "The folder snapshot is stale",
+  );
+
+  releaseSecond();
+  await expect(changed).toBeVisible();
+  await expect(refresh).toBeVisible();
+  await expect(page.locator(".list-status")).toContainText(
+    "The folder snapshot is stale",
+  );
+  await changed.getByRole("button", { name: "Skip file", exact: true }).click();
+
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "download-me.txt: skipped because the destination exists",
+  );
+  expect(requests).toHaveLength(2);
+  expect(requests[0].revision).toMatch(/^[0-9a-f]{64}$/);
+  expect(requests[0].revision).not.toBe(revisions[0]);
+  expect(requests[1]).toEqual({
+    overwrite: "true",
+    revision: revisions[0],
+  });
+});
+
 test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", async ({
   appPage: page,
 }) => {
