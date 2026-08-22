@@ -113,7 +113,7 @@ mod sqlite_cleanup_tests {
         let mut keys = Vec::new();
         for index in 0..3 {
             let upload_id = Uuid::new_v4();
-            let target = temp.path().join(format!("terminal-{index}.bin"));
+            let target = temp.path().join(format!("running-{index}.bin"));
             let stage = upload_temp_path(&target, upload_id)?;
             let session = stored_session(
                 &rooted_fs,
@@ -121,7 +121,11 @@ mod sqlite_cleanup_tests {
                 upload_id,
                 &target,
                 &stage,
-                StoredUploadState::Committed,
+                // A running row is not opportunistically reaped while a later
+                // session is saved. This keeps the test about maintenance
+                // pagination even when coverage instrumentation makes each
+                // actor/SQLite round trip exceed the short fixture TTL.
+                StoredUploadState::Running,
                 None,
             );
             keys.push(session.key);
@@ -129,8 +133,9 @@ mod sqlite_cleanup_tests {
                 store.save_upload_session(session, EXPIRED_TTL).await?,
                 StoreUploadSession::Inserted
             );
+            expire().await;
         }
-        expire().await;
+        assert_eq!(store.expired_upload_sessions(8).await?.len(), 3);
 
         let first = cleanup_expired_upload_sessions_batch(
             &rooted_fs,
