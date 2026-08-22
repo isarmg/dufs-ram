@@ -293,7 +293,7 @@ export async function assertResponse(response, onUnauthorized) {
 /**
  * Accept only the terminal envelope emitted after a staged upload is
  * discarded. Cleanup is successful only when the response is bound to the
- * expected upload and includes the server's durable offset.
+ * expected upload and confirms the complete staged length was discarded.
  *
  * @param {Response} response
  * @param {string} expectedUploadId
@@ -319,7 +319,7 @@ export async function assertDiscardUploadResponse(
   }
   if (
     classification.kind === "rejected" &&
-    Number.isSafeInteger(classification.protocol?.offset)
+    classification.protocol?.offset === expectedLength
   ) {
     return response;
   }

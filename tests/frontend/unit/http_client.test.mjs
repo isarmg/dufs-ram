@@ -12,7 +12,7 @@ test("discard accepts only a bound 204 rejected upload envelope", async () => {
   const validHeaders = {
     "x-dufs-upload-id": uploadId,
     "x-dufs-upload-length": "8",
-    "x-dufs-upload-offset": "4",
+    "x-dufs-upload-offset": "8",
     "x-dufs-operation-state": "rejected",
   };
   const valid = new Response(null, { status: 204, headers: validHeaders });
@@ -42,6 +42,13 @@ test("discard accepts only a bound 204 rejected upload envelope", async () => {
       headers: {
         ...validHeaders,
         "x-dufs-upload-length": "9",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        ...validHeaders,
+        "x-dufs-upload-offset": "4",
       },
     }),
     new Response(null, {

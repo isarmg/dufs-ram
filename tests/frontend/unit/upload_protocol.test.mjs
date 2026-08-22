@@ -111,6 +111,12 @@ test("upload response classifier enforces the phase status-state matrix", () => 
     state: "rejected",
     offset: null,
   }).kind, "invalid");
+  assert.equal(classify({
+    phase: "discard",
+    status: 204,
+    state: "rejected",
+    offset: "4",
+  }).kind, "invalid");
 });
 
 test("upload preflight binds ordered paths to typed target revisions", () => {
@@ -213,7 +219,7 @@ function classify(options) {
     : options.length;
   const offset = options.offset === undefined
     ? options.phase === "discard" && options.state === "rejected"
-      ? "4"
+      ? "8"
       : stateFields.offset
     : options.offset;
   const values = new Map([
