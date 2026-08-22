@@ -84,6 +84,11 @@ fn verify_embedded_assets(server: &TestServer) -> Result<(), Error> {
             "application/javascript; charset=UTF-8",
         ),
         (
+            "modules/shared/index_data.js",
+            format!("{asset_prefix}modules/shared/index_data.js"),
+            "application/javascript; charset=UTF-8",
+        ),
+        (
             "modules/shared/mutation_effect.js",
             format!("{asset_prefix}modules/shared/mutation_effect.js"),
             "application/javascript; charset=UTF-8",
