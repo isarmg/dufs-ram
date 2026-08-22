@@ -787,6 +787,36 @@ test("新建空文件立即 PUT newfile 并进入原位编辑", async ({
   await expect(rowByName(page, "newfile")).toBeVisible();
 });
 
+test("新建完成时清除并发启动的旧行编辑器", async ({ appPage: page }) => {
+  let releasePreflight;
+  let markPreflightStarted;
+  const preflightGate = new Promise(resolve => {
+    releasePreflight = resolve;
+  });
+  const preflightStarted = new Promise(resolve => {
+    markPreflightStarted = resolve;
+  });
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    markPreflightStarted();
+    await preflightGate;
+    await fulfillCreatedItemPreflight(route);
+  });
+
+  await page.getByRole("button", { name: "New empty file" }).click();
+  await preflightStarted;
+  await rowByName(page, "rename-me.txt")
+    .getByRole("button", { name: "Rename rename-me.txt" })
+    .click();
+  await expect(inlineNameInput(page)).toHaveValue("rename-me.txt");
+
+  releasePreflight();
+  await expect(inlineNameInput(page)).toHaveCount(1);
+  await expect(inlineNameInput(page)).toHaveValue("newfile");
+  await expect(inlineNameInput(page)).toBeFocused();
+  await expect(rowByName(page, "rename-me.txt")).toBeVisible();
+  await expect(page.locator(".paths-table tbody tr.is-renaming")).toHaveCount(1);
+});
+
 for (const [label, createdName] of [
   ["New folder", "newfolder"],
   ["New empty file", "newfile"],
