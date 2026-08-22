@@ -158,6 +158,8 @@ fn verify_embedded_assets(server: &TestServer) -> Result<(), Error> {
         let contents = response.bytes()?;
         digest.update((name.len() as u64).to_be_bytes());
         digest.update(name.as_bytes());
+        digest.update((expected_content_type.len() as u64).to_be_bytes());
+        digest.update(expected_content_type.as_bytes());
         digest.update((contents.len() as u64).to_be_bytes());
         digest.update(&contents);
     }
