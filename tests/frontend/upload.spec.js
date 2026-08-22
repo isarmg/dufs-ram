@@ -191,7 +191,13 @@ test("大批次提交时取消会覆盖尚未创建 DOM 行的尾部文件", asy
     name,
     buffer: Buffer.from(name),
   })));
-  await page.waitForFunction(() => window.__dufsBatchFrameReady === true);
+  // This test deliberately intercepts requestAnimationFrame. Use timer polling
+  // so Playwright's waiter cannot consume the frame that the batch owns.
+  await page.waitForFunction(
+    () => window.__dufsBatchFrameReady === true,
+    undefined,
+    { polling: 25 },
+  );
   const changed = page.getByRole("dialog", {
     name: "Upload destination changed",
     exact: true,
