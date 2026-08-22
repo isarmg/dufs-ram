@@ -496,6 +496,10 @@ export function createDirectoryListing(options) {
    */
   function addCreatedItem(file) {
     const item = validateCreatedItem(file);
+    const hadInlineEditor = activeEditor !== null ||
+      tableBody.querySelector(
+        ".inline-name-input, .inline-name-error, .is-renaming",
+      ) !== null;
     activeEditor = null;
     table.classList.remove("has-inline-editor");
     const staleIndex = items.findIndex(candidate => candidate?.name === item.name);
@@ -503,7 +507,8 @@ export function createDirectoryListing(options) {
     const renderedRowIndices = renderedRows.map(
       row => Number(row.id.match(/^addPath(\d+)$/)?.[1] ?? Number.NaN),
     );
-    const canPrepend = staleIndex < 0 && renderedStart === 0 &&
+    const canPrepend = !hadInlineEditor && staleIndex < 0 &&
+      renderedStart === 0 &&
       new Set(renderedRowIndices).size === renderedRowIndices.length &&
       renderedRowIndices.every((index, position) =>
         Number.isSafeInteger(index) &&
