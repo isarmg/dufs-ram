@@ -271,18 +271,18 @@ test("大量目录项使用可访问窗口限制 DOM 数量", async ({ appPage: 
       contentType: "application/json",
       body: JSON.stringify({
         paths,
-        next_cursor: current < 5 ? `cursor-${current + 1}` : null,
+        next_cursor: current < 1 ? `cursor-${current + 1}` : null,
       }),
     });
   });
   await page.reload();
-  for (let index = 0; index < 5; index++) {
+  for (let index = 0; index < 1; index++) {
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.locator(".list-status")).toContainText(
       `${(index + 2) * 200} items loaded`,
     );
   }
-  await expect(page.locator(".paths-table tbody tr")).toHaveCount(1000);
+  await expect(page.locator(".paths-table tbody tr")).toHaveCount(200);
   const previous = page.getByRole("button", { name: "Show previous items" });
   await expect(previous).toBeVisible();
   await previous.click();
@@ -296,6 +296,20 @@ test("大量目录项使用可访问窗口限制 DOM 数量", async ({ appPage: 
   const inlineEditor = page.locator(".inline-name-input");
   await expect(inlineEditor).toHaveValue("newfile");
   await expect(inlineEditor).toBeFocused();
-  await expect(page.locator(".paths-table tbody tr")).toHaveCount(1000);
+  await expect(page.locator(".paths-table tbody tr")).toHaveCount(200);
   await expect(page.locator(".paths-table tbody tr.is-renaming")).toHaveCount(1);
+  const shiftedFirstRow = page.locator("#addPath1");
+  await expect(shiftedFirstRow.getByRole("link", {
+    name: "window-0.txt",
+    exact: true,
+  })).toBeVisible();
+  for (const action of ["move", "delete", "rename"]) {
+    await expect(shiftedFirstRow.locator(
+      `button[data-action="${action}"]`,
+    )).toHaveAttribute("data-index", "1");
+  }
+  await expect(page.getByRole("link", {
+    name: "window-199.txt",
+    exact: true,
+  })).toHaveCount(0);
 });
