@@ -144,7 +144,7 @@ https://files.example.com/
 
 首屏构造期间，直接列表会前后复核当前目录；递归搜索会复核每个即将访问的目录，并在完成后再次复核所有访问过的目录。目录在这些检查间发生可观察变化时返回可重试的 `409`，前端会丢弃已加载页并从第一页重载。该机制只能检测遍历期间的目录身份/元数据变化，并不等于文件系统原子快照：检查间发生又恢复的变化、未反映到目录元数据的文件内容变化，以及最终复核后的变化仍可能不可见。需要文件系统级强一致导出时，应从只读存储快照或等价的版本化源生成结果。
 
-Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理共享根内的所有普通文件和目录；Dufs 自身使用的上传暂存、上传状态及删除回收项属于内部保留项，仍不会显示，也不能通过普通浏览器路径访问。
+Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理共享根内的所有普通文件和目录；Dufs 自身使用的上传暂存及删除回收项属于内部保留项，仍不会显示，也不能通过普通浏览器路径访问。上传控制状态只存在共享根外的 SQLite state store 中，不对应共享根内的状态文件。
 
 ### 上传与续传
 
@@ -152,24 +152,24 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 - `Upload folder` 按钮会保留所选目录中的相对路径，但不会创建空目录；
 - 单次选择最多接受 512 个文件和合计 256 KiB 的 UTF-8 逻辑路径；当前页最多保留 512 个等待或执行中的任务，队列支持常数时间取消，完成/失败/未知/取消历史只保留最近 200 行并报告被隐藏的旧结果，避免大批选择无界占用 DOM 和内存；
 - 入队前会对这一批最终绝对逻辑路径做有界预检；没有重名时直接上传，只有已存在且初步符合替换条件的目标才询问是否覆盖，不可替换的目标会明确跳过；`replaceable` 只是低成本提示，完整 metadata/xattr 检查仍可能在提交前拒绝；
-- 预检不是提交锁。新建默认使用原子 no-replace，已确认覆盖则绑定预检返回的不透明 target revision；真正发布时目标若新出现或发生变化，服务端会保留已同步的 stage，页面只对该文件再次询问“覆盖、跳过或取消后续队列”；确认覆盖使用同一 upload ID 的空 PATCH 发布 stage，不重传文件数据；
+- 预检不是提交锁。新建默认使用原子 no-replace，已确认覆盖则绑定预检返回的不透明 target revision；真正发布时目标若新出现或发生变化，服务端会保留已同步的 stage，页面只对该文件再次询问“覆盖、跳过或取消后续队列”；确认覆盖使用同一 upload ID 的空 PATCH 发布 stage，不重传文件数据。每次可信 target-change 响应都会重新使列表 snapshot 失效，即使用户已在两次冲突之间点过 Refresh；
 - 页面显示每个任务的速度、进度、预计剩余时间和最终结果；
 - 上传成功会使当前分页目录视图进入“内容已变化”状态，以 live status 提示刷新；旧游标不会继续追加，下一次加载操作会从第一页刷新；
 - 当前页面内发生可确认的可重试失败后，`Retry upload` 操作会先核对同一上传任务的服务端检查点，再决定换新 ID 完整上传或从已持久化偏移继续；结果未知或认证失效会暂停队列，不提供该 Retry；
 - 页面刷新后不会自动恢复旧任务，也不会读取 `localStorage` 续传记录；重新选择文件会创建全新上传 ID，避免仅凭文件名、大小和时间戳把不同内容拼接在一起；
 - 拖入文件只会被阻止触发浏览器导航，不会开始上传。
 
-服务端不会直接改写最终文件。stage 始终以 `0600` 创建在目标同目录，且不会出现在 Dufs 的列表和搜索中。上传会话以账号摘要和 UUID 为键，在统一 SQLite state store 中记录根内相对的目标/stage 路径、声明长度、durable offset、stage dev/inode、已确认的 target revision 以及 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown` 内部状态；共享根内不再写入、读取或导入 JSON 上传状态文件。对外响应使用 `running/awaiting-confirmation/committed/rejected/not-seen/not-started/unknown`。`awaiting-confirmation` 表示全部字节已持久化到 stage，但目标在原子发布边界不再符合已确认的条件；它只能由携带当前 revision 的空 PATCH 发布，或经 discard API 明确丢弃。`not-started` 表示请求头中的合法 ID/长度已经绑定到响应，但本次尝试在任何上传 mutation 前就因保留/越界路径、路径或路由 metadata 超时、或未取得上传槽等原因停止；它不证明该 ID 没有先前记录。为限制慢文件系统准备工作占用的资源，服务端按“路径租约 → 上传槽 → 受跟踪的路由 metadata → owner state/上传处理”进入请求；槽满会直接返回绑定的 `429 not-started`，已有检查点仍原样保留，前端显示可重试失败，但点击 Retry 必须先 HEAD 查询原 ID 后才会取得其真实状态。`rejected` 表示确定没有发布；若已有 mutation 会话则清理并尽力持久化该终态，早期策略拒绝也可能只有本次响应，因此重试同样先 HEAD，再按 `rejected/not-seen` 换新 ID。查询其他账号的 ID 与不存在、畸形或不可信的数据库记录一样返回 `404 not-seen`，不会泄露记录是否存在。
+服务端不会直接改写最终文件。stage 始终以 `0600` 创建在目标同目录，且不会出现在 Dufs 的列表和搜索中。上传会话以账号摘要和 UUID 为键，在统一 SQLite state store 中记录根内相对的目标/stage 路径、声明长度、durable offset、stage dev/inode、已确认的 target revision 以及 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown` 内部状态；共享根内不写入、读取或导入 JSON 上传状态文件。对外响应使用 `running/awaiting-confirmation/committed/rejected/not-seen/not-started/unknown`。`awaiting-confirmation` 表示全部字节已持久化到 stage，但目标在原子发布边界不再符合已确认的条件；它只能由携带当前 revision 的空 PATCH 发布，或经 discard API 明确丢弃。discard 会先把完全绑定的 `AwaitingConfirmation` 行原位持久化为 `Rejected`，再按已记录 stage identity 做可重入清理；重试已有 `Rejected` 不续期，仍会继续条件清理，路径已被替换时保留替换物。`not-started` 表示请求头中的合法 ID/长度已经绑定到响应，但本次尝试在任何上传 mutation 前就因保留/越界路径、路径或路由 metadata 超时、未取得上传槽，fresh PUT 的持久 namespace obligation 检查冲突、失败或超时，或随后只读准备阶段的 deadline/未处理 I/O 故障而停止；它不证明该 ID 没有先前记录。为限制慢文件系统准备工作占用的资源，服务端按“路径租约 → 上传槽 → 受跟踪的路由 metadata → fresh PUT 持久路径义务检查 → owner state/上传准备”进入请求；槽满会直接返回绑定的 `429 not-started`，义务冲突、状态库不可用或检查超时分别返回绑定的 `409/503/408 not-started`。随后受跟踪的上传任务仍可只读查询旧会话、目标 identity、metadata 和空间；在创建祖先/stage、截断 stage、更新上传状态或接收正文等首次文件系统/状态 mutation 前，它必须通过与总 deadline 竞争的原子边界。deadline 先关闭边界时服务 abort 该任务，后续代码无法再越界写入，并返回绑定的 `408 request_timeout + not-started + retry`；只读准备中逸出的超时类错误同样为 `408`，其他未处理 I/O 为 `503 upload_precommit_failed + not-started + retry`。这些分支保留已有检查点，前端显示可重试失败，但点击 Retry 必须先 HEAD 查询原 ID 后才会取得其真实状态。只有任务先跨过 mutation 边界后，外层 deadline 或未处理错误才会保守返回 `unknown + query_upload`。普通 pre-publication 拒绝会安全清理旧 stage 并尽力持久化 `Rejected`；更早的策略拒绝也可能只有本次响应。显式 discard 则以先持久化终态、后清理的顺序保证取消后可重入。查询其他账号的 ID 或 owner-scoped DB miss 返回不泄露差异的 `404 not-seen`；畸形数据库行、不合法的持久路径或 SQLite 故障作为状态存储错误失败关闭，不能静默降格为 `not-seen`。
 
-`POST /__dufs__/api/upload/preflight` 只返回当下观测结果；真正的覆盖权限由 `X-Dufs-Upload-Overwrite: true` 与 `X-Dufs-Target-Revision` 共同表达，revision 绑定账号、规范根内路径和目标完整 CAS 身份。缺省或 `false` 为原子 no-replace；无效、过期或属于其他路径的 revision 不会影响已有目标。若已保留 stage 携带从旧目标重放的 uid/gid/mode/xattr，而目标随后消失，服务端会以 `upload_metadata_preservation_refused` 失败关闭；前端先调用 `POST /__dufs__/api/upload/discard`，再用新 ID 和 no-replace 完整上传，不会把旧 metadata 发布到一个新文件。
+`POST /__dufs__/api/upload/preflight` 只返回当下观测结果；覆盖请求由 `X-Dufs-Upload-Overwrite: true` 与 `X-Dufs-Target-Revision` 共同表达，revision 绑定账号、规范根内路径和目标被观察到的完整 replacement identity。缺省或 `false` 使用 `RENAME_NOREPLACE`；无效、过期或属于其他路径的 revision 不会在提交前检查中授权覆盖。这个 token 不是文件系统提供的原子 compare-and-replace：原目标存在时，服务先复核 identity，再执行普通原子 rename；共享根外部 writer 仍可在两次系统调用之间替换目录项。若已保留 stage 携带从旧目标重放的 uid/gid/mode/xattr，而目标随后消失，服务端会以 `upload_metadata_preservation_refused` 失败关闭；前端先调用 `POST /__dufs__/api/upload/discard`，再用新 ID 和 no-replace 完整上传，不会把旧 metadata 发布到一个新文件。
 
-上传查询只读 state store，并把库中的根内相对路径当作不可信输入重新校验。首个 durable offset 按 stage 文件同步、stage 父目录同步、SQLite 提交的顺序建立；活跃 stage 路径跨账号唯一，UUID 或 owner-scoped DB miss 不构成删除权限。部分 `running` 记录还会用 PATCH 实际采用的同一个可写 no-follow stage fd 校验普通文件、单链接、至少达到 durable offset，以及 dev/inode 与最后一次已同步检查点一致；失败清理同样只接受 live fd 或 DB 记录的身份。上传总 deadline 覆盖路径等待、正文接收、磁盘写入、flush 和进入不可取消提交点之前的步骤；正文发送完成后，浏览器会显示独立的提交等待状态。只有完成文件同步、同文件系统原子发布、目标父目录同步并写入 `Committed` 终态后才返回成功；客户端还会核对终态及精确长度/偏移。发布前先同步完整 stage，再持久化 `CommitStarted`；该记录是歧义屏障，对外归为 `unknown`，进程重启时也会恢复为显式 `Unknown`，不会因 stage 已被 rename、缺失或路径被复用而降格为 `not-seen`。
+上传查询只读 state store，并把库中的根内相对路径当作不可信输入重新校验。首个 durable offset 按 stage 文件同步、stage 父目录同步、SQLite 提交的顺序建立；活跃 stage 路径跨账号唯一，UUID 或 owner-scoped DB miss 不构成删除权限。部分 `running` 记录还会用 PATCH 实际采用的同一个可写 no-follow stage fd 校验普通文件、单链接、至少达到 durable offset，以及 dev/inode 与最后一次已同步检查点一致；失败清理同样只接受 live fd 或 DB 记录的身份。上传总 deadline 覆盖路径等待、只读准备、正文接收、磁盘写入、flush 和进入不可取消提交点之前的步骤；受跟踪任务在首次 mutation 前仍保持可确定取消，只有原子 mutation 边界已经由任务跨过后，deadline 才不能再宣称本次没有写入。正文发送完成后，浏览器会显示独立的提交等待状态。只有完成文件同步、同文件系统原子发布、目标父目录同步并写入 `Committed` 终态后才返回成功；客户端还会核对终态及精确长度/偏移。发布前先同步完整 stage，再持久化 `CommitStarted`；该记录是歧义屏障，对外归为 `unknown`，进程重启时也会恢复为显式 `Unknown`，不会因 stage 已被 rename、缺失或路径被复用而降格为 `not-seen`。
 
 在受支持的 Linux 本地文件系统及存储正确兑现同步请求的前提下，成功响应表示文件已经按崩溃持久化语义提交。提交错误会区分 rename 前确定未发布与发布后结果/持久性未知：前者安全清除 stage/checkpoint 并记录拒绝终态，后者或 `committed` 终态写入失败返回“结果未知”，不会把已经恢复成只读权限的 stage 广告成可续传检查点。fresh PUT 在创建祖先/stage/SQLite 会话前先从最近存在的父目录完成空间准入，空间不足不会留下目录；准入成功后若其他正文前准备失败，则自底向上回收仅由本请求创建且仍为空、身份未变的祖先目录，已经被并发请求使用的目录不会删除。
 
-覆盖普通单链接文件时会保留 numeric owner/group、除 setuid/setgid 外的权限位，以及通过预算检查的非特权扩展属性。`security.*`、`trusted.*`（包括 capability、SELinux、IMA/EVM 和 overlay 元数据）或原目标的 setuid/setgid 位会导致覆盖被拒绝；`user.*` 与 `system.posix_acl_access` 可被精确重放。扩展属性名称列表最多 64 KiB、条目最多 1024 个、单值最多 64 KiB；服务先查询每个值的精确长度，再按需分配，索引容量、带 NUL 的名称和全部值合计最多 1 MiB，不会为每个空值或短值先分配 64 KiB。无法安全读取、删除 stage 上额外属性或重放任一项时同样拒绝。多硬链接以及 FIFO、Unix socket、设备、目录等非普通目标也返回冲突；目标先以 `O_PATH` 分类，普通文件再以 `O_NONBLOCK|O_NOFOLLOW` 重新打开并核对 inode。最终提交前会复核目标的 dev/inode、类型、链接数、大小、uid/gid、完整 mode 以及纳秒级 mtime/ctime 快照，并用同一组字段确认 stage 路径仍对应已打开 stage fd；原本不存在的目标必须仍不存在，原有可替换符号链接则必须保持其 nofollow 快照不变。检测到变化时失败关闭。提交前的策略、格式或权限冲突返回 `409`，未预期的底层 I/O 故障通过安全的 `5xx` 报告；文件同步、复核或 rename 失败都确定没有发布并清理会话。rename 已成功但父目录同步失败时，新 inode 可能可见而持久性未确认；即使父目录已同步，终态记录持久化失败也会保守返回 `unknown`，两者都不能视为已经回滚。
+覆盖普通单链接文件时会保留 numeric owner/group、除 setuid/setgid 外的权限位，以及通过预算检查的非特权扩展属性。`security.*`、`trusted.*`（包括 capability、SELinux、IMA/EVM 和 overlay 元数据）或原目标的 setuid/setgid 位会导致覆盖被拒绝；`user.*` 与 `system.posix_acl_access` 可被精确重放。扩展属性名称列表最多 64 KiB、条目最多 1024 个、单值最多 64 KiB；服务先查询每个值的精确长度，再按需分配，索引容量、带 NUL 的名称和全部值合计最多 1 MiB，不会为每个空值或短值先分配 64 KiB。无法安全读取、删除 stage 上额外属性或重放任一项时同样拒绝。多硬链接以及 FIFO、Unix socket、设备、目录等非普通目标也返回冲突；目标先以 `O_PATH` 分类，普通文件再以 `O_NONBLOCK|O_NOFOLLOW` 重新打开并核对 inode。最终提交前会复核目标的 dev/inode、类型、链接数、大小、uid/gid、完整 mode 以及纳秒级 mtime/ctime 快照，并用同一组字段确认 stage 路径仍对应已打开 stage fd。原本不存在的目标通过 `RENAME_NOREPLACE` 发布，成功后还要确认目标名称指向已打开的 stage；晚到目标不会被覆盖，发布后无法确认 identity 时报告结果未知。原有目标则先复核 nofollow 快照再用普通 rename 原子替换，这不是对外部 writer 的严格目录项 CAS。提交前的策略、格式或权限冲突返回 `409`，未预期的底层 I/O 故障通过安全的 `5xx` 报告；确定发生在发布前的文件同步或条件复核失败会清理会话。rename 已成功但发布后 identity/父目录同步无法确认时，新 inode 可能可见而结果或持久性未知；即使父目录已同步，终态记录持久化失败也会保守返回 `unknown`，这些情况都不能视为已经回滚。
 
-进程内路径租约只协调经过当前 Dufs 进程的请求。租约同时检查词法祖先/后代和解析后的 dev/inode 别名；一个较早请求仍在异步解析语义键时，只暂时阻塞词法上相交的后续请求，无关子树可以超车，不会被一次慢解析全局停住。解析完成后仍必须按语义键和协调 epoch 重新核对现有租约及更早冲突 waiter，符号链接别名不会因此并发提交。拥有共享根操作系统写权限的 shell、其他进程或 virtiofs 宿主机属于受信任的存储参与者；它们仍可在任意两个系统调用之间更换目录项，最终 rename 也必须按名称提交，因此上述身份复核不能把共享目录变成对恶意本地写者的隔离边界。生产环境应让专用服务账号和受控运维流程独占写入。强制断电、介质损坏、错误实现同步语义的存储以及后续位腐败仍需要可靠存储和备份处理。
+进程内路径租约只协调经过当前 Dufs 进程的请求。租约同时检查词法祖先/后代和解析后的 dev/inode 别名；一个较早请求仍在异步解析语义键时，只暂时阻塞词法上相交的后续请求，无关子树可以超车，不会被一次慢解析全局停住。解析完成后仍必须按语义键和协调 epoch 重新核对现有租约及更早冲突 waiter，符号链接别名不会因此并发提交。目标应不存在的 upload/move/rename 使用 `RENAME_NOREPLACE`，不会覆盖晚到 occupant，并在成功后核对目的名称与已钉住的源对象；核对失败报告 unknown，而不是声称移动了预期对象。显式覆盖已有目标仍是“复核 source/destination identity → 普通 rename”，不是内核目录项 CAS。拥有共享根操作系统写权限的 shell、其他进程或 virtiofs 宿主机属于受信任的存储参与者；它们仍可在相邻系统调用之间更换源或目标，甚至使普通覆盖移动/替换另一个对象，因此上述身份复核不能把共享目录变成对恶意本地写者的隔离边界。生产环境应让专用服务账号和受控运维流程独占写入。强制断电、介质损坏、错误实现同步语义的存储以及后续位腐败仍需要可靠存储和备份处理。
 
 上传协议、检查点、内部暂存、任务取消和目录同步的完整步骤见[项目工作流程](docs/project-workflow.md#9-持久化上传与断点续传)。
 
@@ -179,20 +179,22 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 - 点击 Rename 也直接在原名称位置编辑。Enter、Tab 或合法名称失焦会提交，Escape 只取消本次编辑；刚创建的对象会保留已经提交的默认名称。文件编辑默认选中最后一个扩展名前的主体，目录和无扩展名文件选中全名；
 - 重命名和移动在页面及后端协议中是两个独立操作：`rename` 只接受新的单段名称并保留父目录，`move` 只接受已经存在的目标目录并保留原名称；需要新的目标目录时先使用 New folder；
 - 不允许覆盖时使用原子不替换语义，并发出现同名目标会返回冲突；
-- 允许覆盖时若不同名称其实是同一 dev/inode 的硬链接，服务会在预检和提交内再次 fd-relative 复核并返回 `409 source_equals_destination`，不会把 POSIX rename 的无变化成功误报为 `204`；
+- 不允许覆盖的 move/rename 在成功后还会核对目的名称是否指向提交前钉住的源对象；若外部 writer 在微窗中替换源，服务不会误报成功，而会把发布身份归为未知；
+- 允许覆盖时若不同名称其实是同一 dev/inode 的硬链接，服务会在预检和提交内再次 fd-relative 复核并返回 `409 source_equals_destination`，不会把 POSIX rename 的无变化成功误报为 `204`。已有目标覆盖仍是提交前复核后调用普通 rename，不是针对外部 writer 的严格 CAS；
 - move、rename、DELETE 与 fresh PUT 在持有语义路径租约后、任何本次文件系统/状态 mutation 前分页检查 SQLite 中仍有效的 upload/purge 路径义务；源或目标目录（包括根内符号链接别名）的变化会使这些相对路径失真时，以稳定 `409 *_state_conflict` 拒绝。状态检查暂不可用则在 mutation 前返回可重试 `503`；
 - 共享根目录本身不能删除；
 - mkdir、move、rename 和 DELETE 的受跟踪提交任务共用 64 个服务端并发许可；额外请求等待许可且仍受普通请求时限约束，不会无界启动后台文件系统 mutation；
 - 删除会先持久化移除原名称，再异步回收磁盘空间；
-- DELETE 在改名前先向 state store 写入 `Prepared` outbox 记录，其中保存账号、根内相对目标/trash 路径及源 dev/inode/类型；随后只有通过身份复核的同父目录 rename 和父目录 `fsync` 成功，才把 job 改为 `Ready` 并返回 `204`。purge outbox 容量为全局 4096、每账号 1024，满载在可见删除前以 `503 purge_backlog_full` 拒绝；
-- 单 worker 从 outbox 原子 claim 到 `Claimed`，每次最多处理 256 个条目或 25 ms；未完成项在进程内轮转，I/O 失败则持久化返回 `Ready` 并从 100 ms 开始指数退避，最长 30 秒，不再因固定失败次数丢弃 job。若 SQLite 状态转换瞬时失败，worker 会有界保留该 claim，回读确认它仍为 `Claimed` 后再继续，避免把“提交成功但回复丢失”误当作待重做；重启会把遗留 `Claimed` 恢复为 `Ready`。独立 reconciler 在启动和运行期持续检查 `Prepared`，按已记录 inode 对比原路径和 trash，判定 rename 未发生、已发生或仍有歧义，绝不删除身份不匹配的路径；
+- DELETE 在改名前先向 state store 写入 `Prepared` outbox 记录，其中保存账号、根内相对目标/trash 路径及源 dev/inode/类型；随后只有通过身份复核的同父目录 rename 和父目录 `fsync` 成功，才把完整 32 字节 trash revision 与 `Ready` 原子写入并返回 `204`。revision 覆盖 dev/inode、类型、链接数、大小、uid/gid、完整 mode 及纳秒级 mtime/ctime；purge outbox 容量为全局 4096、每账号 1024，满载在可见删除前以 `503 purge_backlog_full` 拒绝；
+- 单 worker 从 outbox 原子 claim 到 `Claimed`，每次最多处理 256 个条目或 25 ms；未完成项在进程内轮转，普通 I/O 失败则持久化返回 `Ready` 并从 100 ms 开始指数退避，最长 30 秒，不再因固定失败次数丢弃 job。若 SQLite 状态转换瞬时失败，worker 会有界保留该 claim，回读确认它仍为 `Claimed` 后再继续，避免把“提交成功但回复丢失”误当作待重做；重启会把遗留 `Claimed` 恢复为 `Ready`。`Ready/Claimed` 必须同时通过已提交 revision 和持续 fd 锚点复核；缺失 revision、身份不一致或其他 `InvalidData` 会把当前 trash 根移入永久隐藏 quarantine 并释放 job，而不是继续按路径猜测删除；
 - 一旦发现内部 trash 的身份与持久记录不一致，服务会把该对象原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold` 并释放相应 purge 记录；quarantine 永不参与自动清理。运维人员必须先停止 Dufs，核对日志和对象内容/归属后再手工移除，不能把它当作普通 orphan trash；
-- 启动及每小时的低频根内扫描只为未记账或其他 orphan trash 提供兜底；新 DELETE 的正常可靠性不再依赖扫描重新捕获。分片遍历仍只保存根内路径和 cursor，读到 EOF 后删目录若返回 `ENOTEMPTY` 会从 cursor 0 重扫，FD 数量不随嵌套深度增长；
+- `Prepared` 没有已提交 trash revision，恢复时不再根据弱源 inode 猜测 rename 结果：原目标永远不碰，trash 路径若有任何 occupant 就先移入 quarantine，随后释放 intent。启动及每小时的低频根内扫描只为未记账或其他 orphan trash 提供兜底；新 DELETE 的正常可靠性不再依赖扫描重新捕获。分片遍历仍只保存根内路径和 cursor，FD 数量不随嵌套深度增长；每个最终删除候选会先原子移入随机隔离名，再用既有 fd 复核后 unlink/rmdir，身份异常会使整棵 trash 根进入 quarantine。已记账 job 最终删除返回 `ENOTEMPTY/EXIST` 时也按身份异常 quarantine/release，不从 cursor 0 重扫。未记账 orphan 只有在兜底通道满、取消或普通 I/O 失败时才保持隐藏并等待后续扫描；一旦 purge 返回 `InvalidData`，整棵根会立即进入永久 quarantine，不再作为 orphan 自动发现。能通过 inotify 观察并竞争随机工作名的恶意同 UID writer 仍在威胁边界之外；
+- 若进程在嵌套候选已经移入随机隔离名、尚未完成 unlink 时中断，后续 orphan maintenance 会把 trash 树中的该隔离名视为 `InvalidData`，将整棵根永久 quarantine，而不是把它当普通子项继续自动删除；
 - 内部删除暂存项不是回收站，不提供恢复或撤销功能。
 
-统一 state store 当前使用文件型 SQLite schema v3，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。现存文件会先以只读连接验证 DUFS application id、schema 版本、共享根绑定和完整性，通过后才允许 chmod、journal 配置或恢复写入；空白新库会直接建立 v3，经严格检查的 v2 会在写连接内事务迁移到 v3，其他版本则在零修改下明确拒绝。误指向其他数据库或非 SQLite 文件同样会零修改拒绝；部署时也不能通过 bind mount 等别名让数据库实际落回共享根。
+统一 state store 当前使用文件型 SQLite schema v4，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。现存文件会先以只读连接验证 DUFS application id、schema 版本、共享根绑定和完整性，通过后才允许 chmod、journal 配置或恢复写入；空白新库会直接建立 v4。经严格检查的 v2 会在一个 `BEGIN IMMEDIATE` 事务内依次完成上传 target revision/确认状态迁移和 purge trash revision 迁移，v3 则在一个事务内增加 purge trash revision；其他版本在零修改下明确拒绝。迁移得到的旧 purge job 没有已提交 revision，恢复时会按上述 quarantine/release 规则失败关闭。误指向其他数据库或非 SQLite 文件同样会零修改拒绝；部署时也不能通过 bind mount 等别名让数据库实际落回共享根。
 
-文件型状态库启动恢复会删除 operation 中尚未进入文件系统提交边界的 `Reserved`，把 operation `CommitStarted` 转换为 `Completed/unknown`，把 upload `CommitStarted` 转换为 `Unknown`，并把 purge `Claimed` 重置为可立即重试的 `Ready`。operation 终态 TTL 为 15 分钟；upload session TTL 为 7 天，容量为全局 16384、每账号 4096；purge job 没有固定失败次数或 TTL 逃生口，容量为全局 4096、每账号 1024，直到安全完成或 reconciliation 确认 rename 未发生才删除记录。SQLite 使用 rollback journal `DELETE` 模式和 `synchronous=EXTRA`。SQLite 事务与文件系统 mkdir、rename、文件/目录 `fsync` 不是一个共同事务：operation/upload 在跨域缝隙中恢复为 `unknown`，purge 则依靠已持久化的根内路径和 dev/inode/类型对原目标与 trash 做保守 reconciliation，不会把数据库记录误当成文件系统事务证明。
+文件型状态库启动恢复会删除 operation 中尚未进入文件系统提交边界的 `Reserved`，把 operation `CommitStarted` 转换为 `Completed/unknown`，把 upload `CommitStarted` 转换为 `Unknown`，并把 purge `Claimed` 重置为可立即重试的 `Ready`。operation 终态 TTL 为 15 分钟；upload session TTL 为 7 天，容量为全局 16384、每账号 4096；purge job 没有固定失败次数或 TTL 逃生口，容量为全局 4096、每账号 1024。普通 I/O 故障保留 job 并退避；缺少已提交 revision、身份歧义或最终删除异常则 quarantine 当前对象并释放 job。SQLite 使用 rollback journal `DELETE` 模式和 `synchronous=EXTRA`。SQLite 事务与文件系统 mkdir、rename、文件/目录 `fsync` 不是一个共同事务：operation/upload 在跨域缝隙中恢复为 `unknown`；purge 只有 live DELETE 在 rename 与父目录同步后原子写入的完整 trash revision 才授权后续回收，`Prepared` 恢复从不以数据库意图猜测文件系统结果。
 
 公开的 `GET/HEAD /__dufs__/health` 只检查 HTTP liveness。受认证的 `GET/HEAD /__dufs__/ready` 会并行执行真实写路径探针：通过长期持有的共享根 fd 创建隐藏文件、写入并同步文件、删除后同步根目录；同时在 state-store actor 的现有 SQLite 连接上执行 `BEGIN IMMEDIATE`、写入探针行并 `ROLLBACK`。它还检查扣除进程预留后的最低磁盘水位和停机状态；任一步失败都返回 `503`，而不会把启动时缓存的健康标志当作当前可写证明。
 
@@ -202,7 +204,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 
 新建空文件也使用完整上传协议并为每个默认名称候选生成独立 UUID。前端只有在 fresh PUT 返回 `200` 或 `201`、同一 upload ID、`committed` 且 length/offset 都精确为 0 时才报告成功；只有绑定 ID/长度且确定为 `destination_exists + not-started/rejected` 的结果才尝试下一个名称。若提交竞态留下 `awaiting-confirmation` stage，必须先以同一路径和 ID 得到明确的 discard `204`，才能换用新 ID；清理结果未知时立即停止。`202`/`204` 即使声称 committed 也属于协议异常，客户端只携带原 ID 做一次 HEAD 确认，不会重放 PUT；任何无法排除已经提交的结果都使列表失效，也不会继续创建另一个候选。
 
-目录页的 DELETE、MOVE、RENAME、MKDIR、空 PUT 和普通上传共用单一 mutation 失效通知。确认成功或客户端无法排除已经提交时，现有分页 snapshot、游标和 DOM 都会标记失效并要求从第一页刷新；明确的服务端拒绝、终态失败或分发前取消则不误触发刷新。对于已经分发后报 unknown 的空 PUT，即使一次随后 HEAD 暂时返回 `not-seen`，列表仍按可能与原请求竞态处理并保守失效。
+目录页的 DELETE、MOVE、RENAME、MKDIR、空 PUT 和普通上传共用单一四值 mutation 失效通知：`committed` 表示确认写入，`outcome-unknown` 表示仍可能写入，`refresh-required` 表示服务器已经证明当前列表 snapshot 陈旧但不表示本次写入成功，`not-committed` 才表示确认未改变列表。前三者都会使现有分页 snapshot、游标和 DOM 失效并要求从第一页刷新；非法名称等能够证明目录未变的拒绝和分发前取消使用 `not-committed`。上传目标出现、消失、revision 改变或 reset-stage 等每一个可信 target-change 响应，以及 tracked DELETE/MOVE/RENAME 的确定 revision 冲突，都使用 `refresh-required`；上传不会因同一任务曾经失效过一次就抑制后续通知，所以用户在两次冲突之间刷新得到的新 snapshot 也会再次失效。对于已经分发后报 unknown 的空 PUT，即使一次随后 HEAD 暂时返回 `not-seen`，列表仍按可能与原请求竞态处理并保守失效。
 
 目录页 JavaScript 主动发起的 Fetch 在 30 秒 deadline 内按流读取响应；原生导航、登录表单和文件下载不在该客户端边界内。Fetch 错误体最多 16 KiB、成功体最多 16 MiB，先检查声明长度并在累计越界时立即取消；允许范围内直接重放已校验分块，不再先合并为第二份连续缓冲区。Problem Details 的 `detail`/`title` 最多接受 1024 个 JavaScript UTF-16 code units，超限整条丢弃。上传正文专用 XHR 在响应头、下载进度和最终 UTF-8 长度三个阶段拒绝任何超过 16 KiB 的响应（正常成功响应应为空），但不证明浏览器在事件前从未缓冲额外网络块。16 MiB 成功上限为最多 500 项、接近 Linux PATH_MAX 且可能经 JSON 转义放大的合法目录页保留余量。
 
@@ -419,7 +421,7 @@ KillSignal=SIGTERM
 
 ## 内置页面
 
-`assets/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。资源内容变化会生成新的摘要 URL，只有已知版本化资源使用长期缓存。
+`assets/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。注册为版本化资源的 CSS、JavaScript 和图标以资源名、MIME 类型和内容共同生成摘要 URL；HTML 骨架和内联登录脚本不参与该前缀。只有精确命中的已知版本化资源使用长期缓存。
 
 生产运行不需要 Node.js 或前端打包步骤；Node.js 仅在质量门禁和签名发布阶段使用。
 
@@ -493,7 +495,7 @@ git diff --check
 git status --short
 ```
 
-创建版本时应先确认工作树干净，再用发布脚本从与 Cargo 版本一致、精确指向 `HEAD` 的 Git tag 构建。脚本不会直接在可变 checkout 中跑发布门禁：它先从摘要锁定的 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中以 `env -i`、固定工具路径/工具链及独立 HOME、Cargo home/target、npm cache 和临时目录强制执行完整 `scripts/check.sh`。Cargo 依赖先 vendor 后离线使用；npm 播种器只从 `package-lock.json` 的 HTTPS URL 与 SHA-512 integrity 接受并重新散列宿主 cache 内容，随后使用私有 cache 与 `prefer-offline`，缺失包和 `npm audit` 仍可能需要网络。发布门固定要求 cargo-audit 0.22.2。宿主 RustSec Git 数据库只有在 origin 是官方仓库、HEAD 与 FETCH_HEAD revision 一致且最近 7 天验证过上游时才会以 `--no-hardlinks` 复制并用 `--no-fetch` 离线审计；过期或不存在时强制在隔离 Cargo home 中联网刷新，网络不可用即失败关闭。门禁后通过独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，再丢弃整棵质量树，从同一 commit 全新解包用于签名构建。
+创建版本时应先确认工作树干净，再用发布脚本从与 Cargo 版本一致、精确指向 `HEAD` 的 Git tag 构建。脚本不会直接在可变 checkout 中跑发布门禁：它先从摘要锁定的 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中以 `env -i`、固定工具路径/工具链及独立 HOME、Cargo home/target、npm cache 和临时目录强制执行完整 `scripts/check.sh`。Cargo 依赖先 vendor 后离线使用；npm 播种器只从 `package-lock.json` 的 HTTPS URL 与 SHA-512 integrity 接受并重新散列宿主 cache 内容，随后使用私有 cache 与 `prefer-offline`，缺失包和 `npm audit` 仍可能需要网络。发布门固定要求 cargo-audit 0.22.2。宿主 RustSec Git 数据库只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 `FETCH_HEAD` 时间戳不得比当前时间早超过 7 天或晚超过 300 秒，并通过完整物理/Git/内容封存检查时才可复用；检查还拒绝 alternates、不安全 Git 元数据、symlink/submodule/特殊项、untracked 路径及 tracked 内容或 mode 不匹配。合格输入以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在运行任何项目或依赖代码前用 dummy lockfile 在私有数据库中联网刷新，网络不可用即失败关闭。脚本先对封存数据库执行 `cargo audit --db … --no-fetch --no-yanked` 预审计；隔离门通过必填 `DUFS_QUALITY_AUDIT_DB` 使用同一封存，`scripts/check.sh` 也在其他项目/依赖步骤前先审计。封存时校验 seal 与新鲜度，预审计后只重验 seal；完整门禁后重验 seal 与新鲜度，随后销毁质量树及其 RustSec 数据库。门禁后还通过独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，再从同一 commit 全新解包用于签名构建。`BUILD-ENVIRONMENT.txt` 记录 advisory revision 和 fetch epoch，但不宣称记录内部 index/config 封存摘要。
 
 源树预检、隔离快照和每次解包检查会拒绝 symlink、submodule 及任何非普通文件/目录条目。脚本还会拒绝 Git replace refs、legacy grafts 和仓库私有 attributes；façade 只使用摘要锁定的最小 local config，所有 Git 命令清空 system/global 配置并禁用额外 attributes/replace。检查后、签名前和发布前都会重新确认 commit/tag/版本及原 checkout 的干净状态；前后两份源码 archive 还会复核 commit、tree、mode、额外路径和 SHA-256。
 
@@ -561,7 +563,7 @@ git status --short
 │       │   ├── dispatch.rs         # 认证后端点与文件请求分发
 │       │   └── request.rs          # 单次解析的请求分类与 mutation 进度
 │       ├── session.rs              # 登录、注销与写请求校验
-│       ├── state_store.rs           # schema v3 文件 SQLite 统一控制面 API
+│       ├── state_store.rs           # schema v4 文件 SQLite 统一控制面 API
 │       ├── state_store/
 │       │   ├── actor.rs             # 有界命令 actor 与 live readiness 探针
 │       │   ├── database.rs          # 数据库打开、schema 与恢复

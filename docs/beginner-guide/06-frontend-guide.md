@@ -75,7 +75,7 @@ assets/modules/preview.js
 
 ### 6.3.3 内容哈希前缀和缓存
 
-服务器遍历所有公开嵌入资源的名称和内容，计算一个 SHA-256 前缀，例如：
+服务器遍历所有公开嵌入资源的名称、声明 MIME 类型和内容，对各字段做长度分帧后计算一个 SHA-256 前缀，例如：
 
 ```text
 /__dufs_assets_abcd.../index.js
@@ -88,7 +88,7 @@ assets/modules/preview.js
 Cache-Control: public, max-age=31536000, immutable
 ```
 
-只要任一已注册资源内容变化，重新构建的二进制就会生成新的前缀。旧 URL 可以放心长期缓存，新 HTML 会引用新 URL。
+只要任一已注册资源的名称、MIME 类型或内容变化，重新构建的二进制就会生成新的前缀。旧 URL 可以放心长期缓存，新 HTML 会引用新 URL。
 
 目录 HTML 本身则使用 `private, no-store`。它包含当前用户和当前页面的数据，不能像公共 CSS 一样长期缓存。
 
@@ -159,7 +159,7 @@ body
 | `user` | 当前会话的用户名 |
 | `csrf_token` | 当前页面写请求必须携带的防跨站 token |
 
-服务端先把 JSON 序列化，再编码为 Base64，最后替换 `__INDEX_DATA__` 占位符。JavaScript 从 `<template id="index-data">` 读取并解码。
+服务端先把 JSON 序列化，再编码为 Base64，最后替换 `__INDEX_DATA__` 占位符。JavaScript 从 `<template id="index-data">` 读取并解码；`JSON.parse()` 的结果仍是 `unknown`，必须通过 `shared/index_data.js` 的 `parseIndexData()` 严格校验后才能使用。
 
 Base64 只是为了安全、稳定地把文本嵌入 HTML，不是加密。认证和传输机密性仍依赖会话、HTTPS、CSP 和响应缓存策略。
 
@@ -180,7 +180,7 @@ sequenceDiagram
     H->>A: 求值 app.js，解析 URL 参数
     E->>A: start()
     A->>A: 等待 DOMContentLoaded
-    A->>A: 解码 index-data
+    A->>A: 解码 index-data → JSON.parse 为 unknown → parseIndexData
     A->>A: 生成面包屑
     A->>L: createDirectoryListing(...)
     A->>O: createFileOperations(...)
@@ -216,6 +216,7 @@ aria-label="Root"
 ```mermaid
 flowchart TD
     I[index.js] --> A[app.js]
+    A --> ID[shared/index_data.js]
     A --> D[shared/dom.js]
     A --> P[shared/path.js]
     A --> L[listing/controller.js]
@@ -248,8 +249,9 @@ flowchart TD
 | --- | --- | --- |
 | `app.js` | 启动、查找 DOM、连接模块、绑定顶栏 | 具体列表和写操作协议 |
 | `shared/dom.js` | 创建安全 DOM、SVG 图标、格式化文件大小 | 业务状态 |
+| `shared/index_data.js` | 严格校验并冻结页面启动数据 | 页面业务编排 |
 | `shared/path.js` | 验证逻辑路径、编码浏览器 URL | 访问文件系统 |
-| `shared/mutation_effect.js` | 定义列表可见内容变更后的三值失效契约 | 执行网络请求 |
+| `shared/mutation_effect.js` | 定义列表可见内容变更后的四值失效契约 | 执行网络请求 |
 | `listing/controller.js` | 列表、分页、窗口、排序、行内编辑 | 真正执行重命名和删除 |
 | `operations/file_operations.js` | 新建、移动、重命名、删除、注销 | 列表分页和上传正文 |
 | `operations/dialogs.js` | 应用内确认、输入和焦点恢复 | 发起文件操作 |
@@ -257,6 +259,8 @@ flowchart TD
 | `http/headers.js` | 规范非负整数 HTTP 头的共享解析 | 业务状态判断 |
 | `upload/manager.js` | 上传编排和状态机 | 通用文件列表渲染 |
 | `upload/{preflight,protocol,queue,selection,transport,view}.js` | 预检解析、协议、队列、选择预算、XHR 和进度视图 | 页面级装配 |
+
+目录页当前由 `index.js` 加 18 个 ES modules 构成；后端资源注册表与 `assets/modules/` 文件集合由静态门双向核对，新增模块不能只写 import 而漏掉二进制嵌入。
 
 `app.js` 通过回调连接这些模块。例如：
 
@@ -776,11 +780,12 @@ flowchart TD
 
 ## 6.13 统一列表失效协议
 
-所有可能改变目录可见内容的前端模块只能向列表报告三种效果，定义在 [assets/modules/shared/mutation_effect.js](../../assets/modules/shared/mutation_effect.js)：
+所有可能改变目录可见内容的前端模块只能向列表报告四种效果，定义在 [assets/modules/shared/mutation_effect.js](../../assets/modules/shared/mutation_effect.js)：
 
 ```js
 MUTATION_EFFECT.COMMITTED
 MUTATION_EFFECT.OUTCOME_UNKNOWN
+MUTATION_EFFECT.REFRESH_REQUIRED
 MUTATION_EFFECT.NOT_COMMITTED
 ```
 
@@ -788,6 +793,7 @@ MUTATION_EFFECT.NOT_COMMITTED
 | --- | --- | --- |
 | `committed` | 已确认目录发生变化 | 作废行和 cursor |
 | `outcome-unknown` | 目录可能变化 | 同样作废，但显示更保守文案 |
+| `refresh-required` | 本次写入被拒绝，但服务器证明当前 snapshot 已陈旧 | 作废行和 cursor，不宣称写入成功 |
 | `not-committed` | 已确认没有成功写入 | 保留当前列表 |
 
 ### 6.13.1 失效时具体做什么
@@ -806,7 +812,7 @@ MUTATION_EFFECT.NOT_COMMITTED
 
 ### 6.13.2 为什么失败不总需要刷新
 
-如果服务器明确证明 Rename 因非法名称被拒绝，目录没有变化。此时报告 `not-committed`，继续使用已有列表更友好。
+如果服务器明确证明 Rename 因非法名称被拒绝，目录没有变化。此时报告 `not-committed`，继续使用已有列表更友好。相反，上传目标出现、消失、revision 改变或 reset-stage，以及 DELETE/MOVE/RENAME 的确定 revision 冲突，虽然证明本次写入被拒绝，却也证明旧列表已陈旧，应报告 `refresh-required`。上传管理器对每一个可信 target-change 都重新通知，而不是记住“这个任务已经失效过一次”；因此两次冲突间若用户完成 Refresh，第二次响应仍会使新 snapshot 失效。
 
 如果浏览器超时且一次状态查询也失败，则报告 `outcome-unknown`。即使用户肉眼还没看到变化，也不能继续拿旧 cursor 加载下一页。
 
@@ -822,7 +828,7 @@ MUTATION_EFFECT.NOT_COMMITTED
 - `refreshAfterEditor`；
 - `refreshAfterLoad`。
 
-等待当前临界动作结束后再刷新第一页。上传 committed/unknown 目前只调用 `notifyMutation()`，因此只标记失效并等待用户点 Refresh，不会设置这两个自动刷新标志。
+等待当前临界动作结束后再刷新第一页。上传的 committed/unknown/refresh-required 目前只调用 `notifyMutation()`，因此只标记失效并等待用户点 Refresh，不会设置这两个自动刷新标志。
 
 ## 6.14 对话框系统
 
@@ -913,6 +919,7 @@ const item = payload;
 因此外部边界仍然需要运行时解析器：
 
 - `validateListingPage()` 校验目录页；
+- `parseIndexData()` 校验服务端注入的四字段启动对象；
 - `parseUploadPreflight()` 校验预检顺序和 revision；
 - `classifyUploadResponse()` 校验上传状态矩阵；
 - `parseErrorPayload()` 只从 `application/problem+json` 中容错读取有界、规范命名的顶层字段；
@@ -920,7 +927,7 @@ const item = payload;
 
 `parseErrorPayload()` 也不是完整 Problem Details schema validator：只要 media type 正确，它会尝试读取受支持的有界字段，缺失或非法字段会回落为空值/默认值；只有调用方需要的 HTTP status、协议头和业务组合另行做权威校验。
 
-当前还有一个需要维护者看见的例外：服务端注入的 `index-data` 在 `app.js` 中经过 Base64 解码和 `JSON.parse()` 后，直接用 JSDoc 断言成 `IndexData`，尚未逐字段做运行时校验。它由同一二进制生成、不是任意远端 API 响应，但这仍是静态断言而非运行时证明；修改该 schema 时必须同步前后端和测试，不能把上面的守卫列表理解成“所有外部数据都已验证”。
+`parseIndexData()` 只接受普通对象和恰好 `href/dir_exists/user/csrf_token` 四个 own data property，不接受 accessor 或额外字段；`href` 必须是规范绝对逻辑路径，`dir_exists` 必须是 boolean，`user` 必须为 UTF-8 最多 128 字节的字符串，CSRF 必须恰为 64 位小写十六进制。它复制并冻结结果，调用方不会继续持有未经验证的解析对象。修改这个 schema 时仍必须同步 Rust 生成端、解析器、嵌入资源和正反测试。
 
 一个实用原则是：
 
@@ -994,18 +1001,18 @@ JSDoc 保护开发者写代码时不自相矛盾；
 → XHR PUT 正文并显示进度
 → 必要时 HEAD 查询和 PATCH 恢复
 → 提交时目标变化则再次确认
-→ committed 或 unknown 通知列表失效
+→ committed、unknown 或 refresh-required 通知列表失效
 ```
 
 本章只需记住三点：
 
 1. 预检不是原子锁，提交时必须再次核对目标 revision；
 2. 上传使用 XHR 是为了上传进度，普通控制 API 仍使用 Fetch；
-3. 上传成功或结果未知都必须通过同一个 `notifyMutation()` 边界使列表失效。
+3. 上传成功、结果未知，或服务器证明当前 snapshot 已陈旧时，都必须通过同一个 `notifyMutation()` 边界使列表失效。
 
 完整状态、请求头、覆盖确认、空 PATCH、断点恢复和刷新限制见[第 7 章](07-upload-protocol.md)。
 
-当前工作区还有一个已核实的 discard 契约缺口：服务端成功 discard 会返回 `204` 和 upload 绑定头，其中 operation state 是 `rejected`；通用 `assertResponse()` 却把“2xx + 非 succeeded”当成矛盾。普通上传路径会额外 HEAD 对账后认出 `rejected`，但新建空文件的候选名分支没有这一步，可能把已经成功的 cleanup 报成 unknown，而现有浏览器 mock 用裸 `204` 掩盖了问题。这不是推荐协议；维护时应增加专用 discard 响应分类器，并用带真实头的前后端集成测试锁定契约。第 7 章给出服务端真实成功响应。
+discard 不复用普通 operation 的 `succeeded` 解析。`http/client.js` 的 `assertDiscardUploadResponse()` 只接受严格绑定同一 ID、声明长度、满 offset 的 `204 + rejected`；普通上传的跳过路径和新建空文件候选清理都使用这一分类器，单元测试与 Playwright mock 也携带真实协议头。网络结果歧义时可由 HEAD 的严格 `rejected` 终态确认“未发布”，但不能把它表述成 stage 路径已经物理消失。
 
 ## 6.17 无障碍、主题和小视口回流
 
@@ -1271,7 +1278,7 @@ rg "startInlineRename|commitInlineRename|renamePath|relocatePath" \
 2. 输入怎样按 UTF-8 字节校验；
 3. 如何防止 blur 重复请求；
 4. 后端明确重名后怎样显示覆盖确认；
-5. 成功或 unknown 怎样使列表失效。
+5. committed、unknown 或 refresh-required 怎样使列表失效。
 
 ### 练习三：证明文件夹的按钮不会移动
 
@@ -1295,7 +1302,7 @@ rg "createActionSlot|action-slots|data-action-slot" \
 - `listing/controller.js` 把网络分页、DOM 窗口、行内编辑和焦点恢复放在同一列表边界内；
 - 四个固定 action slot 保证能力缺失时按钮仍不移位；
 - Move 和 Rename 共享可靠性代码，但对用户和后端保持独立语义；
-- 所有可能改变目录可见内容的前端模块通过三值 mutation effect 统一处理列表和 cursor 失效；
+- 所有可能改变目录可见内容的前端模块通过四值 mutation effect 统一处理列表和 cursor 失效；
 - JSDoc 静态检查与运行时不可信数据校验缺一不可；
 - 原生语义、live region、焦点恢复、缩放回流和 forced-colors 共同构成无障碍实现；
 - 调试前端时首先确认新源码已经进入新二进制；只对哈希白名单资源核对新摘要 URL，页面骨架和内联登录脚本要核对新 document/CSP。

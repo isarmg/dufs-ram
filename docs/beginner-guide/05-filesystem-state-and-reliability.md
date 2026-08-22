@@ -108,7 +108,7 @@ Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系�
 - mode；
 - 纳秒级 mtime/ctime。
 
-具体操作不一定使用全部字段，而且不能把最强保证外推到所有 mutation。列表为当前对象提供 revision；DELETE 用 `If-Match` 提交该 revision，Move/Rename 用 `source_revision` 提交源 revision，允许覆盖时还必须携带 `destination_revision`。这些 token 绑定 owner、规范路径和完整 identity，RootedFs 在紧邻 rename 时复核 source，并按模式复核 destination/no-replace 条件；上传覆盖继续使用自己的 target revision CAS。最后一次 `statat` 与 `renameat2` 仍是两个相邻系统调用，因此只能收窄而不能消除拥有共享根写权限的外部进程制造的微小竞争窗。
+具体操作不一定使用全部字段，而且不能把最强保证外推到所有 mutation。列表为当前对象提供 revision；DELETE 用 `If-Match` 提交该 revision，Move/Rename 用 `source_revision` 提交源 revision，允许覆盖时还必须携带 `destination_revision`。这些 token 绑定 owner、规范路径和完整 identity，RootedFs 在紧邻 rename 时复核 source，并按模式复核 destination/no-replace 条件；上传覆盖使用独立 target revision。目标应不存在时用 `RENAME_NOREPLACE`，成功后还验证目的名称对应已钉住的源 fd；已有目标覆盖则是最后一次 identity 复核后执行普通 rename，不是内核目录项 CAS。后者只能收窄而不能消除拥有共享根写权限的外部进程制造的微小竞争窗。
 
 ### revision 不是内容哈希
 
@@ -135,7 +135,7 @@ Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系�
 
 移动和重命名会把源与目标作为同一批租约请求提交；协调器在内部排序、去重后统一判断冲突，而不是由调用者逐把加锁。这样既覆盖两个路径，又避免相反顺序逐锁造成死锁。
 
-但路径租约只约束当前 Dufs 进程。Move/Rename 现在会校验列表提供的 `source_revision`，覆盖时同时校验 `destination_revision`；DELETE 用 `If-Match`，上传使用独立 target revision。它们在 RootedFs 提交边界紧邻 rename 复核完整 identity 或 no-replace 条件，但外部进程仍可在最后一次复核和系统调用之间抢占，因此生产一致性要求共享根由 Dufs 独占写入，人工写入只能停服执行。
+但路径租约只约束当前 Dufs 进程。Move/Rename 现在会校验列表提供的 `source_revision`，覆盖时同时校验 `destination_revision`；DELETE 用 `If-Match`，上传使用独立 target revision。Missing 目标由 `RENAME_NOREPLACE` 防止晚到 occupant 被覆盖，rename 后的 source-anchor 核对避免把错误对象误报为成功；Existing 覆盖仍是 identity 复核与普通 rename 两步，外部进程可以在中间抢占。因此生产一致性要求共享根由 Dufs 独占写入，人工写入只能停服执行。
 
 ## 5.6 检查、原子提交与同步是三件事
 
@@ -156,7 +156,7 @@ Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系�
 - 确定未发布；
 - 已发布但持久性未知。
 
-最后一种典型场景是：rename 已完成，随后父目录同步失败。此时把它转换成普通“失败并重试”会有覆盖已成功文件的风险。
+最后一种典型场景是：rename 已完成，随后目的 identity 核对或父目录同步失败。此时把它转换成普通“失败并重试”会有覆盖已成功文件的风险。
 
 ## 5.8 为什么需要 Operation ID
 
@@ -186,7 +186,7 @@ SHA-256(账号) + Operation UUID
 - 已进入 `CommitStarted` 后异常退出：保守记录 `unknown`；
 - 正常完成：写入成功或失败终态。
 
-配合 Router 的 `MutationProgress`，可以把请求理解为：
+配合 Router 的 `MutationProgress`，可以把普通 Operation 请求理解为：
 
 ```text
 PREFLIGHT ──> RESERVED ──> DETACHED_COMMIT ──> FINAL
@@ -196,7 +196,9 @@ PREFLIGHT ──> RESERVED ──> DETACHED_COMMIT ──> FINAL
    └─ 尚未开始持久 mutation
 ```
 
-这两套边界相关但彼此独立：Router 的 `DETACHED_COMMIT` 是任务能脱离 HTTP waiter 的所有权边界，通常早于持久 `OperationGuard::CommitStarted`；后者才表示具体文件系统提交已经跨过不能安全遗忘的持久状态边界。详见[第 4 章](04-backend-request-lifecycle.md#416-mutationprogress超时时如何避免撒谎)。
+这两套边界相关但彼此独立：对普通 Operation，Router 的 `DETACHED_COMMIT` 是任务能脱离 HTTP waiter 的所有权边界，通常早于持久 `OperationGuard::CommitStarted`；后者才表示具体文件系统提交已经跨过不能安全遗忘的持久状态边界。
+
+上传有一个重要例外。它可以先把 task 放进 `commit_tasks`，同时仍在 `PREFLIGHT` 做 owner state、目标/stage identity、metadata 和空间等只读准备；直到首次文件系统或上传状态 mutation 才原子切到 `DETACHED_COMMIT`。总 deadline 若先把状态切到 `CANCELLED_BEFORE_UPLOAD_MUTATION`，服务会 abort task，任何稍后恢复的只读准备也不能再跨边界，因此返回 `408 not-started + retry`。边界前未处理的只读 I/O 是 `408/503 not-started + retry`；只有 task 先进入 `DETACHED_COMMIT` 后，外层 deadline 或未处理错误才是 `unknown + query_upload`。详见[第 4 章](04-backend-request-lifecycle.md#416-mutationprogress超时时如何避免撒谎)。
 
 `unknown` 的准确含义是：服务不能可靠证明操作成功，也不能可靠证明未发生。它不是“失败”的委婉说法，更不是“请用新 ID 再做一遍”。
 
@@ -272,15 +274,15 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 
 ## 5.13 数据库中保存什么
 
-固定文件是 `<state-dir>/state.sqlite3`，当前 schema v3 主要包含：
+固定文件是 `<state-dir>/state.sqlite3`，当前 schema v4 主要包含：
 
 | 表/概念 | 保存什么 | 不保存什么 |
 | --- | --- | --- |
 | operations | 普通写操作 ID、fingerprint、状态和可重放结果 | 文件正文 |
 | upload sessions | 上传 ID、目标/stage 路径与身份、长度、offset、覆盖 revision、状态 | 浏览器中的 `File` 对象 |
-| purge jobs | 删除 trash 身份、Prepared/Ready/Claimed 状态 | 一个用户可见的回收站目录 |
+| purge jobs | 删除 target/trash 路径、源身份、可选 32 字节 committed trash revision、Prepared/Ready/Claimed 状态 | 一个用户可见的回收站目录 |
 
-容量和寿命都有明确规则：普通完成操作保留约 15 分钟，全局最多 4096、每 owner 最多 1024；上传会话全局最多 16384、每 owner 最多 4096，每次更新后保留 7 天；purge job 全局最多 4096、每 owner 最多 1024。未完成 purge job 没有 TTL，会保留到安全完成；出现歧义或永久故障时，记录继续保留供运维人员调查，当前没有公开的 purge 管理 API。
+容量和寿命都有明确规则：普通完成操作保留约 15 分钟，全局最多 4096、每 owner 最多 1024；上传会话全局最多 16384、每 owner 最多 4096，每次实际更新后保留 7 天；purge job 全局最多 4096、每 owner 最多 1024。普通 purge I/O 故障没有 TTL 或固定失败次数，job 会保留并退避；缺少 committed revision、身份歧义或最终删除的 `InvalidData` 则把当前 trash 根移入永久 quarantine 并释放 job，供运维人员停服调查。当前没有公开的 purge 管理 API。
 
 ## 5.14 数据库自身的安全检查
 
@@ -297,6 +299,8 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 - `synchronous=EXTRA`；
 - application ID、schema version、quick check；
 - 数据库绑定的共享根 device/inode。
+
+空白数据库直接建立 schema v4。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内依次完成 v3 上传字段和 v4 purge revision 迁移；v3 只增加 v4 的 purge revision。其他 schema 版本在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
 
 数据库不能随意复制给另一个共享根继续使用，因为里面的路径、对象身份和未完成动作都绑定旧根。
 
@@ -329,7 +333,7 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 ```mermaid
 stateDiagram-v2
     [*] --> Prepared: SQLite 先记录删除意图和 identity
-    Prepared --> Ready: 原子改名为隐藏 trash + fsync 父目录
+    Prepared --> Ready: 原子改名 + fsync 父目录 + 持久化完整 trash revision
     Ready --> Claimed: worker 领取
     Claimed --> Ready: 临时失败 / 重启恢复
     Claimed --> [*]: 分批清理完成并删除 job
@@ -345,21 +349,21 @@ stateDiagram-v2
 6. operation 进入 `CommitStarted`；
 7. 按 `DeleteIdentity` 复核目标，并原子改名到同目录内部 trash 名称；
 8. `fsync` 父目录；
-9. purge row 进入 `Ready`；
+9. 计算覆盖 dev/inode、类型、nlink、size、uid/gid、完整 mode 和纳秒时间戳的 32 字节 trash revision，并与 `Ready` 原子持久化；
 10. operation 成功并返回 `204`；
 11. 后台 worker 分批递归清理。
 
 因此 `204` 证明目标已经从用户可见命名空间可靠移除，不表示所有数据块已经物理清除。内部 trash 是实现细节，不是可恢复的用户回收站。
 
-### Prepared 恢复为什么要核对两边
+### Prepared 恢复为什么不再猜测两边
 
-若进程在第 7 步附近崩溃，重启时可能看到 `Prepared`：
+若进程在第 7～9 步附近崩溃，重启时可能看到 `Prepared`。它只有 rename 前捕获的弱源身份，没有 live DELETE 在 rename 和父目录同步后提交的 trash revision；当前 target 名或 trash occupant 都不能证明哪个对象经历了原 checked rename。
 
-- trash 位置 identity 匹配：改名已经发生，应转 `Ready`；
-- 原位置 identity 匹配：改名没消费原对象，可撤销意图；
-- 两边都不能确定：保留现场，不猜测删除。
+因此 `Prepared` 恢复规则刻意简单而保守：永远不触碰 target；trash 路径若存在任何 occupant，就原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`；随后释放 intent，绝不把它补写为 `Ready`。schema v4 迁移不会改写旧 purge 行的原状态：旧 `Prepared` 走上述 reconciler；旧 `Claimed` 启动时先恢复为 `Ready`，再与旧 `Ready` 一样由 worker 因 NULL revision 失败关闭，quarantine 当前 trash occupant 并释放 job。只有 live 提交写入的完整 revision 才能授权 `Ready/Claimed` 自动回收。
 
-“不知道就不删”比强行清理更符合文件管理器的数据安全优先级。当前实现会把身份不一致的内部 trash 原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`，随后释放相应 purge 记录；该 quarantine 永不自动清理。运维人员必须先停止 Dufs，结合日志和状态库检查对象后再手工移除。
+worker 还持有 trash 根的 `O_PATH` 锚点，并在每个最终 unlink/rmdir 前把候选移入随机 quarantine/disposal 名，再比较名称与 fd 的完整 identity。缺失 revision、身份不一致、最终 `ENOTEMPTY/EXIST` 或其他 `InvalidData` 都会使整棵 trash 根进入永久 quarantine 并释放 job，不从 cursor 0 重扫；普通瞬时 I/O 才保留 job 并退避。未记账 orphan 在兜底通道满、取消或普通 I/O 失败时保持隐藏，等待以后 maintenance 重新发现；若 purge 返回 `InvalidData`，整棵根立即永久 quarantine，不再进入扫描。quarantine 永不自动清理，运维人员必须先停止 Dufs，结合日志和状态库检查对象后再手工移除。
+
+如果进程恰好在某个嵌套候选已经改成随机隔离名、但尚未 unlink 时中断，下一次 orphan 扫描可能重新捕获外层 trash。worker 看见树内遗留的严格 quarantine 名后不会继续删；它把这视为中断提交留下的身份歧义，并将整棵外层根 quarantine 供人工调查。
 
 ## 5.17 列表快照为什么会失效
 
@@ -367,11 +371,12 @@ stateDiagram-v2
 
 如果可能改变目录可见内容的操作成功，前端继续拿旧 cursor 加载可能出现重复或遗漏。因此这类前端操作必须发布统一 mutation effect：
 
-- `committed`：确认列表变化；
-- `outcome-unknown`：可能变化；
-- `not-committed`：确认没变化。
+- `committed`：确认本次写入且列表变化；
+- `outcome-unknown`：本次写入可能发生；
+- `refresh-required`：本次写入已被拒绝，但服务器证明当前 snapshot 已陈旧；
+- `not-committed`：确认没变化且 snapshot 仍可用。
 
-前两种都会使旧分页状态失效。后端也会在目录变化、快照过期或绑定不一致时拒绝 cursor。前后两层共同防止静默混合两代列表。
+前三种都会使旧分页状态失效。`refresh-required` 常见于上传 target 出现/消失/revision 改变或 reset-stage，以及 DELETE/MOVE/RENAME 的确定 revision 冲突；它不声称本次写入成功。非法名称等能够证明目录未变的拒绝才使用 `not-committed`。后端也会在目录变化、快照过期或绑定不一致时拒绝 cursor。前后两层共同防止静默混合两代列表。
 
 ## 5.18 readiness 如何证明“现在可写”
 
@@ -414,7 +419,7 @@ stateDiagram-v2
 
 ### 场景 F：外部进程替换目标
 
-PathCoordinator 无法控制外部进程。条件覆盖上传、DELETE、Move 和 Rename 都会把客户端看到的 revision 带回提交边界，并在紧邻 rename 时复核完整 identity；覆盖 relocation 还复核 destination revision。这样能把绝大多数陈旧页面或外部替换转为冲突，但最后一次 `statat` 与 `renameat2` 之间仍存在不可消除的微窗。因此不能承诺恶意外部替换总会被检测，生产上必须让 Dufs 独占共享根写入。
+PathCoordinator 无法控制外部进程。目标应不存在时，Upload/Move/Rename 用 `RENAME_NOREPLACE` 保留晚到 occupant，并在成功后确认目的名称仍对应已打开的源；失败会报告 unknown。Existing 覆盖会把客户端看到的 revision 带回提交边界并在紧邻 rename 时复核 source/destination identity，但随后仍是普通 rename，外部 writer 可在两步之间替换任一名称。DELETE 也带 revision；purge 的最终删除候选会先进入随机隔离名并用已打开 fd 再复核。这样能把绝大多数陈旧页面或普通外部替换转为冲突、unknown 或 quarantine，但不能承诺恶意外部替换总会被检测；同 UID writer 还可用 inotify 观察 purge 随机名并主动竞争。因此生产上必须让 Dufs 独占共享根写入；排除同 UID 攻击者需要其不可访问的私有工作目录或系统身份隔离。
 
 ## 5.20 维护这部分代码的规则
 

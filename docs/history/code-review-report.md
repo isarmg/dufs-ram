@@ -1,10 +1,10 @@
 # Dufs 全面代码审查与整改报告
 
-> 文档说明：第 1～12 节以初次审查时的证据、风险解释和修复建议为主，便于追溯“为什么要改”。其中未明确标注“整改状态”“整改后”或“当前代码”的源码行号、测试数量和“当前”措辞属于当时快照；这些明确标注的整改补记、本页开头两张整改表以及第 13～15 节属于后续历史验收快照，第 16 节描述 2026-08-20 的当前上传终态并取代更早章节中与上传确认、覆盖条件或状态 schema 冲突的结论。
+> 文档说明：第 1～12 节以初次审查时的证据、风险解释和修复建议为主，便于追溯“为什么要改”。其中未明确标注“整改状态”“整改后”或“当前代码”的源码行号、测试数量和“当前”措辞属于当时快照；这些明确标注的整改补记、本页开头两张整改表以及第 13～15 节属于后续历史验收快照，第 16 节已在 2026-08-22 同步当前上传终态并取代更早章节中与上传确认、覆盖条件或状态 schema 冲突的结论。
 
 > 2026-08-20 补记：目录 ZIP 已从产品、配置、依赖和测试中整体移除；兼容窗内只保留对任意 `zip` 查询 key 的 `410 directory_archive_unsupported`。下文 ZIP 缺陷、修复和验收记录特意保留作为历史审计证据，不表示当前仍支持目录归档。该补记取代报告中所有与 ZIP 当前可用性有关的旧结论。
 
-> 2026-08-20 上传补记：浏览器不再要求每个合法批次一律确认，而是先做有界目标预检；实际发布使用原子 no-replace 或绑定 owner/path/完整目标 identity 的 revision CAS。晚到冲突保留完整 stage 为 `AwaitingConfirmation`，可空 PATCH 条件发布或显式 discard；任何 `unknown` 都不会自动覆盖。第 16 节给出完整当前口径。
+> 2026-08-20 上传补记：浏览器不再要求每个合法批次一律确认，而是先做有界目标预检；Missing 发布使用原子 no-replace 与发布后 identity 核对，Existing 覆盖使用 owner/path/完整目标 identity 绑定的 revision 做提交前复核，再执行普通 rename。晚到冲突保留完整 stage 为 `AwaitingConfirmation`，可空 PATCH 条件发布或显式 discard；任何 `unknown` 都不会自动覆盖。第 16 节给出完整当前口径。
 
 ## 整改总览（2026-07-28）
 
@@ -14,11 +14,11 @@
 | --- | --- | --- |
 | H-01 | 已修复 | ZIP 名称从真实相对组件逐段构造；拒绝 C0/DEL 控制字符、反斜杠、点组件、绝对/盘符/冒号、Windows 不兼容字符和 Windows 保留设备名（包括 `CONIN$`、`CONOUT$`、`COM0`、`LPT0`），并在 Unicode canonical normalization 后检测不区分大小写的跨平台命名碰撞；创建归档前完成全量预检，并以真实 ZIP 本地头和中央目录测试 `%5C` 攻击链。 |
 | H-02 | 已修复 | 生产后端只启用 Hyper HTTP/1 handler（接受 HTTP/1.0 和 HTTP/1.1），删除 h2/server-auto 依赖；真实 HTTP/2 prior-knowledge preface 被拒绝。 |
-| M-01 | 已修复 | 上传绝对 deadline 从路径排队开始，覆盖正文读取、写入、flush、metadata 恢复及进入不可取消提交点前的步骤；最终同步无法安全取消时，外层按时返回 `unknown`，后台继续持有租约收尾。 |
+| M-01 | 已修复 | 上传绝对 deadline 从路径排队开始，覆盖只读准备、正文读取、写入、flush、metadata 恢复及进入不可取消提交点前的步骤。受跟踪 task 的首次 filesystem/upload-state mutation 与 deadline 原子竞争：deadline 先赢会关闭边界、abort 并返回 `408 not-started + retry`，边界前未处理 I/O 为 `408/503 not-started + retry`；task 先越界后的外层超时才是 `unknown + query_upload`，不可取消的最终同步由后台持有租约收尾。 |
 | M-02 | 已修复 | 浏览器区分 `transferring/submitting/unknown`；正文发送完成即停止传输计时，提交确认有独立上限，未知结果不显示重试。 |
 | M-03 | 已修复 | 先等待路径租约，再占上传槽；热点路径排队受同一上传 deadline 约束。 |
 | M-04 | 已修复 | mkdir、move、DELETE 的账号隔离 operation ID 在校验/路径等待前进入 `Reserved`；pre-commit 明确失败记 `failed`，pre-commit guard 异常丢弃会移除预留，只有 `mark_commit_started` 后异常才记 `unknown`。成功必须 durable 且前端严格核对回显 ID/`succeeded`；每账号配额防止占满全局 registry，实际非上传 mutation task 另受 64 个全局许可约束。 |
-| M-05 | 已修复 | DELETE 在可见 rename 前写入 SQLite `Prepared` purge outbox；容量为全局 4096、每账号 1024，64 项内存 channel 只传递可合并 wake 和旧 orphan，不承担持久排队。单 worker 每片最多 256 项/25 ms；I/O 失败把 job 持久化回 `Ready` 并从 100 ms 退避到 30 秒，不因固定次数丢弃。状态转换瞬时失败时有界保留本地 claim，重启把遗留 `Claimed` 恢复为 `Ready`；独立 reconciler 处理 `Prepared`。维护与 purge 只跨片保存根内路径/cursor；EOF 后仍 `ENOTEMPTY` 会丢弃句柄并从 0 重扫并发新增项，fd 不随深度增长。 |
+| M-05 | 已修复 | DELETE 在可见 rename 前写无 revision 的 SQLite `Prepared` purge outbox；checked rename 与父目录同步后才把完整 32 字节 trash revision 和 `Ready` 原子写入。容量为全局 4096、每账号 1024，内存 channel 只传可合并 wake/orphan。单 worker 每片最多 256 项/25 ms，以 revision+fd 锚点授权删除；普通 I/O 失败持久退避，状态转换瞬时失败有界保留本地 claim，重启将 `Claimed` 恢复为 `Ready`。Prepared 恢复保留 target、quarantine 任意 trash occupant 并释放 intent；身份/最终删除异常也 quarantine/release。最终候选先随机隔离并 fd 复核，`ENOTEMPTY/EXIST` 不从 0 重扫；同 UID 恶意 inotify 竞争仍在威胁边界外。 |
 | M-06 | 已修复 | stage 固定 `0600`；上传会话只存于统一 SQLite `upload_sessions`，共享根内不写入、读取或导入 JSON state sidecar。部分 `Running` 用 PATCH 实际采用的同一个可写 no-follow stage fd 校验普通文件、`nlink == 1`、已记录 dev/inode 及 durable offset，并在该 fd 上截断未确认尾部；`CommitStarted` 是歧义屏障，重启恢复为 `Unknown`，不因 stage 只读、已 rename、缺失或异常降格。覆盖保留 numeric owner/group、非 setuid/setgid mode 与允许的非特权 xattr，`security.*`/`trusted.*` 及 setuid/setgid 目标一律拒绝。xattr 名称列表/条目数/单值上限为 64 KiB/1024/64 KiB；每值先查询精确长度，索引、名称和值总分配上限 1 MiB。上传终态绑定账号摘要，成功后记录 `Committed`，确定拒绝记录 `Rejected`；歧义状态不能盲重试。 |
 | M-07 | 已修复 | 仅明确的不存在、非目录和安全隐藏的链接逃逸映射为 404；权限、容量和其他 I/O 故障继续上抛。 |
 | M-08 | 已修复 | 服务边界统一通过 `AppError` 映射 I/O 状态并隔离公开消息与内部诊断；浏览器 JSON API 使用 RFC 9457 `application/problem+json` 的稳定 `code` 与 `detail`，不再靠纯文本或英文文案决定覆盖逻辑。move overwrite 对不同名称但同一 dev/inode 的硬链接在预检和 commit 内再次 fd-relative 复核，返回 `409 source_equals_destination`，不会把 POSIX rename no-op 误报为 `204`。 |
@@ -43,7 +43,7 @@
 | L-14 | 已修复 | Playwright 每测试使用唯一目录和 worker 账号，启用双 worker、完全并行和一次诊断重试；`failOnFlakyTests: true` 保证首轮失败不会因重试通过而假绿。只有串行执行多次 Argon2 登录、注销和 Cookie 重放的复合认证场景使用 slow 测试预算，不改变产品请求 deadline。 |
 | L-15 | 已修复 | 普通前端请求统一通过 AbortController/deadline 层和有界错误解析；operation 响应接受 `running/succeeded/failed/rejected/unknown` 并核对 ID（状态记录不持久化 rejected）。普通上传 XHR 要求状态绑定同一 ID，只有预期 PUT/PATCH 状态码、`committed` 和精确长度/满 offset 同时成立才成功；直接响应的 `running/rejected/not-started` 提供 Retry，但必须先 HEAD 原 ID，并在 HEAD 阶段严格核对长度/offset。直接 `not-seen`、显式 `unknown`、缺失/非法状态或 committed 不匹配保守归为 unknown。 |
 | L-16 | 已修复 | 浏览器 mutation API 返回统一的 RFC 9457 Problem Details 与稳定错误码；前端只解析 canonical `application/problem+json`，不接受旧文本响应。 |
-| P3 | 已完成 | 发布要求干净、版本 tag 精确指向 HEAD。完整门禁在已验证 commit archive 的无 Git 私有副本中以隔离 Cargo/npm/target/tmp 运行；Cargo vendor 后离线，npm cache 按 lockfile HTTPS+SHA-512 播种，可用 RustSec DB 无硬链接私有 clone。门禁后 snapshot index 复验内容/mode/新增路径，丢弃质量树，再 fresh extract 构建；签名前/发布前继续验证 exact source。全部源码树拒绝 symlink、submodule、特殊文件，双 archive 与 commit tree 完整核对。固定工具离线生成无本地路径泄漏的 SBOM；第三方 notice 要求每个包有非空、经审核的 SPDX `license` 表达式，再验证真实 SPDX AST、完整 permissive 分支与依赖自身许可证文本；`license_file` 不能替代表达式或作为分类 fallback。Rust 标准库 notice 绑定固定工具链审核摘要；`BUILD-ENVIRONMENT.txt` 记录实际源码/target/工具版本且不冒充全链钉扎。环境清单、SBOM、项目许可证和两类 notice 进入 checksum。签名 key 最后短暂打开，正式签名仍要求独立信任域；release 目录原子 no-clobber 发布。 |
+| P3 | 已完成 | 发布要求干净、版本 tag 精确指向 HEAD。完整门禁在已验证 commit archive 的无 Git 私有副本中以隔离 Cargo/npm/target/tmp 运行；Cargo vendor 后离线，npm cache 按 lockfile HTTPS+SHA-512 播种。RustSec DB 必须通过 canonical origin、HEAD/FETCH_HEAD、新鲜度及物理/Git/内容封存检查，或在任何项目/依赖代码前用 dummy lockfile 私有刷新；随后先执行 sealed `--no-fetch --no-yanked` pre-audit，并通过必填 `DUFS_QUALITY_AUDIT_DB` 让 `scripts/check.sh` 首步复审同一 seal。封存时校验 seal 与新鲜度，pre-audit 后只重验 seal；完整门后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。门禁后 snapshot index 复验内容/mode/新增路径，再 fresh extract 构建；签名前/发布前继续验证 exact source。全部源码树拒绝 symlink、submodule、特殊文件，双 archive 与 commit tree 完整核对。固定工具离线生成无本地路径泄漏的 SBOM；第三方 notice 要求每个包有非空、经审核的 SPDX `license` 表达式，再验证真实 SPDX AST、完整 permissive 分支与依赖自身许可证文本；`license_file` 不能替代表式或作为分类 fallback。Rust 标准库 notice 绑定固定工具链审核摘要；`BUILD-ENVIRONMENT.txt` 记录实际源码/target/工具版本与 RustSec revision/fetch epoch，不记录内部 seal 摘要。环境清单、SBOM、项目许可证和两类 notice 进入 checksum。签名 key 最后短暂打开，正式签名仍要求独立信任域；release 目录原子 no-clobber 发布。 |
 
 ### 二次复审追加问题
 
@@ -55,8 +55,8 @@
 | R2-M-02 | Medium | 已修复 | 维护扫描跳过跨设备条目时也提交新 cursor，不再每片重复停在同一项。 |
 | R2-M-03 | Medium | 已修复 | 递归搜索在 tracked blocking worker 中直接转换结果、累计真实结构与字符串容量并排序；配置与运行时均有 100000 项硬上限，排序前后检查 deadline。 |
 | R2-M-04 | Medium | 已修复 | 多地址 listener 改为先 accept 再为已接受 socket 获取全局连接许可，不再因 listener 数超过许可数导致固定地址饥饿。 |
-| R2-M-05 | Medium | 已修复 | 深目录 purge 跨片只保存路径/cursor，fd 数不随深度增长；错误把未完成 job 持久化回 `Ready` 并从 100 ms 退避到 30 秒，健康 job 可越过。job 不再因固定失败次数丢弃；SQLite outbox、公平容量和持续 reconciliation 共同避免故障 job 饿死其他回收或静默遗失。 |
-| R2-M-06 | Medium | 已修复 | 上传提交结果采用类型化发布阶段和 owner-scoped 终态：合法头后依次等待路径租约、尝试上传许可、以持有二者的受跟踪任务读取 route metadata，再查询 owner state/进入上传 mutation。路径/route 超时或槽满使用绑定的 response-only `not-started`；槽满直接返回 `429`，不读取或改变旧 state。前端任何可重试失败都先 HEAD，届时才恢复旧 ID 的真实状态。目标策略及 rename 前失败确定 `NotPublished/rejected`，rename 后持久性或 committed 终态落盘无法确认时保留满 offset running/返回 unknown。 |
+| R2-M-05 | Medium | 已修复 | 深目录 purge 跨片只保存路径/cursor，fd 数不随深度增长；普通 I/O 错误把未完成 job 持久化回 `Ready` 并从 100 ms 退避到 30 秒，健康 job 可越过。完整 revision、fd 锚点、随机最终隔离和 fail-closed quarantine 防止 inode 重用或 late replacement 被误删；身份异常释放 job 而非无限占槽。 |
+| R2-M-06 | Medium | 已修复 | 上传提交结果采用类型化发布阶段和 owner-scoped 终态：合法头后依次等待路径租约、尝试上传许可、以持有二者的受跟踪任务读取 route metadata；fresh PUT 随后在同一 deadline 内检查目标及后代的 durable obligations，再进入可只读准备的 tracked upload task。路径/route/state 超时或槽满使用绑定的 response-only `not-started`；持久状态冲突/不可用返回 `409/503`，槽满返回 `429`，均不创建本次 state。task 的首次 filesystem/upload-state mutation 与 deadline 原子竞争；deadline 或只读 I/O 在边界前失败为 `408/503 not-started + retry`，边界后逸出的错误才是 `unknown/query_upload`。前端任何可重试失败都先 HEAD，届时才恢复旧 ID 的真实状态。确定的发布前失败进入 `NotPublished/Rejected`；Missing rename 后 identity 无法证明、父目录持久性或 `Committed` 终态落盘无法确认时保留 `CommitStarted/Unknown` 歧义屏障并对外返回 `unknown`。 |
 | R2-L-01 | Low | 已修复 | fresh PUT 记录本次新建祖先目录身份；正文前失败时逆序删除仍为空且身份未变的目录。 |
 | R2-L-02 | Low | 已修复 | PathCoordinator 的语义解析错误不再 `.ok()` 后降级为词法锁或无限重试，而是使用以共享根 inode 为锚、与所有路径冲突的保守 wildcard 租约；后续 handler 返回原根边界/I/O 错误。解析中的早期 waiter 只阻塞词法祖先/后代，无关路径可超车；最终语义键与 epoch 复验仍防止别名并发。 |
 | R2-L-03 | Low | 已修复 | `fstat`/`fstatvfs` 在共享预留 mutex 外执行，再按同设备 revision 核对和记账；最多 8 次重试后失败关闭，block/fragment 乘法或预算溢出也失败关闭。上传按分配单元计入保守 metadata overhead，慢文件系统不再跨设备串行阻塞。 |
@@ -878,7 +878,7 @@ ZIP 遍历只收集普通文件：
 
 ## 14. 最终一致性复核与保留边界
 
-最终复核再次逐项对照了代码、回归测试、README、CHANGELOG、安全政策、运维手册、工作流、特性清单和浏览器专项报告。当前一致语义包括：目录遍历复核全部访问目录但不是原子 FS snapshot；ZIP 直接生成有 64 MiB 上限的预算化计划/索引且所有 waiter 有 owner；上传按“路径租约 → 上传许可 → 受跟踪 route metadata → owner state/mutation”进入，槽满不查旧 state 而返回 response-only `not-started`，Retry 必须先 HEAD；终态按账号隔离并区分 committed/rejected/歧义 running，state 与 partial stage 都以同 fd 分类，满偏移记录无条件作为歧义屏障；特权 metadata 拒绝和精确长度 xattr 内存预算；operation 的 Reserved/CommitStarted 生命周期；同 inode 硬链接 move 拒绝；purge 公平退避、有限失败占槽和周期重捕获；实际 temp device 的磁盘 revision/metadata/rounding 记账及乘法溢出失败关闭；解析中路径 waiter 的词法公平性与最终语义复验；未认证导航的精确 `Accept` 解析；30 + 10 秒停机硬截止、专用最终日志刷新线程、第二信号即时退出和 30 秒响应 write-idle；严格分离的 operation/upload 前端词汇；Acorn AST 防御纵深门、隔离 mandatory quality gate、exact-source、特殊树条目拒绝、强制 SPDX 表达式、SBOM、两类 notice 及主动 nginx 测试。
+最终复核再次逐项对照了代码、回归测试、README、CHANGELOG、安全政策、运维手册、工作流、特性清单和浏览器专项报告。当前一致语义包括：目录遍历复核全部访问目录但不是原子 FS snapshot；目录 ZIP 已整体移除；上传按“路径租约 → 上传许可 → 受跟踪 route metadata → fresh PUT durable-obligation scan → owner state/只读准备 → 原子 mutation boundary”进入，槽满不查旧 state 而返回 response-only `not-started`，task 的首次 filesystem/upload-state mutation 与总 deadline 原子竞争，边界前 `408/503 not-started + retry`、边界后 `unknown + query_upload`，两者 Retry 都必须先 HEAD；终态按账号隔离并区分 `Committed/Rejected/Unknown/AwaitingConfirmation`，只有部分 `Running` 支持续传，满 offset 通过 `CommitStarted` 建立歧义屏障；Missing 发布使用 no-replace 与发布后 identity 核对，Existing 覆盖保留外部 writer 微窗；特权 metadata 拒绝和精确长度 xattr 内存预算；operation 的 Reserved/CommitStarted 生命周期；同 inode 硬链接 move 拒绝；purge 以 committed revision+fd 锚点授权，Prepared/身份异常按 quarantine/release 失败关闭，最终候选随机隔离后复核；实际 stage device 的磁盘 revision/metadata/rounding 记账及乘法溢出失败关闭；解析中路径 waiter 的词法公平性与最终语义复验；未认证导航的精确 `Accept` 解析；30 + 10 秒停机硬截止、专用最终日志刷新线程、第二信号即时退出和 30 秒响应 write-idle；operation/upload 前端词汇与四值列表失效协议严格分离；Acorn/strict `checkJs`、IndexData 运行时验证、18 个模块的双向嵌入检查、RustSec 封存输入和隔离质量门共同进入交付链。
 
 未发现仍未记录的同等级代码缺陷。保留项是明确的产品或部署边界，而不是本轮可以通过局部补丁消除的问题：
 
@@ -952,19 +952,20 @@ ZIP 遍历只收集普通文件：
 
 终态判断：**本轮确认的全部代码、测试和文档问题均已关闭；本节验收结论为最终改动已具备提交条件。** 正式发布仍须基于最终提交创建与 Cargo 版本一致、精确指向该提交的 tag，然后从该干净 tag 重新执行 `scripts/check.sh` 与 `scripts/package-release.sh`。
 
-## 16. 上传预检与条件覆盖终态（2026-08-20）
+## 16. 上传预检与条件覆盖终态（2026-08-22 同步）
 
-本节记录“提交前检查目标、提交时仍以原子条件复核、真正冲突时只对受影响文件二次确认”的当前实现，并取代前文“每批上传总是先确认”以及 schema v2 不迁移等历史口径。
+本节记录“提交前检查目标、提交时仍执行 no-replace 或 identity 条件复核、真正冲突时只对受影响文件二次确认”的当前实现，并取代前文“每批上传总是先确认”以及 schema v2 不迁移等历史口径。
 
 | 审查面 | 当前实现与边界 |
 | --- | --- |
 | 有界预检 | 浏览器把文件转换为最终绝对逻辑路径后调用 `POST /__dufs__/api/upload/preflight`。每次必须有 1～512 个互不重复的路径，解码 UTF-8 路径总量最多 256 KiB，JSON wire body 最多 2 MiB；服务按原顺序返回 `path/exists/replaceable/revision`，前端严格绑定数量、顺序、路径和字段类型。预检只是观察，不冒充文件系统锁或原子快照。 |
 | 确认交互 | 没有已存在目标时零确认直接上传；只有已存在且可替换的目标进入覆盖/跳过/取消对话框，不可替换目标不会被自动覆盖。预检后只有实际发生竞态的文件才再次提示，不要求用户手工检查当前目录列表，也不会让一个文件的冲突授权其他文件。 |
-| 原子条件写 | 缺少 `X-Dufs-Upload-Overwrite` 或值为 `false` 使用原子 no-replace。值为 `true` 时必须同时携带 64 位小写十六进制 `X-Dufs-Target-Revision`；revision 绑定账号摘要、规范根内路径和完整 replacement CAS identity，并在 rename 紧前重新验证。旧 revision、非法响应或 `unknown` 都不能降级为无条件覆盖。 |
-| 晚到冲突 | 完整 stage 在最终检查发现目标出现或 identity 改变时不会发布或删除，而是以同一 upload ID、满 offset 持久化为 `AwaitingConfirmation`，对外状态为 `awaiting-confirmation`。用户接受当前目标后，以同一 ID、满 offset、空正文 PATCH 和最新 revision 发布，通常无需重传；若目标再次变化，条件仍失败并再次确认。 |
-| 明确跳过 | 用户跳过晚到冲突时，浏览器向 `POST /__dufs__/api/upload/discard` 发送精确路径和 upload ID。服务在 owner/path/id/state 全部匹配后删除保留 stage、记录 `Rejected` 并返回 `204`；UUID 本身不是跨账号或跨路径删除能力。 |
+| 原子条件写 | 缺少 `X-Dufs-Upload-Overwrite` 或值为 `false` 使用原子 no-replace。值为 `true` 时必须同时携带 64 位小写十六进制 `X-Dufs-Target-Revision`；revision 绑定账号摘要、规范根内路径和完整 replacement identity，并在 rename 紧前重新验证。Missing 发布以 `RENAME_NOREPLACE` 保留晚到 occupant，成功后核对 destination 与已打开 stage；Existing 覆盖仍是 identity 复核后普通 rename，不是针对外部 writer 的目录项 CAS。非法响应或 `unknown` 都不能降级为无条件覆盖。 |
+| 晚到冲突 | 完整 stage 在最终检查发现目标出现或 identity 改变时不会发布或删除，而是以同一 upload ID、满 offset 持久化为 `AwaitingConfirmation`，对外状态为 `awaiting-confirmation`。用户接受当前目标后，以同一 ID、满 offset、空正文 PATCH 和最新 revision 发布，通常无需重传；若目标再次变化，条件仍失败并再次确认，每次可信 target-change 都重新使列表 snapshot 失效，即使用户在两次冲突之间已刷新。 |
+| 明确跳过 | 用户跳过晚到冲突时，浏览器向 `POST /__dufs__/api/upload/discard` 发送精确路径和 upload ID。服务先将 owner/path/id 完全绑定的 `AwaitingConfirmation` 原位 CAS 为 `Rejected` 并设置终态 TTL，再按保留的 stage identity 条件清理；已有 `Rejected` 重试不写库、不续 TTL，但继续 cleanup。严格绑定的 `204` 表示终态及本次安全清理步骤完成，路径 replacement 会保留；HEAD `rejected` 只证明未发布，不证明 stage 路径物理消失。UUID 本身不是跨账号或跨路径删除能力。 |
 | metadata 安全例外 | 覆盖 stage 可能已经重放旧目标 uid/gid、mode 和允许的 xattr。若该目标随后消失，服务返回 `upload_metadata_preservation_refused`，拒绝用空 no-replace PATCH 把旧 metadata 发布为新文件；浏览器必须先 discard，再生成新 ID，以完整正文执行 create-only PUT。这个罕见分支有意以一次重传换取 metadata 语义正确。 |
-| 状态与迁移 | 统一状态库当前为 SQLite schema v3。`upload_sessions` 新增 target revision 和 `AwaitingConfirmation`，完整状态为 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`；v2 是唯一支持的旧版本，并在一个 `BEGIN IMMEDIATE` 事务内迁移为 v3，其他版本零修改拒绝。过期 `Running/AwaitingConfirmation` 只有在 DB 行、路径和 stage identity 仍一致时才清理。 |
-| 未知语义 | 网络中断、超时、非法状态、缺失/错误 revision、ID/长度/offset 不匹配和显式 `unknown` 均失败关闭。前端暂停剩余队列或按既有 HEAD-first 恢复协议处理，不会自动重发可能已经发布的请求，也不会自动覆盖当前目标。 |
+| 状态与迁移 | 统一状态库当前为 SQLite schema v4。`upload_sessions` 状态为 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`；v2 在一个 `BEGIN IMMEDIATE` 事务内依次执行上传 v3 和 purge v4 迁移，v3 在事务内增加 32 字节 committed trash revision，其他版本零修改拒绝。迁移保留旧 purge row 的状态且 revision 为 NULL：旧 `Prepared` 由 reconciler quarantine/release；旧 `Claimed` 启动时先转 `Ready`，再与旧 `Ready` 一样由 worker 因缺失 revision quarantine/release。过期 `Running/AwaitingConfirmation` 只有在 DB 行、路径和 stage identity 一致时才清理；过期 `Rejected` 先做 identity-safe stage cleanup，再按原 snapshot+仍过期条件删除控制行。 |
+| 列表失效 | 前端统一使用 `committed/outcome-unknown/refresh-required/not-committed` 四值契约；前三者使分页 snapshot/cursor 失效。`refresh-required` 表示服务器证明旧列表已陈旧但不声称本次写入成功，每一次 target-change/reset-stage 和确定 revision 冲突都使用该值；uploader 不缓存“一次失效即永久忽略”，因此 Refresh 后的后续冲突仍会再次失效。只有能证明目录未变的拒绝使用 `not-committed`。 |
+| 未知语义 | 客户端网络中断/等待超时、非法状态、缺失/错误 revision、ID/长度/offset 不匹配和显式 `unknown` 均失败关闭。服务端 tracked upload task 在首次 filesystem/upload-state mutation 前与总 deadline 原子竞争：deadline 先赢会关闭边界、abort 并返回 `408 not-started + retry`，只读准备未处理 I/O 为 `408/503 not-started + retry`；task 先跨边界后的外层超时/未处理错误才返回 `unknown + query_upload`。两类响应都按既有 HEAD-first 协议处理，不会自动重发可能已经发布的请求，也不会自动覆盖当前目标。 |
 
-这套设计把两类责任分开：预检负责减少不必要的对话框，no-replace/revision CAS 负责提交时正确性。它没有声称隔离拥有共享根写权限的外部进程，也没有把预检结果视为长期授权；任何目标变化都必须在最终条件提交中重新证明。
+这套设计把两类责任分开：预检负责减少不必要的对话框，no-replace/revision 条件检查负责 Dufs 请求间的提交正确性。它没有声称隔离拥有共享根写权限的外部进程；Existing 覆盖的 identity 复核与普通 rename 之间仍有微窗。预检结果也不是长期授权，任何已观察到的目标变化都必须在最终条件提交中重新证明。

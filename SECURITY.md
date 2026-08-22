@@ -47,6 +47,25 @@ backend port restricted to that gateway. All authenticated users can manage
 the entire shared root. Do not expose this build as a multi-tenant service for
 mutually untrusted users.
 
+The shared root must be writable only by the Dufs service account while the
+service is running. Path leases and identity checks coordinate this process;
+they do not make the namespace an isolation boundary against a shell, host
+process, or other writer with equivalent credentials. A destination expected
+to be missing is published with `RENAME_NOREPLACE`, so a late occupant is not
+overwritten, and the resulting destination is checked against the pinned
+source descriptor before success is reported. Replacing an existing target is
+different: Dufs rechecks source and destination identities and then performs an
+ordinary rename; this is not a kernel directory-entry compare-and-replace, and
+an external writer can still exchange either name in that narrow interval.
+Purge moves each final
+removal candidate to a random quarantine/disposal name and verifies the pinned
+descriptor again before unlinking it; an identity or final-removal anomaly
+quarantines the whole trash root instead of resuming at an old cursor. A
+malicious same-UID process which observes random work names with inotify and
+races the final verification-to-unlink window remains outside the supported
+threat boundary. Excluding that actor requires an inaccessible private work
+directory or operating-system identity isolation, not another pathname check.
+
 The release builder and the release signer are separate security roles.
 Production signing should run under a different operating-system account, on
 an isolated signing host, or in an HSM-backed service which never executes
@@ -76,12 +95,25 @@ archive with a sanitized environment and private Cargo, npm, build, and
 temporary state. Cargo dependencies are vendored before offline checks; npm
 cache entries are admitted only after matching lockfile HTTPS locations and
 SHA-512 integrity. The gate requires cargo-audit 0.22.2. A host RustSec
-database is reusable offline only when its origin is the canonical RustSec
-repository, HEAD matches the fetched revision, and its physical `FETCH_HEAD`
-shows an upstream check within seven days. Otherwise the isolated Cargo home
-must refresh the database over the network and fails closed when that is not
-possible. The accepted advisory revision and fetch epoch are recorded in the
-signed package environment manifest. Missing npm packages and `npm audit` can
+database is reusable only when its origin is the canonical RustSec repository,
+HEAD equals the fetched revision, its physical `FETCH_HEAD` is no more than
+seven days old and no more than 300 seconds ahead of the current clock, and a
+full physical, Git-metadata, mode, and content validation succeeds. Alternates,
+unsafe source/Git entries, symlinks,
+submodules, special files, untracked paths, and tracked content or mode drift
+are rejected. A valid database is cloned without hard links and sealed by its
+revision, fetch epoch, index checksum, and generated-config checksum. An
+invalid, stale, or missing host database is refreshed in private state with a
+dummy lockfile before any project or dependency code runs; lack of network
+fails closed. The release then performs a sealed
+`cargo audit --db ... --no-fetch --no-yanked` pre-audit. The isolated quality
+gate requires that same database through `DUFS_QUALITY_AUDIT_DB`, and
+`scripts/check.sh` audits it before other project or dependency steps. The seal
+is revalidated after the pre-audit; after the complete gate, both the seal and
+freshness are revalidated before the quality database is discarded. The
+accepted advisory revision and fetch epoch are
+recorded in the signed package environment manifest; internal index/config
+seal checksums are validation inputs, not manifest fields. Missing npm packages and `npm audit` can
 still require controlled network access; environment isolation is not itself
 proof of a fully offline quality gate. A separate snapshot index then verifies
 tracked content, modes, and unexpected non-ignored paths. That quality tree is
@@ -120,24 +152,41 @@ limited to 64 KiB and 1024 entries, each value to 64 KiB, and the combined
 index, NUL-terminated names, and exact-sized values to 1 MiB. Values are sized
 before allocation rather than receiving a fixed 64 KiB buffer per attribute.
 
-Upload-state inspection opens the hidden record with no-follow and nonblocking
-flags, classifies and sizes that same descriptor, accepts only a regular file
-of at most 4096 bytes, and performs a bounded 4097-byte read so a concurrent
-append cannot bypass the limit. A symlink, FIFO, device, directory, oversized
-or malformed record is treated as not seen and cannot block a status lookup. A
-partial running checkpoint also opens the stage through the exact writable
-no-follow path used by PATCH, then checks that same descriptor is a regular,
-single-link file whose length reaches the durable offset. A full-offset
-running record remains an ambiguity barrier even when its stage is read-only,
-already renamed, missing, or otherwise abnormal; it is never downgraded to
-not-seen merely because the stage cannot be reopened.
+SQLite `upload_sessions` is the sole upload-state authority; the shared root
+contains no JSON upload-state record. Lookup is keyed by the authenticated
+owner digest and UUID. Stored target/stage paths are treated as untrusted bytes
+and must pass canonical root-relative resolution and exact binding checks.
+Owner-scoped absence is returned as not seen, while a malformed row, invalid
+stored path, or SQLite failure fails closed as a state-storage error rather
+than being silently downgraded to absence. A partial running checkpoint also
+opens the stage through the exact writable no-follow path used by PATCH, then
+checks that descriptor is a regular, single-link file whose identity matches
+the durable checkpoint and whose length reaches the durable offset. A
+full-offset running record remains an ambiguity barrier even when its stage is
+read-only, already renamed, missing, or otherwise abnormal; it is never
+downgraded to not-seen merely because the stage cannot be reopened.
 The response-only `not-started` state means that the current request, whose ID
 and length were parsed, stopped before any upload mutation; it does not prove
 that the same ID has no older owner-scoped record. A retry must therefore query
 the old ID before choosing PATCH, a new ID, or no replay. The server acquires
-the path lease and upload permit before tracked route metadata and owner-state
-inspection; a full upload admission returns `429 not-started` without reading
-or changing any older record.
+the path lease and upload permit before tracked route metadata. A fresh PUT
+then checks durable upload/purge obligations for the target path and its
+descendants, under the same upload deadline and before registering or creating
+this upload mutation. Conflict, state-store failure, and inspection timeout
+return bound `409`, `503`, and `408` not-started responses respectively. A full
+upload admission returns `429 not-started` without reading or changing any
+older record. The subsequently tracked upload task may still perform read-only
+session, target, metadata, and space preparation. Before its first filesystem
+or upload-state mutation, it atomically races that boundary against the total
+deadline. If the deadline closes the boundary first, the server aborts the
+task; no later continuation can cross the closed boundary, and the response is
+bound `408 request_timeout`, `not-started`, and `retry`. An unhandled timeout
+from read-only preparation has the same contract; other unhandled pre-boundary
+I/O is bound `503 upload_precommit_failed`, `not-started`, and `retry`. If the
+task crosses the mutation boundary first, a later outer deadline or unhandled
+error is instead `unknown` with `query_upload`. Existing checkpoints remain
+authoritative in every case, so even a definite not-started response does not
+authorize choosing a replay mode without the owner-scoped HEAD query.
 
 Potential credentials and file contents must never be attached to a report.
 Rotate any secret that was disclosed during investigation.

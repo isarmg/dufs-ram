@@ -141,7 +141,7 @@ URI → RoutePath → RootedPath → 根 FD 相对打开 → fstat identity
 - Move 和 Rename 为什么是两个 API，却共用底层迁移引擎？
 - Operation ID 如何绑定请求内容？
 - 哪个时刻以后超时只能 unknown？
-- committed、outcome-unknown、not-committed 如何影响列表？
+- committed、outcome-unknown、refresh-required、not-committed 如何影响列表？
 
 ### 第 8 次：删除和 SQLite actor
 
@@ -314,7 +314,7 @@ rg "X-Dufs-Upload-Offset" src assets tests
 
 - 这个锁、租约或信号量保护的是哪种资源？
 - 是否跨 `.await` 持有不该长时间占用的锁？
-- 外部进程不受 PathCoordinator 控制时，最终 CAS 是否仍安全？
+- 外部进程不受 PathCoordinator 控制时，这个提交使用 `RENAME_NOREPLACE`，还是只做 identity 复核后普通 rename；剩余竞争窗是什么？
 - Future 取消后，副作用是否可能继续？
 
 ### 持久化
@@ -547,7 +547,7 @@ Time Of Check To Time Of Use：检查与使用之间事实被并发改变的竞�
 ### U
 
 **unknown**
-系统当前无法可靠证明操作成功，也无法证明未发生的结果分类。持久化 Operation/Upload 记录中的 `Unknown` 是终态；Router 在 detached task 超时时先返回的 HTTP `unknown` 则只是当时观察，后台 job 随后仍可能落成 succeeded/failed。两者都不是换新 ID 自动重试的指令。
+系统当前无法可靠证明操作成功，也无法证明未发生的结果分类。持久化 Operation/Upload 记录中的 `Unknown` 是终态；Router 在普通 detached operation 或已经跨过首次 mutation boundary 的上传 task 超时时先返回的 HTTP `unknown`，则只是当时观察，后台工作随后仍可能收束。上传仅仅进入 tracked task 还不够：若总 deadline 在首次 filesystem/upload-state mutation 前先关闭原子边界，task 会被 abort 并返回 `408 not-started + retry`；只读准备未处理 I/O 也是 `408/503 not-started + retry`。无论 definite not-started 还是 unknown，都要先按原 ID 查询，不能直接换 ID 自动重放。
 
 **upload ID**
 单个上传会话的 UUID，绑定 owner、路径、长度、stage identity、offset 和状态。
@@ -565,7 +565,7 @@ Extended Attribute，Linux 文件扩展属性。覆盖重放时必须限制特�
 
 ### 修改 `assets/` 后为什么刷新没变化？
 
-运行中的旧二进制仍包含旧资源。重新 Cargo 构建、重启服务并重新取得页面。若修改的是 `EMBEDDED_ASSETS` 白名单中的 CSS、ES module 或图标，再确认页面请求了新的内容摘要 URL；`index.html`、`login.html` 和内联 `login.js` 不参与该摘要，修改它们时摘要前缀可以不变。
+运行中的旧二进制仍包含旧资源。重新 Cargo 构建、重启服务并重新取得页面。若修改的是 `EMBEDDED_ASSETS` 白名单中的 CSS、ES module、图标或其 MIME 声明，再确认页面请求了新的资源摘要 URL；`index.html`、`login.html` 和内联 `login.js` 不参与该摘要，修改它们时摘要前缀可以不变。
 
 ### 为什么不用 React/Vue？
 

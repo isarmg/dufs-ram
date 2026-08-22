@@ -209,7 +209,7 @@ Arc<Server>::clone()
 | `internal_api` | 是否应使用内部 API 的认证、错误和超时语义 |
 | `upload_context` | 是否能从请求头提取上传 ID、长度和偏移 |
 | `operation_id` | 是否能提取被追踪写操作的 Operation ID |
-| `mutation` | 当前请求是否已经越过可安全取消边界 |
+| `mutation` | 普通操作是否已分离提交，以及上传首次 mutation 是否已越界或已被 deadline 关闭 |
 
 为什么不让认证、超时、日志和错误处理各自重新判断“这是不是 API”？因为规则会逐渐漂移。例如一个新路由可能在认证分支被当成 API，却在超时分支被当成普通页面。集中画像让所有横切逻辑共享同一事实。
 
@@ -274,7 +274,7 @@ CSRF
 
 ### 内容寻址静态资产
 
-登录页面需要 CSS 等资源，因此带内容哈希前缀的嵌入资产也允许匿名 GET/HEAD。文件名包含构建内容摘要，只有成功返回的这类资产可以长期缓存。
+登录页面需要 CSS 等资源，因此带版本摘要前缀的嵌入资产也允许匿名 GET/HEAD。前缀绑定注册资源的名称、MIME 类型和内容，只有成功返回的这类资产可以长期缓存。
 
 普通目录页面、列表 API 和 readiness 都不属于公共路由。
 
@@ -335,7 +335,7 @@ GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公�
 | `/__dufs__/api/move` | POST | 把项目移入另一个目录 |
 | `/__dufs__/api/rename` | POST | 在原父目录修改名称 |
 | `/__dufs__/api/upload/preflight` | POST | 上传前批量观察目标是否冲突 |
-| `/__dufs__/api/upload/discard` | POST | 丢弃等待覆盖确认的上传 stage |
+| `/__dufs__/api/upload/discard` | POST | 先将等待覆盖确认的上传持久化为 Rejected，再按 identity 条件清理 stage；Rejected 可幂等重试 |
 
 不存在的 browser API 返回类型化 `404`，已知 API 使用错误方法则返回 `405` 并带 `Allow` 信息。这样“路由不存在”和“路由存在但方法写错”不会混成同一种故障。
 
@@ -484,7 +484,7 @@ PUT/PATCH 上传有自己的 Upload ID、阶段和超时，不应与普通 Opera
 
 对只读请求，超时通常可以直接回答“本次 HTTP 请求超时”。对重命名或删除则没这么简单：客户端停止等待时，文件系统提交任务可能已经独立运行。
 
-`MutationProgress` 使用三个内部阶段：
+普通 Operation 路径使用 `MutationProgress` 的三个主要阶段：
 
 ```text
 PREFLIGHT
@@ -518,6 +518,30 @@ Operation ID 已经被 Registry 接受，但提交尚未分离。仅仅登记了
 | `DETACHED_COMMIT` | `unknown` | 先查询 job 状态，不能直接重做 |
 
 这解决了一个常见错误：把所有超时都解释成失败，然后用户再次点击，导致原操作和重试同时生效。
+
+### 上传为什么不能只看“task 已经 spawn”
+
+上传也在 `commit_tasks` 中受跟踪，但它可能先做较慢的只读准备：查询 owner-scoped 会话、目标 identity/metadata、stage identity 和空间信息。`53f15ee` 之后，上传 task 的登记不再自动把结果推进为 unknown；它在首次创建祖先/stage、截断 stage、更新上传状态或接收正文前才执行原子比较交换：
+
+```text
+                     task 先赢
+PREFLIGHT ─────────────────────────> DETACHED_COMMIT / 可以 mutation
+    │
+    │ total deadline 先赢
+    ▼
+CANCELLED_BEFORE_UPLOAD_MUTATION ──> abort task / 永远不能再越界
+```
+
+因此服务端总 deadline 与首次 mutation 只有一个能赢：
+
+| 结果 | HTTP/上传状态 | 恢复动作 |
+| --- | --- | --- |
+| deadline 先关闭边界 | `408 request_timeout + not-started` | `retry`，但先用原 Upload ID 做 HEAD |
+| 只读准备的 timeout 逸出 | `408 request_timeout + not-started` | 同上 |
+| 只读准备的其他未处理 I/O 逸出 | `503 upload_precommit_failed + not-started` | 同上 |
+| task 已跨 mutation boundary 后，外层 deadline 或未处理错误逸出 | `unknown` | `query_upload`，禁止盲目重放 |
+
+关闭边界后再 `abort` 不是依赖“希望任务来得及取消”：即使较慢的只读系统调用稍后返回，后续代码也无法把同一个原子状态从 cancelled 改回可 mutation。这里保证的是服务端**总 deadline**的确定分支；浏览器断线或网关取消等待本身无法原子关闭服务端边界，已分发 task 仍可能继续，所以客户端仍需按 upload 协议对账。
 
 ### 为什么 `run_operation_commit` 看起来仍然在 `await`
 

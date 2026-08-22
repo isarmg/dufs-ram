@@ -77,7 +77,7 @@ cargo install cargo-llvm-cov --version 0.8.6 --locked
 
 日常修改并不要求每次都运行覆盖率或依赖审计。先安装它们，是为了准备最终工程级检查。
 
-首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；`cargo audit` 还要取得 RustSec 数据，`npm audit` 要访问 npm registry。正式发布只允许 cargo-audit 0.22.2；宿主 RustSec DB 也必须来自 canonical origin、HEAD 与 FETCH_HEAD revision 一致并在 7 天内验证过上游，才能离线复用。过期或缺失会强制隔离联网刷新，断网即失败关闭。离线执行前必须预热或提供相应缓存/镜像，且预先安装与仓库版本相容的 Chromium、Firefox；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
+首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；`cargo audit` 还要取得 RustSec 数据，`npm audit` 要访问 npm registry。正式发布只允许 cargo-audit 0.22.2。宿主 RustSec DB 只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 FETCH_HEAD 不得比当前时间早超过 7 天或晚超过 300 秒，并通过物理/Git/内容完整性检查后才能复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径和 tracked 内容/mode 漂移都会拒绝。合格数据库以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在运行任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新，断网即失败关闭。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed pre-audit，随后要求 `DUFS_QUALITY_AUDIT_DB` 把同一封存交给 `scripts/check.sh`。封存时校验 seal 与新鲜度，pre-audit 后只重验 seal；完整门后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。离线执行前必须预热或提供相应缓存/镜像，且预先安装与仓库版本相容的 Chromium、Firefox；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
 
 所有 npm 脚本及锁定版本都可以在 [package.json](../../package.json) 和 [package-lock.json](../../package-lock.json) 中找到。生产前端没有 Node 打包步骤；这里安装的是检查和测试工具，不是服务器运行依赖。
 
