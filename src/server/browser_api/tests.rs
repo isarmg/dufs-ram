@@ -45,6 +45,88 @@ async fn move_commit_rejects_target_created_after_precheck() {
 }
 
 #[tokio::test]
+async fn missing_relocation_noreplace_collision_matches_request_semantics() {
+    for (expected_destination, expected_outcome) in [
+        (None, RelocationCommitOutcome::DestinationExists),
+        (
+            Some(ReplacementTargetIdentity::Missing),
+            RelocationCommitOutcome::DestinationChanged,
+        ),
+    ] {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        std::fs::write(&source, "source-content").unwrap();
+        let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
+
+        let competing_destination = destination.clone();
+        rooted_fs.inject_before_missing_rename_once(move || {
+            std::fs::write(competing_destination, "competitor-content").unwrap();
+        });
+
+        assert_eq!(
+            commit_relocation(
+                &rooted_fs,
+                &source,
+                &destination,
+                expected_source,
+                expected_destination,
+            )
+            .await
+            .unwrap(),
+            expected_outcome
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source-content");
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "competitor-content"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_relocation_is_unknown_when_the_renamed_source_misses_its_anchor() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let source = temp.path().join("source.txt");
+    let displaced_source = temp.path().join("displaced-source.txt");
+    let destination = temp.path().join("destination.txt");
+    let rooted_fs = RootedFs::new(temp.path()).unwrap();
+    std::fs::write(&source, "source-content").unwrap();
+    let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
+
+    let replaced_source = source.clone();
+    let preserved_source = displaced_source.clone();
+    rooted_fs.inject_before_missing_rename_once(move || {
+        std::fs::rename(&replaced_source, &preserved_source).unwrap();
+        std::fs::write(&replaced_source, "external-content").unwrap();
+    });
+
+    let error = commit_relocation(
+        &rooted_fs,
+        &source,
+        &destination,
+        expected_source,
+        Some(ReplacementTargetIdentity::Missing),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read_to_string(&displaced_source).unwrap(),
+        "source-content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        "external-content"
+    );
+}
+
+#[tokio::test]
 async fn overwrite_commit_rejects_two_names_for_the_same_inode() {
     let temp = assert_fs::TempDir::new().unwrap();
     let source = temp.path().join("source.txt");
