@@ -53,9 +53,9 @@ use protocol::{
     RESUMABLE_UPLOAD_MIN_SIZE, TARGET_REPLACEABLE_HEADER, UPLOAD_ID_HEADER, UPLOAD_OFFSET_HEADER,
 };
 pub(super) use protocol::{
-    TARGET_REVISION_HEADER, TargetRevision, UploadMode, UploadOptions, UploadOverwritePolicy,
-    apply_upload_record_headers, parse_upload_id, parse_upload_length, parse_upload_offset,
-    parse_upload_overwrite,
+    TARGET_REVISION_HEADER, TargetRevision, UploadMode, UploadOptions, UploadOverwriteParseError,
+    UploadOverwritePolicy, apply_upload_record_headers, parse_upload_id, parse_upload_length,
+    parse_upload_offset, parse_upload_overwrite,
 };
 pub(super) use record::UploadRecordStore;
 use record::{

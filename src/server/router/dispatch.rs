@@ -27,8 +27,9 @@ use crate::{
         session::{LOGIN_ERROR_QUERY, LOGIN_PATH, LOGOUT_PATH},
         status_bad_request, status_csrf_forbid, status_method_not_allowed, status_not_found,
         upload::{
-            TargetRevision, UploadMode, UploadOptions, UploadOverwritePolicy, parse_upload_id,
-            parse_upload_length, parse_upload_offset, parse_upload_overwrite, target_revision,
+            TargetRevision, UploadMode, UploadOptions, UploadOverwriteParseError,
+            UploadOverwritePolicy, parse_upload_id, parse_upload_length, parse_upload_offset,
+            parse_upload_overwrite, target_revision,
         },
     },
 };
@@ -528,12 +529,15 @@ impl<'a> RequestDispatcher<'a> {
         match parse_upload_overwrite(&self.headers) {
             Ok(value) => Ok(Some(value)),
             Err(error) => {
-                let code = if error.to_string().contains("target-revision") {
-                    ErrorCode::INVALID_TARGET_REVISION
-                } else {
-                    ErrorCode::INVALID_UPLOAD_OVERWRITE
+                let (code, detail) = match error {
+                    UploadOverwriteParseError::UploadOverwrite(detail) => {
+                        (ErrorCode::INVALID_UPLOAD_OVERWRITE, detail)
+                    }
+                    UploadOverwriteParseError::TargetRevision(detail) => {
+                        (ErrorCode::INVALID_TARGET_REVISION, detail)
+                    }
                 };
-                self.render_bad_upload_header(code, error.to_string())?;
+                self.render_bad_upload_header(code, detail)?;
                 Ok(None)
             }
         }
