@@ -1,9 +1,4 @@
 bind:
-  - 0.0.0.0
-path-prefix: dufs
-hidden:
-  - dir3
-  - test.txt
-auth: 
-  - user:pass@/:rw
-allow-upload: true
+  - 127.0.0.1
+auth:
+  - 'user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs'

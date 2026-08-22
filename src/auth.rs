@@ -1,753 +1,553 @@
-use crate::{args::Args, server::Response, utils::unix_now};
-
-use anyhow::{anyhow, bail, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::{ed25519::signature::SignerMut, Signature, SigningKey};
+use crate::utils::{decode_hex_to_slice, encode_hex};
+use anyhow::{Context, Result, anyhow, bail};
+use argon2::{
+    Algorithm, Argon2, Params, Version,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use headers::HeaderValue;
-use hyper::{header::WWW_AUTHENTICATE, Method};
-use indexmap::IndexMap;
-use lazy_static::lazy_static;
-use md5::Context;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
-use sha_crypt::PasswordVerifier;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
-use uuid::Uuid;
+use subtle::ConstantTimeEq;
 
-const REALM: &str = "DUFS";
-const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
-const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
+pub const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
+pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const SESSION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+pub(crate) const MAX_USERNAME_BYTES: usize = 128;
 
-lazy_static! {
-    static ref NONCESTARTHASH: Context = {
-        let mut h = Context::new();
-        h.consume(Uuid::new_v4().as_bytes());
-        h.consume(std::process::id().to_be_bytes());
-        h
-    };
+const SESSION_CAPACITY: usize = 1024;
+const SESSION_PER_USER_CAPACITY: usize = 32;
+const MAX_ACCOUNTS: usize = 1024;
+const SECRET_BYTES: usize = 32;
+const SALT_BYTES: usize = 16;
+const ARGON2_VERSION: u32 = 19;
+const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
+const ARGON2_ITERATIONS: u32 = 2;
+const ARGON2_PARALLELISM: u32 = 1;
+const ARGON2_OUTPUT_BYTES: usize = 32;
+const ENCODED_SECRET_LEN: usize = SECRET_BYTES * 2;
+const COOKIE_ATTRIBUTES: &str = "Path=/; HttpOnly; Secure; SameSite=Strict";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub user: String,
+    pub csrf_token: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AccessControl {
-    empty: bool,
-    use_hashed_password: bool,
-    users: IndexMap<String, (String, AccessPaths)>,
-    anonymous: Option<AccessPaths>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedSession {
+    pub token: String,
+    pub session: SessionInfo,
 }
 
-impl Default for AccessControl {
-    fn default() -> Self {
-        AccessControl {
-            empty: true,
-            use_hashed_password: false,
-            users: IndexMap::new(),
-            anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
+/// Proof that [`AccessControl`] has verified an account password.
+///
+/// The username is intentionally private and this type is not cloneable, so a
+/// session can only be created from a successful verification result.
+pub(crate) struct VerifiedUser {
+    user: String,
+}
+
+#[derive(Debug)]
+struct SessionRecord {
+    user: String,
+    csrf_token: [u8; SECRET_BYTES],
+    created_at: Instant,
+    last_seen: Instant,
+}
+
+impl SessionRecord {
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) >= SESSION_ABSOLUTE_TIMEOUT
+            || now.saturating_duration_since(self.last_seen) >= SESSION_IDLE_TIMEOUT
+    }
+
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            user: self.user.clone(),
+            csrf_token: encode_hex(self.csrf_token),
         }
     }
 }
 
-impl AccessControl {
-    pub fn new(raw_rules: &[&str]) -> Result<Self> {
-        if raw_rules.is_empty() {
-            return Ok(Self::default());
-        }
-        let new_raw_rules = split_rules(raw_rules);
-        let mut use_hashed_password = false;
-        let mut annoy_paths = None;
-        let mut account_paths_pairs = vec![];
-        for rule in &new_raw_rules {
-            let (account, paths) =
-                split_account_paths(rule).ok_or_else(|| anyhow!("Invalid auth `{rule}`"))?;
-            if account.is_empty() {
-                if annoy_paths.is_some() {
-                    bail!("Invalid auth, no duplicate anonymous rules");
-                }
-                annoy_paths = Some(paths)
-            } else if let Some((user, pass)) = account.split_once(':') {
-                if user.is_empty() || pass.is_empty() {
-                    bail!("Invalid auth `{rule}`");
-                }
-                account_paths_pairs.push((user, pass, paths));
-            }
-        }
-        let mut anonymous = None;
-        if let Some(paths) = annoy_paths {
-            let mut access_paths = AccessPaths::default();
-            access_paths
-                .merge(paths)
-                .ok_or_else(|| anyhow!("Invalid auth value `@{paths}"))?;
-            anonymous = Some(access_paths);
-        }
-        let mut users = IndexMap::new();
-        for (user, pass, paths) in account_paths_pairs.into_iter() {
-            let mut access_paths = AccessPaths::default();
-            access_paths
-                .merge(paths)
-                .ok_or_else(|| anyhow!("Invalid auth value `{user}:{pass}@{paths}"))?;
-            if let Some(anon_ap) = &anonymous {
-                let orig_user = access_paths.clone();
-                access_paths.absorb_anon(
-                    anon_ap,
-                    &orig_user,
-                    AccessPerm::IndexOnly,
-                    AccessPerm::IndexOnly,
-                );
-            }
-            if pass.starts_with("$6$") {
-                use_hashed_password = true;
-            }
-            users.insert(user.to_string(), (pass.to_string(), access_paths));
+#[derive(Debug, Default)]
+struct SessionStore {
+    entries: HashMap<[u8; SECRET_BYTES], SessionRecord>,
+}
+
+impl SessionStore {
+    fn purge_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, session| !session.is_expired(now));
+    }
+
+    fn insert(&mut self, token_digest: [u8; SECRET_BYTES], session: SessionRecord) -> Result<()> {
+        if self.entries.contains_key(&token_digest) {
+            bail!("Generated a duplicate session token");
         }
 
-        Ok(Self {
-            empty: false,
-            use_hashed_password,
-            users,
-            anonymous,
-        })
+        let same_user_count = self
+            .entries
+            .values()
+            .filter(|existing| existing.user == session.user)
+            .count();
+        let oldest_for_user = || {
+            self.entries
+                .iter()
+                .filter(|(_, existing)| existing.user == session.user)
+                .min_by_key(|(_, existing)| (existing.last_seen, existing.created_at))
+                .map(|(digest, _)| *digest)
+        };
+        let oldest = if same_user_count >= SESSION_PER_USER_CAPACITY
+            || (self.entries.len() >= SESSION_CAPACITY && same_user_count > 0)
+        {
+            oldest_for_user()
+        } else if self.entries.len() >= SESSION_CAPACITY {
+            self.entries
+                .iter()
+                .min_by_key(|(_, existing)| (existing.last_seen, existing.created_at))
+                .map(|(digest, _)| *digest)
+        } else {
+            None
+        };
+        if let Some(oldest) = oldest {
+            self.entries.remove(&oldest);
+        }
+
+        self.entries.insert(token_digest, session);
+        Ok(())
+    }
+}
+
+/// Immutable account configuration loaded at startup.
+///
+/// Password hashes stay private and custom `Debug` output only exposes the
+/// configured usernames. Cloning this value never clones or shares runtime
+/// sessions; each server constructs its own [`AccessControl`].
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct AuthConfig {
+    users: HashMap<String, String>,
+}
+
+impl AuthConfig {
+    pub fn new(raw_accounts: &[&str]) -> Result<Self> {
+        if raw_accounts.len() > MAX_ACCOUNTS {
+            bail!("At most {MAX_ACCOUNTS} auth accounts may be configured");
+        }
+        let mut users = HashMap::new();
+
+        for (index, account) in raw_accounts.iter().enumerate() {
+            let account_number = index + 1;
+            let (user, password) = account.split_once(':').ok_or_else(|| {
+                anyhow!("Invalid auth account #{account_number}: expected `user:<argon2id PHC>`")
+            })?;
+            if user.is_empty() || password.is_empty() {
+                bail!(
+                    "Invalid auth account #{account_number}: username and Argon2id PHC must not be empty"
+                );
+            }
+            if user.len() > MAX_USERNAME_BYTES {
+                bail!(
+                    "Invalid auth account #{account_number}: username exceeds the {MAX_USERNAME_BYTES}-byte limit"
+                );
+            }
+            if users.contains_key(user) {
+                bail!("Invalid auth account #{account_number}: duplicate username");
+            }
+
+            validate_argon2id_hash(password).with_context(|| {
+                format!("Invalid Argon2id PHC in auth account #{account_number}")
+            })?;
+
+            users.insert(user.to_string(), password.to_string());
+        }
+
+        Ok(Self { users })
     }
 
     pub fn has_users(&self) -> bool {
         !self.users.is_empty()
     }
+}
 
-    pub fn guard(
-        &self,
-        path: &str,
-        method: &Method,
-        authorization: Option<&HeaderValue>,
-        token: Option<&String>,
-        guard_options: bool,
-    ) -> (Option<String>, Option<AccessPaths>) {
-        if self.empty {
-            return (None, Some(AccessPaths::new(AccessPerm::ReadWrite)));
-        }
-
-        if method == Method::GET {
-            if let Some(token) = token {
-                if let Ok((user, ap)) = self.verify_token(token, path) {
-                    return (Some(user), ap.guard(path, method));
-                }
-            }
-        }
-
-        if let Some(authorization) = authorization {
-            if let Some(user) = get_auth_user(authorization) {
-                if let Some((pass, ap)) = self.users.get(&user) {
-                    if method == Method::OPTIONS {
-                        return (Some(user), Some(AccessPaths::new(AccessPerm::ReadOnly)));
-                    }
-                    if check_auth(authorization, method.as_str(), &user, pass).is_some() {
-                        return (Some(user), ap.guard(path, method));
-                    }
-                }
-            }
-
-            return (None, None);
-        }
-
-        if !guard_options && method == Method::OPTIONS {
-            return (None, Some(AccessPaths::new(AccessPerm::ReadOnly)));
-        }
-
-        if let Some(ap) = self.anonymous.as_ref() {
-            return (None, ap.guard(path, method));
-        }
-
-        (None, None)
-    }
-
-    pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
-        let (pass, _) = self
-            .users
-            .get(user)
-            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
-        let exp = unix_now().as_millis() as u64 + TOKEN_EXPIRATION;
-        let message = format!("{path}:{exp}");
-        let mut signing_key = derive_secret_key(user, pass);
-        let sig = signing_key.sign(message.as_bytes()).to_bytes();
-
-        let mut raw = Vec::with_capacity(64 + 8 + user.len());
-        raw.extend_from_slice(&sig);
-        raw.extend_from_slice(&exp.to_be_bytes());
-        raw.extend_from_slice(user.as_bytes());
-
-        Ok(hex::encode(raw))
-    }
-
-    fn verify_token<'a>(&'a self, token: &str, path: &str) -> Result<(String, &'a AccessPaths)> {
-        let raw = hex::decode(token)?;
-
-        if raw.len() < 72 {
-            bail!("Invalid token");
-        }
-
-        let sig_bytes = &raw[..64];
-        let exp_bytes = &raw[64..72];
-        let user_bytes = &raw[72..];
-
-        let exp = u64::from_be_bytes(exp_bytes.try_into()?);
-        if unix_now().as_millis() as u64 > exp {
-            bail!("Token expired");
-        }
-
-        let user = std::str::from_utf8(user_bytes)?;
-        let (pass, ap) = self
-            .users
-            .get(user)
-            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
-
-        let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes)?);
-
-        let message = format!("{path}:{exp}");
-        derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
-        Ok((user.to_string(), ap))
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut users: Vec<_> = self.users.keys().collect();
+        users.sort_unstable();
+        f.debug_struct("AuthConfig").field("users", &users).finish()
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct AccessPaths {
-    perm: AccessPerm,
-    children: IndexMap<String, AccessPaths>,
+impl<'de> Deserialize<'de> for AuthConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let accounts = Vec::<String>::deserialize(deserializer)?;
+        let accounts: Vec<_> = accounts.iter().map(String::as_str).collect();
+        Self::new(&accounts).map_err(serde::de::Error::custom)
+    }
 }
 
-impl AccessPaths {
-    pub fn new(perm: AccessPerm) -> Self {
+#[derive(Clone)]
+pub struct AccessControl {
+    config: AuthConfig,
+    sessions: Arc<Mutex<SessionStore>>,
+}
+
+impl Default for AccessControl {
+    fn default() -> Self {
+        Self::from_config(AuthConfig::default())
+    }
+}
+
+impl fmt::Debug for AccessControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut users: Vec<_> = self.config.users.keys().collect();
+        users.sort_unstable();
+        f.debug_struct("AccessControl")
+            .field("users", &users)
+            .field("active_sessions", &self.lock_sessions().entries.len())
+            .finish()
+    }
+}
+
+impl PartialEq for AccessControl {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+    }
+}
+
+impl AccessControl {
+    /// Create a fresh runtime authentication service from static account
+    /// configuration. The new service never shares sessions with another
+    /// service created from the same configuration.
+    pub fn from_config(config: AuthConfig) -> Self {
         Self {
-            perm,
-            ..Default::default()
+            config,
+            sessions: Arc::new(Mutex::new(SessionStore::default())),
         }
     }
 
-    pub fn perm(&self) -> AccessPerm {
-        self.perm
+    pub fn config(&self) -> &AuthConfig {
+        &self.config
     }
 
-    pub fn set_perm(&mut self, perm: AccessPerm) {
-        if !perm.indexonly() {
-            self.perm = perm;
+    pub fn has_users(&self) -> bool {
+        self.config.has_users()
+    }
+
+    /// Verify credentials without mutating the session store.
+    pub(crate) fn verify_credentials(&self, user: &str, password: &str) -> Option<VerifiedUser> {
+        self.verify_password(user, password).then(|| VerifiedUser {
+            user: user.to_string(),
+        })
+    }
+
+    /// Create a session for a previously verified account.
+    pub(crate) fn create_session(
+        &self,
+        verified_user: VerifiedUser,
+        previous_token: Option<&str>,
+    ) -> Result<CreatedSession> {
+        let user = verified_user.user;
+        let token = random_secret()?;
+        let token_digest = session_digest(&token);
+        let csrf_token = random_bytes()?;
+        let now = Instant::now();
+
+        let mut sessions = self.lock_sessions();
+        sessions.purge_expired(now);
+        if sessions.entries.contains_key(&token_digest) {
+            bail!("Generated a duplicate session token");
         }
-    }
-
-    pub fn merge(&mut self, paths: &str) -> Option<()> {
-        for item in paths.trim_matches(',').split(',') {
-            let (path, perm) = match item.split_once(':') {
-                None => (item, AccessPerm::ReadOnly),
-                Some((path, "ro")) => (path, AccessPerm::ReadOnly),
-                Some((path, "rw")) => (path, AccessPerm::ReadWrite),
-                _ => return None,
-            };
-            self.add(path, perm);
+        // Check the new digest before removing the previous session, then
+        // replace under the same lock. This preserves the old session on a
+        // random-token collision and avoids evicting an unrelated session
+        // when a full store rotates one of its existing entries.
+        if let Some(previous_token) = previous_token {
+            sessions.entries.remove(&session_digest(previous_token));
         }
-        Some(())
+        sessions.insert(
+            token_digest,
+            SessionRecord {
+                user: user.clone(),
+                csrf_token,
+                created_at: now,
+                last_seen: now,
+            },
+        )?;
+
+        Ok(CreatedSession {
+            token,
+            session: SessionInfo {
+                user,
+                csrf_token: encode_hex(csrf_token),
+            },
+        })
     }
 
-    pub fn guard(&self, path: &str, method: &Method) -> Option<Self> {
-        let target = self.find(path)?;
-        if !is_readonly_method(method) && !target.perm().readwrite() {
+    /// Verify credentials and create a fresh session.
+    ///
+    /// If `previous_token` is present, it is removed only after the
+    /// credentials have been verified and a replacement token has been
+    /// generated successfully.
+    #[cfg(test)]
+    pub fn login(
+        &self,
+        user: &str,
+        password: &str,
+        previous_token: Option<&str>,
+    ) -> Result<Option<CreatedSession>> {
+        let Some(verified_user) = self.verify_credentials(user, password) else {
+            return Ok(None);
+        };
+        self.create_session(verified_user, previous_token).map(Some)
+    }
+
+    /// Authenticate a session and refresh its idle timeout.
+    pub fn authenticate(&self, token: &str) -> Option<SessionInfo> {
+        self.authenticate_at(token, Instant::now())
+    }
+
+    /// Remove a session. Returns whether an active or expired record existed.
+    pub fn logout(&self, token: &str) -> bool {
+        if !is_encoded_secret(token) {
+            return false;
+        }
+        self.lock_sessions()
+            .entries
+            .remove(&session_digest(token))
+            .is_some()
+    }
+
+    /// Check the CSRF value belonging to an unexpired session.
+    ///
+    /// The comparison always covers all 256 bits for a syntactically valid
+    /// or invalid candidate of the expected length.
+    pub fn verify_csrf(&self, token: &str, expected: &str, candidate: &str) -> bool {
+        if !is_encoded_secret(token) {
+            return false;
+        }
+
+        let now = Instant::now();
+        let digest = session_digest(token);
+        let mut sessions = self.lock_sessions();
+        let Some(session) = sessions.entries.get(&digest) else {
+            return false;
+        };
+        if session.is_expired(now) {
+            sessions.entries.remove(&digest);
+            return false;
+        }
+
+        let (expected, expected_valid) = decode_secret_for_comparison(expected);
+        let (candidate, candidate_valid) = decode_secret_for_comparison(candidate);
+        let expected_equal = session.csrf_token.ct_eq(&expected);
+        let candidate_equal = session.csrf_token.ct_eq(&candidate);
+        bool::from(expected_equal & candidate_equal) && expected_valid && candidate_valid
+    }
+
+    fn verify_password(&self, user: &str, password: &str) -> bool {
+        let Some((password_hash, known_user)) = self
+            .config
+            .users
+            .get(user)
+            .map(|hash| (hash, true))
+            .or_else(|| self.config.users.values().next().map(|hash| (hash, false)))
+        else {
+            return false;
+        };
+
+        let verified = PasswordHash::new(password_hash).ok().is_some_and(|hash| {
+            current_argon2()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        });
+        known_user && verified
+    }
+
+    fn authenticate_at(&self, token: &str, now: Instant) -> Option<SessionInfo> {
+        if !is_encoded_secret(token) {
             return None;
         }
-        Some(target)
-    }
 
-    fn add(&mut self, path: &str, perm: AccessPerm) {
-        let path = path.trim_matches('/');
-        if path.is_empty() {
-            self.set_perm(perm);
-        } else {
-            let parts: Vec<&str> = path.split('/').collect();
-            self.add_impl(&parts, perm);
-        }
-    }
-
-    fn add_impl(&mut self, parts: &[&str], perm: AccessPerm) {
-        if parts.is_empty() {
-            self.perm = perm;
-            return;
-        }
-        let child = self.children.entry(parts[0].to_string()).or_default();
-        child.add_impl(&parts[1..], perm)
-    }
-
-    /// Merge anonymous `AccessPaths` into `self` (a user's paths) with "higher perm wins" semantics.
-    /// `orig_user` is a snapshot of `self` before any anonymous merging begins, used so that
-    /// the user's own effective perm is measured against the pre-merge state.
-    fn absorb_anon(
-        &mut self,
-        anon: &AccessPaths,
-        orig_user: &AccessPaths,
-        user_inherited: AccessPerm,
-        anon_inherited: AccessPerm,
-    ) {
-        let anon_eff = if !anon.perm.indexonly() {
-            anon.perm
-        } else {
-            anon_inherited
-        };
-        let orig_user_eff = if !orig_user.perm.indexonly() {
-            orig_user.perm
-        } else {
-            user_inherited
-        };
-
-        let combined = std::cmp::max(anon_eff, orig_user_eff);
-        if !combined.indexonly() && combined > self.perm {
-            self.perm = combined;
+        let digest = session_digest(token);
+        let mut sessions = self.lock_sessions();
+        let expired = sessions
+            .entries
+            .get(&digest)
+            .is_some_and(|session| session.is_expired(now));
+        if expired {
+            sessions.entries.remove(&digest);
+            return None;
         }
 
-        let default_ap = AccessPaths::default();
-        for (name, anon_child) in &anon.children {
-            let orig_user_child = orig_user.children.get(name).unwrap_or(&default_ap);
-            let user_child = self.children.entry(name.clone()).or_default();
-            user_child.absorb_anon(anon_child, orig_user_child, orig_user_eff, anon_eff);
-        }
+        let session = sessions.entries.get_mut(&digest)?;
+        session.last_seen = now;
+        Some(session.info())
     }
 
-    pub fn find(&self, path: &str) -> Option<AccessPaths> {
-        let parts: Vec<&str> = path
-            .trim_matches('/')
-            .split('/')
-            .filter(|v| !v.is_empty())
-            .collect();
-        self.find_impl(&parts, self.perm)
+    fn lock_sessions(&self) -> MutexGuard<'_, SessionStore> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn find_impl(&self, parts: &[&str], perm: AccessPerm) -> Option<AccessPaths> {
-        let perm = if !self.perm.indexonly() {
-            self.perm
-        } else {
-            perm
-        };
-        if parts.is_empty() {
-            if perm.indexonly() {
-                return Some(self.clone());
-            } else {
-                return Some(AccessPaths::new(perm));
-            }
-        }
-        let child = match self.children.get(parts[0]) {
-            Some(v) => v,
-            None => {
-                if perm.indexonly() {
-                    return None;
-                } else {
-                    return Some(AccessPaths::new(perm));
-                }
-            }
-        };
-        child.find_impl(&parts[1..], perm)
+    pub fn session_cookie(&self, token: &str) -> Result<HeaderValue> {
+        session_cookie(token)
     }
 
-    pub fn child_names(&self) -> Vec<&String> {
-        self.children.keys().collect()
-    }
-
-    pub fn entry_paths(&self, base: &Path) -> Vec<PathBuf> {
-        if !self.perm().indexonly() {
-            return vec![base.to_path_buf()];
-        }
-        let mut output = vec![];
-        self.entry_paths_impl(&mut output, base);
-        output
-    }
-
-    fn entry_paths_impl(&self, output: &mut Vec<PathBuf>, base: &Path) {
-        for (name, child) in self.children.iter() {
-            let base = base.join(name);
-            if child.perm().indexonly() {
-                child.entry_paths_impl(output, &base);
-            } else {
-                output.push(base)
-            }
-        }
+    pub fn clear_session_cookie(&self) -> HeaderValue {
+        clear_session_cookie()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub enum AccessPerm {
-    #[default]
-    IndexOnly,
-    ReadOnly,
-    ReadWrite,
-}
-
-impl AccessPerm {
-    pub fn indexonly(&self) -> bool {
-        self == &AccessPerm::IndexOnly
-    }
-
-    pub fn readwrite(&self) -> bool {
-        self == &AccessPerm::ReadWrite
+impl From<AuthConfig> for AccessControl {
+    fn from(config: AuthConfig) -> Self {
+        Self::from_config(config)
     }
 }
 
-pub fn www_authenticate(res: &mut Response, args: &Args) -> Result<()> {
-    if args.auth.use_hashed_password {
-        let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
-        res.headers_mut().insert(WWW_AUTHENTICATE, basic);
-    } else {
-        let nonce = create_nonce()?;
-        let digest = HeaderValue::from_str(&format!(
-            "Digest realm=\"{REALM}\", nonce=\"{nonce}\", qop=\"auth\""
-        ))?;
-        let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
-        res.headers_mut().append(WWW_AUTHENTICATE, digest);
-        res.headers_mut().append(WWW_AUTHENTICATE, basic);
+/// Hash a password with Argon2id v19 and the crate's standard parameters.
+pub fn hash_password(password: &str) -> Result<String> {
+    if password.is_empty() {
+        bail!("Password must not be empty");
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        bail!("Password exceeds the {MAX_PASSWORD_BYTES}-byte limit");
+    }
+    let mut salt = [0u8; SALT_BYTES];
+    getrandom::fill(&mut salt).map_err(|err| anyhow!("Failed to generate password salt: {err}"))?;
+    let salt = SaltString::encode_b64(&salt)
+        .map_err(|err| anyhow!("Failed to encode password salt: {err}"))?;
+    current_argon2()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| anyhow!("Failed to hash password: {err}"))
+}
+
+pub fn session_cookie(token: &str) -> Result<HeaderValue> {
+    if !is_encoded_secret(token) {
+        bail!("Invalid session token");
+    }
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE_NAME}={token}; {COOKIE_ATTRIBUTES}"
+    ))
+    .context("Failed to create the session cookie")
+}
+
+pub fn clear_session_cookie() -> HeaderValue {
+    HeaderValue::from_static(
+        "__Host-dufs-session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
+    )
+}
+
+pub fn session_token_from_cookie(cookie: &HeaderValue) -> Option<&str> {
+    cookie
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            (name == SESSION_COOKIE_NAME && is_encoded_secret(value)).then_some(value)
+        })
+}
+
+fn validate_argon2id_hash(password_hash: &str) -> Result<()> {
+    let parsed =
+        PasswordHash::new(password_hash).map_err(|err| anyhow!("Invalid PHC string: {err}"))?;
+    if parsed.algorithm.as_str() != "argon2id" {
+        bail!("Expected the argon2id algorithm");
+    }
+    if parsed.version != Some(ARGON2_VERSION) {
+        bail!("Expected Argon2id version 19");
+    }
+    let Some(salt) = parsed.salt else {
+        bail!("Argon2id PHC string must include a salt and output");
+    };
+    let Some(output) = parsed.hash else {
+        bail!("Argon2id PHC string must include a salt and output");
+    };
+
+    let mut decoded_salt = [0u8; 64];
+    let decoded_salt = salt
+        .decode_b64(&mut decoded_salt)
+        .map_err(|err| anyhow!("Invalid Argon2id salt: {err}"))?;
+    if decoded_salt.len() != SALT_BYTES {
+        bail!("Argon2id salt must be exactly {SALT_BYTES} bytes");
+    }
+    if output.len() != ARGON2_OUTPUT_BYTES {
+        bail!("Argon2id output must be exactly {ARGON2_OUTPUT_BYTES} bytes");
+    }
+
+    if parsed.params.iter().count() != 3
+        || parsed.params.get_decimal("m") != Some(ARGON2_MEMORY_KIB)
+        || parsed.params.get_decimal("t") != Some(ARGON2_ITERATIONS)
+        || parsed.params.get_decimal("p") != Some(ARGON2_PARALLELISM)
+    {
+        bail!(
+            "Argon2id parameters must be exactly m={},t={},p={}",
+            ARGON2_MEMORY_KIB,
+            ARGON2_ITERATIONS,
+            ARGON2_PARALLELISM
+        );
+    }
+
+    let params =
+        Params::try_from(&parsed).map_err(|err| anyhow!("Invalid Argon2id parameters: {err}"))?;
+    if params.m_cost() != ARGON2_MEMORY_KIB
+        || params.t_cost() != ARGON2_ITERATIONS
+        || params.p_cost() != ARGON2_PARALLELISM
+        || params.output_len() != Some(ARGON2_OUTPUT_BYTES)
+        || !params.keyid().is_empty()
+        || !params.data().is_empty()
+    {
+        bail!("Argon2id PHC string does not match the current password policy");
     }
     Ok(())
 }
 
-pub fn get_auth_user(authorization: &HeaderValue) -> Option<String> {
-    if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
-        let value: Vec<u8> = STANDARD.decode(value).ok()?;
-        let parts: Vec<&str> = std::str::from_utf8(&value).ok()?.split(':').collect();
-        Some(parts[0].to_string())
-    } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
-        let digest_map = to_headermap(value).ok()?;
-        let username = digest_map.get(b"username".as_ref())?;
-        std::str::from_utf8(username).map(|v| v.to_string()).ok()
-    } else {
-        None
-    }
+fn current_argon2() -> Argon2<'static> {
+    let params = Params::new(
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+        Some(ARGON2_OUTPUT_BYTES),
+    )
+    .expect("the fixed Argon2id password policy is valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-pub fn check_auth(
-    authorization: &HeaderValue,
-    method: &str,
-    auth_user: &str,
-    auth_pass: &str,
-) -> Option<()> {
-    if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
-        let value: Vec<u8> = STANDARD.decode(value).ok()?;
-        let (user, pass) = std::str::from_utf8(&value).ok()?.split_once(':')?;
-
-        if user != auth_user {
-            return None;
-        }
-
-        if auth_pass.starts_with("$6$") {
-            if sha_crypt::ShaCrypt::SHA512
-                .verify_password(pass.as_bytes(), auth_pass)
-                .is_ok()
-            {
-                return Some(());
-            }
-        } else if pass == auth_pass {
-            return Some(());
-        }
-
-        None
-    } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
-        let digest_map = to_headermap(value).ok()?;
-        if let (Some(username), Some(nonce), Some(user_response)) = (
-            digest_map
-                .get(b"username".as_ref())
-                .and_then(|b| std::str::from_utf8(b).ok()),
-            digest_map.get(b"nonce".as_ref()),
-            digest_map.get(b"response".as_ref()),
-        ) {
-            match validate_nonce(nonce) {
-                Ok(true) => {}
-                _ => return None,
-            }
-            if auth_user != username {
-                return None;
-            }
-
-            let mut h = Context::new();
-            h.consume(format!("{auth_user}:{REALM}:{auth_pass}").as_bytes());
-            let auth_pass = format!("{:x}", h.finalize());
-
-            let mut ha = Context::new();
-            ha.consume(method);
-            ha.consume(b":");
-            if let Some(uri) = digest_map.get(b"uri".as_ref()) {
-                ha.consume(uri);
-            }
-            let ha = format!("{:x}", ha.finalize());
-            let mut correct_response = None;
-            if let Some(qop) = digest_map.get(b"qop".as_ref()) {
-                if qop == &b"auth".as_ref() || qop == &b"auth-int".as_ref() {
-                    correct_response = Some({
-                        let mut c = Context::new();
-                        c.consume(&auth_pass);
-                        c.consume(b":");
-                        c.consume(nonce);
-                        c.consume(b":");
-                        if let Some(nc) = digest_map.get(b"nc".as_ref()) {
-                            c.consume(nc);
-                        }
-                        c.consume(b":");
-                        if let Some(cnonce) = digest_map.get(b"cnonce".as_ref()) {
-                            c.consume(cnonce);
-                        }
-                        c.consume(b":");
-                        c.consume(qop);
-                        c.consume(b":");
-                        c.consume(&*ha);
-                        format!("{:x}", c.finalize())
-                    });
-                }
-            }
-            let correct_response = match correct_response {
-                Some(r) => r,
-                None => {
-                    let mut c = Context::new();
-                    c.consume(&auth_pass);
-                    c.consume(b":");
-                    c.consume(nonce);
-                    c.consume(b":");
-                    c.consume(&*ha);
-                    format!("{:x}", c.finalize())
-                }
-            };
-            if correct_response.as_bytes() == *user_response {
-                return Some(());
-            }
-        }
-        None
-    } else {
-        None
-    }
+fn random_bytes() -> Result<[u8; SECRET_BYTES]> {
+    let mut bytes = [0u8; SECRET_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| anyhow!("Failed to generate random secret: {err}"))?;
+    Ok(bytes)
 }
 
-fn derive_secret_key(user: &str, pass: &str) -> SigningKey {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{user}:{pass}").as_bytes());
-    let hash = hasher.finalize();
-    SigningKey::from_bytes(&hash.into())
+fn random_secret() -> Result<String> {
+    Ok(encode_hex(random_bytes()?))
 }
 
-/// Check if a nonce is still valid.
-/// Return an error if it was never valid
-fn validate_nonce(nonce: &[u8]) -> Result<bool> {
-    if nonce.len() != 34 {
-        bail!("invalid nonce");
-    }
-    //parse hex
-    if let Ok(n) = std::str::from_utf8(nonce) {
-        //get time
-        if let Ok(secs_nonce) = u32::from_str_radix(&n[..8], 16) {
-            //check time
-            let now = unix_now();
-            let secs_now = now.as_secs() as u32;
-
-            if let Some(dur) = secs_now.checked_sub(secs_nonce) {
-                //check hash
-                let mut h = NONCESTARTHASH.clone();
-                h.consume(secs_nonce.to_be_bytes());
-                let h = format!("{:x}", h.finalize());
-                if h[..26] == n[8..34] {
-                    return Ok(dur < DIGEST_AUTH_TIMEOUT);
-                }
-            }
-        }
-    }
-    bail!("invalid nonce");
+fn session_digest(token: &str) -> [u8; SECRET_BYTES] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
-fn is_readonly_method(method: &Method) -> bool {
-    method == Method::GET
-        || method == Method::OPTIONS
-        || method == Method::HEAD
-        || method.as_str() == "PROPFIND"
-        || method.as_str() == "CHECKAUTH"
-        || method.as_str() == "LOGOUT"
+fn is_encoded_secret(value: &str) -> bool {
+    value.len() == ENCODED_SECRET_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn strip_prefix<'a>(search: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    let l = prefix.len();
-    if search.len() < l {
-        return None;
-    }
-    if &search[..l] == prefix {
-        Some(&search[l..])
-    } else {
-        None
-    }
-}
-
-fn to_headermap(header: &[u8]) -> Result<HashMap<&[u8], &[u8]>, ()> {
-    let mut sep = Vec::new();
-    let mut assign = Vec::new();
-    let mut i: usize = 0;
-    let mut esc = false;
-    for c in header {
-        match (c, esc) {
-            (b'=', false) => assign.push(i),
-            (b',', false) => sep.push(i),
-            (b'"', false) => esc = true,
-            (b'"', true) => esc = false,
-            _ => {}
-        }
-        i += 1;
-    }
-    sep.push(i);
-
-    i = 0;
-    let mut ret = HashMap::new();
-    for (&k, &a) in sep.iter().zip(assign.iter()) {
-        while header[i] == b' ' {
-            i += 1;
-        }
-        if a <= i || k <= 1 + a {
-            //keys and values must contain one char
-            return Err(());
-        }
-        let key = &header[i..a];
-        let val = if header[1 + a] == b'"' && header[k - 1] == b'"' {
-            //escaped
-            &header[2 + a..k - 1]
-        } else {
-            //not escaped
-            &header[1 + a..k]
-        };
-        i = 1 + k;
-        ret.insert(key, val);
-    }
-    Ok(ret)
-}
-
-fn create_nonce() -> Result<String> {
-    let now = unix_now();
-    let secs = now.as_secs() as u32;
-    let mut h = NONCESTARTHASH.clone();
-    h.consume(secs.to_be_bytes());
-
-    let n = format!("{:08x}{:032x}", secs, h.finalize());
-    Ok(n[..34].to_string())
-}
-
-fn split_account_paths(s: &str) -> Option<(&str, &str)> {
-    let i = s.find("@/")?;
-    Some((&s[0..i], &s[i + 1..]))
-}
-
-fn split_rules(rules: &[&str]) -> Vec<String> {
-    let mut output = vec![];
-    for rule in rules {
-        let parts: Vec<&str> = rule.split('|').collect();
-        let mut rules_list = vec![];
-        let mut concated_part = String::new();
-        for (i, part) in parts.iter().enumerate() {
-            if part.contains("@/") {
-                concated_part.push_str(part);
-                let mut concated_part_tmp = String::new();
-                std::mem::swap(&mut concated_part_tmp, &mut concated_part);
-                rules_list.push(concated_part_tmp);
-                continue;
-            }
-            concated_part.push_str(part);
-            if i < parts.len() - 1 {
-                concated_part.push('|');
-            }
-        }
-        if !concated_part.is_empty() {
-            rules_list.push(concated_part)
-        }
-        output.extend(rules_list);
-    }
-    output
+fn decode_secret_for_comparison(value: &str) -> ([u8; SECRET_BYTES], bool) {
+    let mut decoded = [0u8; SECRET_BYTES];
+    let valid = value.len() == ENCODED_SECRET_LEN && decode_hex_to_slice(value, &mut decoded);
+    (decoded, valid)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_split_account_paths() {
-        assert_eq!(
-            split_account_paths("user:pass@/:rw"),
-            Some(("user:pass", "/:rw"))
-        );
-        assert_eq!(
-            split_account_paths("user:pass@@/:rw"),
-            Some(("user:pass@", "/:rw"))
-        );
-        assert_eq!(
-            split_account_paths("user:pass@1@/:rw"),
-            Some(("user:pass@1", "/:rw"))
-        );
-    }
-
-    #[test]
-    fn test_compact_split_rules() {
-        assert_eq!(
-            split_rules(&["user1:pass1@/:rw|user2:pass2@/:rw"]),
-            ["user1:pass1@/:rw", "user2:pass2@/:rw"]
-        );
-        assert_eq!(
-            split_rules(&["user1:pa|ss1@/:rw|user2:pa|ss2@/:rw"]),
-            ["user1:pa|ss1@/:rw", "user2:pa|ss2@/:rw"]
-        );
-        assert_eq!(
-            split_rules(&["user1:pa|ss1@/:rw|@/"]),
-            ["user1:pa|ss1@/:rw", "@/"]
-        );
-    }
-
-    #[test]
-    fn test_access_paths() {
-        let mut paths = AccessPaths::default();
-        paths.add("/dir1", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir21", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir21/dir211", AccessPerm::ReadOnly);
-        paths.add("/dir2/dir22", AccessPerm::ReadOnly);
-        paths.add("/dir2/dir22/dir221", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir23/dir231", AccessPerm::ReadWrite);
-        assert_eq!(
-            paths.entry_paths(Path::new("/tmp")),
-            [
-                "/tmp/dir1",
-                "/tmp/dir2/dir21",
-                "/tmp/dir2/dir22",
-                "/tmp/dir2/dir23/dir231",
-            ]
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            paths
-                .find("dir2")
-                .map(|v| v.entry_paths(Path::new("/tmp/dir2"))),
-            Some(
-                [
-                    "/tmp/dir2/dir21",
-                    "/tmp/dir2/dir22",
-                    "/tmp/dir2/dir23/dir231"
-                ]
-                .iter()
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-            )
-        );
-        assert_eq!(
-            paths.find("dir1/file"),
-            Some(AccessPaths::new(AccessPerm::ReadWrite))
-        );
-        assert_eq!(
-            paths.find("dir2/dir21/file"),
-            Some(AccessPaths::new(AccessPerm::ReadWrite))
-        );
-        assert_eq!(
-            paths.find("dir2/dir21/dir211/file"),
-            Some(AccessPaths::new(AccessPerm::ReadOnly))
-        );
-        assert_eq!(
-            paths.find("dir2/dir22/file"),
-            Some(AccessPaths::new(AccessPerm::ReadOnly))
-        );
-        assert_eq!(
-            paths.find("dir2/dir22/dir221/file"),
-            Some(AccessPaths::new(AccessPerm::ReadWrite))
-        );
-        assert_eq!(paths.find("dir2/dir23/file"), None);
-        assert_eq!(
-            paths.find("dir2/dir23//dir231/file"),
-            Some(AccessPaths::new(AccessPerm::ReadWrite))
-        );
-    }
-}
+mod tests;

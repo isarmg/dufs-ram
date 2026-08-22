@@ -1,0 +1,1056 @@
+use super::*;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use tempfile::tempdir;
+
+const CAPACITY: usize = 8;
+const PER_OWNER: usize = 4;
+const TTL: Duration = Duration::from_secs(60);
+type SchemaRow = (String, String, String);
+type DatabaseSchemaSnapshot = (i64, i64, String, Vec<SchemaRow>);
+
+fn key(owner: u8, id: u8) -> OperationKey {
+    OperationKey {
+        owner: [owner; 32],
+        id: [id; 16],
+    }
+}
+
+fn fingerprint(value: u8) -> [u8; 32] {
+    [value; 32]
+}
+
+fn success(status: u16) -> StoredOutcome {
+    StoredOutcome {
+        status,
+        state: StoredTerminalState::Succeeded,
+        code: None,
+    }
+}
+
+fn root(device: u64, inode: u64) -> RootIdentity {
+    RootIdentity::new(device, inode)
+}
+
+fn upload(owner: u8, id: u8, offset: u64) -> StoredUploadSession {
+    StoredUploadSession {
+        key: UploadSessionKey {
+            owner: [owner; 32],
+            id: [id; 16],
+        },
+        target_path: PathBuf::from(format!("targets/{owner}-{id}")),
+        stage_path: PathBuf::from(format!("staging/{owner}-{id}")),
+        upload_length: 10,
+        durable_offset: offset,
+        state: StoredUploadState::Running,
+        stage_identity: None,
+        target_revision: None,
+    }
+}
+
+fn purge(owner: u8, id: u8) -> StoredPurgeJob {
+    StoredPurgeJob {
+        key: PurgeJobKey {
+            owner: [owner; 32],
+            id: [id; 16],
+        },
+        target_path: PathBuf::from(format!("targets/{owner}-{id}")),
+        trash_path: PathBuf::from(format!("trash/{owner}-{id}")),
+        source_identity: StoredFileIdentity {
+            device: u64::from(owner),
+            inode: u64::from(id),
+        },
+        is_directory: false,
+        state: StoredPurgeState::Prepared,
+        attempts: 0,
+    }
+}
+
+fn repository_limits(
+    upload_capacity: usize,
+    upload_per_owner: usize,
+    purge_capacity: usize,
+    purge_per_owner: usize,
+) -> RepositoryLimits {
+    RepositoryLimits {
+        upload_capacity,
+        upload_per_owner,
+        purge_capacity,
+        purge_per_owner,
+    }
+}
+
+fn temporary_with_repository_limits(limits: RepositoryLimits) -> Result<StateStore> {
+    StateStore::temporary_with_limits_for_test(
+        CAPACITY,
+        PER_OWNER,
+        TTL,
+        COMMAND_QUEUE_CAPACITY,
+        limits,
+    )
+}
+
+fn database_schema_snapshot(path: &Path) -> Result<DatabaseSchemaSnapshot> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let application_id = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let journal_mode = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    let mut statement = connection.prepare(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )?;
+    let schema = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((application_id, user_version, journal_mode, schema))
+}
+
+#[tokio::test]
+async fn operation_lifecycle_replays_exact_outcome() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+    let key = key(1, 1);
+    let lease = match store.begin_operation(key, fingerprint(1)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert_eq!(
+        store.begin_operation(key, fingerprint(1)).await?,
+        StoreBegin::Running
+    );
+    assert_eq!(
+        store.begin_operation(key, fingerprint(2)).await?,
+        StoreBegin::Conflict
+    );
+    assert!(store.mark_operation_commit_started(key, lease).await?);
+    assert!(!store.mark_operation_commit_started(key, lease).await?);
+    let outcome = success(201);
+    assert!(
+        store
+            .complete_operation(key, lease, outcome.clone())
+            .await?
+    );
+    assert_eq!(
+        store.operation_status(key).await?,
+        StoreStatus::Completed(outcome.clone())
+    );
+    assert_eq!(
+        store.begin_operation(key, fingerprint(1)).await?,
+        StoreBegin::Replay(outcome)
+    );
+    assert!(store.is_healthy());
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_probe_checks_the_live_read_and_write_paths() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+
+    store.probe_readiness().await?;
+    store.set_query_only(true).await?;
+    let error = store
+        .probe_readiness()
+        .await
+        .expect_err("query-only mode must fail the readiness write probe");
+    assert!(
+        format!("{error:#}").contains("readiness"),
+        "unexpected readiness error: {error:#}"
+    );
+    assert!(store.is_healthy());
+    store.set_query_only(false).await?;
+    store.probe_readiness().await?;
+    assert!(store.is_healthy());
+    assert_eq!(
+        store.operation_status(key(7, 7)).await?,
+        StoreStatus::NotFound
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_command_error_does_not_stop_the_actor() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+
+    let error = store
+        .inject_sql_error()
+        .await
+        .expect_err("the injected SQL statement must fail");
+    assert!(
+        format!("{error:#}").contains("__dufs_missing_test_table"),
+        "unexpected injected error: {error:#}"
+    );
+
+    assert!(store.is_healthy());
+    store.probe_readiness().await?;
+    assert!(matches!(
+        store.begin_operation(key(8, 8), fingerprint(8)).await?,
+        StoreBegin::Started { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_begin_delivery_does_not_leave_a_reservation() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+
+    // Cancellation before the actor replies is detected by Sender::send
+    // and cleaned up immediately on the actor's SQLite connection.
+    let cancelled_before_reply = key(1, 1);
+    let (reply, receiver) = oneshot::channel();
+    drop(receiver);
+    store.send(Command::Begin {
+        key: cancelled_before_reply,
+        fingerprint: fingerprint(1),
+        reply,
+    })?;
+    assert_eq!(
+        store.operation_status(cancelled_before_reply).await?,
+        StoreStatus::NotFound
+    );
+
+    // Cancellation after send succeeds but before the future receives its
+    // value drops BeginEnvelope and exercises its FIFO cleanup fallback.
+    let cancelled_after_reply = key(1, 2);
+    let (reply, receiver) = oneshot::channel();
+    store.send(Command::Begin {
+        key: cancelled_after_reply,
+        fingerprint: fingerprint(2),
+        reply,
+    })?;
+    let _ = store.operation_status(key(9, 9)).await?;
+    drop(receiver);
+    assert_eq!(
+        store.operation_status(cancelled_after_reply).await?,
+        StoreStatus::NotFound
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandon_removes_reserved_and_marks_commit_unknown() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+    let reserved = key(1, 1);
+    let reserved_lease = match store.begin_operation(reserved, fingerprint(1)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    store.abandon_operation(reserved, reserved_lease);
+    assert_eq!(
+        store.operation_status(reserved).await?,
+        StoreStatus::NotFound
+    );
+
+    let committing = key(1, 2);
+    let committing_lease = match store.begin_operation(committing, fingerprint(2)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert!(
+        store
+            .mark_operation_commit_started(committing, committing_lease)
+            .await?
+    );
+    store.abandon_operation(committing, committing_lease);
+    assert_eq!(
+        store.operation_status(committing).await?,
+        StoreStatus::Completed(StoredOutcome::uncertain())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandon_sql_error_is_deferred_without_stopping_the_actor() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+    let operation = key(1, 7);
+    let lease = match store.begin_operation(operation, fingerprint(7)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+
+    store.set_query_only(true).await?;
+    store.abandon_operation(operation, lease);
+    store.set_query_only(false).await?;
+
+    assert!(store.is_healthy());
+    assert_eq!(
+        store.operation_status(operation).await?,
+        StoreStatus::NotFound
+    );
+    store.probe_readiness().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn enforces_global_and_per_owner_capacity() -> Result<()> {
+    let store = StateStore::temporary_for_test(2, 1, TTL)?;
+    assert!(matches!(
+        store.begin_operation(key(1, 1), fingerprint(1)).await?,
+        StoreBegin::Started { .. }
+    ));
+    assert_eq!(
+        store.begin_operation(key(1, 2), fingerprint(2)).await?,
+        StoreBegin::Full
+    );
+    assert!(matches!(
+        store.begin_operation(key(2, 2), fingerprint(2)).await?,
+        StoreBegin::Started { .. }
+    ));
+    assert_eq!(
+        store.begin_operation(key(3, 3), fingerprint(3)).await?,
+        StoreBegin::Full
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_operations_hold_capacity_before_expiration() -> Result<()> {
+    let store = StateStore::temporary_for_test(1, 1, TTL)?;
+    let first = key(1, 1);
+    let lease = match store.begin_operation(first, fingerprint(1)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert!(store.complete_operation(first, lease, success(204)).await?);
+    assert_eq!(
+        store.begin_operation(key(2, 2), fingerprint(2)).await?,
+        StoreBegin::Full
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn expiration_releases_capacity() -> Result<()> {
+    let store = StateStore::temporary_for_test(1, 1, Duration::ZERO)?;
+    let first = key(1, 1);
+    let lease = match store.begin_operation(first, fingerprint(1)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert!(store.complete_operation(first, lease, success(204)).await?);
+    assert!(matches!(
+        store.begin_operation(key(2, 2), fingerprint(2)).await?,
+        StoreBegin::Started { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_recovers_nonterminal_operations() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(10, 20);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+
+    let reserved = key(1, 1);
+    let _reserved_lease = match store.begin_operation(reserved, fingerprint(1)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    let committing = key(1, 2);
+    let committing_lease = match store.begin_operation(committing, fingerprint(2)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert!(
+        store
+            .mark_operation_commit_started(committing, committing_lease)
+            .await?
+    );
+    store.shutdown_for_test();
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        reopened.operation_status(reserved).await?,
+        StoreStatus::NotFound
+    );
+    assert_eq!(
+        reopened.operation_status(committing).await?,
+        StoreStatus::Completed(StoredOutcome::uncertain())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_outcome_survives_restart() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(u64::MAX, u64::MAX - 1);
+    let operation = key(3, 4);
+    let outcome = success(204);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    let lease = match store.begin_operation(operation, fingerprint(9)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert!(
+        store
+            .complete_operation(operation, lease, outcome.clone())
+            .await?
+    );
+    store.shutdown_for_test();
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        reopened.begin_operation(operation, fingerprint(9)).await?,
+        StoreBegin::Replay(outcome)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(2, 1, 8, 4))?;
+    let mut first = upload(1, 1, 0);
+    assert_eq!(
+        store.save_upload_session(first.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store.save_upload_session(first.clone(), TTL).await?,
+        StoreUploadSession::Unchanged
+    );
+
+    let mut wrong_binding = first.clone();
+    wrong_binding.target_path = PathBuf::from("targets/different");
+    assert_eq!(
+        store.save_upload_session(wrong_binding, TTL).await?,
+        StoreUploadSession::Conflict
+    );
+
+    first.durable_offset = 4;
+    first.stage_identity = Some(StoredFileIdentity {
+        device: 11,
+        inode: 12,
+    });
+    assert_eq!(
+        store.save_upload_session(first.clone(), TTL).await?,
+        StoreUploadSession::Updated
+    );
+    assert_eq!(store.upload_session(first.key).await?, Some(first.clone()));
+
+    let mut backwards = first.clone();
+    backwards.durable_offset = 3;
+    assert_eq!(
+        store.save_upload_session(backwards, TTL).await?,
+        StoreUploadSession::Conflict
+    );
+    assert_eq!(
+        store.save_upload_session(upload(1, 2, 0), TTL).await?,
+        StoreUploadSession::Full
+    );
+    assert_eq!(
+        store.save_upload_session(upload(2, 2, 0), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store.save_upload_session(upload(3, 3, 0), TTL).await?,
+        StoreUploadSession::Full
+    );
+
+    first.durable_offset = first.upload_length;
+    first.state = StoredUploadState::CommitStarted;
+    assert_eq!(
+        store
+            .save_upload_session(first.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Updated
+    );
+    assert!(
+        store.expired_upload_sessions(8).await?.is_empty(),
+        "an in-flight publication must not be expired while the process is alive"
+    );
+    first.state = StoredUploadState::Committed;
+    assert_eq!(
+        store
+            .save_upload_session(first.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Updated
+    );
+    assert_eq!(store.expired_upload_sessions(8).await?, vec![first.clone()]);
+
+    // Insertion purges expired terminal sessions before applying quotas.
+    assert_eq!(
+        store.save_upload_session(upload(3, 3, 0), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(store.upload_session(first.key).await?, None);
+    let replacement_key = UploadSessionKey {
+        owner: [3; 32],
+        id: [3; 16],
+    };
+    assert!(store.remove_upload_session(replacement_key).await?);
+    assert!(!store.remove_upload_session(replacement_key).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_jobs_are_idempotent_bounded_and_owner_scoped() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 4, 2, 1))?;
+    let first = purge(1, 1);
+    assert_eq!(
+        store.prepare_purge_job(first.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert_eq!(
+        store.prepare_purge_job(first.clone()).await?,
+        StorePurgeJob::Existing
+    );
+
+    let mut wrong_identity = first.clone();
+    wrong_identity.source_identity.inode += 1;
+    assert_eq!(
+        store.prepare_purge_job(wrong_identity).await?,
+        StorePurgeJob::Conflict
+    );
+    let mut colliding_path = purge(2, 2);
+    colliding_path.trash_path = first.trash_path.clone();
+    assert_eq!(
+        store.prepare_purge_job(colliding_path).await?,
+        StorePurgeJob::Conflict
+    );
+    assert_eq!(
+        store.prepare_purge_job(purge(1, 2)).await?,
+        StorePurgeJob::Full
+    );
+
+    let second = purge(2, 2);
+    assert_eq!(
+        store.prepare_purge_job(second.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert_eq!(
+        store.prepare_purge_job(purge(3, 3)).await?,
+        StorePurgeJob::Full
+    );
+    assert_eq!(
+        store.prepared_purge_jobs(8).await?,
+        vec![first.clone(), second.clone()]
+    );
+
+    assert!(store.mark_purge_job_ready(first.key).await?);
+    assert!(store.mark_purge_job_ready(first.key).await?);
+    let mut ready = first.clone();
+    ready.state = StoredPurgeState::Ready;
+    assert_eq!(store.purge_jobs(8).await?, vec![ready, second.clone()]);
+    let mut claimed = store
+        .claim_due_purge_job()
+        .await?
+        .expect("ready purge job should be claimable");
+    claimed.state = StoredPurgeState::Claimed;
+    assert_eq!(store.purge_job(first.key).await?, Some(claimed.clone()));
+    assert!(store.retry_purge_job(first.key, Duration::ZERO).await?);
+    let retried = store
+        .claim_due_purge_job()
+        .await?
+        .expect("retried purge job should be claimable");
+    assert_eq!(retried.attempts, 1);
+    assert!(store.complete_purge_job(first.key).await?);
+    assert!(!store.complete_purge_job(first.key).await?);
+
+    assert_eq!(
+        store.prepare_purge_job(purge(3, 3)).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.remove_purge_job(second.key).await?);
+    assert!(!store.remove_purge_job(second.key).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn state_blocking_paths_are_complete_and_keyset_paginated() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 8, 8, 8))?;
+
+    let running = upload(1, 1, 4);
+    assert_eq!(
+        store.save_upload_session(running.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    let mut committing = upload(1, 2, 10);
+    committing.state = StoredUploadState::CommitStarted;
+    assert_eq!(
+        store.save_upload_session(committing.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    let mut terminal = upload(1, 3, 10);
+    terminal.state = StoredUploadState::Committed;
+    assert_eq!(
+        store.save_upload_session(terminal, TTL).await?,
+        StoreUploadSession::Inserted
+    );
+
+    let prepared = purge(2, 1);
+    assert_eq!(
+        store.prepare_purge_job(prepared.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    let claimed = purge(2, 2);
+    assert_eq!(
+        store.prepare_purge_job(claimed.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(claimed.key).await?);
+    assert_eq!(
+        store
+            .claim_due_purge_job()
+            .await?
+            .expect("ready purge job should be claimed")
+            .key,
+        claimed.key
+    );
+    let ready = purge(2, 3);
+    assert_eq!(
+        store.prepare_purge_job(ready.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(ready.key).await?);
+
+    let mut cursor = None;
+    let mut paths = Vec::new();
+    loop {
+        // A one-row page proves the cursor cannot skip the second path
+        // belonging to the same owner/id record.
+        let page = store.state_blocking_paths(cursor, 1).await?;
+        paths.extend(page.paths);
+        let Some(next) = page.next else {
+            break;
+        };
+        cursor = Some(next);
+    }
+
+    assert_eq!(
+        paths,
+        vec![
+            StateBlockingPath {
+                path: running.target_path,
+                allows_exact_replacement: true,
+            },
+            StateBlockingPath {
+                path: running.stage_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: committing.target_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: committing.stage_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: prepared.target_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: prepared.trash_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: claimed.trash_path,
+                allows_exact_replacement: false,
+            },
+            StateBlockingPath {
+                path: ready.trash_path,
+                allows_exact_replacement: false,
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_and_purge_state_survive_restart_with_unix_path_bytes() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(71, 73);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+
+    let mut session = upload(4, 5, 6);
+    session.target_path = PathBuf::from(OsString::from_vec(vec![b't', 0xff]));
+    session.stage_path = PathBuf::from(OsString::from_vec(vec![b's', 0xfe]));
+    session.stage_identity = Some(StoredFileIdentity {
+        device: u64::MAX,
+        inode: u64::MAX - 1,
+    });
+    assert_eq!(
+        store.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+
+    let mut committing = upload(4, 6, 10);
+    committing.state = StoredUploadState::CommitStarted;
+    committing.stage_identity = Some(StoredFileIdentity {
+        device: 17,
+        inode: 19,
+    });
+    assert_eq!(
+        store.save_upload_session(committing.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+
+    let mut prepared = purge(6, 7);
+    prepared.target_path = PathBuf::from(OsString::from_vec(vec![b'p', 0xfd]));
+    prepared.trash_path = PathBuf::from(OsString::from_vec(vec![b'q', 0xfc]));
+    assert_eq!(
+        store.prepare_purge_job(prepared.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(prepared.key).await?);
+    let claimed = store
+        .claim_due_purge_job()
+        .await?
+        .expect("purge job should be claimable before restart");
+    assert_eq!(claimed.state, StoredPurgeState::Claimed);
+    store.shutdown_for_test();
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(reopened.upload_session(session.key).await?, Some(session));
+    committing.state = StoredUploadState::Unknown;
+    assert_eq!(
+        reopened.upload_session(committing.key).await?,
+        Some(committing)
+    );
+    let mut recovered = prepared;
+    recovered.state = StoredPurgeState::Ready;
+    assert_eq!(
+        reopened.purge_job(recovered.key).await?,
+        Some(recovered.clone())
+    );
+    recovered.state = StoredPurgeState::Claimed;
+    assert_eq!(
+        reopened.claim_due_purge_job().await?,
+        Some(recovered),
+        "a claimed job must be reset to immediately-due Ready on reopen"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(211, 223);
+    let mut session = upload(7, 9, 4);
+
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        store.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    store.shutdown_for_test();
+
+    // Rebuild only the upload table in its exact v2 shape. All other
+    // schema objects and root binding came from the real initializer.
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "DROP INDEX upload_sessions_expiry;
+         ALTER TABLE upload_sessions RENAME TO upload_sessions_v3_source;
+         CREATE TABLE upload_sessions (
+             owner_digest BLOB NOT NULL CHECK(length(owner_digest) = 32),
+             upload_id BLOB NOT NULL CHECK(length(upload_id) = 16),
+             target_path BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
+             stage_path BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
+             upload_length INTEGER NOT NULL CHECK(upload_length >= 0),
+             durable_offset INTEGER NOT NULL CHECK(durable_offset >= 0),
+             state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4)),
+             stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
+             stage_inode_be BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
+             updated_at_ms INTEGER NOT NULL,
+             expires_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(owner_digest, upload_id),
+             CHECK(target_path != stage_path),
+             CHECK(durable_offset <= upload_length),
+             CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
+             CHECK(state != 2 OR durable_offset = upload_length),
+             CHECK(state != 1 OR durable_offset = upload_length)
+         ) STRICT, WITHOUT ROWID;
+         INSERT INTO upload_sessions
+         SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
+                durable_offset, state, stage_device_be, stage_inode_be,
+                updated_at_ms, expires_at_ms
+           FROM upload_sessions_v3_source;
+         DROP TABLE upload_sessions_v3_source;
+         CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);",
+    )?;
+    connection.pragma_update(None, "user_version", 2_i32)?;
+    drop(connection);
+
+    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        migrated.upload_session(session.key).await?,
+        Some(session.clone())
+    );
+    assert_eq!(migrated.inspect_pragmas().await?.user_version, 3);
+
+    session.target_revision = Some([0x5a; 32]);
+    assert_eq!(
+        migrated.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Updated
+    );
+    session.durable_offset = session.upload_length;
+    session.state = StoredUploadState::CommitStarted;
+    assert_eq!(
+        migrated.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Updated
+    );
+    session.state = StoredUploadState::AwaitingConfirmation;
+    assert_eq!(
+        migrated.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Updated
+    );
+    migrated.shutdown_for_test();
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(reopened.upload_session(session.key).await?, Some(session));
+    reopened.shutdown_for_test();
+    Ok(())
+}
+
+#[test]
+fn rejects_foreign_database_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("foreign.sqlite3");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE foreign_records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO foreign_records(value) VALUES ('must remain untouched');",
+        )?;
+        connection.pragma_update(None, "application_id", 0x1122_3344_i32)?;
+        connection.pragma_update(None, "user_version", 1_i32)?;
+        let mode: String =
+            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        assert!(mode.eq_ignore_ascii_case("wal"));
+    }
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let bytes_before = fs::read(&path)?;
+    let mode_before = fs::metadata(&path)?.mode() & 0o777;
+    let schema_before = database_schema_snapshot(&path)?;
+
+    let result = StateStore::open(&path, &root(1, 2), CAPACITY, PER_OWNER, TTL);
+    let error = result.err().expect("a foreign database must be rejected");
+    assert!(format!("{error:#}").contains("application id"));
+
+    assert_eq!(fs::read(&path)?, bytes_before);
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, mode_before);
+    assert_eq!(database_schema_snapshot(&path)?, schema_before);
+    assert!(schema_before.2.eq_ignore_ascii_case("wal"));
+    Ok(())
+}
+
+#[test]
+fn rejects_v1_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("legacy-v1.sqlite3");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE legacy_operations (
+                 id INTEGER PRIMARY KEY,
+                 error_message TEXT NOT NULL
+             ) STRICT;
+             INSERT INTO legacy_operations(error_message)
+             VALUES ('must remain untouched');",
+        )?;
+        connection.pragma_update(None, "application_id", APPLICATION_ID)?;
+        connection.pragma_update(None, "user_version", 1_i32)?;
+        let mode: String =
+            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        assert!(mode.eq_ignore_ascii_case("wal"));
+    }
+    fs::set_permissions(&path, Permissions::from_mode(0o644))?;
+    let bytes_before = fs::read(&path)?;
+    let mode_before = fs::metadata(&path)?.mode() & 0o777;
+    let schema_before = database_schema_snapshot(&path)?;
+    assert_eq!(schema_before.1, 1);
+
+    let result = StateStore::open(&path, &root(101, 103), CAPACITY, PER_OWNER, TTL);
+    let error = result.err().expect("a schema v1 database must be rejected");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("schema version 1"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("requires schema version 3")
+            && message.contains("migration only from schema version 2"),
+        "unexpected error: {message}"
+    );
+
+    assert_eq!(fs::read(&path)?, bytes_before);
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, mode_before);
+    assert_eq!(database_schema_snapshot(&path)?, schema_before);
+    assert!(schema_before.2.eq_ignore_ascii_case("wal"));
+    assert!(
+        schema_before
+            .3
+            .iter()
+            .any(|(_, name, sql)| { name == "legacy_operations" && sql.contains("error_message") })
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_non_sqlite_file_without_changing_mode_or_bytes() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("not-sqlite.sqlite3");
+    let contents = b"this is owned by another application\n";
+    fs::write(&path, contents)?;
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let mode_before = fs::metadata(&path)?.mode() & 0o777;
+
+    assert!(StateStore::open(&path, &root(1, 2), CAPACITY, PER_OWNER, TTL).is_err());
+    assert_eq!(fs::read(&path)?, contents);
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, mode_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn initializes_a_preexisting_empty_database_after_read_only_preflight() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("empty.sqlite3");
+    fs::write(&path, [])?;
+    fs::set_permissions(&path, Permissions::from_mode(0o644))?;
+
+    let store = StateStore::open(&path, &root(107, 109), CAPACITY, PER_OWNER, TTL)?;
+    let pragmas = store.inspect_pragmas().await?;
+    assert_eq!(pragmas.application_id, i64::from(APPLICATION_ID));
+    assert_eq!(pragmas.user_version, i64::from(SCHEMA_VERSION));
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
+    store.shutdown_for_test();
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_queue_keeps_control_commands_and_shutdown_available() -> Result<()> {
+    let store =
+        StateStore::temporary_with_limits_for_test(CAPACITY, PER_OWNER, TTL, 1, REPOSITORY_LIMITS)?;
+    let operation = key(9, 1);
+    let lease = match store.begin_operation(operation, fingerprint(9)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    store.send(Command::Block {
+        entered: entered_sender,
+        release: release_receiver,
+    })?;
+    entered_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    let (queued_reply, queued_receiver) = oneshot::channel();
+    store.send(Command::Status {
+        key: key(9, 9),
+        reply: queued_reply,
+    })?;
+    let error = store
+        .operation_status(key(9, 8))
+        .await
+        .expect_err("a saturated bounded queue must reject new work");
+    assert_eq!(
+        error.downcast_ref::<StateStoreDispatchError>(),
+        Some(&StateStoreDispatchError::QueueFull)
+    );
+    assert!(store.is_healthy());
+
+    // Abandon uses the separate control channel, so cleanup cannot be
+    // dropped merely because the regular command queue is saturated.
+    store.abandon_operation(operation, lease);
+    release_sender.send(())?;
+    assert_eq!(queued_receiver.await??, StoreStatus::NotFound);
+    assert_eq!(
+        store.operation_status(operation).await?,
+        StoreStatus::NotFound
+    );
+
+    let clone = store.clone();
+    store.close().await?;
+    clone.close().await?;
+    assert!(!clone.is_healthy());
+    let error = clone
+        .operation_status(operation)
+        .await
+        .expect_err("a closed store must reject dispatch");
+    assert_eq!(
+        error.downcast_ref::<StateStoreDispatchError>(),
+        Some(&StateStoreDispatchError::Unavailable)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_database_has_expected_identity_permissions_and_pragmas() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(7, 11);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    let pragmas = store.inspect_pragmas().await?;
+    assert_eq!(pragmas.journal_mode.to_ascii_lowercase(), "delete");
+    assert_eq!(pragmas.synchronous, 3);
+    assert_eq!(pragmas.foreign_keys, 1);
+    assert_eq!(pragmas.trusted_schema, 0);
+    assert_eq!(pragmas.mmap_size, 0);
+    assert_eq!(pragmas.application_id, i64::from(APPLICATION_ID));
+    assert_eq!(pragmas.user_version, i64::from(SCHEMA_VERSION));
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
+    store.shutdown_for_test();
+
+    let mismatch = StateStore::open(
+        &path,
+        &root(identity.device, identity.inode + 1),
+        CAPACITY,
+        PER_OWNER,
+        TTL,
+    );
+    assert!(mismatch.is_err());
+    Ok(())
+}
+
+#[test]
+fn rejects_symbolic_link_database() -> Result<()> {
+    let directory = tempdir()?;
+    let target = directory.path().join("target.sqlite3");
+    fs::write(&target, [])?;
+    let link = directory.path().join("state.sqlite3");
+    symlink(&target, &link)?;
+    let result = StateStore::open(&link, &root(1, 1), CAPACITY, PER_OWNER, TTL);
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn rejects_invalid_limits_and_outcomes() -> Result<()> {
+    assert!(StateStore::temporary_for_test(0, 0, TTL).is_err());
+    assert!(StateStore::temporary_for_test(1, 2, TTL).is_err());
+    assert!(
+        StateStore::temporary_with_limits_for_test(
+            CAPACITY,
+            PER_OWNER,
+            TTL,
+            1,
+            repository_limits(0, 0, 1, 1),
+        )
+        .is_err()
+    );
+    assert!(
+        StateStore::temporary_with_limits_for_test(
+            CAPACITY,
+            PER_OWNER,
+            TTL,
+            1,
+            repository_limits(1, 1, 1, 2),
+        )
+        .is_err()
+    );
+    let invalid = StoredOutcome {
+        status: 204,
+        state: StoredTerminalState::Failed,
+        code: Some("failed".to_string()),
+    };
+    assert!(invalid.validate().is_err());
+    let mut invalid_upload = upload(1, 1, 5);
+    invalid_upload.state = StoredUploadState::CommitStarted;
+    assert!(invalid_upload.validate().is_err());
+    let mut invalid_purge = purge(1, 1);
+    invalid_purge.trash_path = invalid_purge.target_path.clone();
+    assert!(invalid_purge.validate_new().is_err());
+    Ok(())
+}

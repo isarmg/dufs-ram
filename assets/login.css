@@ -1,0 +1,224 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont,
+    sans-serif;
+  --bg: #f5f6f3;
+  --surface-strong: #fafbf8;
+  --text: #202a33;
+  --muted: #60707c;
+  --primary: #245b75;
+  --danger: #a73d46;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button,
+input {
+  font: inherit;
+  line-height: inherit;
+}
+
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.content-card {
+  /*
+   * A 3:2 card uses 1/18 of its width and 1/12 of its height for
+   * matching horizontal and vertical corner radii.
+   */
+  --content-card-radius-x: 5.5556%;
+  --content-card-radius-y: 8.3333%;
+  --content-card-row-height: calc(100cqh / 6);
+  --content-card-font-size: calc(var(--content-card-row-height) * .5);
+  --content-card-glyph-half: calc(var(--content-card-font-size) * .5);
+  --content-card-text-start: calc(
+    var(--content-card-radius-x) - var(--content-card-glyph-half)
+  );
+  position: relative;
+  width: min(380px, 100%);
+  aspect-ratio: 3 / 2;
+  overflow: hidden;
+  container-type: size;
+  color: var(--text);
+  background: var(--surface-strong);
+  border: 0;
+  border-radius: var(--content-card-radius-x) / var(--content-card-radius-y);
+}
+
+.card-inner {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-rows: repeat(6, minmax(0, 1fr));
+  grid-auto-rows: 0;
+  min-width: 0;
+  min-height: 0;
+  padding-inline: var(--content-card-text-start);
+  font-size: var(--content-card-font-size);
+  line-height: 1.2;
+}
+
+.card-row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 2ch;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.card-row-label {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 1ch;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.card-row-content {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  gap: 4px;
+}
+
+.input-row,
+.error-row {
+  grid-template-columns: minmax(0, 1fr);
+  column-gap: 0;
+}
+
+.login-input {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  outline: 0;
+}
+
+.login-input:focus {
+  border-bottom-color: var(--primary);
+}
+
+.login-label-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 1em;
+  height: 1em;
+  flex: 0 0 1em;
+  border: 1px solid currentcolor;
+  border-radius: .25em;
+}
+
+.login-label-icon svg {
+  width: .65em;
+  height: .65em;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.75;
+}
+
+.login-error {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--danger);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.card-action-button {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  color: var(--primary);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+  font-weight: 400;
+}
+
+.card-action-button:hover,
+.card-action-button:focus-visible {
+  color: var(--text);
+  outline: 0;
+  text-decoration: underline;
+}
+
+.hidden {
+  visibility: hidden;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #151a1d;
+    --surface-strong: #252c31;
+    --text: #edf2f4;
+    --muted: #a4b0b7;
+    --primary: #5fa8c8;
+    --danger: #ff8a92;
+  }
+}
+
+@media (forced-colors: active) {
+  .content-card {
+    color: CanvasText;
+    background: Canvas;
+    border: 2px solid CanvasText;
+  }
+
+  .login-label-icon,
+  .login-input,
+  .card-action-button {
+    color: ButtonText;
+    background: ButtonFace;
+    forced-color-adjust: auto;
+  }
+
+  .login-input,
+  .card-action-button {
+    box-sizing: border-box;
+    border: 1px solid ButtonText;
+  }
+
+  .login-input:focus,
+  .card-action-button:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .login-error {
+    color: MarkText;
+    background: Mark;
+  }
+}

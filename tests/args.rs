@@ -1,50 +1,242 @@
 //! Run file server with different args
 
+#[path = "support/fixtures.rs"]
 mod fixtures;
-mod utils;
 
-use fixtures::{server, Error, TestServer};
+use assert_cmd::prelude::*;
+use assert_fs::fixture::TempDir;
+use clap::ArgMatches;
+use dufs::args::{Args, build_cli};
+use fixtures::{Error, TEST_ACCOUNT, tmpdir};
 use rstest::rstest;
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
 
 #[rstest]
-fn path_prefix_index(#[with(&["--path-prefix", "xyz"])] server: TestServer) -> Result<(), Error> {
-    let resp = reqwest::blocking::get(format!("{}{}", server.url(), "xyz"))?;
-    assert_resp_paths!(resp);
+fn runtime_environment_cannot_supply_required_account(tmpdir: TempDir) -> Result<(), Error> {
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .env("DUFS_AUTH", "environment-user:environment-password")
+        .assert()
+        .stderr(predicates::str::contains(
+            "At least one account is required",
+        ))
+        .failure();
     Ok(())
 }
 
 #[rstest]
-fn path_prefix_file(#[with(&["--path-prefix", "xyz"])] server: TestServer) -> Result<(), Error> {
-    let resp = reqwest::blocking::get(format!("{}{}/index.html", server.url(), "xyz"))?;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text()?, "This is index.html");
+fn regular_file_cannot_be_used_as_shared_root(tmpdir: TempDir) -> Result<(), Error> {
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path().join("index.html"))
+        .args(["--auth", TEST_ACCOUNT])
+        .assert()
+        .stderr(predicates::str::contains("must be a directory"))
+        .failure();
     Ok(())
 }
 
 #[rstest]
-fn path_prefix_reject_same_component(
-    #[with(&["--path-prefix", "xyz"])] server: TestServer,
+#[case("--path-prefix")]
+#[case("--hidden")]
+#[case("--state-db")]
+#[case("--compress")]
+#[case("--max-zip-entries")]
+#[case("--max-zip-uncompressed-size")]
+#[case("--max-zip-output-size")]
+#[case("--max-concurrent-zips")]
+fn removed_options_are_rejected(tmpdir: TempDir, #[case] option: &str) -> Result<(), Error> {
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .args(["--auth", TEST_ACCOUNT, option, "value"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(format!(
+            "unexpected argument '{option}'"
+        )));
+    Ok(())
+}
+
+#[rstest]
+fn state_dir_is_required(tmpdir: TempDir) -> Result<(), Error> {
+    let matches = build_cli().try_get_matches_from([
+        "dufs",
+        tmpdir.path().to_str().expect("UTF-8 test path"),
+        "--auth",
+        TEST_ACCOUNT,
+    ])?;
+    let error = Args::parse(matches).expect_err("missing state directory was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("persistent SQLite state directory is required"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn state_dir_cli_derives_a_fixed_database_path_and_is_revalidatable(
+    tmpdir: TempDir,
 ) -> Result<(), Error> {
-    let resp = reqwest::blocking::get(format!("{}xyzpublic.txt", server.url()))?;
-    assert_eq!(resp.status(), 400);
+    let state_dir = private_state_dir()?;
+    let args = Args::parse(state_dir_matches(tmpdir.path(), state_dir.path()))?;
+    assert_eq!(
+        args.state_dir.as_deref(),
+        Some(std::fs::canonicalize(state_dir.path())?.as_path())
+    );
+    let args = args.validate()?;
+    assert_eq!(args.state_dir.as_deref(), Some(state_dir.path()));
     Ok(())
 }
 
 #[rstest]
-fn path_prefix_reject_extra_component_text(
-    #[with(&["--path-prefix", "xyz"])] server: TestServer,
-) -> Result<(), Error> {
-    let resp = reqwest::blocking::get(format!("{}xyzevil/public.txt", server.url()))?;
-    assert_eq!(resp.status(), 400);
+fn state_dir_cli_rejects_a_missing_directory(tmpdir: TempDir) -> Result<(), Error> {
+    let parent = TempDir::new()?;
+    let missing = parent.path().join("missing");
+    let error = Args::parse(state_dir_matches(tmpdir.path(), &missing))
+        .expect_err("missing state directory was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to inspect state directory"),
+        "unexpected error: {error:#}"
+    );
     Ok(())
 }
 
 #[rstest]
-fn path_prefix_propfind(
-    #[with(&["--path-prefix", "xyz"])] server: TestServer,
+#[case(false)]
+#[case(true)]
+fn state_dir_cli_rejects_a_symbolic_link(
+    tmpdir: TempDir,
+    #[case] trailing_slash: bool,
 ) -> Result<(), Error> {
-    let resp = fetch!(b"PROPFIND", format!("{}{}", server.url(), "xyz")).send()?;
-    let text = resp.text()?;
-    assert!(text.contains("<D:href>/xyz/</D:href>"));
+    let parent = TempDir::new()?;
+    let target = parent.path().join("target");
+    let state_dir = parent.path().join("state");
+    std::fs::create_dir(&target)?;
+    std::os::unix::fs::symlink(&target, &state_dir)?;
+    let configured = if trailing_slash {
+        std::path::PathBuf::from(format!("{}/", state_dir.display()))
+    } else {
+        state_dir.clone()
+    };
+
+    let error = Args::parse(state_dir_matches(tmpdir.path(), &configured))
+        .expect_err("symbolic-link state directory was accepted");
+    assert!(
+        error.to_string().contains("must not be a symbolic link"),
+        "unexpected error: {error:#}"
+    );
     Ok(())
+}
+
+#[rstest]
+fn state_dir_cli_rejects_non_private_permissions(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = TempDir::new()?;
+    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o750))?;
+
+    let error = Args::parse(state_dir_matches(tmpdir.path(), state_dir.path()))
+        .expect_err("non-private state directory was accepted");
+    assert!(
+        error.to_string().contains("must have permissions 0700"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn state_dir_cli_rejects_shared_root_overlap(tmpdir: TempDir) -> Result<(), Error> {
+    let nested_state = tmpdir.path().join("state");
+    std::fs::create_dir(&nested_state)?;
+    std::fs::set_permissions(&nested_state, std::fs::Permissions::from_mode(0o700))?;
+    let error = Args::parse(state_dir_matches(tmpdir.path(), &nested_state))
+        .expect_err("state directory inside the shared root was accepted");
+    assert!(
+        error.to_string().contains("must not overlap shared path"),
+        "unexpected error: {error:#}"
+    );
+
+    let parent_state = private_state_dir()?;
+    let nested_root = parent_state.path().join("shared");
+    std::fs::create_dir(&nested_root)?;
+    let error = Args::parse(state_dir_matches(&nested_root, parent_state.path()))
+        .expect_err("state directory containing the shared root was accepted");
+    assert!(
+        error.to_string().contains("must not overlap shared path"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn state_dir_cli_rejects_a_symbolic_link_fixed_database(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let target = state_dir.path().join("target.sqlite3");
+    std::fs::write(&target, [])?;
+    std::os::unix::fs::symlink(&target, state_dir.path().join("state.sqlite3"))?;
+
+    let error = Args::parse(state_dir_matches(tmpdir.path(), state_dir.path()))
+        .expect_err("symbolic-link fixed database was accepted");
+    assert!(
+        error.to_string().contains("must not be a symbolic link"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case("")]
+#[case("-journal")]
+#[case("-wal")]
+#[case("-shm")]
+fn state_dir_cli_rejects_fixed_database_log_collisions(
+    tmpdir: TempDir,
+    #[case] suffix: &str,
+) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let state_db = state_dir.path().join("state.sqlite3");
+    let mut log_file = state_db.as_os_str().to_os_string();
+    log_file.push(suffix);
+    let matches = build_cli().try_get_matches_from([
+        OsString::from("dufs"),
+        tmpdir.path().as_os_str().to_owned(),
+        OsString::from("--auth"),
+        OsString::from(TEST_ACCOUNT),
+        OsString::from("--state-dir"),
+        state_dir.path().as_os_str().to_owned(),
+        OsString::from("--log-file"),
+        log_file,
+    ])?;
+
+    let error = Args::parse(matches).expect_err("SQLite/log path collision was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with SQLite state database"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+fn state_dir_matches(serve_path: &Path, state_dir: &Path) -> ArgMatches {
+    build_cli()
+        .try_get_matches_from([
+            OsString::from("dufs"),
+            serve_path.as_os_str().to_owned(),
+            OsString::from("--auth"),
+            OsString::from(TEST_ACCOUNT),
+            OsString::from("--state-dir"),
+            state_dir.as_os_str().to_owned(),
+        ])
+        .expect("valid state-dir command line")
+}
+
+fn private_state_dir() -> Result<TempDir, Error> {
+    let state_dir = TempDir::new()?;
+    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(state_dir)
 }

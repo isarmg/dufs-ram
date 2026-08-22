@@ -1,0 +1,19 @@
+serve-path: /srv/dufs
+state-dir: /var/lib/dufs
+bind:
+  - 127.0.0.1
+port: 5000
+auth:
+  # Replace this entire value with `admin:` followed by the output of
+  # `/opt/dufs/bin/dufs hash-password`. Keep the YAML string quoted.
+  - 'admin:$argon2id$REPLACE_WITH_A_REAL_HASH'
+log-format: '$time_iso8601 $log_level $remote_addr $remote_user "$request" $status operation_id=$operation_id operation_state=$operation_state'
+max-upload-size: 107374182400
+upload-idle-timeout: 60
+upload-total-timeout: 86400
+max-concurrent-uploads: 4
+min-free-space: 1073741824
+max-connections: 256
+max-search-entries: 10000
+max-concurrent-searches: 2
+request-timeout: 300

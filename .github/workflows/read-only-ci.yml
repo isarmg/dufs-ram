@@ -1,0 +1,294 @@
+name: Read-only CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: read-only-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24.8.0"
+  RUST_TOOLCHAIN: "1.97.1"
+  SHELLCHECK_VERSION: "0.11.0"
+  SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+  CARGO_LLVM_COV_VERSION: "0.8.6"
+  CARGO_LLVM_COV_SHA256: "eff7a72a3432ef18956a7f7424f87f7d08b30f465c79e1f03baeee17f7ccb960"
+  CARGO_TERM_COLOR: always
+  CI: "1"
+
+jobs:
+  static:
+    name: Static sources and docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the fixed Node.js release
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install the checksum-pinned ShellCheck binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          install_dir="${RUNNER_TEMP}/shellcheck"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          printf '%s  %s\n' "$SHELLCHECK_SHA256" "$archive" | sha256sum --check
+          mkdir -p "$install_dir"
+          tar --no-same-owner -xJf "$archive" -C "$install_dir"
+          printf '%s\n' "$install_dir/shellcheck-v${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+      - name: Record the static-analysis environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
+          printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+          uname -a
+          node --version
+          npm --version
+          git --version
+          bash --version | sed -n '1p'
+          shellcheck --version
+      - name: Install and record locked JavaScript tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm ls --depth=0
+          ./node_modules/.bin/tsc --version
+      - name: Check Shell sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts=(
+            scripts/check.sh
+            scripts/check-coverage.sh
+            scripts/check-deployment.sh
+            scripts/package-release.sh
+            tests/data/generate_tls_certs.sh
+          )
+          bash -n "${scripts[@]}"
+          shellcheck --severity=warning "${scripts[@]}"
+      - name: Check JavaScript and Markdown
+        run: |
+          npm run check:js
+          npm run check:types
+          npm run check:docs
+          npm run test:frontend:unit
+      - name: Verify checks did not alter tracked sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          test -z "$(git status --short --untracked-files=no)"
+
+  rust:
+    name: Rust format, lint, and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the fixed Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt
+      - name: Record the Rust environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
+          printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+          uname -a
+          rustc +"$RUST_TOOLCHAIN" --version --verbose
+          cargo +"$RUST_TOOLCHAIN" --version --verbose
+      - name: Run Rust gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +"$RUST_TOOLCHAIN" fmt --all --check
+          cargo +"$RUST_TOOLCHAIN" clippy --locked --all-targets --all-features -- -D warnings
+          cargo +"$RUST_TOOLCHAIN" test --locked --all-targets --all-features
+
+  compatibility:
+    name: Node.js minimum version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the declared minimum Node.js release
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "18.20.8"
+          package-manager-cache: false
+      - name: Run source checks on the minimum Node.js release
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check:js
+          npm run check:types
+          npm run check:docs
+          npm run test:frontend:unit
+
+  quality:
+    name: Coverage, deployment, and release smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the source without credentials
+        id: quality_source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the fixed Node.js release
+        id: quality_node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install the fixed Rust toolchain
+        id: quality_rust
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --component llvm-tools-preview
+      - name: Install the checksum-pinned coverage tool
+        id: coverage_tool
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/cargo-llvm-cov.tar.gz"
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${CARGO_LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$CARGO_LLVM_COV_SHA256" "$archive" | sha256sum --check
+          install -d -m 0755 "$cargo_bin"
+          tar --no-same-owner -xzf "$archive" -C "$cargo_bin" cargo-llvm-cov
+          chmod 0755 "$cargo_bin/cargo-llvm-cov"
+          cargo llvm-cov --version
+      - name: Run coverage checks
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_rust.outcome == 'success' && steps.coverage_tool.outcome == 'success' }}
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-coverage.sh
+      - name: Install deployment validator when absent
+        id: deployment_validator
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_node.outcome == 'success' && steps.quality_rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v nginx >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes nginx
+          fi
+          nginx -v
+          systemd-analyze --version | sed -n '1p'
+      - name: Run deployment checks
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_node.outcome == 'success' && steps.quality_rust.outcome == 'success' && steps.deployment_validator.outcome == 'success' }}
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-deployment.sh
+      - name: Run release packaging self-tests
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_node.outcome == 'success' && steps.quality_rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv --version | sed -n '1p'
+          ./scripts/package-release.sh --self-test
+      - name: Build and execute the release binary
+        if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_rust.outcome == 'success' }}
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+          ./target/release/dufs --version | grep -F "dufs "
+
+  browser:
+    name: Browser (${{ matrix.browser }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser:
+          - chromium
+          - firefox
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the fixed Node.js release
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install the fixed Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Record the browser-test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
+          printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+          uname -a
+          node --version
+          npm --version
+          rustc +"$RUST_TOOLCHAIN" --version
+          cargo +"$RUST_TOOLCHAIN" --version
+      - name: Install locked JavaScript tools and browser
+        shell: bash
+        env:
+          BROWSER: ${{ matrix.browser }}
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          ./node_modules/.bin/playwright --version
+          ./node_modules/.bin/playwright install --with-deps "$BROWSER"
+      - name: Build the test server
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --quiet
+      - name: Run the isolated browser project
+        env:
+          BROWSER: ${{ matrix.browser }}
+        run: node tests/frontend/run.mjs --project="$BROWSER"
