@@ -354,8 +354,6 @@ test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", asyn
       revision: request.headers()["x-dufs-target-revision"] || null,
       length: request.headers()["x-dufs-upload-length"],
       offset: request.headers()["x-dufs-upload-offset"] || null,
-      overwrite: request.headers()["x-dufs-upload-overwrite"],
-      revision: request.headers()["x-dufs-target-revision"] || null,
       bodyLength: request.postDataBuffer()?.length || 0,
     });
     if (request.method() === "PUT") {
@@ -458,6 +456,8 @@ test("可信暂存冲突丢弃后 Skip 时使列表失效且不覆盖", async ({
     requests.push({
       method: request.method(),
       uploadId: request.headers()["x-dufs-upload-id"],
+      overwrite: request.headers()["x-dufs-upload-overwrite"],
+      revision: request.headers()["x-dufs-target-revision"] || null,
     });
     await route.fulfill({
       status: 409,
