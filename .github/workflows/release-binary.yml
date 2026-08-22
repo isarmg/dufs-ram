@@ -1,0 +1,238 @@
+name: Release Linux binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-linux-binary-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+  TARGET: x86_64-unknown-linux-gnu
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Verify, build, and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the exact tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the tag and source version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t versions < <(
+            sed -n \
+              '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' \
+              Cargo.toml
+          )
+          if ((${#versions[@]} != 1)); then
+            printf 'Expected one package version; found %s.\n' \
+              "${#versions[@]}" >&2
+            exit 1
+          fi
+
+          version="${versions[0]}"
+          expected_tag="v${version}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" || \
+            "$GITHUB_REF_NAME" != "$expected_tag" ]]
+          then
+            printf 'Tag %s does not match Cargo version %s.\n' \
+              "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+
+          tag_commit="$(
+            git rev-parse --verify "refs/tags/${GITHUB_REF_NAME}^{commit}"
+          )"
+          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            printf 'Tag commit %s does not match workflow commit %s.\n' \
+              "$tag_commit" "$GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'Validated %s at %s.\n' "$expected_tag" "$tag_commit"
+
+      - name: Require the complete read-only CI for this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          ci_run_id=""
+          for _ in {1..60}; do
+            ci_run_id="$(
+              gh run list \
+                --workflow read-only-ci.yml \
+                --commit "$GITHUB_SHA" \
+                --event push \
+                --limit 20 \
+                --json databaseId,createdAt \
+                --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // empty'
+            )"
+            if [[ -n "$ci_run_id" ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [[ -z "$ci_run_id" ]]; then
+            printf 'No read-only CI run appeared for commit %s.\n' \
+              "$GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          printf 'Waiting for read-only CI run %s.\n' "$ci_run_id"
+          gh run watch "$ci_run_id" --exit-status --interval 10
+
+      - name: Install the fixed Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustc +"$RUST_TOOLCHAIN" --version --verbose
+          cargo +"$RUST_TOOLCHAIN" --version --verbose
+
+      - name: Build the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          env \
+            CARGO_INCREMENTAL=0 \
+            DUFS_BUILD_GIT_SHA="$GITHUB_SHA" \
+            SOURCE_DATE_EPOCH="$source_date_epoch" \
+            TZ=UTC \
+            ZERO_AR_DATE=1 \
+            cargo +"$RUST_TOOLCHAIN" build \
+              --locked \
+              --release \
+              --target "$TARGET"
+
+      - name: Prepare and verify the release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          asset_name="dufs-${VERSION}-${TARGET}"
+          source_binary="target/${TARGET}/release/dufs"
+          install -d -m 0755 dist
+          install -m 0755 "$source_binary" "dist/$asset_name"
+
+          expected_version="dufs $VERSION (git $GITHUB_SHA)"
+          actual_version="$("dist/$asset_name" --version)"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            printf 'Expected version %s; found %s.\n' \
+              "$expected_version" "$actual_version" >&2
+            exit 1
+          fi
+
+          ldd_output="$(ldd "dist/$asset_name")"
+          printf '%s\n' "$ldd_output"
+          if [[ "$ldd_output" == *"not found"* ]]; then
+            printf 'The release binary has unresolved shared libraries.\n' >&2
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum "$asset_name" > "$asset_name.sha256"
+            sha256sum --check "$asset_name.sha256"
+          )
+
+      - name: Create and verify a draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          asset_name="dufs-${VERSION}-${TARGET}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            printf 'Release %s already exists; refusing to replace it.\n' \
+              "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          prerelease_flags=()
+          if [[ "$VERSION" == *-* ]]; then
+            prerelease_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/$asset_name" \
+            "dist/$asset_name.sha256" \
+            --verify-tag \
+            --draft \
+            --title "Dufs $VERSION" \
+            --generate-notes \
+            "${prerelease_flags[@]}"
+
+          expected_assets="$(
+            printf '%s\n' "$asset_name" "$asset_name.sha256" | sort
+          )"
+          actual_assets="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --json assets,isDraft \
+              --jq '.assets[].name' | sort
+          )"
+          is_draft="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --json isDraft \
+              --jq '.isDraft'
+          )"
+          if [[ "$is_draft" != "true" || \
+            "$actual_assets" != "$expected_assets" ]]
+          then
+            printf 'Draft release verification failed.\n' >&2
+            printf 'Expected assets:\n%s\n' "$expected_assets" >&2
+            printf 'Actual assets:\n%s\n' "$actual_assets" >&2
+            exit 1
+          fi
+
+      - name: Publish the verified GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          latest_flags=(--latest)
+          if [[ "$VERSION" == *-* ]]; then
+            latest_flags=(--latest=false)
+          fi
+          gh release edit "$GITHUB_REF_NAME" \
+            --draft=false \
+            "${latest_flags[@]}"
+
+          is_draft="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --json isDraft \
+              --jq '.isDraft'
+          )"
+          if [[ "$is_draft" != "false" ]]; then
+            printf 'Release %s remained a draft.\n' \
+              "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi

@@ -155,7 +155,9 @@ systemctl start dufs
 
 仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Node 最低版本兼容、Rust、质量和 Chromium/Firefox 层不会创建 tag、release、签名或制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
-仓库有意不配置自动 GitHub Release 工作流。`0.48.0` 当前尚未发布，精确 `v0.48.0` tag 缺失是预期状态；不要为让脚本“先通过”而提前建 tag，只有最终源码、审查和发布准备完成后才创建并独立确认其目标 commit。
+仓库另有 `.github/workflows/release-binary.yml`，只在维护者推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，等待同一 commit 的完整 `read-only-ci.yml` 成功，再在固定 Rust 工具链下构建 `x86_64-unknown-linux-gnu` 二进制；版本字符串必须包含完整源码 SHA，动态库必须全部可解析。工作流先创建草稿 GitHub Release，核对其中只有预期二进制和 SHA-256 文件后才公开，并拒绝覆盖已有同名 Release。它不会创建、移动或删除 tag，也不读取发布私钥；SHA-256 只提供传输完整性，不构成发布者签名。tag 必须通过 GitHub Ruleset 限制为仅维护者可创建并禁止更新/删除。`0.48.0` 当前尚未发布，精确 `v0.48.0` tag 缺失是预期状态；不要为让工作流或脚本“先通过”而提前建 tag，只有最终源码、审查和发布准备完成后才创建并独立确认其目标 commit。
+
+自动 GitHub Release 是面向直接下载运行的便捷通道：其二进制在 `ubuntu-24.04` 托管 runner 上构建，必须匹配目标 CPU、glibc、动态加载器与 `openat2` 内核能力。需要 CycloneDX SBOM、第三方和标准库许可证清单、构建环境记录、可重复归档及独立公钥签名时，仍必须执行下述本地正式发布流程；不能把同一 Release 中的 checksum 当作独立信任根。
 
 发布包由 `scripts/package-release.sh` 从干净 Git 提交构建。`Cargo.toml` 的版本必须存在精确的 `v<version>` tag，且该 tag 必须指向当前 HEAD。脚本强制执行完整 `scripts/check.sh`，不是依赖调用者事先声称检查通过；门禁后、签名前和发布前都会再次核对 HEAD、tag、版本与干净状态。启动检查显式拒绝 `refs/replace/*`、legacy grafts 和仓库私有 `info/attributes`。
 
