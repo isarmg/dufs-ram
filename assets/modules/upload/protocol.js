@@ -163,7 +163,7 @@ export function classifyUploadResponse(options) {
     (
       phase === "discard" &&
       protocol.state === "rejected" &&
-      protocol.offset === null
+      protocol.offset !== expectedLength
     )
   ) {
     return uploadClassification("invalid", protocol, true);
