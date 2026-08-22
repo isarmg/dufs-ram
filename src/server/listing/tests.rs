@@ -34,6 +34,32 @@ async fn listing_problem_protocol_ignores_diagnostic_reason_strings() {
     assert_eq!(problem["recovery"], "retry");
 }
 
+#[tokio::test]
+async fn list_snapshot_allocation_failure_uses_the_listing_error_code() {
+    use http_body_util::BodyExt as _;
+
+    let root = Path::new("/srv/share");
+    let error = ListingError::limit(
+        "list_snapshot",
+        root,
+        root,
+        "result_allocation_failed",
+        ListingProblem::ListSnapshotAllocationFailed,
+    );
+    let mut response = Response::default();
+
+    respond_list_api_listing_error(&mut response, &error).unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["code"], "list_snapshot_limit");
+    assert_eq!(
+        problem["detail"],
+        "Directory listing exceeds the snapshot capacity"
+    );
+}
+
 #[test]
 fn bounded_vector_growth_accounts_for_old_and_new_allocations() {
     let mut values = Vec::with_capacity(4);
