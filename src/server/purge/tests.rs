@@ -1,7 +1,10 @@
 use super::super::ServerLifecycle;
 use super::*;
 use crate::{Args, auth::AuthConfig};
-use std::{os::unix::fs::PermissionsExt, sync::Arc};
+use std::{
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    sync::Arc,
+};
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 
@@ -219,6 +222,70 @@ async fn claimed_identity_mismatch_is_quarantined_instead_of_retried_or_deleted(
     assert_eq!(
         std::fs::read(quarantined.path()).unwrap(),
         b"external replacement"
+    );
+}
+
+#[tokio::test]
+async fn claimed_in_place_revision_change_is_quarantined_deterministically() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("claimed-revision-change.txt");
+    std::fs::write(&target, "preserve after revision change").unwrap();
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
+
+    let before = std::fs::symlink_metadata(&trash).unwrap();
+    let before_mode = before.mode() & 0o777;
+    let changed_mode = if before_mode == 0o600 { 0o640 } else { 0o600 };
+    let mut permissions = before.permissions();
+    permissions.set_mode(changed_mode);
+    std::fs::set_permissions(&trash, permissions).unwrap();
+    let changed = std::fs::symlink_metadata(&trash).unwrap();
+    assert_eq!((changed.dev(), changed.ino()), (before.dev(), before.ino()));
+    assert_eq!(changed.mode() & 0o777, changed_mode);
+    assert_ne!(changed.mode() & 0o777, before_mode);
+
+    let claimed = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(server.open_purge_work(claimed).await.unwrap().is_none());
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("an in-place revision change must be retained in quarantine");
+    let quarantined_metadata = quarantined.metadata().unwrap();
+    assert_eq!(
+        (quarantined_metadata.dev(), quarantined_metadata.ino()),
+        (before.dev(), before.ino())
+    );
+    assert_eq!(
+        std::fs::read(quarantined.path()).unwrap(),
+        b"preserve after revision change"
     );
 }
 
