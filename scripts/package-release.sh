@@ -175,6 +175,340 @@ classify_advisory_database_identity() {
   fi
 }
 
+run_advisory_database_git() {
+  local database="$1"
+  shift
+
+  run_git_isolated \
+    -c core.attributesFile=/dev/null \
+    -c core.excludesFile=/dev/null \
+    -c core.fileMode=true \
+    -c core.fsmonitor=false \
+    -c core.untrackedCache=false \
+    -C "$database" \
+    "$@"
+}
+
+run_advisory_database_git_with_index() {
+  local database="$1"
+  local index_file="$2"
+  shift 2
+
+  env -i \
+    HOME=/ \
+    XDG_CONFIG_HOME=/ \
+    LANG=C \
+    LC_ALL=C \
+    PATH=/usr/bin:/bin \
+    GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_INDEX_FILE="$index_file" \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_OPTIONAL_LOCKS=0 \
+    "$git_command" \
+    -c core.attributesFile=/dev/null \
+    -c core.excludesFile=/dev/null \
+    -c core.fileMode=true \
+    -c core.fsmonitor=false \
+    -c core.untrackedCache=false \
+    -C "$database" \
+    "$@"
+}
+
+cleanup_advisory_database_validation() {
+  local status=$?
+  local cleanup_failed=false
+  local index_path="${advisory_validation_index-}"
+  local index_directory="${advisory_validation_directory-}"
+  local cleanup_entry
+
+  trap - EXIT HUP INT TERM
+  set +e
+  for cleanup_entry in "$index_path" "$index_path.lock"; do
+    [[ -n "$index_path" ]] || continue
+    if [[ "${cleanup_entry%/*}" != "$index_directory" ||
+      "${cleanup_entry##*/}" != dufs-rustsec-index.* ]]
+    then
+      printf 'Refusing to remove unexpected RustSec verification index: %s\n' \
+        "$cleanup_entry" >&2
+      cleanup_failed=true
+    elif [[ -e "$cleanup_entry" || -L "$cleanup_entry" ]] &&
+      ! rm -f -- "$cleanup_entry"
+    then
+      cleanup_failed=true
+    fi
+  done
+  if [[ "$cleanup_failed" == true && "$status" -eq 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+reject_advisory_database_untracked_stream() {
+  local stream_fd="$1"
+  local untracked_path=""
+
+  if IFS= read -r -d '' -u "$stream_fd" untracked_path; then
+    printf 'RustSec advisory database contains an untracked path: %q\n' \
+      "$untracked_path" >&2
+    return 1
+  fi
+  [[ -z "$untracked_path" ]] || {
+    printf 'RustSec untracked-path listing ended with a truncated entry: %q\n' \
+      "$untracked_path" >&2
+    return 1
+  }
+}
+
+validate_advisory_database_tracked_stream() {
+  local stream_fd="$1"
+  local database="${advisory_validation_database-}"
+  local entry=""
+  local metadata
+  local mode
+  local object_type
+  local expected_object_id
+  local path
+  local physical_path
+  local file_metadata
+  local raw_mode
+  local link_count
+  local numeric_mode
+  local actual_object_id
+
+  [[ -d "$database" && ! -L "$database" ]] || {
+    printf 'RustSec tracked-file validator lacks a physical database.\n' >&2
+    return 1
+  }
+  while IFS= read -r -d '' -u "$stream_fd" entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    read -r mode object_type expected_object_id <<< "$metadata"
+    case "$mode:$object_type" in
+      100644:blob|100755:blob) ;;
+      120000:blob)
+        printf 'Refusing symbolic link in RustSec database: %q\n' "$path" >&2
+        return 1
+        ;;
+      160000:commit)
+        printf 'Refusing submodule in RustSec database: %q\n' "$path" >&2
+        return 1
+        ;;
+      *)
+        printf \
+          'Refusing unsupported RustSec Git entry mode/type %s/%s at %q.\n' \
+          "$mode" \
+          "$object_type" \
+          "$path" >&2
+        return 1
+        ;;
+    esac
+    case "$path" in
+      ""|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*)
+        printf 'Refusing unsafe RustSec database path: %q\n' "$path" >&2
+        return 1
+        ;;
+    esac
+    [[ "$expected_object_id" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || {
+      printf 'RustSec database entry has an invalid object ID: %q\n' \
+        "$path" >&2
+      return 1
+    }
+
+    physical_path="$database/$path"
+    [[ -f "$physical_path" && ! -L "$physical_path" ]] || {
+      printf 'RustSec tracked path is not a physical file: %q\n' "$path" >&2
+      return 1
+    }
+    file_metadata="$(stat -c '%f %h' -- "$physical_path")" || return $?
+    read -r raw_mode link_count <<< "$file_metadata"
+    [[ "$raw_mode" =~ ^[0-9a-f]+$ && "$link_count" =~ ^[0-9]+$ ]] || {
+      printf 'RustSec tracked path returned invalid metadata: %q\n' "$path" >&2
+      return 1
+    }
+    numeric_mode=$((16#$raw_mode))
+    (( (numeric_mode & 0170000) == 0100000 && link_count == 1 )) || {
+      printf 'RustSec tracked path is not a private regular file: %q\n' \
+        "$path" >&2
+      return 1
+    }
+    case "$mode" in
+      100644)
+        (( (numeric_mode & 0111) == 0 )) || {
+          printf 'RustSec tracked mode differs from revision at %q.\n' \
+            "$path" >&2
+          return 1
+        }
+        ;;
+      100755)
+        (( (numeric_mode & 0100) != 0 )) || {
+          printf 'RustSec tracked mode differs from revision at %q.\n' \
+            "$path" >&2
+          return 1
+        }
+        ;;
+    esac
+    actual_object_id="$(
+      run_advisory_database_git \
+        "$database" \
+        hash-object --no-filters -- "$path"
+    )" || return $?
+    [[ "$actual_object_id" == "$expected_object_id" ]] || {
+      printf 'RustSec tracked content differs from revision at %q.\n' \
+        "$path" >&2
+      return 1
+    }
+  done
+  [[ -z "$entry" ]] || {
+    printf 'RustSec tracked-file listing ended with a truncated entry: %q\n' \
+      "$entry" >&2
+    return 1
+  }
+}
+
+validate_advisory_database_state() (
+  local database="$1"
+  local expected_revision="${2:-}"
+  local expected_fetch_epoch="${3:-}"
+  local expected_index_checksum="${4:-}"
+  local expected_config_checksum="${5:-}"
+  local identity
+  local revision
+  local fetch_epoch
+  local git_directory
+  local git_common_directory
+  local metadata_path
+  local index_checksum
+  local config_checksum
+  local advisory_validation_directory
+  local advisory_validation_index=""
+  local advisory_validation_database="$database"
+
+  trap cleanup_advisory_database_validation EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  validate_extracted_source_tree "$database" || return $?
+  validate_source_git_metadata "$database" || return $?
+  identity="$(read_advisory_database_identity "$database")" || return $?
+  read -r revision fetch_epoch <<< "$identity"
+  if [[ -n "$expected_revision" && "$revision" != "$expected_revision" ]]; then
+    printf 'RustSec advisory database revision changed from %s to %s.\n' \
+      "$expected_revision" \
+      "$revision" >&2
+    return 1
+  fi
+  if [[ -n "$expected_fetch_epoch" && \
+    "$fetch_epoch" != "$expected_fetch_epoch" ]]
+  then
+    printf 'RustSec advisory database fetch epoch changed from %s to %s.\n' \
+      "$expected_fetch_epoch" \
+      "$fetch_epoch" >&2
+    return 1
+  fi
+
+  git_directory="$(
+    run_advisory_database_git "$database" \
+      rev-parse --path-format=absolute --git-dir
+  )" || return $?
+  git_common_directory="$(
+    run_advisory_database_git "$database" \
+      rev-parse --path-format=absolute --git-common-dir
+  )" || return $?
+  for metadata_path in \
+    "$git_directory/objects/info/alternates" \
+    "$git_directory/objects/info/http-alternates" \
+    "$git_common_directory/objects/info/alternates" \
+    "$git_common_directory/objects/info/http-alternates"
+  do
+    if [[ -e "$metadata_path" || -L "$metadata_path" ]]; then
+      printf 'RustSec advisory database contains object alternates: %s\n' \
+        "$metadata_path" >&2
+      return 1
+    fi
+  done
+  [[ -f "$git_directory/index" && ! -L "$git_directory/index" ]] || {
+    printf 'RustSec advisory database lacks a physical Git index.\n' >&2
+    return 1
+  }
+  [[ -f "$git_common_directory/config" && \
+    ! -L "$git_common_directory/config" ]] || {
+    printf 'RustSec advisory database lacks a physical Git configuration.\n' >&2
+    return 1
+  }
+  index_checksum="$(sha256sum < "$git_directory/index")"
+  index_checksum="${index_checksum%% *}"
+  config_checksum="$(sha256sum < "$git_common_directory/config")"
+  config_checksum="${config_checksum%% *}"
+  [[ "$index_checksum" =~ ^[0-9a-f]{64}$ && \
+    "$config_checksum" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'RustSec advisory database metadata checksums are invalid.\n' >&2
+    return 1
+  }
+  if [[ -n "$expected_index_checksum" && \
+    "$index_checksum" != "$expected_index_checksum" ]]
+  then
+    printf 'RustSec advisory database index changed after it was sealed.\n' >&2
+    return 1
+  fi
+  if [[ -n "$expected_config_checksum" && \
+    "$config_checksum" != "$expected_config_checksum" ]]
+  then
+    printf 'RustSec advisory database Git configuration changed after it was sealed.\n' \
+      >&2
+    return 1
+  fi
+  if ! run_advisory_database_git "$database" \
+    diff-index --cached --quiet "$revision" --
+  then
+    printf 'RustSec advisory database index differs from revision %s.\n' \
+      "$revision" >&2
+    return 1
+  fi
+  with_private_nul_stream \
+    validate_advisory_database_tracked_stream \
+    run_advisory_database_git \
+      "$database" \
+      ls-tree -rz --full-tree "$revision" || return $?
+  advisory_validation_directory="$({
+    cd -P -- "${TMPDIR:-/tmp}" && pwd -P
+  })" || {
+    printf 'Unable to resolve the RustSec verification directory.\n' >&2
+    return 1
+  }
+  advisory_validation_index="$(
+    mktemp \
+      --tmpdir="$advisory_validation_directory" \
+      dufs-rustsec-index.XXXXXXXXXX
+  )" || {
+    printf 'Unable to create a private RustSec verification index.\n' >&2
+    return 1
+  }
+  rm -f -- "$advisory_validation_index" || return $?
+  run_advisory_database_git_with_index \
+    "$database" \
+    "$advisory_validation_index" \
+    read-tree "$revision" || return $?
+  with_private_nul_stream \
+    reject_advisory_database_untracked_stream \
+    run_advisory_database_git_with_index \
+      "$database" \
+      "$advisory_validation_index" \
+      ls-files --others -z -- || return $?
+  rm -f -- "$advisory_validation_index" "$advisory_validation_index.lock" || \
+    return $?
+  advisory_validation_index=""
+
+  printf '%s %s %s %s\n' \
+    "$revision" \
+    "$fetch_epoch" \
+    "$index_checksum" \
+    "$config_checksum"
+)
+
 write_build_environment_manifest() {
   local destination="$1"
   local source_sha="$2"
@@ -1598,6 +1932,12 @@ run_publication_self_test() {
   local advisory_database_test_fetch_epoch
   local advisory_database_test_classification
   local advisory_database_test_status
+  local advisory_database_test_state
+  local advisory_database_test_index_checksum
+  local advisory_database_test_config_checksum
+  local advisory_database_filter_marker
+  local advisory_database_test_mode
+  local advisory_database_untracked_directory
   local freshness_current_epoch
   local freshness_expected_status
   local freshness_fetch_epoch
@@ -1659,8 +1999,12 @@ EOF
 
   advisory_database_test="$test_root/advisory-database"
   run_git_isolated init --quiet "$advisory_database_test"
+  printf 'README.md filter=release-self-test-filter\n' > \
+    "$advisory_database_test/.gitattributes"
   printf 'self-test\n' > "$advisory_database_test/README.md"
-  run_git_isolated -C "$advisory_database_test" add README.md
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    add .gitattributes README.md
   run_git_isolated \
     -C "$advisory_database_test" \
     -c user.name=release-self-test \
@@ -1690,6 +2034,162 @@ EOF
     printf 'release self-test produced an invalid RustSec database identity\n' >&2
     return 1
   }
+  advisory_database_filter_marker="$test_root/rustsec-filter-ran"
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    config \
+    filter.release-self-test-filter.clean \
+    "tee -- $advisory_database_filter_marker"
+  validate_advisory_database_state \
+    "$advisory_database_test" >/dev/null || return $?
+  [[ ! -e "$advisory_database_filter_marker" ]] || {
+    printf 'release self-test executed a RustSec repository clean filter\n' >&2
+    return 1
+  }
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    config --unset-all filter.release-self-test-filter.clean
+  advisory_database_test_state="$(
+    validate_advisory_database_state "$advisory_database_test"
+  )" || return $?
+  read -r \
+    advisory_database_test_revision \
+    advisory_database_test_fetch_epoch \
+    advisory_database_test_index_checksum \
+    advisory_database_test_config_checksum <<< \
+    "$advisory_database_test_state"
+
+  printf 'changed after the RustSec seal\n' > "$advisory_database_test/README.md"
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf 'release self-test accepted a modified tracked RustSec advisory\n' >&2
+    return 1
+  fi
+  printf 'self-test\n' > "$advisory_database_test/README.md"
+
+  advisory_database_test_mode="$(
+    stat -Lc '%a' -- "$advisory_database_test/README.md"
+  )"
+  chmod u+x -- "$advisory_database_test/README.md"
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf 'release self-test accepted a RustSec tracked-mode change\n' >&2
+    return 1
+  fi
+  chmod "$advisory_database_test_mode" -- "$advisory_database_test/README.md"
+
+  advisory_database_untracked_directory="$advisory_database_test/crates/release-self-test"
+  install -d -m 0700 "$advisory_database_untracked_directory"
+  printf 'untracked advisory\n' > \
+    "$advisory_database_untracked_directory/RUSTSEC-9999-9999.toml"
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf 'release self-test accepted an untracked RustSec advisory\n' >&2
+    return 1
+  fi
+  rm -f -- "$advisory_database_untracked_directory/RUSTSEC-9999-9999.toml"
+  rmdir -- "$advisory_database_untracked_directory" \
+    "$advisory_database_test/crates"
+
+  printf 'staged index change\n' > "$advisory_database_test/README.md"
+  run_git_isolated -C "$advisory_database_test" add README.md
+  printf 'self-test\n' > "$advisory_database_test/README.md"
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf 'release self-test accepted a modified RustSec Git index\n' >&2
+    return 1
+  fi
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    reset --quiet HEAD -- README.md
+  advisory_database_test_state="$(
+    validate_advisory_database_state \
+      "$advisory_database_test" \
+      "$advisory_database_test_revision" \
+      "$advisory_database_test_fetch_epoch"
+  )" || return $?
+  read -r \
+    advisory_database_test_revision \
+    advisory_database_test_fetch_epoch \
+    advisory_database_test_index_checksum \
+    advisory_database_test_config_checksum <<< \
+    "$advisory_database_test_state"
+
+  printf 'README.md export-ignore\n' > \
+    "$advisory_database_test/.git/info/attributes"
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf 'release self-test accepted unsafe RustSec Git metadata\n' >&2
+    return 1
+  fi
+  rm -f -- "$advisory_database_test/.git/info/attributes"
+  validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null
+
+  # Exercise the formal-release sequence as one chain: a successful pre-gate
+  # seal must still reject an otherwise-successful gate that leaves any new
+  # database state behind.
+  advisory_database_test_state="$(
+    validate_advisory_database_state "$advisory_database_test"
+  )" || return $?
+  read -r \
+    advisory_database_test_revision \
+    advisory_database_test_fetch_epoch \
+    advisory_database_test_index_checksum \
+    advisory_database_test_config_checksum <<< \
+    "$advisory_database_test_state"
+  (
+    printf 'simulated quality-gate output\n' > \
+      "$advisory_database_test/quality-gate-output"
+  )
+  if validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null 2>&1
+  then
+    printf '%s\n' \
+      'release self-test accepted RustSec state changed by the simulated quality gate' >&2
+    return 1
+  fi
+  rm -f -- "$advisory_database_test/quality-gate-output"
+  validate_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" >/dev/null
+
   run_git_isolated \
     -C "$advisory_database_test" \
     remote set-url origin https://example.invalid/advisory-db.git
@@ -2659,6 +3159,7 @@ for command_name in \
   stat \
   sync \
   tar \
+  touch \
   true
 do
   require_command "$command_name"
@@ -3035,33 +3536,52 @@ do
   fi
 done
 
-quality_vendor_config="$release_stage/quality-vendor-config.toml"
-(
-  cd "$quality_source"
-  "${vendor_environment[@]}" \
-    "$cargo_command" vendor \
-    --locked \
-    --versioned-dirs \
-    "$quality_vendor" > "$quality_vendor_config"
+audit_environment=(
+  env -i
+  "CARGO=$cargo_command"
+  "CARGO_HOME=$quality_isolated_cargo_home"
+  "GIT_ATTR_NOSYSTEM=1"
+  "GIT_CEILING_DIRECTORIES=$release_stage_physical_at_creation"
+  "GIT_CONFIG_GLOBAL=/dev/null"
+  "GIT_CONFIG_NOSYSTEM=1"
+  "GIT_CONFIG_SYSTEM=/dev/null"
+  "GIT_NO_REPLACE_OBJECTS=1"
+  "HOME=$quality_isolated_home"
+  "LANG=C"
+  "LC_ALL=C"
+  "NO_COLOR=1"
+  "PATH=$quality_tool_path"
+  "RUSTUP_TOOLCHAIN=$required_rust_version"
+  "TMPDIR=$quality_tmp_dir"
+  "TZ=UTC"
 )
-[[ -s "$quality_vendor_config" ]] || {
-  printf 'Cargo produced an empty quality-gate vendor configuration.\n' >&2
-  exit 1
-}
-validate_extracted_source_tree "$quality_vendor"
-install -m 0600 \
-  "$quality_vendor_config" \
-  "$quality_isolated_cargo_home/config.toml"
+if [[ -n "$host_rustup_home" ]]; then
+  audit_environment+=("RUSTUP_HOME=$host_rustup_home")
+fi
+for network_variable in \
+  ALL_PROXY \
+  HTTPS_PROXY \
+  HTTP_PROXY \
+  NO_PROXY \
+  SSL_CERT_DIR \
+  SSL_CERT_FILE
+do
+  if [[ -v "$network_variable" ]]; then
+    audit_environment+=("$network_variable=${!network_variable}")
+  fi
+done
 
-quality_audit_db_available=false
 host_audit_db="$host_cargo_home/advisory-db"
 rustsec_advisory_db_revision=""
 rustsec_advisory_db_fetch_epoch=""
+rustsec_advisory_db_index_checksum=""
+rustsec_advisory_db_config_checksum=""
 advisory_database_current_epoch="$(date -u +%s)"
 [[ "$advisory_database_current_epoch" =~ ^[0-9]{1,12}$ ]] || {
   printf 'Unable to determine the current epoch for RustSec freshness checks.\n' >&2
   exit 1
 }
+quality_audit_db_reused=false
 if [[ -e "$host_audit_db" || -L "$host_audit_db" ]]; then
   host_audit_database_classification="$(
     classify_advisory_database_identity "$host_audit_db"
@@ -3082,20 +3602,37 @@ if [[ -e "$host_audit_db" || -L "$host_audit_db" ]]; then
         advisory_database_freshness_status=$?
       case "$advisory_database_freshness_status" in
         0)
-          run_git_isolated clone \
-            --quiet \
-            --no-hardlinks \
-            -- \
+          if validate_advisory_database_state \
             "$host_audit_db" \
-            "$quality_audit_db"
-          validate_extracted_source_tree "$quality_audit_db"
-          quality_audit_db_available=true
-          rustsec_advisory_db_revision="$host_audit_database_revision"
-          rustsec_advisory_db_fetch_epoch="$host_audit_database_fetch_epoch"
+            "$host_audit_database_revision" \
+            "$host_audit_database_fetch_epoch" >/dev/null
+          then
+            run_git_isolated clone \
+              --quiet \
+              --no-hardlinks \
+              -- \
+              "$host_audit_db" \
+              "$quality_audit_db"
+            run_advisory_database_git \
+              "$quality_audit_db" \
+              remote set-url origin "$rustsec_advisory_database_url"
+            printf '%s\t\t%s\n' \
+              "$host_audit_database_revision" \
+              "$rustsec_advisory_database_url" > \
+              "$quality_audit_db/.git/FETCH_HEAD"
+            touch \
+              --date="@$host_audit_database_fetch_epoch" \
+              -- \
+              "$quality_audit_db/.git/FETCH_HEAD"
+            quality_audit_db_reused=true
+          else
+            printf '%s\n' \
+              'The fresh host RustSec database failed full validation; the isolated release pre-audit will require a network refresh.' >&2
+          fi
           ;;
         1)
           printf '%s\n' \
-            'The reusable RustSec database is stale; the isolated gate will require a network refresh.'
+            'The reusable RustSec database is stale; the isolated release pre-audit will require a network refresh.'
           ;;
         *)
           printf 'RustSec advisory database has an invalid future fetch timestamp.\n' >&2
@@ -3105,7 +3642,7 @@ if [[ -e "$host_audit_db" || -L "$host_audit_db" ]]; then
       ;;
     unavailable)
       printf '%s\n' \
-        'The host RustSec database is not reusable; the isolated gate will require a network refresh.' >&2
+        'The host RustSec database is not reusable; the isolated release pre-audit will require a network refresh.' >&2
       ;;
     *)
       printf 'Internal error: invalid RustSec database classification.\n' >&2
@@ -3113,6 +3650,90 @@ if [[ -e "$host_audit_db" || -L "$host_audit_db" ]]; then
       ;;
   esac
 fi
+if [[ "$quality_audit_db_reused" != true ]]; then
+  audit_refresh_lockfile="$release_stage/audit-refresh-Cargo.lock"
+  printf 'version = 4\n' > "$audit_refresh_lockfile"
+  printf '%s\n' \
+    'Refreshing the private RustSec database before any project or dependency code runs.'
+  (
+    cd "$quality_source"
+    "${audit_environment[@]}" \
+      "$cargo_command" audit \
+      --db "$quality_audit_db" \
+      --file "$audit_refresh_lockfile" \
+      --no-yanked \
+      --url "$rustsec_advisory_database_url"
+  )
+  rm -f -- "$audit_refresh_lockfile"
+fi
+
+quality_audit_database_state="$(
+  validate_advisory_database_state "$quality_audit_db"
+)" || exit $?
+read -r \
+  rustsec_advisory_db_revision \
+  rustsec_advisory_db_fetch_epoch \
+  rustsec_advisory_db_index_checksum \
+  rustsec_advisory_db_config_checksum <<< \
+  "$quality_audit_database_state"
+advisory_database_current_epoch="$(date -u +%s)"
+[[ "$advisory_database_current_epoch" =~ ^[0-9]{1,12}$ ]] || {
+  printf 'Unable to refresh the current epoch for RustSec checks.\n' >&2
+  exit 1
+}
+advisory_database_freshness_status=0
+validate_advisory_database_freshness \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$advisory_database_current_epoch" \
+  "$rustsec_advisory_database_maximum_age_seconds" \
+  "$rustsec_advisory_database_maximum_future_skew_seconds" || \
+  advisory_database_freshness_status=$?
+case "$advisory_database_freshness_status" in
+  0) ;;
+  1)
+    printf 'The private RustSec advisory database is stale after refresh.\n' >&2
+    exit 1
+    ;;
+  *)
+    printf 'The private RustSec advisory database has an invalid future timestamp.\n' >&2
+    exit 1
+    ;;
+esac
+
+printf 'Running the sealed RustSec pre-audit for commit %s.\n' "$source_sha"
+(
+  cd "$quality_source"
+  "${audit_environment[@]}" \
+    CARGO_NET_OFFLINE=true \
+    "$cargo_command" audit \
+    --db "$quality_audit_db" \
+    --no-fetch \
+    --no-yanked
+)
+validate_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum" >/dev/null
+
+quality_vendor_config="$release_stage/quality-vendor-config.toml"
+(
+  cd "$quality_source"
+  "${vendor_environment[@]}" \
+    "$cargo_command" vendor \
+    --locked \
+    --versioned-dirs \
+    "$quality_vendor" > "$quality_vendor_config"
+)
+[[ -s "$quality_vendor_config" ]] || {
+  printf 'Cargo produced an empty quality-gate vendor configuration.\n' >&2
+  exit 1
+}
+validate_extracted_source_tree "$quality_vendor"
+install -m 0600 \
+  "$quality_vendor_config" \
+  "$quality_isolated_cargo_home/config.toml"
 
 "$node_command" \
   "$quality_source/scripts/seed-npm-cache.mjs" \
@@ -3131,6 +3752,7 @@ quality_environment=(
   "CI=1"
   "DUFS_BUILD_GIT_SHA=$source_sha"
   "DUFS_ISOLATED_QUALITY_GATE=1"
+  "DUFS_QUALITY_AUDIT_DB=$quality_audit_db"
   "DUFS_REQUIRE_SHELLCHECK=1"
   "GIT_ATTR_NOSYSTEM=1"
   "GIT_CEILING_DIRECTORIES=$release_stage_physical_at_creation"
@@ -3167,9 +3789,6 @@ fi
 if [[ -n "$host_browser_cache" ]]; then
   quality_environment+=("PLAYWRIGHT_BROWSERS_PATH=$host_browser_cache")
 fi
-if [[ "$quality_audit_db_available" == true ]]; then
-  quality_environment+=("DUFS_QUALITY_AUDIT_DB=$quality_audit_db")
-fi
 for network_variable in \
   ALL_PROXY \
   HTTPS_PROXY \
@@ -3190,33 +3809,22 @@ printf \
   cd "$quality_source"
   "${quality_environment[@]}" ./scripts/check.sh
 )
-if [[ "$quality_audit_db_available" == true ]]; then
-  validate_extracted_source_tree "$quality_audit_db"
-  quality_audit_database_revision_after_gate="$(
-    advisory_database_revision "$quality_audit_db"
-  )"
-  [[ "$quality_audit_database_revision_after_gate" == \
-    "$rustsec_advisory_db_revision" ]] || {
-    printf 'The no-fetch RustSec database changed during the quality gate.\n' >&2
-    exit 1
-  }
-else
-  quality_audit_database_identity="$(
-    read_advisory_database_identity "$quality_audit_db"
-  )" || exit $?
-  read -r \
-    rustsec_advisory_db_revision \
-    rustsec_advisory_db_fetch_epoch <<< "$quality_audit_database_identity"
-  advisory_database_current_epoch="$(date -u +%s)"
-  validate_advisory_database_freshness \
-    "$rustsec_advisory_db_fetch_epoch" \
-    "$advisory_database_current_epoch" \
-    "$rustsec_advisory_database_maximum_age_seconds" \
-    "$rustsec_advisory_database_maximum_future_skew_seconds" || {
-    printf 'The refreshed RustSec advisory database is not fresh enough to release.\n' >&2
-    exit 1
-  }
-fi
+validate_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum" >/dev/null
+advisory_database_current_epoch="$(date -u +%s)"
+validate_advisory_database_freshness \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$advisory_database_current_epoch" \
+  "$rustsec_advisory_database_maximum_age_seconds" \
+  "$rustsec_advisory_database_maximum_future_skew_seconds" || {
+  printf 'The sealed RustSec advisory database is no longer fresh enough to release.\n' \
+    >&2
+  exit 1
+}
 verify_quality_source_after_gate \
   "$quality_source" \
   "$release_stage/quality-after.index" \

@@ -61,15 +61,6 @@ elif [[ "${DUFS_REQUIRE_SHELLCHECK:-}" == "1" ]]; then
 else
   printf '\n==> SKIP: 未安装 ShellCheck；CI 会固定使用 0.11.0 并强制执行。\n'
 fi
-# 发布自测统一聚合 normalize-sbom、third-party notices 与 npm cache seed，
-# 避免在总检查入口重复执行或让三者的验证范围发生漂移。
-run ./scripts/package-release.sh --self-test
-run ./scripts/check-deployment.sh
-
-run cargo fmt --all --check
-run cargo clippy --locked --all-targets --all-features -- -D warnings
-run cargo test --locked --all-targets --all-features
-run ./scripts/check-coverage.sh
 
 cargo_audit_version="$(cargo audit --version 2>/dev/null)" || {
   printf 'required Cargo subcommand is unavailable: cargo audit\n' >&2
@@ -83,17 +74,31 @@ expected_cargo_audit_version="cargo-audit-audit $required_cargo_audit_version"
   exit 1
 }
 printf '\n==> %s\n' "$cargo_audit_version"
-if [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]]; then
-  [[ "${DUFS_ISOLATED_QUALITY_GATE:-}" == "1" ]] || {
-    printf 'DUFS_QUALITY_AUDIT_DB is reserved for the isolated release gate\n' >&2
+if [[ "${DUFS_ISOLATED_QUALITY_GATE:-}" == "1" ]]; then
+  [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]] || {
+    printf 'isolated release gate requires its sealed RustSec database\n' >&2
     exit 1
   }
   run cargo audit \
     --db "$DUFS_QUALITY_AUDIT_DB" \
-    --no-fetch
+    --no-fetch \
+    --no-yanked
+elif [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]]; then
+  printf 'DUFS_QUALITY_AUDIT_DB is reserved for the isolated release gate\n' >&2
+  exit 1
 else
   run cargo audit
 fi
+
+# 发布自测统一聚合 normalize-sbom、third-party notices 与 npm cache seed，
+# 避免在总检查入口重复执行或让三者的验证范围发生漂移。
+run ./scripts/package-release.sh --self-test
+run ./scripts/check-deployment.sh
+
+run cargo fmt --all --check
+run cargo clippy --locked --all-targets --all-features -- -D warnings
+run cargo test --locked --all-targets --all-features
+run ./scripts/check-coverage.sh
 
 run npm ci --ignore-scripts --no-audit --no-fund
 run ./node_modules/.bin/tsc --version
