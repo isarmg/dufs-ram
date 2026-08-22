@@ -454,7 +454,10 @@ fn replacement_metadata_applies_posix_access_acl_after_user_attributes() {
         .open(&staged_path)
         .unwrap();
     let staged_stat = staged.metadata().unwrap();
-    let named_uid = if staged_stat.uid() == 1 { 2 } else { 1 };
+    // Use an ID that is guaranteed to be mapped in narrow user namespaces.
+    // The named entry only exercises ACL replay ordering; it does not need to
+    // designate a different account from the file owner.
+    let named_uid = staged_stat.uid();
     let mut access_acl = 2_u32.to_le_bytes().to_vec();
     push_acl_entry(&mut access_acl, 0x01, 0x04, u32::MAX); // ACL_USER_OBJ
     push_acl_entry(&mut access_acl, 0x02, 0x04, named_uid); // ACL_USER
