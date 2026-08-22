@@ -34,6 +34,7 @@ pub(in crate::server) struct TrashEntry {
 pub(super) struct PurgeDirectory {
     name: OsString,
     cursor: DirectoryCursor,
+    identity: DeleteIdentity,
 }
 
 pub(super) struct PurgeResume {
@@ -155,7 +156,18 @@ impl TrashEntry {
                     fsync(&self.parent).map_err(std::io::Error::from)?;
                     return Ok(true);
                 }
-                Err(error) => return Err(std::io::Error::from(error)),
+                Err(error) => {
+                    if matches!(
+                        statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW),
+                        Ok(metadata) if identity_from_stat(&metadata) != self.identity
+                    ) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash directory identity changed while opening it",
+                        ));
+                    }
+                    return Err(std::io::Error::from(error));
+                }
             }
             match unlinkat(&self.parent, &self.name, AtFlags::empty()) {
                 Ok(()) | Err(Errno::NOENT) => {}
@@ -188,7 +200,22 @@ impl TrashEntry {
                     fsync(&self.parent).map_err(std::io::Error::from)?;
                     return Ok(true);
                 }
-                Err(error) => return Err(std::io::Error::from(error)),
+                Err(error) => {
+                    match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(metadata) if identity_from_stat(&metadata) != self.identity => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "trash directory identity changed while opening it",
+                            ));
+                        }
+                        Err(Errno::NOENT) => {
+                            fsync(&self.parent).map_err(std::io::Error::from)?;
+                            return Ok(true);
+                        }
+                        _ => {}
+                    }
+                    return Err(std::io::Error::from(error));
+                }
             };
             if identity_from_stat(&fstat(&directory).map_err(std::io::Error::from)?)
                 != self.identity
@@ -201,6 +228,7 @@ impl TrashEntry {
             self.purge_stack.push(PurgeDirectory {
                 name: self.name.clone(),
                 cursor: DirectoryCursor::default(),
+                identity: self.identity,
             });
             Some(Dir::new(directory).map_err(std::io::Error::from)?)
         } else {
@@ -230,6 +258,17 @@ impl TrashEntry {
                     .as_ref()
                     .expect("a pending unlink has an open parent directory");
                 let parent_fd = parent.fd().map_err(std::io::Error::from)?;
+                match statat(parent_fd, &completed.name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) if identity_from_stat(&metadata) == completed.identity => {}
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child directory identity changed before purge",
+                        ));
+                    }
+                    Err(Errno::NOENT) => continue,
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
                 match unlinkat(parent_fd, &completed.name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(error) => {
@@ -267,6 +306,20 @@ impl TrashEntry {
                         return Ok(false);
                     }
                 } else {
+                    match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(metadata) if identity_from_stat(&metadata) == self.identity => {}
+                        Ok(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "trash root directory identity changed before purge",
+                            ));
+                        }
+                        Err(Errno::NOENT) => {
+                            fsync(&self.parent).map_err(std::io::Error::from)?;
+                            return Ok(true);
+                        }
+                        Err(error) => return Err(std::io::Error::from(error)),
+                    }
                     match unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR) {
                         Ok(()) | Err(Errno::NOENT) => {}
                         Err(error) => {
@@ -344,6 +397,7 @@ impl TrashEntry {
                 }
             };
             if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+                let child_identity = identity_from_stat(&metadata);
                 let child = match openat2(
                     directory_fd,
                     &name,
@@ -360,6 +414,15 @@ impl TrashEntry {
                         continue;
                     }
                     Err(error) => {
+                        if matches!(
+                            statat(directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW),
+                            Ok(current) if identity_from_stat(&current) != child_identity
+                        ) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "trash child directory identity changed while opening it",
+                            ));
+                        }
                         self.remember_purge_directory(
                             directory
                                 .as_ref()
@@ -369,6 +432,14 @@ impl TrashEntry {
                         return Err(std::io::Error::from(error));
                     }
                 };
+                if identity_from_stat(&fstat(&child).map_err(std::io::Error::from)?)
+                    != child_identity
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "trash child directory identity changed while opening it",
+                    ));
+                }
                 let child = match Dir::new(child) {
                     Ok(child) => child,
                     Err(error) => {
@@ -388,9 +459,28 @@ impl TrashEntry {
                 self.purge_stack.push(PurgeDirectory {
                     name,
                     cursor: DirectoryCursor::default(),
+                    identity: child_identity,
                 });
                 directory = Some(child);
             } else {
+                match statat(directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(current)
+                        if identity_from_stat(&current) == identity_from_stat(&metadata) => {}
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child identity changed before purge",
+                        ));
+                    }
+                    Err(Errno::NOENT) => {
+                        self.purge_stack
+                            .last_mut()
+                            .expect("directory purge stack is non-empty")
+                            .cursor = next_cursor;
+                        continue;
+                    }
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
                 match unlinkat(directory_fd, &name, AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(error) => {
@@ -447,6 +537,14 @@ impl TrashEntry {
                 (root, 1)
             }
         };
+        if identity_from_stat(&fstat(&current).map_err(std::io::Error::from)?)
+            != self.purge_stack[depth - 1].identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "retained trash directory identity changed before resumed purge",
+            ));
+        }
         while depth < target_depth {
             if cancellation.is_some_and(CancellationToken::is_cancelled)
                 || *examined >= max_entries
@@ -466,8 +564,27 @@ impl TrashEntry {
                 Mode::empty(),
                 ResolveFlags::NO_XDEV,
             ) {
-                Ok(next) => current = next,
+                Ok(next) => {
+                    if identity_from_stat(&fstat(&next).map_err(std::io::Error::from)?)
+                        != frame.identity
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child directory identity changed before resumed purge",
+                        ));
+                    }
+                    current = next;
+                }
                 Err(error) => {
+                    if matches!(
+                        statat(&current, &frame.name, AtFlags::SYMLINK_NOFOLLOW),
+                        Ok(metadata) if identity_from_stat(&metadata) != frame.identity
+                    ) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child directory identity changed before resumed purge",
+                        ));
+                    }
                     self.purge_resume = Some(PurgeResume {
                         directory: current,
                         depth,
@@ -542,6 +659,7 @@ impl TrashEntry {
         self.purge_stack.push(PurgeDirectory {
             name: self.name.clone(),
             cursor: DirectoryCursor::default(),
+            identity: self.identity,
         });
         self.remember_purge_directory(&directory, 1)
     }

@@ -1,6 +1,13 @@
 name: Dependency Audit
 
 on:
+  push:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - package-lock.json
+      - package.json
+      - .github/workflows/dependency-audit.yml
   pull_request:
     paths:
       - Cargo.lock
@@ -44,7 +51,8 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" install cargo-audit \
             --version "$CARGO_AUDIT_VERSION" \
             --locked
-          cargo audit --version
+          test "$(cargo audit --version)" = \
+            "cargo-audit-audit $CARGO_AUDIT_VERSION"
       - name: Audit the locked Rust dependency graph
         run: cargo audit
       - name: Use the fixed Node.js release

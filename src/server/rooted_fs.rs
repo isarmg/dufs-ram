@@ -1,6 +1,9 @@
 use super::{
     blocking_io::blocking_io_gate,
-    internal_names::{delete_trash_name, upload_readiness_probe_name},
+    internal_names::{
+        InternalEntryName, classify_internal_name, delete_trash_name, quarantine_name,
+        upload_readiness_probe_name,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use rustix::{
@@ -105,6 +108,17 @@ impl ReplacementTargetIdentity {
         matches!(self, Self::Existing(_))
     }
 
+    pub(super) fn delete_identity(self) -> Option<DeleteIdentity> {
+        let Self::Existing(target) = self else {
+            return None;
+        };
+        Some(DeleteIdentity {
+            device: target.device,
+            inode: target.inode,
+            is_directory: target.file_type == FileType::Directory,
+        })
+    }
+
     /// Whether the inexpensive target inspection found an object type whose
     /// metadata can safely participate in the upload replacement protocol.
     /// The later metadata capture remains authoritative (notably for xattrs),
@@ -151,6 +165,15 @@ pub(super) enum ReplaceAndSyncOutcome {
     Rejected,
     NotPublished(std::io::Error),
     PublishedDurabilityUnknown(std::io::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CheckedRelocationOutcome {
+    Relocated,
+    SourceChanged,
+    DestinationChanged,
+    DestinationExists,
+    SameFile,
 }
 
 #[derive(Debug)]
@@ -217,6 +240,7 @@ pub(super) struct RootedDirEntry {
     pub(super) file_name: OsString,
     pub(super) metadata: std::fs::Metadata,
     pub(super) is_symlink: bool,
+    pub(super) revision_identity: ReplacementTargetIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -444,7 +468,6 @@ impl RootedFs {
 
         while let Some(entry) = directory.read() {
             let entry = entry.map_err(std::io::Error::from)?;
-            let entry_type = entry.file_type();
             let name = entry.file_name().to_bytes();
             let next_cursor = DirectoryCursor(entry.offset());
             if matches!(name, b"." | b"..") {
@@ -462,11 +485,11 @@ impl RootedFs {
                 return Ok(DirectoryVisitProgress::Paused(resume_cursor));
             }
             let directory_fd = directory.fd().map_err(std::io::Error::from)?;
-            let is_symlink = directory_entry_is_symlink(entry_type, || {
-                let nofollow = statat(directory_fd, &file_name, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(std::io::Error::from)?;
-                Ok(FileType::from_raw_mode(nofollow.st_mode) == FileType::Symlink)
-            })?;
+            let nofollow = statat(directory_fd, &file_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(std::io::Error::from)?;
+            let is_symlink = FileType::from_raw_mode(nofollow.st_mode) == FileType::Symlink;
+            let revision_identity =
+                ReplacementTargetIdentity::Existing(replacement_target_identity(&nofollow));
             let target = match openat2(
                 &self.inner.root,
                 &child_relative,
@@ -503,6 +526,7 @@ impl RootedFs {
                 file_name,
                 metadata,
                 is_symlink,
+                revision_identity,
             };
             resume_cursor = next_cursor;
             if !visitor(entry)? {
@@ -983,15 +1007,16 @@ impl RootedFs {
         }
     }
 
-    /// Rename with overwrite semantics, but report two distinct directory
-    /// entries that already refer to the same inode as a no-op. POSIX rename
-    /// otherwise returns success while leaving both hard-link names in place,
-    /// which is not a successful browser relocation.
-    pub(super) async fn rename_replace_distinct(
+    /// Relocate a directory entry only while the object identities observed by
+    /// the browser API still match. The final comparisons and rename share one
+    /// blocking closure so external writers cannot exploit an await boundary.
+    pub(super) async fn rename_if_unchanged(
         &self,
         source: &Path,
         destination: &Path,
-    ) -> std::io::Result<bool> {
+        expected_source: ReplacementTargetIdentity,
+        expected_destination: Option<ReplacementTargetIdentity>,
+    ) -> std::io::Result<CheckedRelocationOutcome> {
         let this = self.clone();
         let source = source.to_path_buf();
         let destination = destination.to_path_buf();
@@ -1001,30 +1026,85 @@ impl RootedFs {
                 .ancestor_creation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let source = this.open_parent_blocking(&source, false)?;
-            let destination = this.open_parent_blocking(&destination, false)?;
+            let source = match this.open_parent_blocking(&source, false) {
+                Ok(source) => source,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(CheckedRelocationOutcome::SourceChanged);
+                }
+                Err(error) => return Err(error),
+            };
+            let destination = match this.open_parent_blocking(&destination, false) {
+                Ok(destination) => destination,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(CheckedRelocationOutcome::DestinationChanged);
+                }
+                Err(error) => return Err(error),
+            };
             let same_parent = opened_directories_match(&source.fd, &destination.fd)?;
-            let source_stat = statat(&source.fd, &source.name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(std::io::Error::from)?;
-            let same_inode = match statat(
+            let source_stat = match statat(&source.fd, &source.name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(source_stat) => source_stat,
+                Err(Errno::NOENT | Errno::NOTDIR) => {
+                    return Ok(CheckedRelocationOutcome::SourceChanged);
+                }
+                Err(error) => return Err(std::io::Error::from(error)),
+            };
+            if ReplacementTargetIdentity::Existing(replacement_target_identity(&source_stat))
+                != expected_source
+            {
+                return Ok(CheckedRelocationOutcome::SourceChanged);
+            }
+            let current_destination = match statat(
                 &destination.fd,
                 &destination.name,
                 AtFlags::SYMLINK_NOFOLLOW,
             ) {
-                Ok(destination_stat) => {
-                    source_stat.st_dev == destination_stat.st_dev
-                        && source_stat.st_ino == destination_stat.st_ino
-                }
-                Err(Errno::NOENT) => false,
+                Ok(destination_stat) => ReplacementTargetIdentity::Existing(
+                    replacement_target_identity(&destination_stat),
+                ),
+                Err(Errno::NOENT | Errno::NOTDIR) => ReplacementTargetIdentity::Missing,
                 Err(error) => return Err(std::io::Error::from(error)),
             };
-            if same_inode {
-                return Ok(false);
+
+            if let Some(expected_destination) = expected_destination {
+                if current_destination != expected_destination {
+                    return Ok(CheckedRelocationOutcome::DestinationChanged);
+                }
+                if let ReplacementTargetIdentity::Existing(destination_identity) =
+                    current_destination
+                    && source_stat.st_dev == destination_identity.device
+                    && source_stat.st_ino == destination_identity.inode
+                {
+                    return Ok(CheckedRelocationOutcome::SameFile);
+                }
+                renameat(&source.fd, &source.name, &destination.fd, &destination.name)
+                    .map_err(std::io::Error::from)?;
+            } else {
+                match renameat_with(
+                    &source.fd,
+                    &source.name,
+                    &destination.fd,
+                    &destination.name,
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {}
+                    Err(Errno::EXIST) => {
+                        return Ok(CheckedRelocationOutcome::DestinationExists);
+                    }
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
             }
-            renameat(&source.fd, &source.name, &destination.fd, &destination.name)
-                .map_err(std::io::Error::from)?;
             sync_renamed_parents(&source.fd, &destination.fd, same_parent)?;
-            Ok(true)
+            Ok(CheckedRelocationOutcome::Relocated)
         })
         .await
     }
@@ -1119,6 +1199,7 @@ impl RootedFs {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn rename_no_replace(
         &self,
         source: &Path,
@@ -1216,7 +1297,7 @@ impl RootedFs {
         expected: DeleteIdentity,
     ) -> std::io::Result<TrashEntry> {
         match self
-            .move_to_trash_with_expected_identity_outcome(path, trash_id, expected)
+            .move_to_trash_with_expected_identity_outcome(path, trash_id, expected, None)
             .await
         {
             CheckedTrashMove::Moved(entry) => Ok(entry),
@@ -1238,6 +1319,7 @@ impl RootedFs {
         path: &Path,
         trash_id: Uuid,
         expected: DeleteIdentity,
+        expected_revision_identity: Option<ReplacementTargetIdentity>,
     ) -> CheckedTrashMove {
         let this = self.clone();
         let path = path.to_path_buf();
@@ -1253,16 +1335,32 @@ impl RootedFs {
             .run(move || {
                 let parent = match this.open_parent_blocking(&path, false) {
                     Ok(parent) => parent,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return CheckedTrashMove::TargetChanged;
+                    }
                     Err(error) => return CheckedTrashMove::NotMoved(error),
                 };
                 let metadata = match statat(&parent.fd, &parent.name, AtFlags::SYMLINK_NOFOLLOW) {
                     Ok(metadata) => metadata,
+                    Err(Errno::NOENT | Errno::NOTDIR) => {
+                        return CheckedTrashMove::TargetChanged;
+                    }
                     Err(error) => {
                         return CheckedTrashMove::NotMoved(std::io::Error::from(error));
                     }
                 };
                 let actual = delete_identity_from_stat(&metadata);
-                if actual != expected {
+                let actual_revision_identity =
+                    ReplacementTargetIdentity::Existing(replacement_target_identity(&metadata));
+                if actual != expected
+                    || expected_revision_identity
+                        .is_some_and(|expected| expected != actual_revision_identity)
+                {
                     return CheckedTrashMove::TargetChanged;
                 }
                 if let Err(error) = renameat_with(
@@ -1280,10 +1378,33 @@ impl RootedFs {
                         std::io::Error::from(error),
                     );
                 }
+                let moved_identity = match statat(&parent.fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => delete_identity_from_stat(&metadata),
+                    Err(error) => {
+                        let _ = fsync(&parent.fd);
+                        return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "renamed trash entry could not be verified at the commit boundary: {error}"
+                            ),
+                        ));
+                    }
+                };
+                if moved_identity != expected {
+                    let _ = fsync(&parent.fd);
+                    return CheckedTrashMove::DurabilityUnknown(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "renamed trash entry identity changed at the commit boundary",
+                    ));
+                }
                 if let Err(error) = fsync(&parent.fd) {
                     return CheckedTrashMove::DurabilityUnknown(std::io::Error::from(error));
                 }
-                CheckedTrashMove::Moved(TrashEntry::new(File::from(parent.fd), name, actual))
+                CheckedTrashMove::Moved(TrashEntry::new(
+                    File::from(parent.fd),
+                    name,
+                    moved_identity,
+                ))
             })
             .await
         {
@@ -1346,6 +1467,64 @@ impl RootedFs {
         Ok(parent.join(delete_trash_name(trash_id)))
     }
 
+    /// Moves an identity-ambiguous internal trash entry to a reserved name
+    /// that maintenance will never purge automatically. This releases the
+    /// durable job capacity without turning an unrelated occupant into an
+    /// orphan-trash deletion candidate.
+    pub(super) async fn quarantine_internal_trash(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let this = self.clone();
+        let path = path.to_path_buf();
+        blocking_io_gate()
+            .run(move || {
+                let file_name = path.file_name().and_then(|name| name.to_str());
+                if file_name.and_then(classify_internal_name)
+                    != Some(InternalEntryName::DeleteTrash)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "only a canonical internal trash entry can be quarantined",
+                    ));
+                }
+                let parent_path = path
+                    .parent()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "internal trash entry has no parent directory",
+                        )
+                    })?
+                    .to_path_buf();
+                let parent = this.open_parent_blocking(&path, false)?;
+                for _ in 0..16 {
+                    let name = OsString::from(quarantine_name(Uuid::new_v4()));
+                    match renameat_with(
+                        &parent.fd,
+                        &parent.name,
+                        &parent.fd,
+                        &name,
+                        RenameFlags::NOREPLACE,
+                    ) {
+                        Ok(()) => {
+                            fsync(&parent.fd).map_err(std::io::Error::from)?;
+                            return Ok(Some(parent_path.join(name)));
+                        }
+                        Err(Errno::EXIST) => continue,
+                        Err(Errno::NOENT | Errno::NOTDIR) => return Ok(None),
+                        Err(error) => return Err(std::io::Error::from(error)),
+                    }
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "failed to allocate a unique quarantine name",
+                ))
+            })
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     pub(super) fn capture_entry_for_purge_blocking(
         &self,
         path: &Path,
@@ -1403,7 +1582,7 @@ impl RootedFs {
         let identity = delete_identity_from_stat(&metadata);
         if expected_directory.is_some_and(|expected| identity.is_directory != expected) {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
+                std::io::ErrorKind::InvalidData,
                 "purge candidate changed type during maintenance discovery",
             ));
         }
@@ -1648,6 +1827,7 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
 }
 
 #[inline]
+#[cfg(test)]
 fn directory_entry_is_symlink<F>(file_type: FileType, probe: F) -> std::io::Result<bool>
 where
     F: FnOnce() -> std::io::Result<bool>,

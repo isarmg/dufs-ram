@@ -1,8 +1,10 @@
 use super::{
     Response, Server,
+    identity::OwnerId,
     internal_names::is_internal_name,
     problem::{ApiError, ErrorCode, RecoveryAdvice, render_problem},
     rooted_fs::{RootedDirEntry, RootedFs},
+    upload::{TargetRevision, target_revision},
 };
 use crate::{auth::SessionInfo, http_utils::body_full};
 
@@ -297,6 +299,7 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let owner = list_snapshot_owner(account);
+        let revision_owner = OwnerId::persistent(account);
         let logical_path = query_params.get("path").map(String::as_str).unwrap_or("/");
         let Some(path) = self
             .content
@@ -487,6 +490,7 @@ impl Server {
                         &list_path,
                         ListSnapshotOptions {
                             serve_path: &serve_path,
+                            revision_owner,
                             max_entries: MAX_LIST_SNAPSHOT_ENTRIES,
                             max_bytes: MAX_CACHED_LIST_SNAPSHOT_BYTES_PER_OWNER,
                             sort: &sort_for_task,
@@ -512,11 +516,14 @@ impl Server {
             match self
                 .search_dir(
                     &path,
-                    &search,
-                    &sort,
-                    &order,
-                    list_permit.clone(),
-                    cancellation.clone(),
+                    SearchOptions {
+                        search: &search,
+                        sort: &sort,
+                        order: &order,
+                        revision_owner,
+                        permit: list_permit.clone(),
+                        cancellation: cancellation.clone(),
+                    },
                 )
                 .await
             {
@@ -630,12 +637,16 @@ impl Server {
     async fn search_dir(
         &self,
         path: &Path,
-        search: &str,
-        sort: &str,
-        order: &str,
-        permit: Arc<OwnedSemaphorePermit>,
-        cancellation: CancellationToken,
+        options: SearchOptions<'_>,
     ) -> ListingResult<Vec<PathItem>> {
+        let SearchOptions {
+            search,
+            sort,
+            order,
+            revision_owner,
+            permit,
+            cancellation,
+        } = options;
         let started = Instant::now();
         let max_duration = Duration::from_secs(self.content.args.request_timeout);
         let search = search.to_owned();
@@ -656,7 +667,7 @@ impl Server {
                 permit: Some(permit.clone()),
             },
             move |_entry, name| Ok(case_folded_contains(name, &search)),
-            move |entry| pathitem_from_rooted_entry(entry, &base_path, &serve_path),
+            move |entry| pathitem_from_rooted_entry(entry, &base_path, &serve_path, revision_owner),
             path_item_heap_bytes,
             Some(CollectionByteBudget {
                 max_bytes: MAX_CACHED_LIST_SNAPSHOT_BYTES_PER_OWNER,
@@ -767,6 +778,7 @@ impl Server {
 
 struct ListSnapshotOptions<'a> {
     serve_path: &'a Path,
+    revision_owner: OwnerId,
     max_entries: usize,
     max_bytes: usize,
     sort: &'a str,
@@ -774,6 +786,15 @@ struct ListSnapshotOptions<'a> {
     running: &'a AtomicBool,
     cancellation: &'a CancellationToken,
     max_duration: Duration,
+}
+
+struct SearchOptions<'a> {
+    search: &'a str,
+    sort: &'a str,
+    order: &'a str,
+    revision_owner: OwnerId,
+    permit: Arc<OwnedSemaphorePermit>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone, Copy)]
@@ -790,6 +811,7 @@ fn collect_list_snapshot_blocking(
 ) -> ListingResult<Vec<PathItem>> {
     let ListSnapshotOptions {
         serve_path,
+        revision_owner,
         max_entries,
         max_bytes,
         sort,
@@ -843,7 +865,7 @@ fn collect_list_snapshot_blocking(
                 return Ok(true);
             }
             let entry_path = entry.path.clone();
-            match pathitem_from_rooted_entry(entry, path, serve_path) {
+            match pathitem_from_rooted_entry(entry, path, serve_path, revision_owner) {
                 Ok(item) => {
                     let item_heap_weight = path_item_heap_bytes(&item);
                     let proposed_heap_bytes = heap_bytes.saturating_add(item_heap_weight);
@@ -1174,6 +1196,7 @@ fn pathitem_from_rooted_entry(
     entry: RootedDirEntry,
     base_path: &Path,
     serve_path: &Path,
+    revision_owner: OwnerId,
 ) -> ListingResult<PathItem> {
     strict_file_name(&entry.path, "pathitem_filename", serve_path)?;
     let is_dir = entry.metadata.is_dir();
@@ -1194,12 +1217,19 @@ fn pathitem_from_rooted_entry(
     };
     let size = if is_dir { 0 } else { entry.metadata.len() };
     let name = strict_relative_path(&entry.path, base_path, "pathitem_relative_path", serve_path)?;
+    let revision_path = entry
+        .path
+        .strip_prefix(serve_path)
+        .map_err(|_| ListingError::invariant("pathitem_revision_path", &entry.path, serve_path))?;
+    let revision = target_revision(revision_owner, revision_path, entry.revision_identity)
+        .expect("a listed directory entry has an existing revision identity");
     Ok(PathItem {
         path_type,
         sort_name: name.to_lowercase(),
         name,
         mtime,
         size,
+        revision,
     })
 }
 
@@ -1367,6 +1397,7 @@ struct PathItem {
     name: String,
     mtime: u64,
     size: u64,
+    revision: TargetRevision,
 }
 
 impl PathItem {

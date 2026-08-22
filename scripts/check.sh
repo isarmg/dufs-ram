@@ -3,6 +3,7 @@ set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
+required_cargo_audit_version="0.22.2"
 
 run() {
   printf '\n==> %s\n' "$*"
@@ -70,10 +71,18 @@ run cargo clippy --locked --all-targets --all-features -- -D warnings
 run cargo test --locked --all-targets --all-features
 run ./scripts/check-coverage.sh
 
-if ! cargo audit --version >/dev/null 2>&1; then
+cargo_audit_version="$(cargo audit --version 2>/dev/null)" || {
   printf 'required Cargo subcommand is unavailable: cargo audit\n' >&2
   exit 1
-fi
+}
+expected_cargo_audit_version="cargo-audit-audit $required_cargo_audit_version"
+[[ "$cargo_audit_version" == "$expected_cargo_audit_version" ]] || {
+  printf 'cargo-audit %s is required; found: %s\n' \
+    "$required_cargo_audit_version" \
+    "$cargo_audit_version" >&2
+  exit 1
+}
+printf '\n==> %s\n' "$cargo_audit_version"
 if [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]]; then
   [[ "${DUFS_ISOLATED_QUALITY_GATE:-}" == "1" ]] || {
     printf 'DUFS_QUALITY_AUDIT_DB is reserved for the isolated release gate\n' >&2

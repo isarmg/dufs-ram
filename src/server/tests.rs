@@ -1,6 +1,6 @@
 use super::{purge::PreparePurge, *};
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -264,6 +264,8 @@ async fn changed_purge_identity_is_preserved_without_blocking_later_jobs() {
         .await
         .unwrap();
     bad.replace_directory_with_file_for_test().unwrap();
+    std::fs::write(&bad_trash, "unrelated replacement").unwrap();
+    let bad_replacement = std::fs::symlink_metadata(&bad_trash).unwrap();
     assert!(
         server
             .state
@@ -318,6 +320,13 @@ async fn changed_purge_identity_is_preserved_without_blocking_later_jobs() {
                     .await
                     .unwrap()
                     .is_none()
+                && server
+                    .state
+                    .state_store
+                    .purge_job(bad_prepared.key)
+                    .await
+                    .unwrap()
+                    .is_none()
             {
                 return;
             }
@@ -328,17 +337,25 @@ async fn changed_purge_identity_is_preserved_without_blocking_later_jobs() {
     .expect("the healthy purge job remained behind a failing queue entry");
 
     assert!(
-        bad_trash.is_file(),
-        "the replacement trash inode was deleted"
+        !bad_trash.exists(),
+        "the ambiguous replacement must leave the automatic trash namespace"
     );
-    let bad_job = server
-        .state
-        .state_store
-        .purge_job(bad_prepared.key)
-        .await
+    let quarantined = std::fs::read_dir(temp.path())
         .unwrap()
-        .expect("an ambiguous purge job must remain durable");
-    assert!(bad_job.attempts > 0);
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("the identity-ambiguous replacement must be quarantined");
+    let quarantined_metadata = quarantined.metadata().unwrap();
+    assert_eq!(quarantined_metadata.dev(), bad_replacement.dev());
+    assert_eq!(quarantined_metadata.ino(), bad_replacement.ino());
+    assert_eq!(
+        std::fs::read_to_string(quarantined.path()).unwrap(),
+        "unrelated replacement"
+    );
 
     shutdown.cancel();
     worker.await.unwrap();

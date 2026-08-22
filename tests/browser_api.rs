@@ -84,6 +84,16 @@ fn post_json(
     body: Value,
     csrf_token: Option<&str>,
 ) -> Result<Response, Error> {
+    let body = enrich_relocation_revisions(context, action, body)?;
+    post_json_raw(context, action, body, csrf_token)
+}
+
+fn post_json_raw(
+    context: &BrowserContext<'_>,
+    action: &str,
+    body: Value,
+    csrf_token: Option<&str>,
+) -> Result<Response, Error> {
     let mut request = context
         .request(Method::POST, context.api_base.join(action)?)
         .header("content-type", "application/json")
@@ -101,6 +111,7 @@ fn post_json_with_operation(
     body: Value,
     operation_id: Uuid,
 ) -> Result<Response, Error> {
+    let body = enrich_relocation_revisions(context, action, body)?;
     Ok(context
         .request(Method::POST, context.api_base.join(action)?)
         .header("content-type", "application/json")
@@ -108,6 +119,66 @@ fn post_json_with_operation(
         .header("X-Dufs-Operation-Id", operation_id.to_string())
         .body(body.to_string())
         .send()?)
+}
+
+fn enrich_relocation_revisions(
+    context: &BrowserContext<'_>,
+    action: &str,
+    mut body: Value,
+) -> Result<Value, Error> {
+    if !matches!(action, "move" | "rename") {
+        return Ok(body);
+    }
+    let Some(fields) = body.as_object_mut() else {
+        return Ok(body);
+    };
+    let Some(source) = fields
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(body);
+    };
+    if !fields.contains_key("source_revision") {
+        let revision = preflight_upload_target(context.server, &source)?
+            .revision
+            .unwrap_or_else(|| "0".repeat(64));
+        fields.insert("source_revision".to_owned(), Value::String(revision));
+    }
+    if fields.get("overwrite").and_then(Value::as_bool) == Some(true)
+        && !fields.contains_key("destination_revision")
+    {
+        let destination = match action {
+            "move" => fields
+                .get("directory")
+                .and_then(Value::as_str)
+                .zip(source.rsplit('/').next())
+                .map(|(directory, name)| logical_test_child(directory, name)),
+            "rename" => fields.get("name").and_then(Value::as_str).map(|name| {
+                let parent = source
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+                    .unwrap_or_default();
+                logical_test_child(if parent.is_empty() { "/" } else { parent }, name)
+            }),
+            _ => None,
+        };
+        if let Some(destination) = destination {
+            let revision = preflight_upload_target(context.server, &destination)?
+                .revision
+                .unwrap_or_else(|| "0".repeat(64));
+            fields.insert("destination_revision".to_owned(), Value::String(revision));
+        }
+    }
+    Ok(body)
+}
+
+fn logical_test_child(directory: &str, name: &str) -> String {
+    if directory == "/" {
+        format!("/{name}")
+    } else {
+        format!("{directory}/{name}")
+    }
 }
 
 fn response_json(response: Response) -> Result<Value, Error> {
@@ -193,7 +264,13 @@ fn assert_concurrent_no_replace_renames(
 ) -> Result<(), Error> {
     std::fs::write(server.path().join("source-a.txt"), "source-a")?;
     std::fs::write(server.path().join("source-b.txt"), "source-b")?;
-    let request = |source: &str| {
+    let source_a_revision = preflight_upload_target(server, "/source-a.txt")?
+        .revision
+        .ok_or("missing source-a revision")?;
+    let source_b_revision = preflight_upload_target(server, "/source-b.txt")?
+        .revision
+        .ok_or("missing source-b revision")?;
+    let request = |source: &str, source_revision: &str| {
         context
             .request(Method::POST, context.api_base.join("rename").unwrap())
             .header(CSRF_HEADER, &context.csrf_token)
@@ -202,14 +279,15 @@ fn assert_concurrent_no_replace_renames(
             .body(
                 json!({
                     "source": source,
+                    "source_revision": source_revision,
                     "name": "winner.txt",
                     "overwrite": false
                 })
                 .to_string(),
             )
     };
-    let request_a = request("/source-a.txt");
-    let request_b = request("/source-b.txt");
+    let request_a = request("/source-a.txt", &source_a_revision);
+    let request_b = request("/source-b.txt", &source_b_revision);
     let barrier = Arc::new(Barrier::new(3));
 
     let (response_a, response_b) = std::thread::scope(|scope| {

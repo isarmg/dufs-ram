@@ -1,5 +1,6 @@
 use super::{
     Request, Response, Server, body_full,
+    identity::OwnerId,
     operation_registry::{
         BeginOperation, OperationFingerprint, OperationGuard, OperationOutcome,
         TrackedOperationError, apply_conflict, apply_invalid_id, apply_operation_outcome,
@@ -8,9 +9,10 @@ use super::{
     },
     problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
     protocol::OperationPublicState,
-    rooted_fs::RootedFs,
+    rooted_fs::{CheckedRelocationOutcome, ReplacementTargetIdentity, RootedFs},
     router::MutationProgress,
     status_no_content,
+    upload::{TARGET_REVISION_HEADER, TargetRevision, target_revision},
 };
 
 use anyhow::Result;
@@ -39,6 +41,7 @@ const API_BODY_LIMIT: usize = 16 * 1024;
 const UPLOAD_PREFLIGHT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const UPLOAD_PREFLIGHT_PATH_LIMIT: usize = 512;
 const UPLOAD_PREFLIGHT_PATH_BYTES_LIMIT: usize = 256 * 1024;
+pub(in crate::server) const SOURCE_REVISION_HEADER: &str = "x-dufs-source-revision";
 type TrackedOperation = Option<(Uuid, OperationGuard)>;
 
 pub(super) fn is_tracked_browser_mutation(path: &str) -> bool {
@@ -62,6 +65,10 @@ struct MoveRequest {
     source: String,
     directory: String,
     #[serde(default)]
+    source_revision: Option<String>,
+    #[serde(default)]
+    destination_revision: Option<String>,
+    #[serde(default)]
     overwrite: bool,
 }
 
@@ -70,6 +77,10 @@ struct MoveRequest {
 struct RenameRequest {
     source: String,
     name: String,
+    #[serde(default)]
+    source_revision: Option<String>,
+    #[serde(default)]
+    destination_revision: Option<String>,
     #[serde(default)]
     overwrite: bool,
 }
@@ -391,7 +402,7 @@ impl Server {
             },
             MOVE_API_PATH => match serde_json::from_slice::<MoveRequest>(&body) {
                 Ok(request) => {
-                    self.handle_api_move(request, operation, mutation.clone(), res)
+                    self.handle_api_move(owner, request, operation, mutation.clone(), res)
                         .await?
                 }
                 Err(_) => {
@@ -406,7 +417,7 @@ impl Server {
             },
             RENAME_API_PATH => match serde_json::from_slice::<RenameRequest>(&body) {
                 Ok(request) => {
-                    self.handle_api_rename(request, operation, mutation.clone(), res)
+                    self.handle_api_rename(owner, request, operation, mutation.clone(), res)
                         .await?
                 }
                 Err(_) => {
@@ -740,6 +751,7 @@ impl Server {
 
     async fn handle_api_move(
         &self,
+        owner: &str,
         request: MoveRequest,
         mut operation: TrackedOperation,
         mutation: MutationProgress,
@@ -795,9 +807,12 @@ impl Server {
                 source,
                 destination,
                 destination_directory: directory,
+                source_revision: request.source_revision,
+                destination_revision: request.destination_revision,
                 overwrite: request.overwrite,
                 kind: RelocationKind::Move,
             },
+            owner,
             operation,
             mutation,
             res,
@@ -807,6 +822,7 @@ impl Server {
 
     async fn handle_api_rename(
         &self,
+        owner: &str,
         request: RenameRequest,
         mut operation: TrackedOperation,
         mutation: MutationProgress,
@@ -863,9 +879,12 @@ impl Server {
                 source,
                 destination,
                 destination_directory,
+                source_revision: request.source_revision,
+                destination_revision: request.destination_revision,
                 overwrite: request.overwrite,
                 kind: RelocationKind::Rename,
             },
+            owner,
             operation,
             mutation,
             res,
@@ -876,6 +895,7 @@ impl Server {
     async fn handle_api_relocation(
         &self,
         request: RelocationRequest,
+        owner: &str,
         mut operation: TrackedOperation,
         mutation: MutationProgress,
         res: &mut Response,
@@ -884,9 +904,72 @@ impl Server {
             source,
             destination,
             destination_directory,
+            source_revision,
+            destination_revision,
             overwrite,
             kind,
         } = request;
+        let source_revision = match source_revision.as_deref() {
+            Some(value) => match TargetRevision::parse(value) {
+                Some(revision) => revision,
+                None => {
+                    finish_api_error(
+                        operation.take(),
+                        res,
+                        StatusCode::BAD_REQUEST,
+                        TrackedOperationError::InvalidSourceRevision,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            None => {
+                finish_api_error(
+                    operation.take(),
+                    res,
+                    StatusCode::PRECONDITION_REQUIRED,
+                    TrackedOperationError::SourceRevisionRequired,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let destination_revision = match (overwrite, destination_revision.as_deref()) {
+            (false, None) => None,
+            (false, Some(_)) => {
+                finish_api_error(
+                    operation.take(),
+                    res,
+                    StatusCode::BAD_REQUEST,
+                    TrackedOperationError::InvalidDestinationRevision,
+                )
+                .await?;
+                return Ok(());
+            }
+            (true, None) => {
+                finish_api_error(
+                    operation.take(),
+                    res,
+                    StatusCode::PRECONDITION_REQUIRED,
+                    TrackedOperationError::DestinationRevisionRequired,
+                )
+                .await?;
+                return Ok(());
+            }
+            (true, Some(value)) => match TargetRevision::parse(value) {
+                Some(revision) => Some(revision),
+                None => {
+                    finish_api_error(
+                        operation.take(),
+                        res,
+                        StatusCode::BAD_REQUEST,
+                        TrackedOperationError::InvalidDestinationRevision,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+        };
         if source == destination {
             finish_api_error(
                 operation.take(),
@@ -902,6 +985,23 @@ impl Server {
             .path_coordinator
             .acquire([&source, &destination])
             .await;
+
+        let revision_owner = OwnerId::persistent(owner);
+        let source_identity = self.content.rooted_fs.replacement_identity(&source).await?;
+        let source_relative = self.content.rooted_fs.state_relative_path(&source)?;
+        let current_source_revision =
+            target_revision(revision_owner, &source_relative, source_identity);
+        if current_source_revision != Some(source_revision) {
+            apply_revision_header(res, SOURCE_REVISION_HEADER, current_source_revision)?;
+            finish_api_error(
+                operation.take(),
+                res,
+                StatusCode::PRECONDITION_FAILED,
+                TrackedOperationError::SourceChanged,
+            )
+            .await?;
+            return Ok(());
+        }
 
         if self.guard_root_contained(&source).await?
             || self.guard_root_contained(&destination).await?
@@ -973,28 +1073,53 @@ impl Server {
             }
             Err(err) => return Err(err.into()),
         }
-        let destination_meta = match self.content.rooted_fs.metadata_nofollow(&destination).await {
-            Ok(meta) => Some(meta),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.into()),
+        let destination_identity = self
+            .content
+            .rooted_fs
+            .replacement_identity(&destination)
+            .await?;
+        let destination_relative = self.content.rooted_fs.state_relative_path(&destination)?;
+        let current_destination_revision =
+            target_revision(revision_owner, &destination_relative, destination_identity);
+        if overwrite && current_destination_revision != destination_revision {
+            apply_revision_header(res, TARGET_REVISION_HEADER, current_destination_revision)?;
+            finish_api_error(
+                operation.take(),
+                res,
+                StatusCode::PRECONDITION_FAILED,
+                TrackedOperationError::DestinationChanged,
+            )
+            .await?;
+            return Ok(());
+        }
+        let destination_meta = if destination_identity.exists() {
+            Some(
+                self.content
+                    .rooted_fs
+                    .metadata_nofollow(&destination)
+                    .await?,
+            )
+        } else {
+            None
         };
         if let Some(destination_meta) = &destination_meta {
-            if !overwrite {
-                finish_api_error(
-                    operation.take(),
-                    res,
-                    StatusCode::CONFLICT,
-                    TrackedOperationError::DestinationExists,
-                )
-                .await?;
-                return Ok(());
-            }
             if source_meta.is_dir() || destination_meta.is_dir() {
                 finish_api_error(
                     operation.take(),
                     res,
                     StatusCode::CONFLICT,
                     TrackedOperationError::DirectoryOverwriteForbidden,
+                )
+                .await?;
+                return Ok(());
+            }
+            if !overwrite {
+                apply_revision_header(res, TARGET_REVISION_HEADER, current_destination_revision)?;
+                finish_api_error(
+                    operation.take(),
+                    res,
+                    StatusCode::CONFLICT,
+                    TrackedOperationError::DestinationExists,
                 )
                 .await?;
                 return Ok(());
@@ -1064,9 +1189,14 @@ impl Server {
                 if let Some(operation) = operation_guard.as_mut() {
                     operation.mark_commit_started().await?;
                 }
-                let relocation_outcome =
-                    commit_relocation(&rooted_fs, &commit_source, &commit_destination, overwrite)
-                        .await?;
+                let relocation_outcome = commit_relocation(
+                    &rooted_fs,
+                    &commit_source,
+                    &commit_destination,
+                    source_identity,
+                    overwrite.then_some(destination_identity),
+                )
+                .await?;
                 if let Some(operation) = operation_guard {
                     let outcome = match relocation_outcome {
                         RelocationCommitOutcome::Relocated => {
@@ -1079,6 +1209,14 @@ impl Server {
                         RelocationCommitOutcome::SameFile => OperationOutcome::failure(
                             StatusCode::CONFLICT,
                             TrackedOperationError::SourceEqualsDestination,
+                        ),
+                        RelocationCommitOutcome::SourceChanged => OperationOutcome::failure(
+                            StatusCode::PRECONDITION_FAILED,
+                            TrackedOperationError::SourceChanged,
+                        ),
+                        RelocationCommitOutcome::DestinationChanged => OperationOutcome::failure(
+                            StatusCode::PRECONDITION_FAILED,
+                            TrackedOperationError::DestinationChanged,
                         ),
                     };
                     operation.complete(outcome).await?;
@@ -1103,6 +1241,51 @@ impl Server {
                     res,
                     StatusCode::CONFLICT,
                     TrackedOperationError::SourceEqualsDestination,
+                )?;
+                return Ok(());
+            }
+            RelocationCommitOutcome::SourceChanged => {
+                match self.content.rooted_fs.replacement_identity(&source).await {
+                    Ok(identity) => apply_revision_header(
+                        res,
+                        SOURCE_REVISION_HEADER,
+                        target_revision(revision_owner, &source_relative, identity),
+                    )?,
+                    Err(error) => log::warn!(
+                        "Failed to inspect the current relocation source revision path={} error={error:#}",
+                        source.display()
+                    ),
+                }
+                render_completed_error(
+                    operation_id,
+                    res,
+                    StatusCode::PRECONDITION_FAILED,
+                    TrackedOperationError::SourceChanged,
+                )?;
+                return Ok(());
+            }
+            RelocationCommitOutcome::DestinationChanged => {
+                match self
+                    .content
+                    .rooted_fs
+                    .replacement_identity(&destination)
+                    .await
+                {
+                    Ok(identity) => apply_revision_header(
+                        res,
+                        TARGET_REVISION_HEADER,
+                        target_revision(revision_owner, &destination_relative, identity),
+                    )?,
+                    Err(error) => log::warn!(
+                        "Failed to inspect the current relocation destination revision path={} error={error:#}",
+                        destination.display()
+                    ),
+                }
+                render_completed_error(
+                    operation_id,
+                    res,
+                    StatusCode::PRECONDITION_FAILED,
+                    TrackedOperationError::DestinationChanged,
                 )?;
                 return Ok(());
             }
@@ -1174,8 +1357,24 @@ struct RelocationRequest {
     source: PathBuf,
     destination: PathBuf,
     destination_directory: PathBuf,
+    source_revision: Option<String>,
+    destination_revision: Option<String>,
     overwrite: bool,
     kind: RelocationKind,
+}
+
+pub(in crate::server) fn apply_revision_header(
+    res: &mut Response,
+    name: &'static str,
+    revision: Option<TargetRevision>,
+) -> Result<()> {
+    if let Some(revision) = revision {
+        res.headers_mut()
+            .insert(name, HeaderValue::from_str(&revision.encode())?);
+    } else {
+        res.headers_mut().remove(name);
+    }
+    Ok(())
 }
 
 fn is_single_browser_name(name: &str) -> bool {
@@ -1198,6 +1397,8 @@ fn logical_child(directory: &str, name: &str) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelocationCommitOutcome {
     Relocated,
+    SourceChanged,
+    DestinationChanged,
     DestinationExists,
     SameFile,
 }
@@ -1206,25 +1407,25 @@ async fn commit_relocation(
     rooted_fs: &RootedFs,
     source: &Path,
     destination: &Path,
-    overwrite: bool,
+    expected_source: ReplacementTargetIdentity,
+    expected_destination: Option<ReplacementTargetIdentity>,
 ) -> Result<RelocationCommitOutcome> {
-    if overwrite {
-        return Ok(
-            if rooted_fs
-                .rename_replace_distinct(source, destination)
-                .await?
-            {
-                RelocationCommitOutcome::Relocated
-            } else {
-                RelocationCommitOutcome::SameFile
-            },
-        );
-    }
-    Ok(if rooted_fs.rename_no_replace(source, destination).await? {
-        RelocationCommitOutcome::Relocated
-    } else {
-        RelocationCommitOutcome::DestinationExists
-    })
+    Ok(
+        match rooted_fs
+            .rename_if_unchanged(source, destination, expected_source, expected_destination)
+            .await?
+        {
+            CheckedRelocationOutcome::Relocated => RelocationCommitOutcome::Relocated,
+            CheckedRelocationOutcome::SourceChanged => RelocationCommitOutcome::SourceChanged,
+            CheckedRelocationOutcome::DestinationChanged => {
+                RelocationCommitOutcome::DestinationChanged
+            }
+            CheckedRelocationOutcome::DestinationExists => {
+                RelocationCommitOutcome::DestinationExists
+            }
+            CheckedRelocationOutcome::SameFile => RelocationCommitOutcome::SameFile,
+        },
+    )
 }
 
 #[cfg(test)]

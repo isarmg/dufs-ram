@@ -6,6 +6,7 @@ import {
   ERROR_RESPONSE_BODY_LIMIT,
   PAGE_EXPIRED_MESSAGE,
   RESULT_UNKNOWN_MESSAGE,
+  assertDiscardUploadResponse,
   assertResponse,
   isAuthenticationError,
   isRequestErrorCode,
@@ -42,6 +43,7 @@ import {
   createUploadView,
   renderCancelled,
   renderCheckpoint,
+  renderCleanup,
   renderComplete,
   renderFailure,
   renderProgress,
@@ -655,7 +657,7 @@ export function createUploadManager(options) {
       restartAfterDiscard = false,
     ) {
       this.phase = "checking";
-      renderCheckpoint(this.view, this.name);
+      renderCleanup(this.view, this.name);
       try {
         const response = await requestNoContent(
           "/__dufs__/api/upload/discard",
@@ -677,7 +679,11 @@ export function createUploadManager(options) {
             resultId: this.uploadId,
           },
         );
-        await assertResponse(response);
+        await assertDiscardUploadResponse(
+          response,
+          this.uploadId,
+          this.file.size,
+        );
         this.finishDiscard(skipReason, restartAfterDiscard);
       } catch (error) {
         if (isAuthenticationError(error)) {
@@ -961,10 +967,8 @@ export function createUploadManager(options) {
           }
           this.uploadOffset = offset;
           if (this.uploadOffset === this.file.size) {
-            this.unknown(
-              "All upload bytes are durable, but publication is still awaiting terminal confirmation",
-              "query_upload",
-            );
+            resolveUnknown(this);
+            this.sendBody(true);
             return;
           }
           resolveUnknown(this);

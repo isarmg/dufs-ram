@@ -120,6 +120,195 @@ async fn reconciliation_promotes_an_intent_after_the_checked_rename() {
 }
 
 #[tokio::test]
+async fn reconciliation_quarantines_unrelated_trash_and_releases_ambiguous_intent() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("ambiguous.txt");
+    std::fs::write(&target, "original").unwrap();
+    let (prepared, job) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+
+    std::fs::remove_file(&target).unwrap();
+    std::fs::write(&target, "replacement").unwrap();
+    std::fs::write(&trash, "unrelated trash occupant").unwrap();
+
+    server.reconcile_prepared_purge_job(&job).await.unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none(),
+        "an isolated ambiguous entry must not consume purge capacity forever"
+    );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("identity-ambiguous trash must be retained in quarantine");
+    assert_eq!(
+        std::fs::read(quarantined.path()).unwrap(),
+        b"unrelated trash occupant"
+    );
+}
+
+#[tokio::test]
+async fn claimed_identity_mismatch_is_quarantined_instead_of_retried_or_deleted() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("claimed-ambiguous.txt");
+    std::fs::write(&target, "original").unwrap();
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    drop(
+        server
+            .content
+            .rooted_fs
+            .move_to_trash_with_expected_identity(
+                &target,
+                prepared.trash_id,
+                prepared.source_identity,
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(
+        server
+            .state
+            .state_store
+            .mark_purge_job_ready(prepared.key)
+            .await
+            .unwrap()
+    );
+    let claimed = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+
+    std::fs::remove_file(&trash).unwrap();
+    std::fs::write(&trash, "external replacement").unwrap();
+
+    assert!(server.open_purge_work(claimed).await.unwrap().is_none());
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("a replacement at a claimed trash name must be quarantined");
+    assert_eq!(
+        std::fs::read(quarantined.path()).unwrap(),
+        b"external replacement"
+    );
+}
+
+#[tokio::test]
+async fn identity_change_during_claimed_purge_quarantines_the_replacement_root() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("claimed-directory");
+    std::fs::create_dir(&target).unwrap();
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    drop(
+        server
+            .content
+            .rooted_fs
+            .move_to_trash_with_expected_identity(
+                &target,
+                prepared.trash_id,
+                prepared.source_identity,
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(
+        server
+            .state
+            .state_store
+            .mark_purge_job_ready(prepared.key)
+            .await
+            .unwrap()
+    );
+    let claimed = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+    let work = server.open_purge_work(claimed).await.unwrap().unwrap();
+
+    std::fs::remove_dir(&trash).unwrap();
+    std::fs::create_dir(&trash).unwrap();
+    std::fs::write(trash.join("preserve.txt"), "external replacement").unwrap();
+
+    assert!(matches!(
+        server.process_purge_work(work).await,
+        PurgeWorkResult::Complete
+    ));
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("a replacement root discovered during purge must be quarantined");
+    assert_eq!(
+        std::fs::read(quarantined.path().join("preserve.txt")).unwrap(),
+        b"external replacement"
+    );
+}
+
+#[tokio::test]
 async fn a_locally_retained_claim_is_reloaded_before_retrying() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());

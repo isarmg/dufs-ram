@@ -237,10 +237,14 @@ fn durable_state_blocks_namespace_rebases_through_symlink_aliases(
     assert_eq!(upload_rebase["recovery"], "refresh_target");
 
     let delete_operation_id = Uuid::new_v4();
+    let delete_revision = preflight_upload_target(&server, "/state-alias")?
+        .revision
+        .ok_or("state alias has no revision")?;
     let delete_rebase = context
         .request(Method::DELETE, server.url().join("state-alias")?)
         .header(CSRF_HEADER, &context.csrf_token)
         .header("X-Dufs-Operation-Id", delete_operation_id.to_string())
+        .header("If-Match", format!("\"{delete_revision}\""))
         .send()?;
     assert_eq!(delete_rebase.status(), 409);
     assert_eq!(
@@ -298,6 +302,131 @@ fn rename_requires_explicit_overwrite_and_no_replace_has_one_winner(
 }
 
 #[rstest]
+fn overwrite_confirmation_rejects_a_destination_replaced_by_another_client(
+    server: TestServer,
+) -> Result<(), Error> {
+    std::fs::write(server.path().join("race-source.txt"), "client-a-source")?;
+    std::fs::write(server.path().join("race-target.txt"), "original-target")?;
+    let context = browser_context(&server, "")?;
+    let source_revision = preflight_upload_target(&server, "/race-source.txt")?
+        .revision
+        .ok_or("race source has no revision")?;
+
+    let first = post_json_raw(
+        &context,
+        "rename",
+        json!({
+            "source": "/race-source.txt",
+            "source_revision": source_revision,
+            "name": "race-target.txt",
+            "overwrite": false
+        }),
+        Some(&context.csrf_token),
+    )?;
+    assert_eq!(first.status(), 409);
+    assert_eq!(
+        first.headers().get("x-dufs-operation-state").unwrap(),
+        "failed"
+    );
+    let confirmed_revision = first
+        .headers()
+        .get("x-dufs-target-revision")
+        .ok_or("destination conflict omitted its revision")?
+        .to_str()?
+        .to_owned();
+    assert_eq!(response_json(first)?["code"], "destination_exists");
+
+    let client_b = with_upload_overwrite_headers(
+        server.request(Method::PUT, server.url().join("race-target.txt")?),
+        Uuid::new_v4(),
+        15,
+        &confirmed_revision,
+    )
+    .body(b"client-b-target".to_vec())
+    .send()?;
+    assert_eq!(client_b.status(), 201);
+
+    let stale_confirmation = post_json_raw(
+        &context,
+        "rename",
+        json!({
+            "source": "/race-source.txt",
+            "source_revision": source_revision,
+            "name": "race-target.txt",
+            "overwrite": true,
+            "destination_revision": confirmed_revision
+        }),
+        Some(&context.csrf_token),
+    )?;
+    assert_eq!(stale_confirmation.status(), 412);
+    let current_revision = stale_confirmation
+        .headers()
+        .get("x-dufs-target-revision")
+        .ok_or("stale destination response omitted its current revision")?
+        .to_str()?
+        .to_owned();
+    assert_ne!(current_revision, confirmed_revision);
+    assert_eq!(
+        response_json(stale_confirmation)?["code"],
+        "destination_changed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("race-target.txt"))?,
+        "client-b-target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("race-source.txt"))?,
+        "client-a-source"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn relocation_requires_source_and_confirmed_destination_revisions(
+    server: TestServer,
+) -> Result<(), Error> {
+    let context = browser_context(&server, "")?;
+    let missing_source_revision = post_json_raw(
+        &context,
+        "rename",
+        json!({
+            "source": "/test.html",
+            "name": "index.html",
+            "overwrite": false
+        }),
+        Some(&context.csrf_token),
+    )?;
+    assert_eq!(missing_source_revision.status(), 428);
+    assert_eq!(
+        response_json(missing_source_revision)?["code"],
+        "source_revision_required"
+    );
+
+    let source_revision = preflight_upload_target(&server, "/test.html")?
+        .revision
+        .ok_or("relocation source has no revision")?;
+    let missing_destination_revision = post_json_raw(
+        &context,
+        "rename",
+        json!({
+            "source": "/test.html",
+            "source_revision": source_revision,
+            "name": "index.html",
+            "overwrite": true
+        }),
+        Some(&context.csrf_token),
+    )?;
+    assert_eq!(missing_destination_revision.status(), 428);
+    assert_eq!(
+        response_json(missing_destination_revision)?["code"],
+        "destination_revision_required"
+    );
+    assert!(server.path().join("test.html").is_file());
+    assert!(server.path().join("index.html").is_file());
+    Ok(())
+}
+
+#[rstest]
 fn rename_overwrite_rejects_hardlink_aliases_without_claiming_success(
     server: TestServer,
 ) -> Result<(), Error> {
@@ -340,7 +469,8 @@ fn move_rejects_missing_source_and_directory_overwrite(server: TestServer) -> Re
         }),
         Some(&context.csrf_token),
     )?;
-    assert_eq!(missing.status(), 404);
+    assert_eq!(missing.status(), 412);
+    assert_eq!(response_json(missing)?["code"], "source_changed");
 
     std::fs::create_dir(server.path().join("target-parent"))?;
     std::fs::create_dir(server.path().join("target-parent/dir1"))?;

@@ -19,7 +19,7 @@ const PATH_TYPES = new Set(["Dir", "SymlinkDir", "File", "SymlinkFile"]);
 
 /** @typedef {(typeof MUTATION_EFFECT)[keyof typeof MUTATION_EFFECT]} MutationEffect */
 
-/** @typedef {"succeeded" | "retry" | "unknown" | "authentication"} InlineRenameResult */
+/** @typedef {"succeeded" | "retry" | "refresh" | "unknown" | "authentication"} InlineRenameResult */
 
 /**
  * @typedef {{
@@ -36,6 +36,7 @@ const PATH_TYPES = new Set(["Dir", "SymlinkDir", "File", "SymlinkFile"]);
  *   name: string,
  *   mtime: number,
  *   size: number,
+ *   revision: string,
  * }} ListingItem
  */
 
@@ -162,7 +163,9 @@ export function createDirectoryListing(options) {
     loadMore.classList.remove("hidden");
     invalidationMessage = effect === MUTATION_EFFECT.OUTCOME_UNKNOWN
       ? "Folder contents may have changed; refresh the list before loading more items."
-      : "Folder contents changed; refresh the list before loading more items.";
+      : effect === MUTATION_EFFECT.REFRESH_REQUIRED
+        ? "The folder snapshot is stale; refresh the list before another operation."
+        : "Folder contents changed; refresh the list before loading more items.";
     listStatus.textContent = invalidationMessage;
   }
 
@@ -179,6 +182,7 @@ export function createDirectoryListing(options) {
     switch (effect) {
       case MUTATION_EFFECT.COMMITTED:
       case MUTATION_EFFECT.OUTCOME_UNKNOWN:
+      case MUTATION_EFFECT.REFRESH_REQUIRED:
         invalidate(effect);
         return true;
       case MUTATION_EFFECT.NOT_COMMITTED:
@@ -650,6 +654,11 @@ export function createDirectoryListing(options) {
     const result = await editor.commitPromise;
     if (activeEditor !== editor) return true;
 
+    if (result === "refresh") {
+      await cancelInlineRename(editor, true, true);
+      await refreshFromFirstPage();
+      return true;
+    }
     if (result === "retry") {
       editor.commitPromise = null;
       editor.input.disabled = false;
@@ -1030,7 +1039,8 @@ function validateCreatedItem(file) {
     !Number.isSafeInteger(file.mtime) ||
     file.mtime < 0 ||
     !Number.isSafeInteger(file.size) ||
-    file.size < 0
+    file.size < 0 ||
+    !isCanonicalRevision(file.revision)
   ) {
     throw new TypeError("Invalid created file list item");
   }
@@ -1126,6 +1136,7 @@ function validateListingPage(payload) {
       typeof file.size !== "number" ||
       !Number.isSafeInteger(file.size) ||
       file.size < 0 ||
+      !isCanonicalRevision(file.revision) ||
       names.has(file.name)
     ) {
       throw new Error("Invalid file list item");
@@ -1136,12 +1147,18 @@ function validateListingPage(payload) {
       name: file.name,
       mtime: file.mtime,
       size: file.size,
+      revision: /** @type {string} */ (file.revision),
     });
   });
   return Object.freeze({
     paths: Object.freeze(paths),
     nextCursor,
   });
+}
+
+/** @param {unknown} value */
+function isCanonicalRevision(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 /** @param {string} text */

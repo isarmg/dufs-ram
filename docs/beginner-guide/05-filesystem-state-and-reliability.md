@@ -108,7 +108,7 @@ Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系�
 - mode；
 - 纳秒级 mtime/ctime。
 
-具体操作不一定使用全部字段，而且不能把最强保证外推到所有 mutation。条件覆盖上传会把用户确认的目标 revision 做最终 CAS，删除也会捕获 `DeleteIdentity` 并在移入 trash 时复核；普通 Move/Rename 目前主要依靠进程内路径租约与 `renameat2` 的原子目标语义，并不会把前置读取的 source metadata 作为提交时 source CAS。因此外部进程若绕过 Dufs 改写同一路径，普通 relocation 的保证弱于上传和删除。
+具体操作不一定使用全部字段，而且不能把最强保证外推到所有 mutation。列表为当前对象提供 revision；DELETE 用 `If-Match` 提交该 revision，Move/Rename 用 `source_revision` 提交源 revision，允许覆盖时还必须携带 `destination_revision`。这些 token 绑定 owner、规范路径和完整 identity，RootedFs 在紧邻 rename 时复核 source，并按模式复核 destination/no-replace 条件；上传覆盖继续使用自己的 target revision CAS。最后一次 `statat` 与 `renameat2` 仍是两个相邻系统调用，因此只能收窄而不能消除拥有共享根写权限的外部进程制造的微小竞争窗。
 
 ### revision 不是内容哈希
 
@@ -135,7 +135,7 @@ Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系�
 
 移动和重命名会把源与目标作为同一批租约请求提交；协调器在内部排序、去重后统一判断冲突，而不是由调用者逐把加锁。这样既覆盖两个路径，又避免相反顺序逐锁造成死锁。
 
-但路径租约只约束当前 Dufs 进程。不同操作会按自身协议使用 no-replace rename、目标 revision CAS 或对象身份复核，来缩小或检测一部分检查后竞争；这些机制并非每个 mutation 全部具备。特别是外部进程仍可绕过租约改写路径，普通 Move/Rename 对 source 被外部替换的防护弱于上传和删除。
+但路径租约只约束当前 Dufs 进程。Move/Rename 现在会校验列表提供的 `source_revision`，覆盖时同时校验 `destination_revision`；DELETE 用 `If-Match`，上传使用独立 target revision。它们在 RootedFs 提交边界紧邻 rename 复核完整 identity 或 no-replace 条件，但外部进程仍可在最后一次复核和系统调用之间抢占，因此生产一致性要求共享根由 Dufs 独占写入，人工写入只能停服执行。
 
 ## 5.6 检查、原子提交与同步是三件事
 
@@ -359,7 +359,7 @@ stateDiagram-v2
 - 原位置 identity 匹配：改名没消费原对象，可撤销意图；
 - 两边都不能确定：保留现场，不猜测删除。
 
-“不知道就不删”比强行清理更符合文件管理器的数据安全优先级。
+“不知道就不删”比强行清理更符合文件管理器的数据安全优先级。当前实现会把身份不一致的内部 trash 原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`，随后释放相应 purge 记录；该 quarantine 永不自动清理。运维人员必须先停止 Dufs，结合日志和状态库检查对象后再手工移除。
 
 ## 5.17 列表快照为什么会失效
 
@@ -414,7 +414,7 @@ stateDiagram-v2
 
 ### 场景 F：外部进程替换目标
 
-PathCoordinator 无法控制外部进程。条件覆盖上传和删除会用最终 identity/revision 检查把变化转为冲突或未知；普通 Move/Rename 没有等价的 source identity CAS，只保证系统调用自身的原子 no-replace/replace 语义。因此不能笼统承诺外部替换总会被检测，生产上仍应限制其他写者并为 relocation 补充针对该边界的审查与测试。
+PathCoordinator 无法控制外部进程。条件覆盖上传、DELETE、Move 和 Rename 都会把客户端看到的 revision 带回提交边界，并在紧邻 rename 时复核完整 identity；覆盖 relocation 还复核 destination revision。这样能把绝大多数陈旧页面或外部替换转为冲突，但最后一次 `statat` 与 `renameat2` 之间仍存在不可消除的微窗。因此不能承诺恶意外部替换总会被检测，生产上必须让 Dufs 独占共享根写入。
 
 ## 5.20 维护这部分代码的规则
 

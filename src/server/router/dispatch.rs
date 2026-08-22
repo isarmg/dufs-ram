@@ -5,8 +5,13 @@ use crate::{
     request_context::RequestContext,
     server::{
         HEALTH_CHECK_PATH, READINESS_CHECK_PATH, Request, Response, Server,
-        browser_api::{BROWSER_API_PREFIX, is_browser_api_endpoint},
+        browser_api::{
+            BROWSER_API_PREFIX, SOURCE_REVISION_HEADER, apply_revision_header,
+            is_browser_api_endpoint,
+        },
+        delete::DeleteRequest,
         head_only_for,
+        identity::OwnerId,
         listing::LIST_API_PATH,
         operation_registry::{
             BeginOperation, JOB_STATUS_PREFIX, OperationFingerprint, OperationGuard,
@@ -22,14 +27,17 @@ use crate::{
         session::{LOGIN_ERROR_QUERY, LOGIN_PATH, LOGOUT_PATH},
         status_bad_request, status_csrf_forbid, status_method_not_allowed, status_not_found,
         upload::{
-            UploadMode, UploadOptions, UploadOverwritePolicy, parse_upload_id, parse_upload_length,
-            parse_upload_offset, parse_upload_overwrite,
+            TargetRevision, UploadMode, UploadOptions, UploadOverwritePolicy, parse_upload_id,
+            parse_upload_length, parse_upload_offset, parse_upload_overwrite, target_revision,
         },
     },
 };
 
 use anyhow::Result;
-use hyper::{HeaderMap, Method, StatusCode, Uri, header::COOKIE};
+use hyper::{
+    HeaderMap, Method, StatusCode, Uri,
+    header::{COOKIE, IF_MATCH},
+};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, timeout_at};
@@ -75,7 +83,16 @@ struct UploadRequest {
 #[derive(Clone, Copy, Default)]
 struct MutationHeaders {
     delete_operation_id: Option<uuid::Uuid>,
+    delete_condition: DeleteCondition,
     upload: Option<UploadRequest>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum DeleteCondition {
+    #[default]
+    Missing,
+    Invalid,
+    Revision(TargetRevision),
 }
 
 struct AuthenticatedRequest {
@@ -441,8 +458,14 @@ impl<'a> RequestDispatcher<'a> {
         } else {
             None
         };
+        let delete_condition = if self.method == Method::DELETE {
+            parse_delete_condition(&self.headers)
+        } else {
+            DeleteCondition::Missing
+        };
         Ok(Some(MutationHeaders {
             delete_operation_id,
+            delete_condition,
             upload,
         }))
     }
@@ -602,7 +625,32 @@ impl<'a> RequestDispatcher<'a> {
         let id = headers
             .delete_operation_id
             .expect("DELETE operation ID was validated");
-        let fingerprint = OperationFingerprint::new(&[b"DELETE", self.route_path.as_bytes()]);
+        let revision = match headers.delete_condition {
+            DeleteCondition::Revision(revision) => revision,
+            DeleteCondition::Missing => {
+                apply_tracked_delete_rejection(
+                    id,
+                    &mut self.response,
+                    StatusCode::PRECONDITION_REQUIRED,
+                    ErrorCode::SOURCE_REVISION_REQUIRED,
+                    "The If-Match header is required",
+                )?;
+                return Ok(DeletePreparation::Complete);
+            }
+            DeleteCondition::Invalid => {
+                apply_tracked_delete_rejection(
+                    id,
+                    &mut self.response,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::INVALID_SOURCE_REVISION,
+                    "If-Match must contain one strong quoted target revision",
+                )?;
+                return Ok(DeletePreparation::Complete);
+            }
+        };
+        let revision_bytes = revision.into_bytes();
+        let fingerprint =
+            OperationFingerprint::new(&[b"DELETE", self.route_path.as_bytes(), &revision_bytes]);
         match self
             .server
             .state
@@ -885,7 +933,7 @@ impl<'a> RequestDispatcher<'a> {
             Method::GET | Method::HEAD => self.dispatch_content_read(target, session).await,
             Method::PUT => self.dispatch_fresh_upload(target, headers, session).await,
             Method::PATCH => self.dispatch_resumed_upload(target, headers, session).await,
-            Method::DELETE => self.dispatch_delete(target, session).await,
+            Method::DELETE => self.dispatch_delete(target, headers, session).await,
             _ => {
                 status_method_not_allowed(&mut self.response, "GET, HEAD, PUT, PATCH, DELETE");
                 Ok(())
@@ -1039,31 +1087,57 @@ impl<'a> RequestDispatcher<'a> {
     async fn dispatch_delete(
         &mut self,
         target: &mut PreparedTarget,
+        headers: MutationHeaders,
         session: &SessionInfo,
     ) -> Result<()> {
         let (id, operation) = target
             .delete_operation
             .take()
             .expect("DELETE operation was started");
-        if target.is_miss {
+        let expected_revision = match headers.delete_condition {
+            DeleteCondition::Revision(revision) => revision,
+            _ => unreachable!("DELETE revision was validated before the operation began"),
+        };
+        let revision_owner = OwnerId::persistent(&session.user);
+        let identity = self
+            .server
+            .content
+            .rooted_fs
+            .replacement_identity(target.path.as_path())
+            .await?;
+        let relative = self
+            .server
+            .content
+            .rooted_fs
+            .state_relative_path(target.path.as_path())?;
+        let current_revision = target_revision(revision_owner, &relative, identity);
+        if current_revision != Some(expected_revision) {
+            apply_revision_header(&mut self.response, SOURCE_REVISION_HEADER, current_revision)?;
             let outcome = OperationOutcome::failure(
-                StatusCode::NOT_FOUND,
-                TrackedOperationError::TargetNotFound,
+                StatusCode::PRECONDITION_FAILED,
+                TrackedOperationError::DeleteTargetChanged,
             );
             operation.complete(outcome).await?;
             return apply_operation_outcome(&mut self.response, id, outcome, false);
         }
+        let delete_identity = identity
+            .delete_identity()
+            .expect("a matching DELETE revision identifies an existing target");
         self.server
             .handle_delete(
-                &session.user,
-                target.path.as_path(),
+                DeleteRequest {
+                    owner: &session.user,
+                    path: target.path.as_path(),
+                    expected_revision_identity: identity,
+                    expected_delete_identity: delete_identity,
+                    mutation: self.mutation.clone(),
+                    path_lease: target
+                        .path_lease
+                        .take()
+                        .expect("DELETE acquired a path lease"),
+                    operation: (id, operation),
+                },
                 &mut self.response,
-                self.mutation.clone(),
-                target
-                    .path_lease
-                    .take()
-                    .expect("DELETE acquired a path lease"),
-                (id, operation),
             )
             .await
     }
@@ -1094,6 +1168,28 @@ impl<'a> RequestDispatcher<'a> {
             .take()
             .expect("request body was not consumed by an earlier route phase")
     }
+}
+
+fn parse_delete_condition(headers: &HeaderMap) -> DeleteCondition {
+    let mut values = headers.get_all(IF_MATCH).iter();
+    let Some(value) = values.next() else {
+        return DeleteCondition::Missing;
+    };
+    if values.next().is_some() {
+        return DeleteCondition::Invalid;
+    }
+    let Ok(value) = value.to_str() else {
+        return DeleteCondition::Invalid;
+    };
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return DeleteCondition::Invalid;
+    };
+    TargetRevision::parse(value)
+        .map(DeleteCondition::Revision)
+        .unwrap_or(DeleteCondition::Invalid)
 }
 
 fn render_api_method_not_allowed(res: &mut Response, allow: &'static str) -> Result<()> {

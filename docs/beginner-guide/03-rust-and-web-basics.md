@@ -315,7 +315,7 @@ HTTP URI path
   → RootedPath
 ```
 
-随后文件系统操作才从已经打开的共享根 FD 相对解析，并按具体操作需要检查对象类型或 identity。不是所有操作都有“预检 identity → 提交时 CAS”；例如条件覆盖上传和删除的身份绑定强于普通 Move/Rename。
+随后文件系统操作才从已经打开的共享根 FD 相对解析，并按具体操作需要检查对象类型或 identity。列表项携带绑定当前对象完整身份的 revision；DELETE 通过 `If-Match` 回传，Move/Rename 在 JSON 中回传 `source_revision`，允许覆盖时还回传 `destination_revision`。后端把这些 token 绑定 owner、规范路径和身份，并在紧邻 rename 的提交检查中重新核对。最终 `statat → renameat2` 仍是两个相邻系统调用，不能把它宣传成对恶意外部 writer 的隔离。
 
 直接写 `shared_root.join(user_path)` 并不足以抵抗符号链接逃逸或检查后替换。第 5 章会说明项目的路径类型和 `RootedFs`。
 

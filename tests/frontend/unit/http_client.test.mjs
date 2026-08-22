@@ -3,9 +3,120 @@ import test from "node:test";
 
 import {
   RequestError,
+  assertDiscardUploadResponse,
 } from "../../../assets/modules/http/client.js";
 
 const uploadId = "00000000-0000-4000-8000-000000000001";
+
+test("discard accepts only a bound 204 rejected upload envelope", async () => {
+  const validHeaders = {
+    "x-dufs-upload-id": uploadId,
+    "x-dufs-upload-length": "8",
+    "x-dufs-upload-offset": "4",
+    "x-dufs-operation-state": "rejected",
+  };
+  const valid = new Response(null, { status: 204, headers: validHeaders });
+  assert.equal(
+    await assertDiscardUploadResponse(valid, uploadId, 8),
+    valid,
+  );
+
+  const invalidResponses = [
+    new Response(null, { status: 205, headers: validHeaders }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        ...validHeaders,
+        "x-dufs-operation-state": "committed",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        ...validHeaders,
+        "x-dufs-upload-id": "00000000-0000-4000-8000-000000000002",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        ...validHeaders,
+        "x-dufs-upload-length": "9",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: Object.fromEntries(
+        Object.entries(validHeaders).filter(([name]) =>
+          name !== "x-dufs-upload-offset"
+        ),
+      ),
+    }),
+  ];
+  for (const response of invalidResponses) {
+    await assert.rejects(
+      assertDiscardUploadResponse(response, uploadId, 8),
+      error => error instanceof RequestError &&
+        error.code === "invalid_discard_result" &&
+        error.kind === "protocol" &&
+        error.outcomeUnknown === true &&
+        error.uploadId === uploadId &&
+        error.uploadState === "unknown",
+    );
+  }
+});
+
+test("operation errors retain only canonical conditional revisions", async () => {
+  const operationId = "00000000-0000-4000-8000-000000000009";
+  const sourceRevision = "a".repeat(64);
+  const targetRevision = "b".repeat(64);
+  const response = new Response(JSON.stringify({
+    type: "urn:dufs:problem:destination_exists",
+    title: "Conflict",
+    status: 409,
+    detail: "Destination exists",
+    code: "destination_exists",
+  }), {
+    status: 409,
+    headers: {
+      "content-type": "application/problem+json",
+      "x-dufs-operation-id": operationId,
+      "x-dufs-operation-state": "failed",
+      "x-dufs-source-revision": sourceRevision,
+      "x-dufs-target-revision": targetRevision,
+    },
+  });
+  const { assertResponse } = await import(
+    "../../../assets/modules/http/client.js"
+  );
+  let caught;
+  try {
+    await assertResponse(response);
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof RequestError);
+  assert.equal(caught.sourceRevision, sourceRevision);
+  assert.equal(caught.targetRevision, targetRevision);
+
+  const malformed = new Response("Conflict", {
+    status: 409,
+    headers: {
+      "x-dufs-operation-id": operationId,
+      "x-dufs-operation-state": "failed",
+      "x-dufs-source-revision": sourceRevision.toUpperCase(),
+      "x-dufs-target-revision": "opaque",
+    },
+  });
+  try {
+    await assertResponse(malformed);
+    assert.fail("malformed revision response unexpectedly succeeded");
+  } catch (error) {
+    assert.ok(error instanceof RequestError);
+    assert.equal(error.sourceRevision, "");
+    assert.equal(error.targetRevision, "");
+  }
+});
 
 test("JSON requests validate media type and consume the bounded body once", async () => {
   const previousWindow = globalThis.window;
@@ -542,4 +653,3 @@ test("upload protocol headers override conflicting problem extensions", async ()
     },
   );
 });
-

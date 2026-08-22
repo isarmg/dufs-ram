@@ -490,9 +490,13 @@ fn accounts_have_independent_sessions_and_full_filesystem_access(
     assert_eq!(overwritten.status(), StatusCode::CREATED);
     let read_by_user = server.get_with(&user, shared_url.clone())?;
     assert_eq!(read_by_user.text()?, "overwritten by admin");
+    let delete_revision = preflight_upload_target_with(&server, &user, "/created-by-user.txt")?
+        .revision
+        .ok_or("shared delete target has no revision")?;
 
     let deleted = server
         .request_with(&user, Method::DELETE, shared_url)
+        .header("If-Match", format!("\"{delete_revision}\""))
         .send()?;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     assert!(!server.path().join("created-by-user.txt").exists());
@@ -627,9 +631,14 @@ fn valid_csrf_allows_put_patch_delete_and_browser_post(
         .send()?;
     assert_eq!(mkdir.status(), StatusCode::CREATED);
     assert!(server.path().join("csrf-valid-directory").is_dir());
+    let delete_revision =
+        preflight_upload_target_with(&server, &session, "/csrf-valid-upload.txt")?
+            .revision
+            .ok_or("valid csrf delete target has no revision")?;
 
     let delete = server
         .request_with(&session, Method::DELETE, upload_url)
+        .header("If-Match", format!("\"{delete_revision}\""))
         .send()?;
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
     assert!(!server.path().join("csrf-valid-upload.txt").exists());

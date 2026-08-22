@@ -184,6 +184,9 @@ fn file_mutations_require_session_csrf(server: TestServer) -> Result<(), Error> 
         std::fs::read_to_string(server.path().join("csrf-protected.txt"))?,
         "created and appended"
     );
+    let delete_revision = preflight_upload_target(&server, "/csrf-protected.txt")?
+        .revision
+        .ok_or("csrf delete target has no revision")?;
 
     for csrf_token in [None, Some("invalid")] {
         let mut request = context.request(Method::DELETE, file_url.clone());
@@ -200,6 +203,7 @@ fn file_mutations_require_session_csrf(server: TestServer) -> Result<(), Error> 
         .request(Method::DELETE, file_url)
         .header(CSRF_HEADER, &context.csrf_token)
         .header("X-Dufs-Operation-Id", Uuid::new_v4().to_string())
+        .header("If-Match", format!("\"{delete_revision}\""))
         .send()?;
     assert_eq!(response.status(), 204);
     assert!(!server.path().join("csrf-protected.txt").exists());

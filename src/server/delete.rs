@@ -1,5 +1,7 @@
 use super::{
     Response, Server,
+    browser_api::{SOURCE_REVISION_HEADER, apply_revision_header},
+    identity::OwnerId,
     operation_registry::{
         OperationGuard, OperationOutcome, TrackedOperationError, apply_operation_outcome,
         set_operation_headers,
@@ -8,8 +10,9 @@ use super::{
     problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
     protocol::OperationPublicState,
     purge::{PreparePurge, PreparedPurge},
-    rooted_fs::CheckedTrashMove,
+    rooted_fs::{CheckedTrashMove, DeleteIdentity, ReplacementTargetIdentity},
     router::MutationProgress,
+    upload::{TargetRevision, target_revision},
 };
 use anyhow::Result;
 use hyper::StatusCode;
@@ -18,18 +21,34 @@ use std::{path::Path, sync::Arc};
 enum DeleteCommitOutcome {
     Succeeded,
     Rejected(OperationOutcome),
+    TargetChanged(OperationOutcome, Option<TargetRevision>),
+}
+
+pub(super) struct DeleteRequest<'a> {
+    pub(super) owner: &'a str,
+    pub(super) path: &'a Path,
+    pub(super) expected_revision_identity: ReplacementTargetIdentity,
+    pub(super) expected_delete_identity: DeleteIdentity,
+    pub(super) mutation: MutationProgress,
+    pub(super) path_lease: PathLease,
+    pub(super) operation: (uuid::Uuid, OperationGuard),
 }
 
 impl Server {
     pub(super) async fn handle_delete(
         self: &Arc<Self>,
-        owner: &str,
-        path: &Path,
+        request: DeleteRequest<'_>,
         res: &mut Response,
-        mutation: MutationProgress,
-        path_lease: PathLease,
-        operation: (uuid::Uuid, OperationGuard),
     ) -> Result<()> {
+        let DeleteRequest {
+            owner,
+            path,
+            expected_revision_identity,
+            expected_delete_identity,
+            mutation,
+            path_lease,
+            operation,
+        } = request;
         let (operation_id, operation) = operation;
         match self.has_persisted_path_conflict(&[path]).await {
             Ok(false) => {}
@@ -73,7 +92,10 @@ impl Server {
         let commit_outcome = self
             .run_operation_commit(mutation, async move {
                 let mut operation = operation;
-                let prepared = match server.prepare_purge(&owner, &path).await {
+                let prepared = match server
+                    .prepare_purge_with_identity(&owner, &path, expected_delete_identity)
+                    .await
+                {
                     Ok(PreparePurge::Prepared(prepared)) => prepared,
                     Ok(PreparePurge::Full) => {
                         let outcome = OperationOutcome::failure(
@@ -118,6 +140,7 @@ impl Server {
                             &path,
                             trash_id,
                             source_identity,
+                            Some(expected_revision_identity),
                         )
                         .await
                     {
@@ -129,13 +152,36 @@ impl Server {
                                 );
                             }
                             let outcome = OperationOutcome::failure(
-                                StatusCode::CONFLICT,
+                                StatusCode::PRECONDITION_FAILED,
                                 TrackedOperationError::DeleteTargetChanged,
                             );
                             if let Some(operation) = operation.take() {
                                 operation.complete(outcome).await?;
                             }
-                            return Ok(DeleteCommitOutcome::Rejected(outcome));
+                            let relative =
+                                server.content.rooted_fs.state_relative_path(&path)?;
+                            let current_revision = match server
+                                .content
+                                .rooted_fs
+                                .replacement_identity(&path)
+                                .await
+                            {
+                                Ok(identity) => target_revision(
+                                    OwnerId::persistent(&owner),
+                                    &relative,
+                                    identity,
+                                ),
+                                Err(error) => {
+                                    warn!(
+                                        "Failed to inspect the changed DELETE target for a response revision error={error:#}"
+                                    );
+                                    None
+                                }
+                            };
+                            return Ok(DeleteCommitOutcome::TargetChanged(
+                                outcome,
+                                current_revision,
+                            ));
                         }
                         CheckedTrashMove::NotMoved(error) => {
                             if !server.state.state_store.remove_purge_job(key).await? {
@@ -197,6 +243,10 @@ impl Server {
                 )?;
             }
             DeleteCommitOutcome::Rejected(outcome) => {
+                apply_operation_outcome(res, operation_id, outcome, false)?;
+            }
+            DeleteCommitOutcome::TargetChanged(outcome, current_revision) => {
+                apply_revision_header(res, SOURCE_REVISION_HEADER, current_revision)?;
                 apply_operation_outcome(res, operation_id, outcome, false)?;
             }
         }

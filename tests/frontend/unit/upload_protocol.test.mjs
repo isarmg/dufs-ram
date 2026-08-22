@@ -56,6 +56,15 @@ test("upload response classifier enforces the phase status-state matrix", () => 
       "not-started": [],
       unknown: [500, 503],
     },
+    discard: {
+      running: [],
+      "awaiting-confirmation": [],
+      committed: [],
+      rejected: [204],
+      "not-seen": [],
+      "not-started": [],
+      unknown: [],
+    },
   };
   const candidateStatuses = [
     200, 201, 202, 204, 206, 403, 404, 408, 409, 413, 418, 429, 500,
@@ -95,6 +104,12 @@ test("upload response classifier enforces the phase status-state matrix", () => 
     status: 200,
     state: "committed",
     offset: "4",
+  }).kind, "invalid");
+  assert.equal(classify({
+    phase: "discard",
+    status: 204,
+    state: "rejected",
+    offset: null,
   }).kind, "invalid");
 });
 
@@ -197,7 +212,9 @@ function classify(options) {
     ? stateFields.length
     : options.length;
   const offset = options.offset === undefined
-    ? stateFields.offset
+    ? options.phase === "discard" && options.state === "rejected"
+      ? "4"
+      : stateFields.offset
     : options.offset;
   const values = new Map([
     ["x-dufs-upload-id", options.uploadId || uploadId],

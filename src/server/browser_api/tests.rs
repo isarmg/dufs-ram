@@ -28,10 +28,11 @@ async fn move_commit_rejects_target_created_after_precheck() {
     let destination = temp.path().join("destination.txt");
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
     std::fs::write(&source, "source-content").unwrap();
+    let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
 
     std::fs::write(&destination, "competitor-content").unwrap();
     assert_eq!(
-        commit_relocation(&rooted_fs, &source, &destination, false)
+        commit_relocation(&rooted_fs, &source, &destination, expected_source, None)
             .await
             .unwrap(),
         RelocationCommitOutcome::DestinationExists
@@ -51,11 +52,19 @@ async fn overwrite_commit_rejects_two_names_for_the_same_inode() {
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
     std::fs::write(&source, "shared-content").unwrap();
     std::fs::hard_link(&source, &destination).unwrap();
+    let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
+    let expected_destination = rooted_fs.replacement_identity(&destination).await.unwrap();
 
     assert_eq!(
-        commit_relocation(&rooted_fs, &source, &destination, true)
-            .await
-            .unwrap(),
+        commit_relocation(
+            &rooted_fs,
+            &source,
+            &destination,
+            expected_source,
+            Some(expected_destination),
+        )
+        .await
+        .unwrap(),
         RelocationCommitOutcome::SameFile
     );
     assert!(source.exists());
@@ -63,7 +72,32 @@ async fn overwrite_commit_rejects_two_names_for_the_same_inode() {
 }
 
 #[tokio::test]
-async fn relocation_commit_never_recreates_a_removed_destination_directory() {
+async fn relocation_commit_rejects_a_source_replaced_after_revision_check() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let source = temp.path().join("source.txt");
+    let replacement = temp.path().join("replacement.txt");
+    let destination = temp.path().join("destination.txt");
+    let rooted_fs = RootedFs::new(temp.path()).unwrap();
+    std::fs::write(&source, "original-source").unwrap();
+    let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
+    std::fs::write(&replacement, "external-replacement").unwrap();
+    std::fs::rename(&replacement, &source).unwrap();
+
+    assert_eq!(
+        commit_relocation(&rooted_fs, &source, &destination, expected_source, None)
+            .await
+            .unwrap(),
+        RelocationCommitOutcome::SourceChanged
+    );
+    assert_eq!(
+        std::fs::read_to_string(source).unwrap(),
+        "external-replacement"
+    );
+    assert!(!destination.exists());
+}
+
+#[tokio::test]
+async fn relocation_commit_reports_a_removed_destination_directory_as_changed() {
     for overwrite in [false, true] {
         let temp = assert_fs::TempDir::new().unwrap();
         let source = temp.path().join("source.txt");
@@ -72,21 +106,22 @@ async fn relocation_commit_never_recreates_a_removed_destination_directory() {
         let rooted_fs = RootedFs::new(temp.path()).unwrap();
         std::fs::write(&source, "source-content").unwrap();
         std::fs::create_dir(&destination_directory).unwrap();
+        let expected_source = rooted_fs.replacement_identity(&source).await.unwrap();
+        let expected_destination = rooted_fs.replacement_identity(&destination).await.unwrap();
 
         // Simulate an external writer removing the directory after the
         // handler's existence precheck but before the atomic commit.
         std::fs::remove_dir(&destination_directory).unwrap();
-        let error = commit_relocation(&rooted_fs, &source, &destination, overwrite)
-            .await
-            .unwrap_err();
-        let io_error = error
-            .downcast_ref::<std::io::Error>()
-            .expect("a removed destination directory must remain an I/O error");
-
-        assert!(matches!(
-            io_error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ));
+        let outcome = commit_relocation(
+            &rooted_fs,
+            &source,
+            &destination,
+            expected_source,
+            overwrite.then_some(expected_destination),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RelocationCommitOutcome::DestinationChanged);
         assert!(source.is_file());
         assert!(!destination_directory.exists());
     }
@@ -117,6 +152,18 @@ async fn unavailable_state_admission_rejects_move_before_commit_and_allows_same_
     std::fs::write(&source, "source-content").unwrap();
     std::fs::create_dir(&destination_directory).unwrap();
     let (server, _state_dir) = test_server(temp.path());
+    let source_revision = target_revision(
+        OwnerId::persistent("owner"),
+        Path::new("source.txt"),
+        server
+            .content
+            .rooted_fs
+            .replacement_identity(&source)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .encode();
     let operation_id = Uuid::new_v4();
     let fingerprint = OperationFingerprint::new(&[b"state-admission-test"]);
     let operation = match server
@@ -138,9 +185,12 @@ async fn unavailable_state_admission_rejects_move_before_commit_and_allows_same_
     let mut unavailable = Response::default();
     server
         .handle_api_move(
+            "owner",
             MoveRequest {
                 source: "/source.txt".to_string(),
                 directory: "/target".to_string(),
+                source_revision: Some(source_revision.clone()),
+                destination_revision: None,
                 overwrite: false,
             },
             Some((operation_id, operation)),
@@ -187,9 +237,12 @@ async fn unavailable_state_admission_rejects_move_before_commit_and_allows_same_
     let mut completed = Response::default();
     server
         .handle_api_move(
+            "owner",
             MoveRequest {
                 source: "/source.txt".to_string(),
                 directory: "/target".to_string(),
+                source_revision: Some(source_revision),
+                destination_revision: None,
                 overwrite: false,
             },
             Some((operation_id, retry)),

@@ -546,6 +546,8 @@ impl Server {
             && !self.lifecycle.force_shutdown.is_cancelled();
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         *res.status_mut() = if ready {
             StatusCode::OK
         } else {

@@ -62,6 +62,119 @@ capture_version_line() {
   printf '%s\n' "$output"
 }
 
+validate_cargo_audit_version_line() {
+  local actual="$1"
+  local required_version="$2"
+
+  [[ "$actual" == "cargo-audit-audit $required_version" ]]
+}
+
+validate_advisory_database_freshness() {
+  local fetch_epoch="$1"
+  local current_epoch="$2"
+  local maximum_age_seconds="$3"
+  local maximum_future_skew_seconds="$4"
+  local fetch_number
+  local current_number
+  local maximum_age_number
+  local maximum_future_skew_number
+
+  [[ "$fetch_epoch" =~ ^[0-9]{1,12}$ &&
+    "$current_epoch" =~ ^[0-9]{1,12}$ &&
+    "$maximum_age_seconds" =~ ^[0-9]{1,12}$ &&
+    "$maximum_future_skew_seconds" =~ ^[0-9]{1,12}$ ]] || return 2
+  fetch_number=$((10#$fetch_epoch))
+  current_number=$((10#$current_epoch))
+  maximum_age_number=$((10#$maximum_age_seconds))
+  maximum_future_skew_number=$((10#$maximum_future_skew_seconds))
+
+  (( fetch_number <= current_number + maximum_future_skew_number )) || return 2
+  if (( current_number > fetch_number &&
+    current_number - fetch_number > maximum_age_number ))
+  then
+    return 1
+  fi
+}
+
+advisory_database_revision() {
+  local database="$1"
+  local revision
+
+  [[ -d "$database" && ! -L "$database" &&
+    -d "$database/.git" && ! -L "$database/.git" ]] || {
+    printf 'RustSec advisory database is not a physical Git worktree: %s\n' \
+      "$database" >&2
+    return 1
+  }
+  revision="$(
+    run_git_isolated -C "$database" rev-parse --verify 'HEAD^{commit}'
+  )" || {
+    printf 'Unable to resolve the RustSec advisory database revision.\n' >&2
+    return 1
+  }
+  [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || {
+    printf 'RustSec advisory database returned an invalid revision.\n' >&2
+    return 1
+  }
+  printf '%s\n' "$revision"
+}
+
+read_advisory_database_identity() {
+  local database="$1"
+  local revision
+  local origin
+  local fetch_head
+  local fetched_revision
+  local fetch_epoch
+
+  revision="$(advisory_database_revision "$database")" || return $?
+  origin="$(
+    run_git_isolated -C "$database" remote get-url --all origin
+  )" || {
+    printf 'Unable to read the RustSec advisory database origin.\n' >&2
+    return 1
+  }
+  case "$origin" in
+    https://github.com/RustSec/advisory-db|https://github.com/RustSec/advisory-db.git) ;;
+    *)
+      printf 'RustSec advisory database has an untrusted origin: %s\n' \
+        "${origin:-missing}" >&2
+      return 1
+      ;;
+  esac
+
+  fetch_head="$database/.git/FETCH_HEAD"
+  [[ -f "$fetch_head" && ! -L "$fetch_head" ]] || {
+    printf 'RustSec advisory database lacks a physical FETCH_HEAD freshness record.\n' >&2
+    return 1
+  }
+  IFS=$'\t' read -r fetched_revision _ < "$fetch_head" || {
+    printf 'Unable to read the RustSec advisory database FETCH_HEAD.\n' >&2
+    return 1
+  }
+  [[ "$fetched_revision" == "$revision" ]] || {
+    printf 'RustSec advisory database HEAD does not match its last fetched revision.\n' >&2
+    return 1
+  }
+  fetch_epoch="$(stat -c '%Y' -- "$fetch_head")" || return $?
+  [[ "$fetch_epoch" =~ ^[0-9]{1,12}$ ]] || {
+    printf 'RustSec advisory database returned an invalid fetch timestamp.\n' >&2
+    return 1
+  }
+  printf '%s %s\n' "$revision" "$fetch_epoch"
+}
+
+classify_advisory_database_identity() {
+  local database="$1"
+  local identity
+
+  if identity="$(read_advisory_database_identity "$database")"; then
+    printf 'reusable %s\n' "$identity"
+  else
+    printf 'unavailable\n'
+  fi
+}
+
 write_build_environment_manifest() {
   local destination="$1"
   local source_sha="$2"
@@ -71,9 +184,12 @@ write_build_environment_manifest() {
   local rustc_version="$6"
   local cargo_version="$7"
   local cargo_cyclonedx_version="$8"
-  local node_command="$9"
+  local cargo_audit_version="$9"
   shift 9
-  local npm_command="$1"
+  local rustsec_advisory_db_revision="$1"
+  local rustsec_advisory_db_fetch_epoch="$2"
+  local node_command="$3"
+  local npm_command="$4"
   local node_version
   local npm_version
   local git_version
@@ -93,7 +209,7 @@ write_build_environment_manifest() {
   sha256sum_version="$(capture_version_line sha256sum sha256sum --version)" || return $?
 
   {
-    printf 'format=dufs-build-environment-v1\n'
+    printf 'format=dufs-build-environment-v2\n'
     printf 'source_sha=%s\n' "$source_sha"
     printf 'source_version=%s\n' "$source_version"
     printf 'source_date_epoch=%s\n' "$source_date_epoch"
@@ -102,6 +218,11 @@ write_build_environment_manifest() {
     printf 'rustc=%s\n' "$rustc_version"
     printf 'cargo=%s\n' "$cargo_version"
     printf 'cargo_cyclonedx=%s\n' "$cargo_cyclonedx_version"
+    printf 'cargo_audit=%s\n' "$cargo_audit_version"
+    printf 'rustsec_advisory_db_revision=%s\n' \
+      "$rustsec_advisory_db_revision"
+    printf 'rustsec_advisory_db_fetch_epoch=%s\n' \
+      "$rustsec_advisory_db_fetch_epoch"
     printf 'node=%s\n' "$node_version"
     printf 'npm=%s\n' "$npm_version"
     printf 'git=%s\n' "$git_version"
@@ -1369,6 +1490,15 @@ run_publication_self_test() {
   local documentation_archive_checksum_one
   local documentation_archive_checksum_two
   local documentation_unpack_root
+  local advisory_database_test
+  local advisory_database_test_revision
+  local advisory_database_test_fetch_epoch
+  local advisory_database_test_classification
+  local advisory_database_test_status
+  local freshness_current_epoch
+  local freshness_expected_status
+  local freshness_fetch_epoch
+  local freshness_status
 
   current_uid="$(id -u)"
   test_root="$(mktemp -d -t dufs-release-self-test.XXXXXXXX)"
@@ -1376,6 +1506,114 @@ run_publication_self_test() {
   cleanup_path="$test_root"
   cleanup_parent="${test_root%/*}"
   cleanup_prefix="dufs-release-self-test."
+
+  validate_cargo_audit_version_line \
+    'cargo-audit-audit 0.22.2' \
+    "$required_cargo_audit_version" || {
+    printf 'release self-test rejected the pinned cargo-audit version\n' >&2
+    return 1
+  }
+  if validate_cargo_audit_version_line \
+    'cargo-audit-audit 0.22.1' \
+    "$required_cargo_audit_version"
+  then
+    printf 'release self-test accepted an unpinned cargo-audit version\n' >&2
+    return 1
+  fi
+
+  while read -r \
+    freshness_fetch_epoch freshness_current_epoch freshness_expected_status
+  do
+    freshness_status=0
+    validate_advisory_database_freshness \
+      "$freshness_fetch_epoch" \
+      "$freshness_current_epoch" \
+      "$rustsec_advisory_database_maximum_age_seconds" \
+      "$rustsec_advisory_database_maximum_future_skew_seconds" || \
+      freshness_status=$?
+    [[ "$freshness_status" == "$freshness_expected_status" ]] || {
+      printf \
+        'release self-test classified RustSec freshness case %s/%s as %s, expected %s\n' \
+        "$freshness_fetch_epoch" \
+        "$freshness_current_epoch" \
+        "$freshness_status" \
+        "$freshness_expected_status" >&2
+      return 1
+    }
+  done <<EOF
+1000000 1000000 0
+$((1000000 - rustsec_advisory_database_maximum_age_seconds)) 1000000 0
+$((999999 - rustsec_advisory_database_maximum_age_seconds)) 1000000 1
+$((1000000 + rustsec_advisory_database_maximum_future_skew_seconds)) 1000000 0
+$((1000001 + rustsec_advisory_database_maximum_future_skew_seconds)) 1000000 2
+invalid 1000000 2
+EOF
+
+  advisory_database_test="$test_root/advisory-database"
+  run_git_isolated init --quiet "$advisory_database_test"
+  printf 'self-test\n' > "$advisory_database_test/README.md"
+  run_git_isolated -C "$advisory_database_test" add README.md
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    -c user.name=release-self-test \
+    -c user.email=release-self-test@example.invalid \
+    commit --quiet -m initial
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    remote add origin "$rustsec_advisory_database_url"
+  advisory_database_test_revision="$(
+    advisory_database_revision "$advisory_database_test"
+  )"
+  printf '%s\t\t%s\n' \
+    "$advisory_database_test_revision" \
+    "$rustsec_advisory_database_url" > \
+    "$advisory_database_test/.git/FETCH_HEAD"
+  advisory_database_test_classification="$(
+    classify_advisory_database_identity "$advisory_database_test"
+  )"
+  read -r \
+    advisory_database_test_status \
+    advisory_database_test_revision \
+    advisory_database_test_fetch_epoch <<< \
+    "$advisory_database_test_classification"
+  [[ "$advisory_database_test_status" == "reusable" &&
+    "$advisory_database_test_revision" =~ ^[0-9a-f]{40}$ &&
+    "$advisory_database_test_fetch_epoch" =~ ^[0-9]{1,12}$ ]] || {
+    printf 'release self-test produced an invalid RustSec database identity\n' >&2
+    return 1
+  }
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    remote set-url origin https://example.invalid/advisory-db.git
+  [[ "$(
+    classify_advisory_database_identity \
+      "$advisory_database_test" 2>/dev/null
+  )" == "unavailable" ]] || {
+    printf 'release self-test classified an untrusted RustSec origin as reusable\n' >&2
+    return 1
+  }
+  run_git_isolated \
+    -C "$advisory_database_test" \
+    remote set-url origin "$rustsec_advisory_database_url"
+  rm -f -- "$advisory_database_test/.git/FETCH_HEAD"
+  [[ "$(
+    classify_advisory_database_identity \
+      "$advisory_database_test" 2>/dev/null
+  )" == "unavailable" ]] || {
+    printf 'release self-test classified a missing RustSec FETCH_HEAD as reusable\n' >&2
+    return 1
+  }
+  printf '%s\t\t%s\n' \
+    0000000000000000000000000000000000000000 \
+    "$rustsec_advisory_database_url" > \
+    "$advisory_database_test/.git/FETCH_HEAD"
+  [[ "$(
+    classify_advisory_database_identity \
+      "$advisory_database_test" 2>/dev/null
+  )" == "unavailable" ]] || {
+    printf 'release self-test classified a mismatched RustSec FETCH_HEAD as reusable\n' >&2
+    return 1
+  }
 
   build_environment_manifest="$test_root/BUILD-ENVIRONMENT.txt"
   write_build_environment_manifest \
@@ -1387,10 +1625,13 @@ run_publication_self_test() {
     'rustc 1.97.1 (test)' \
     'cargo 1.97.1 (test)' \
     'cargo-cyclonedx-cyclonedx 0.5.9' \
+    'cargo-audit-audit 0.22.2' \
+    0123456789abcdef0123456789abcdef01234567 \
+    1234567890 \
     "$node_command" \
     "$npm_command"
   grep -Fxq \
-    'format=dufs-build-environment-v1' \
+    'format=dufs-build-environment-v2' \
     "$build_environment_manifest"
   grep -Fxq \
     'source_sha=0123456789abcdef0123456789abcdef01234567' \
@@ -1404,6 +1645,9 @@ run_publication_self_test() {
     rustc \
     cargo \
     cargo_cyclonedx \
+    cargo_audit \
+    rustsec_advisory_db_revision \
+    rustsec_advisory_db_fetch_epoch \
     node \
     npm \
     git \
@@ -2113,6 +2357,10 @@ output_dir_argument="$project_dir/dist"
 output_dir_was_set=false
 self_test=false
 required_cargo_cyclonedx_version="0.5.9"
+required_cargo_audit_version="0.22.2"
+rustsec_advisory_database_url="https://github.com/RustSec/advisory-db.git"
+rustsec_advisory_database_maximum_age_seconds=604800
+rustsec_advisory_database_maximum_future_skew_seconds=300
 while (($# > 0)); do
   case "$1" in
     --signing-key)
@@ -2145,6 +2393,7 @@ done
 for command_name in \
   cargo \
   chmod \
+  date \
   env \
   find \
   flock \
@@ -2301,6 +2550,21 @@ cargo_cyclonedx_version="$(
     "$cargo_command" cyclonedx --version 2>/dev/null
 )" || {
   printf 'Required Cargo subcommand is unavailable: cargo cyclonedx\n' >&2
+  exit 1
+}
+cargo_audit_version="$(
+  env RUSTUP_TOOLCHAIN="$required_rust_version" \
+    "$cargo_command" audit --version 2>/dev/null
+)" || {
+  printf 'Required Cargo subcommand is unavailable: cargo audit\n' >&2
+  exit 1
+}
+validate_cargo_audit_version_line \
+  "$cargo_audit_version" \
+  "$required_cargo_audit_version" || {
+  printf 'Required cargo-audit version is %s; found: %s\n' \
+    "$required_cargo_audit_version" \
+    "$cargo_audit_version" >&2
   exit 1
 }
 expected_cargo_cyclonedx_version="cargo-cyclonedx-cyclonedx $required_cargo_cyclonedx_version"
@@ -2551,15 +2815,63 @@ install -m 0600 \
 
 quality_audit_db_available=false
 host_audit_db="$host_cargo_home/advisory-db"
-if [[ -d "$host_audit_db/.git" && ! -L "$host_audit_db" ]]; then
-  run_git_isolated clone \
-    --quiet \
-    --no-hardlinks \
-    -- \
-    "$host_audit_db" \
-    "$quality_audit_db"
-  validate_extracted_source_tree "$quality_audit_db"
-  quality_audit_db_available=true
+rustsec_advisory_db_revision=""
+rustsec_advisory_db_fetch_epoch=""
+advisory_database_current_epoch="$(date -u +%s)"
+[[ "$advisory_database_current_epoch" =~ ^[0-9]{1,12}$ ]] || {
+  printf 'Unable to determine the current epoch for RustSec freshness checks.\n' >&2
+  exit 1
+}
+if [[ -e "$host_audit_db" || -L "$host_audit_db" ]]; then
+  host_audit_database_classification="$(
+    classify_advisory_database_identity "$host_audit_db"
+  )" || exit $?
+  read -r \
+    host_audit_database_status \
+    host_audit_database_revision \
+    host_audit_database_fetch_epoch <<< \
+    "$host_audit_database_classification"
+  case "$host_audit_database_status" in
+    reusable)
+      advisory_database_freshness_status=0
+      validate_advisory_database_freshness \
+        "$host_audit_database_fetch_epoch" \
+        "$advisory_database_current_epoch" \
+        "$rustsec_advisory_database_maximum_age_seconds" \
+        "$rustsec_advisory_database_maximum_future_skew_seconds" || \
+        advisory_database_freshness_status=$?
+      case "$advisory_database_freshness_status" in
+        0)
+          run_git_isolated clone \
+            --quiet \
+            --no-hardlinks \
+            -- \
+            "$host_audit_db" \
+            "$quality_audit_db"
+          validate_extracted_source_tree "$quality_audit_db"
+          quality_audit_db_available=true
+          rustsec_advisory_db_revision="$host_audit_database_revision"
+          rustsec_advisory_db_fetch_epoch="$host_audit_database_fetch_epoch"
+          ;;
+        1)
+          printf '%s\n' \
+            'The reusable RustSec database is stale; the isolated gate will require a network refresh.'
+          ;;
+        *)
+          printf 'RustSec advisory database has an invalid future fetch timestamp.\n' >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    unavailable)
+      printf '%s\n' \
+        'The host RustSec database is not reusable; the isolated gate will require a network refresh.' >&2
+      ;;
+    *)
+      printf 'Internal error: invalid RustSec database classification.\n' >&2
+      exit 1
+      ;;
+  esac
 fi
 
 "$node_command" \
@@ -2638,6 +2950,33 @@ printf \
   cd "$quality_source"
   "${quality_environment[@]}" ./scripts/check.sh
 )
+if [[ "$quality_audit_db_available" == true ]]; then
+  validate_extracted_source_tree "$quality_audit_db"
+  quality_audit_database_revision_after_gate="$(
+    advisory_database_revision "$quality_audit_db"
+  )"
+  [[ "$quality_audit_database_revision_after_gate" == \
+    "$rustsec_advisory_db_revision" ]] || {
+    printf 'The no-fetch RustSec database changed during the quality gate.\n' >&2
+    exit 1
+  }
+else
+  quality_audit_database_identity="$(
+    read_advisory_database_identity "$quality_audit_db"
+  )" || exit $?
+  read -r \
+    rustsec_advisory_db_revision \
+    rustsec_advisory_db_fetch_epoch <<< "$quality_audit_database_identity"
+  advisory_database_current_epoch="$(date -u +%s)"
+  validate_advisory_database_freshness \
+    "$rustsec_advisory_db_fetch_epoch" \
+    "$advisory_database_current_epoch" \
+    "$rustsec_advisory_database_maximum_age_seconds" \
+    "$rustsec_advisory_database_maximum_future_skew_seconds" || {
+    printf 'The refreshed RustSec advisory database is not fresh enough to release.\n' >&2
+    exit 1
+  }
+fi
 verify_quality_source_after_gate \
   "$quality_source" \
   "$release_stage/quality-after.index" \
@@ -2839,6 +3178,9 @@ write_build_environment_manifest \
   "$rustc_version" \
   "$cargo_version" \
   "$cargo_cyclonedx_version" \
+  "$cargo_audit_version" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
   "$node_command" \
   "$npm_command"
 verify_release_documentation_layout "$package_root" "$node_command"

@@ -3,7 +3,13 @@ use super::*;
 #[rstest]
 fn delete_file(server: TestServer) -> Result<(), Error> {
     let url = format!("{}test.html", server.url());
-    let resp = server.request(reqwest::Method::DELETE, &url).send()?;
+    let revision = preflight_upload_target(&server, "/test.html")?
+        .revision
+        .ok_or("delete target has no revision")?;
+    let resp = server
+        .request(reqwest::Method::DELETE, &url)
+        .header("If-Match", format!("\"{revision}\""))
+        .send()?;
     assert_eq!(resp.status(), 204);
     let resp = server.get(url)?;
     assert_eq!(resp.status(), 404);
@@ -11,11 +17,43 @@ fn delete_file(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn delete_file_404(server: TestServer) -> Result<(), Error> {
+fn delete_requires_a_source_revision(server: TestServer) -> Result<(), Error> {
     let resp = server
         .request(reqwest::Method::DELETE, format!("{}file1", server.url()))
         .send()?;
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 428);
+    Ok(())
+}
+
+#[rstest]
+fn delete_rejects_a_stale_revision_and_preserves_the_current_file(
+    server: TestServer,
+) -> Result<(), Error> {
+    let revision = preflight_upload_target(&server, "/test.html")?
+        .revision
+        .ok_or("delete target has no revision")?;
+    let target = server.path().join("test.html");
+    std::fs::write(&target, "replacement after listing")?;
+
+    let response = server
+        .request(
+            reqwest::Method::DELETE,
+            format!("{}test.html", server.url()),
+        )
+        .header("If-Match", format!("\"{revision}\""))
+        .send()?;
+
+    assert_eq!(response.status(), 412);
+    let current_revision = response
+        .headers()
+        .get("x-dufs-source-revision")
+        .ok_or("stale DELETE response has no current source revision")?
+        .to_str()?;
+    assert_ne!(current_revision, revision);
+    assert_eq!(
+        std::fs::read_to_string(target)?,
+        "replacement after listing"
+    );
     Ok(())
 }
 
@@ -46,8 +84,12 @@ fn delete_root_is_forbidden_and_preserves_contents(server: TestServer) -> Result
 
 #[rstest]
 fn delete_child_directory_still_succeeds(server: TestServer) -> Result<(), Error> {
+    let revision = preflight_upload_target(&server, "/dir1")?
+        .revision
+        .ok_or("delete directory has no revision")?;
     let resp = server
         .request(reqwest::Method::DELETE, format!("{}dir1/", server.url()))
+        .header("If-Match", format!("\"{revision}\""))
         .send()?;
     assert_eq!(resp.status(), 204);
     assert!(!server.path().join("dir1").exists());
@@ -57,7 +99,9 @@ fn delete_child_directory_still_succeeds(server: TestServer) -> Result<(), Error
 }
 
 #[rstest]
-fn delete_ancestor_waits_for_active_upload(server: TestServer) -> Result<(), Error> {
+fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
+    server: TestServer,
+) -> Result<(), Error> {
     use fixtures::{TEST_PASSWORD, TEST_USER};
     use std::{
         io::Write,
@@ -107,6 +151,9 @@ fn delete_ancestor_waits_for_active_upload(server: TestServer) -> Result<(), Err
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    let delete_revision = preflight_upload_target(&server, "/locked")?
+        .revision
+        .ok_or("active upload ancestor has no revision")?;
 
     let delete_url = format!("{}locked/", server.url());
     let cookie = session.cookie().to_owned();
@@ -118,6 +165,7 @@ fn delete_ancestor_waits_for_active_upload(server: TestServer) -> Result<(), Err
             .header("cookie", cookie)
             .header("x-dufs-csrf-token", csrf)
             .header("x-dufs-operation-id", Uuid::new_v4().to_string())
+            .header("if-match", format!("\"{delete_revision}\""))
             .send()
             .map(|response| response.status());
         let _ = delete_tx.send(result);
@@ -136,7 +184,8 @@ fn delete_ancestor_waits_for_active_upload(server: TestServer) -> Result<(), Err
         .map_err(|_| "ancestor delete did not resume after upload commit")??;
     delete_thread.join().unwrap();
     drop(upload);
-    assert_eq!(delete_status, reqwest::StatusCode::NO_CONTENT);
-    assert!(!upload_dir.exists());
+    assert_eq!(delete_status, reqwest::StatusCode::PRECONDITION_FAILED);
+    assert!(upload_dir.exists());
+    assert_eq!(std::fs::read(upload_dir.join("file.txt"))?, b"abc123");
     Ok(())
 }

@@ -2,11 +2,14 @@ import {
   CSRF_HEADER,
   OPERATION_ID_HEADER,
   RequestError,
+  SOURCE_REVISION_HEADER,
+  assertDiscardUploadResponse,
   assertFreshUploadResponse,
   assertResponse,
   isAuthenticationError,
   postJson,
   queryUnknownUpload,
+  requestJson,
   requestNoContent,
   runMutationWithReconciliation,
 } from "../http/client.js";
@@ -23,12 +26,18 @@ import {
   UPLOAD_LENGTH_HEADER,
   UPLOAD_OVERWRITE_HEADER,
 } from "../upload/protocol.js";
+import { parseUploadPreflight } from "../upload/preflight.js";
 
 const DEFAULT_FOLDER_NAME = "newfolder";
 const DEFAULT_FILE_NAME = "newfile";
 const DEFAULT_NAME_ATTEMPT_LIMIT = 1_000;
+const REVISION_REFRESH_CODES = Object.freeze([
+  "delete_target_changed",
+  "source_changed",
+  "destination_changed",
+]);
 
-/** @typedef {"succeeded" | "retry" | "unknown" | "authentication"} InlineRenameResult */
+/** @typedef {"succeeded" | "retry" | "refresh" | "unknown" | "authentication"} InlineRenameResult */
 
 /**
  * @typedef {{
@@ -45,8 +54,8 @@ const DEFAULT_NAME_ATTEMPT_LIMIT = 1_000;
  * @typedef {{
  *   data: IndexData,
  *   listing: {
- *     getItem: (index: number) => ({ name: string, path_type: string } | null),
- *     addCreatedItem: (file: { path_type: "Dir" | "File", name: string, mtime: number, size: number }) => number,
+ *     getItem: (index: number) => ({ name: string, path_type: string, revision: string } | null),
+ *     addCreatedItem: (file: { path_type: "Dir" | "File", name: string, mtime: number, size: number, revision: string }) => number,
  *     remove: (index: number) => void,
  *     removeByName: (name: string) => void,
  *     notifyMutation: (effect: (typeof MUTATION_EFFECT)[keyof typeof MUTATION_EFFECT]) => boolean,
@@ -96,6 +105,7 @@ export function createFileOperations(options) {
           headers: {
             [CSRF_HEADER]: data.csrf_token,
             [OPERATION_ID_HEADER]: operationId,
+            "If-Match": `"${file.revision}"`,
           },
         }, {
           outcomeUnknown: true,
@@ -103,7 +113,8 @@ export function createFileOperations(options) {
         }),
         onUnauthorized,
       );
-      listing.notifyMutation(trackedMutationEffect(result));
+      const effect = trackedMutationEffect(result);
+      listing.notifyMutation(effect);
       if (result.kind === "authentication") return;
       if (result.kind === "succeeded") {
         listing.removeByName(file.name);
@@ -117,6 +128,9 @@ export function createFileOperations(options) {
         }`,
         returnFocus,
       });
+      if (effect === MUTATION_EFFECT.REFRESH_REQUIRED) {
+        await listing.refreshFromFirstPage();
+      }
     } finally {
       end(pendingKey);
     }
@@ -142,7 +156,12 @@ export function createFileOperations(options) {
     const destination = logicalChild(logicalParent(source), name);
     return await relocatePath({
       endpoint: "rename",
-      request: { source, name, overwrite: false },
+      request: {
+        source,
+        name,
+        source_revision: file.revision,
+        overwrite: false,
+      },
       source,
       destination,
       fileName: file.name,
@@ -190,7 +209,12 @@ export function createFileOperations(options) {
     if (source === destination) return;
     await relocatePath({
       endpoint: "move",
-      request: { source, directory, overwrite: false },
+      request: {
+        source,
+        directory,
+        source_revision: file.revision,
+        overwrite: false,
+      },
       source,
       destination,
       fileName: file.name,
@@ -206,8 +230,8 @@ export function createFileOperations(options) {
    * @param {{
    *   endpoint: "move" | "rename",
    *   request: (
-   *     { source: string, directory: string, overwrite: boolean } |
-   *     { source: string, name: string, overwrite: boolean }
+   *     { source: string, directory: string, source_revision: string, overwrite: boolean, destination_revision?: string } |
+   *     { source: string, name: string, source_revision: string, overwrite: boolean, destination_revision?: string }
    *   ),
    *   source: string,
    *   destination: string,
@@ -242,9 +266,12 @@ export function createFileOperations(options) {
         onUnauthorized,
       );
       if (result.kind === "authentication") return "authentication";
-      if (
-        isDefiniteTrackedConflict(result, "destination_exists")
-      ) {
+      const destinationRevision = trackedConflictRevision(
+        result,
+        "destination_exists",
+        "targetRevision",
+      );
+      if (destinationRevision) {
         if (!await dialogs.confirmAction({
           title: "Overwrite destination?",
           message: `Replace "${destination}" with "${source}"?`,
@@ -252,9 +279,13 @@ export function createFileOperations(options) {
           danger: true,
           returnFocus,
         })) return "retry";
-        request.overwrite = true;
+        const overwriteRequest = {
+          ...request,
+          overwrite: true,
+          destination_revision: destinationRevision,
+        };
         result = await runMutationWithReconciliation(
-          () => postBrowserApi(endpoint, request),
+          () => postBrowserApi(endpoint, overwriteRequest),
           onUnauthorized,
         );
         if (result.kind === "authentication") return "authentication";
@@ -269,6 +300,11 @@ export function createFileOperations(options) {
           }`,
           returnFocus,
         });
+        if (effect === MUTATION_EFFECT.REFRESH_REQUIRED) {
+          if (verb === "rename") return "refresh";
+          await listing.refreshFromFirstPage();
+          return "retry";
+        }
         return effect === MUTATION_EFFECT.OUTCOME_UNKNOWN
           ? "unknown"
           : "retry";
@@ -427,19 +463,48 @@ export function createFileOperations(options) {
    * @param {Element | null} returnFocus
    */
   async function showCreatedItem(name, pathType, returnFocus) {
+    const path = logicalPath(name);
+    let revision;
+    try {
+      const { response, payload } = await requestJson(
+        "/__dufs__/api/upload/preflight",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CSRF_HEADER]: data.csrf_token,
+          },
+          body: JSON.stringify({ paths: [path] }),
+        },
+        { outcomeUnknown: false },
+      );
+      await assertResponse(response, onUnauthorized);
+      const [target] = parseUploadPreflight(payload, [path]);
+      revision = target.exists ? target.revision : null;
+    } catch (error) {
+      if (isAuthenticationError(error)) return;
+      await listing.refreshFromFirstPage();
+      return;
+    }
+    if (revision === null) {
+      await listing.refreshFromFirstPage();
+      return;
+    }
     const index = listing.addCreatedItem({
       path_type: pathType,
       name,
       mtime: Date.now(),
       size: 0,
+      revision,
     });
     await listing.startInlineRename(index, returnFocus, { created: true });
   }
 
   /**
-   * A staged conflict owns server-side temporary state. Only an explicit 204
-   * proves that state was discarded; every other result stops candidate
-   * generation so a later upload ID cannot leak or bypass the staged session.
+   * A staged conflict owns server-side temporary state. Only the bound 204 +
+   * rejected upload envelope proves that state was discarded; every other
+   * result stops candidate generation so a later upload ID cannot leak or
+   * bypass the staged session.
    *
    * @param {string} name
    * @param {string} uploadId
@@ -465,17 +530,12 @@ export function createFileOperations(options) {
           resultId: uploadId,
         },
       );
-      await assertResponse(response, onUnauthorized);
-      if (response.status !== 204) {
-        throw new RequestError("Invalid staged-upload cleanup response", {
-          status: response.status,
-          code: "invalid_discard_response",
-          kind: "protocol",
-          outcomeUnknown: true,
-          operationId: uploadId,
-          operationState: "unknown",
-        });
-      }
+      await assertDiscardUploadResponse(
+        response,
+        uploadId,
+        0,
+        onUnauthorized,
+      );
       return true;
     } catch (error) {
       if (isAuthenticationError(error)) return false;
@@ -590,6 +650,23 @@ function isDefiniteTrackedConflict(result, code) {
     );
 }
 
+/**
+ * Return conditional authority only from the direct, definite failure that
+ * carried it. A reconciled job result cannot safely recreate response headers.
+ *
+ * @param {Awaited<ReturnType<typeof runMutationWithReconciliation>>} result
+ * @param {string} code
+ * @param {"sourceRevision" | "targetRevision"} field
+ */
+function trackedConflictRevision(result, code, field) {
+  return isDefiniteTrackedConflict(result, code) &&
+      result.kind === "failed" &&
+      result.status === null &&
+      result.error instanceof RequestError
+    ? result.error[field]
+    : "";
+}
+
 /** @param {unknown} error */
 function isDefiniteFreshUploadConflict(error) {
   return error instanceof RequestError &&
@@ -622,6 +699,13 @@ function isAwaitingUploadConflict(error, uploadId) {
 export function trackedMutationEffect(result) {
   if (result.kind === "succeeded") return MUTATION_EFFECT.COMMITTED;
   if (result.kind !== "failed") return MUTATION_EFFECT.NOT_COMMITTED;
+  if (
+    REVISION_REFRESH_CODES.some(code =>
+      isDefiniteTrackedConflict(result, code)
+    )
+  ) {
+    return MUTATION_EFFECT.REFRESH_REQUIRED;
+  }
   if (
     result.status?.kind === "running" ||
     result.status?.kind === "unknown" ||

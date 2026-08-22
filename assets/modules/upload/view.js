@@ -74,6 +74,7 @@ export function createUploadView(index, name, url, onCancel) {
 
 /** @param {UploadView} view @param {string} name @param {boolean} [retry] */
 export function renderWaiting(view, name, retry = false) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   setCancelMode(
     view,
     "Cancel",
@@ -86,6 +87,7 @@ export function renderWaiting(view, name, retry = false) {
     view.liveNode,
   );
   announce(view, `${name}: ${message.toLowerCase()}`);
+  restoreReplacedStatusFocus(view, restoreFocus, view.cancelButton);
 }
 
 /**
@@ -103,6 +105,7 @@ export function renderProgress(view, name, speedText, progressText, announceNow)
     !view.statusCell.contains(view.cancelButton) ||
     !view.statusCell.contains(view.liveNode)
   ) {
+    const restoreFocus = view.statusCell.contains(document.activeElement);
     // A retry after an overwrite decision re-enters progress rendering from a
     // view that intentionally has no cancel button. Rebuild the owned status
     // nodes atomically instead of using a possibly detached node as the
@@ -113,6 +116,7 @@ export function renderProgress(view, name, speedText, progressText, announceNow)
       view.cancelButton,
       view.liveNode,
     );
+    restoreReplacedStatusFocus(view, restoreFocus, view.cancelButton);
   }
   view.speedNode.textContent = speedText;
   view.progressNode.textContent = progressText;
@@ -123,6 +127,7 @@ export function renderProgress(view, name, speedText, progressText, announceNow)
 
 /** @param {UploadView} view @param {string} name */
 export function renderCheckpoint(view, name) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   setCancelMode(view, "Cancel", `Cancel resume status check for ${name}`);
   view.statusCell.replaceChildren(
     createElement("span", { text: "Checking resume status…" }),
@@ -130,10 +135,23 @@ export function renderCheckpoint(view, name) {
     view.liveNode,
   );
   announce(view, `${name}: checking resume status`);
+  restoreReplacedStatusFocus(view, restoreFocus, view.cancelButton);
+}
+
+/** @param {UploadView} view @param {string} name */
+export function renderCleanup(view, name) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
+  view.statusCell.replaceChildren(
+    createElement("span", { text: "Cleaning up staged upload…" }),
+    view.liveNode,
+  );
+  announce(view, `${name}: cleaning up staged upload`);
+  restoreReplacedStatusFocus(view, restoreFocus);
 }
 
 /** @param {UploadView} view @param {string} name */
 export function renderSubmitting(view, name) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   setCancelMode(view, "Stop waiting", `Stop waiting for upload ${name}`);
   view.statusCell.replaceChildren(
     createElement("span", { text: "Submitting…" }),
@@ -141,6 +159,7 @@ export function renderSubmitting(view, name) {
     view.liveNode,
   );
   announce(view, `${name}: upload data sent; waiting for server confirmation`);
+  restoreReplacedStatusFocus(view, restoreFocus, view.cancelButton);
 }
 
 /** @param {UploadView} view @param {string} name */
@@ -154,6 +173,7 @@ export function renderWaitingForOverwrite(view, name) {
 
 /** @param {UploadView} view @param {string} name */
 export function renderComplete(view, name) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   view.statusCell.replaceChildren(
     createElement("span", {
       text: "✓",
@@ -162,6 +182,7 @@ export function renderComplete(view, name) {
     view.liveNode,
   );
   announce(view, `${name}: upload complete`);
+  restoreReplacedStatusFocus(view, restoreFocus);
 }
 
 /**
@@ -171,6 +192,7 @@ export function renderComplete(view, name) {
  * @param {HTMLButtonElement | null} [retryButton]
  */
 export function renderFailure(view, name, reason, retryButton = null) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   view.statusCell.replaceChildren(createElement("span", {
     className: "upload-failure",
     text: `✗ ${reason}`,
@@ -179,6 +201,7 @@ export function renderFailure(view, name, reason, retryButton = null) {
   if (retryButton) view.statusCell.append(retryButton);
   view.statusCell.append(view.liveNode);
   announce(view, `${name}: ${reason}`);
+  restoreReplacedStatusFocus(view, restoreFocus, retryButton);
 }
 
 /**
@@ -188,6 +211,7 @@ export function renderFailure(view, name, reason, retryButton = null) {
  * @param {HTMLButtonElement | null} [recoveryButton]
  */
 export function renderUnknown(view, name, reason, recoveryButton = null) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   view.statusCell.replaceChildren(
     createElement("span", {
       className: "upload-failure upload-unknown",
@@ -198,24 +222,57 @@ export function renderUnknown(view, name, reason, recoveryButton = null) {
   if (recoveryButton) view.statusCell.append(recoveryButton);
   view.statusCell.append(view.liveNode);
   announce(view, `${name}: upload result unknown; ${reason}`);
+  restoreReplacedStatusFocus(view, restoreFocus, recoveryButton);
 }
 
 /** @param {UploadView} view @param {string} name */
 export function renderCancelled(view, name) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   view.statusCell.replaceChildren(
     createElement("span", { text: "Cancelled" }),
     view.liveNode,
   );
   announce(view, `${name}: upload cancelled`);
+  restoreReplacedStatusFocus(view, restoreFocus);
 }
 
 /** @param {UploadView} view @param {string} name @param {string} reason */
 export function renderSkipped(view, name, reason) {
+  const restoreFocus = view.statusCell.contains(document.activeElement);
   view.statusCell.replaceChildren(
     createElement("span", { text: `Skipped (${reason})` }),
     view.liveNode,
   );
   announce(view, `${name}: skipped because the ${reason}`);
+  restoreReplacedStatusFocus(view, restoreFocus);
+}
+
+/**
+ * Keep keyboard focus in a useful place when a status transition removes the
+ * currently focused Cancel/Stop-waiting control.
+ *
+ * @param {UploadView} view
+ * @param {boolean} restoreFocus
+ * @param {HTMLButtonElement | null} [preferredFocus]
+ */
+function restoreReplacedStatusFocus(
+  view,
+  restoreFocus,
+  preferredFocus = null,
+) {
+  if (!restoreFocus) return;
+  /** @type {HTMLElement | null} */
+  let target = preferredFocus;
+  if (!target?.isConnected || target.hasAttribute("disabled")) {
+    const nameLink = view.row.querySelector(".cell-name a");
+    target = nameLink instanceof HTMLElement ? nameLink : null;
+  }
+  if (target) {
+    target.focus({ preventScroll: true });
+    return;
+  }
+  view.statusCell.tabIndex = -1;
+  view.statusCell.focus({ preventScroll: true });
 }
 
 /** @param {UploadView} view @param {string} message */

@@ -11,6 +11,8 @@ pub(super) const UPLOAD_STATE_SUFFIX: &str = ".state";
 pub(super) const UPLOAD_STATE_TEMP_SUFFIX: &str = ".tmp";
 pub(super) const DELETE_TRASH_PREFIX: &str = ".dufs-upload-delete-";
 pub(super) const DELETE_TRASH_SUFFIX: &str = ".trash";
+pub(super) const QUARANTINE_PREFIX: &str = ".dufs-quarantine-";
+pub(super) const QUARANTINE_SUFFIX: &str = ".hold";
 const READINESS_TARGET_TAG: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -24,6 +26,10 @@ pub(in crate::server) fn upload_readiness_probe_name(upload_id: Uuid) -> String 
 
 pub(in crate::server) fn delete_trash_name(trash_id: Uuid) -> String {
     format!("{DELETE_TRASH_PREFIX}{trash_id}{DELETE_TRASH_SUFFIX}")
+}
+
+pub(in crate::server) fn quarantine_name(quarantine_id: Uuid) -> String {
+    format!("{QUARANTINE_PREFIX}{quarantine_id}{QUARANTINE_SUFFIX}")
 }
 
 pub(in crate::server) fn upload_temp_path(path: &Path, upload_id: Uuid) -> Result<PathBuf> {
@@ -44,6 +50,7 @@ pub(super) enum InternalEntryName {
     State,
     StateTemp,
     DeleteTrash,
+    Quarantine,
 }
 
 pub(in crate::server) fn is_internal_name(file_name: &str) -> bool {
@@ -51,6 +58,9 @@ pub(in crate::server) fn is_internal_name(file_name: &str) -> bool {
 }
 
 pub(super) fn classify_internal_name(file_name: &str) -> Option<InternalEntryName> {
+    if is_quarantine_name(file_name) {
+        return Some(InternalEntryName::Quarantine);
+    }
     if is_delete_trash_name(file_name) {
         return Some(InternalEntryName::DeleteTrash);
     }
@@ -109,6 +119,13 @@ fn is_delete_trash_name(file_name: &str) -> bool {
         .is_some_and(is_canonical_uuid)
 }
 
+fn is_quarantine_name(file_name: &str) -> bool {
+    file_name
+        .strip_prefix(QUARANTINE_PREFIX)
+        .and_then(|value| value.strip_suffix(QUARANTINE_SUFFIX))
+        .is_some_and(is_canonical_uuid)
+}
+
 fn is_canonical_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
 }
@@ -163,6 +180,12 @@ mod tests {
         assert_eq!(
             classify_internal_name(&trash),
             Some(InternalEntryName::DeleteTrash)
+        );
+
+        let quarantine = quarantine_name(upload_id);
+        assert_eq!(
+            classify_internal_name(&quarantine),
+            Some(InternalEntryName::Quarantine)
         );
     }
 }

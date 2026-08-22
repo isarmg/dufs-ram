@@ -7,7 +7,7 @@ pub(in crate::server) struct UploadTargetInspection {
     pub(in crate::server) revision: Option<TargetRevision>,
 }
 
-pub(super) fn target_revision(
+pub(in crate::server) fn target_revision(
     owner_id: OwnerId,
     canonical_relative_path: &Path,
     identity: ReplacementTargetIdentity,

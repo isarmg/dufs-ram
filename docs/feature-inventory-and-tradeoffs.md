@@ -61,12 +61,12 @@
 | --- | --- | --- | --- | --- | --- |
 | P-01 | 浏览器文件管理器 | 浏览、下载、上传、新建、移动、重命名、删除和搜索一个共享目录 | 删除其中核心 CRUD 后不再是完整文件管理器 | 核心 | 高 |
 | P-02 | 单进程、单共享根部署模型 | 一个进程管理一个根目录；启动时长期持有根目录 fd 并尝试非阻塞独占 `flock`，同一根目录上的第二个 Dufs 实例会启动失败 | 多根目录仍需分别运行进程；删除共享根锁会让误启的第二实例越过进程内协调和磁盘预留 | 保障 | 高 |
-| P-03 | 仅 64 位 Linux | `build.rs` 拒绝非 Linux 和非 64 位目标 | 恢复其他平台需要重写 fd 相对文件系统和持久化边界 | 保障 | 高 |
+| P-03 | 64 位 Linux 编译边界；x86-64 验证基线 | `build.rs` 拒绝非 Linux 和非 64 位目标；自动 CI、部署样例和正式制品验收只覆盖 `x86_64-unknown-linux-gnu`，其他 64 位目标是未验证的 best effort | 恢复其他系统需要重写 fd 相对文件系统和持久化边界；把新 CPU 架构列为支持前必须补等价 CI、浏览器与部署验证 | 保障 | 高 |
 | P-04 | Linux `openat2` 必需 | 启动时探测；缺少 `openat2` 时失败关闭，不使用不安全降级 | 删除要求会破坏当前根目录安全模型 | 保障 | 高 |
 | P-05 | 现代桌面浏览器 | 面向 Chromium、Edge、Firefox 桌面环境；不承诺手机 Web | 恢复移动端需要重新设计布局、交互和测试矩阵 | 核心 | 中 |
 | P-06 | 单个可执行文件 | HTML、CSS、JavaScript 和图标编译进 Rust 可执行文件 | 改成独立前端会增加部署单元和版本协调 | 建议保留 | 中 |
 | P-07 | 外部网关终止 HTTPS | Dufs 只提供明文 HTTP/TCP，默认绑定回环地址；是否仅在内网可达由显式 bind、防火墙/ACL 和网关部署共同保证。证书、TLS、HSTS 和公网策略由网关负责 | 若恢复内置 TLS，会重新引入证书配置和 TLS 依赖 | 保障 | 高 |
-| P-08 | 可验证交付 | 当前 checkout 未配置 Git remote、托管 release 或 Docker 文件；仓库提供只读分层 GitHub Actions、MIT/Apache-2.0 双许可证、`SECURITY.md`、部署基线、运维手册，以及生成带源码 SHA、实际构建环境清单、CycloneDX SBOM、`THIRD_PARTY_LICENSES.txt`、经摘要审核的 Rust 标准库 notice、校验和与 OpenSSL 签名的本地发布脚本。远程门只做反馈，不签名或发布 | 不影响运行；删除这些材料会失去持续回归、来源追踪、许可声明和制品验证基线，托管发布仍需另建 | 开发/运维 | 中 |
+| P-08 | 可验证交付 | fork 托管在 `isarmg/dufs-ram`，但有意没有自动 GitHub Release 工作流；`0.48.0` 尚未发布且精确 `v0.48.0` tag 缺失是当前预期状态。仓库提供只读分层 GitHub Actions、MIT/Apache-2.0 双许可证、`SECURITY.md`、部署基线、运维手册，以及生成带源码 SHA、实际构建环境清单、CycloneDX SBOM、`THIRD_PARTY_LICENSES.txt`、经摘要审核的 Rust 标准库 notice、校验和与 OpenSSL 签名的本地发布脚本。远程门只做反馈，不签名或发布 | 不影响运行；删除这些材料会失去持续回归、来源追踪、许可声明和制品验证基线；正式 tag 只能在源码与发布准备完成后创建，托管发布仍需单独设计授权链 | 开发/运维 | 中 |
 | P-09 | 不兼容旧配置 | 删除的旧参数、环境变量或账号格式不会被兼容；YAML 未知字段直接报错 | 增加兼容层会扩大分支和维护成本 | 建议保留 | 中 |
 
 ## 3. 启动、命令行和 YAML 配置
@@ -234,7 +234,7 @@
 | M-06 | 禁止目录移入自身 | 源目录不能移动到自己的后代 | 删除会产生无效或危险操作 | 保障 | 低 |
 | M-07 | 删除文件或目录 | 页面确认后调用 `DELETE`；共享根本身始终返回 `403` | 删除后不再是完整文件管理器 | 核心 | 高 |
 | M-08 | 持久化可见删除 | 先在同一父目录原子改名为隐藏 trash 并 `fsync`，再返回 `204` | 直接递归删除无法在中断时明确保证名称是否已消失 | 保障 | 高 |
-| M-09 | 持久、有界、公平的后台回收 | DELETE 在 checked rename 前写 `Prepared`，父目录 fsync 后转 `Ready`；outbox 全局 4096、每账号 1024，满载在可见 mutation 前拒绝。worker 原子 claim 为 `Claimed`，复核 trash dev/inode/类型后按 256 项/25 ms 分片；I/O 失败持久化回 `Ready`，100 ms 指数退避到最长 30 秒，不因固定次数丢 job。defer/complete 瞬时失败时有界保留本地 claim，回读确认仍为 `Claimed` 才重做；重启将 `Claimed`→`Ready`。独立 reconciler 在启动和运行期按路径+inode 处理 `Prepared`；递归打开用 `RESOLVE_NO_XDEV`，不跨嵌套/bind mount。分片 cursor 仅在内存，但 job/trash 根持久；低频扫描只兜底 orphan | 去掉 outbox 会使断电后的新 DELETE 重新依赖全树扫描；去掉 inode/mount 边界复核、有界容量、公平分片或持久退避会引入同名替换物误删、跨存储删除、无界积压、健康 job 饥饿或永久丢失回收 | 保障 | 中 |
+| M-09 | 持久、有界、公平的后台回收 | DELETE 在 checked rename 前写 `Prepared`，父目录 fsync 后转 `Ready`；outbox 全局 4096、每账号 1024，满载在可见 mutation 前拒绝。worker 原子 claim 为 `Claimed`，复核 trash dev/inode/类型后按 256 项/25 ms 分片；I/O 失败持久化回 `Ready`，100 ms 指数退避到最长 30 秒，不因固定次数丢 job。defer/complete 瞬时失败时有界保留本地 claim，回读确认仍为 `Claimed` 才重做；重启将 `Claimed`→`Ready`。独立 reconciler 在启动和运行期按路径+inode 处理 `Prepared`；身份歧义的内部 trash 会改名为永久隐藏的 `.dufs-quarantine-<uuid>.hold` 并停止自动清理，必须停服人工检查/移除。递归打开用 `RESOLVE_NO_XDEV`，不跨嵌套/bind mount。分片 cursor 仅在内存，但 job/trash 根持久；低频扫描只兜底 orphan | 去掉 outbox 会使断电后的新 DELETE 重新依赖全树扫描；去掉 inode/mount 边界复核、有界容量、公平分片、quarantine 或持久退避会引入同名替换物误删、跨存储删除、无界积压、健康 job 饥饿或永久丢失回收 | 保障 | 中 |
 | M-10 | 无回收站/撤销 | 内部 trash 不对用户开放，逻辑删除后不可从页面恢复 | 若需要恢复功能，必须新增正式回收站模型 | 当前边界 | 高 |
 | M-11 | 新项目权限策略 | 新建及零字节普通文件都从私有上传 stage 发布，并由显式 `fchmod` 使最终 permission bits 固定为 `0600`；新建和自动补建目录以 mode `0777` 请求创建，实际权限受进程 umask 与父目录 default ACL 影响；覆盖普通文件使用 U-19 的非特权 metadata 保留/特权 metadata 拒绝语义，替换符号链接后的普通文件仍为 `0600` | 新文件由服务账号拥有；目录权限继续依赖部署的 umask/default ACL。若底层策略自动赋予安全标签，应在部署环境验证；若需共享给其他本地账号必须明确设计权限策略 | 当前边界 | 低 |
 
@@ -257,7 +257,7 @@
 | S-09 | 公平等待与重新解析 | 较早 waiter 仍在解析语义键时，只按词法祖先/后代关系阻塞后续 waiter，无关路径可超车；协调 epoch 变化时重新求语义键，插入前再次核对 epoch、现有租约和更早冲突 waiter。后来发现的符号链接别名会等待已取得的冲突租约；协调器不直接观察外部文件系统变化 | 全局阻塞解析会形成无关路径队头阻塞；不做最终语义/epoch 复验又可能沿用过期身份或放行别名并发 | 保障 |
 | S-10 | 多路径原子登记 | move 和 rename 的源与派生目标先排序、去重，再在同一个 mutex 临界区整体检查并登记 | 删除整体登记会破坏确定性和冲突判断；当前算法并非逐把锁获取 | 保障 |
 | S-11 | 提交任务独立收尾 | 浏览器或网关断开不会取消已经开始的最终 rename/fsync | 客户端取消可能让文件停在不明确阶段 | 保障 |
-| S-12 | 单实例锁与外部写边界 | 根目录 fd 的独占 advisory `flock` 会阻止遵循同一协议的第二个 Dufs 实例；路径协调器仍只覆盖当前进程，shell、virtiofs 宿主和不理会 advisory lock 的其他程序不受约束 | 外部并发修改仍需部署侧避免；若要多节点共享同一存储，需要分布式协调而不是删除本地锁 | 当前边界 |
+| S-12 | 单实例锁与外部写边界 | 根目录 fd 的独占 advisory `flock` 会阻止遵循同一协议的第二个 Dufs 实例；路径协调器仍只覆盖当前进程，shell、virtiofs 宿主和不理会 advisory lock 的其他程序不受约束。本文一致性保证要求 Dufs 独占写入共享根，人工修改只能停服执行 | 外部并发修改必须由部署侧排除；若要多节点共享同一存储，需要分布式协调而不是删除本地锁 | 当前边界 |
 | S-13 | 常量 fd 的根内递归清理 | delete trash、过期上传和内部目录的递归清理保存根内相对目录路径与 cursor；每个工作片从已有父目录 fd 逐级使用 `openat(..., O_NOFOLLOW)`、`statat` 和 `unlinkat`，片结束前关闭工作 fd，不拼回绝对路径，也不依赖 `/proc/self/fd`。purge 错误把 job 持久化回 `Ready`；分片 cursor 不持久，重启从已记账 trash 根重新遍历 | 退回 procfs/普通绝对路径会重新引入部署依赖和路径替换竞态；跨片保存各层打开 fd 会使资源随深度增长；消费错误时丢 job 会破坏持久回收 | 保障 |
 | S-14 | 普通写操作幂等协议 | 浏览器为 mkdir、move、rename、DELETE 生成 UUID operation ID；registry 在路径等待/业务校验前先按账号摘要、ID 和指纹建立 `Reserved`，同请求运行中返回 `202`，完成后可重放，不同指纹复用 ID 返回冲突。已知提交前错误记录为 `failed`；pre-commit guard 丢弃会移除预留，只有 `mark_commit_started` 后的异常才为 `unknown`。schema v3 文件型 SQLite 同时持久化管理 operation/upload/purge，使用 rollback journal `DELETE`、`synchronous=EXTRA`，启动删除 operation `Reserved`、把 operation `CommitStarted` 转为 `Completed/unknown`，并在 15 分钟 TTL 内重放 `Completed`；v2 是唯一支持事务迁移的旧 schema。Operation 容量全局 4096、每账号 1024；`/__dufs__/api/jobs/<uuid>` 是当前唯一公开查询入口且只包含这类 mutation | 删除后，断线或 `504` 会再次变成只能猜测并可能重复执行的结果不确定性；把所有 pre-commit 取消记成 unknown 会泄漏虚假运行记录；误把 SQLite 当成文件系统事务会产生错误恢复决策 | 保障 |
 
@@ -323,7 +323,7 @@
 | O-11 | 第二信号立即退出 | 第二次 SIGINT/SIGTERM 不再等待或 flush 日志；SIGKILL 同样无法保证收尾，尾部日志可能丢失 | 是管理员明确的强制退出边界 | 开发/运维 | 低 |
 | O-12 | 正常退出日志 flush | 仅正常停止在 tracked cleanup 后由专用命名 OS thread 执行一次最多 5 秒的日志刷新，不依赖 Tokio blocking pool；主任务以 biased select 继续监听第二信号。硬截止和第二信号路径跳过并立即退出 | 删除可能丢失最后一批诊断记录；把 flush 放进强退路径或可能耗尽的共享阻塞池会突破硬截止，停止监听第二信号又会破坏管理员强退语义 | 开发/运维 | 低 |
 | O-13 | 内置资源日志降噪 | 只有成功返回的版本化资源 `GET` 跳过普通访问日志；资源错误、HEAD、登录、健康检查和其他请求仍记录 | 删除过滤会增加静态资源噪声；扩大过滤会漏掉诊断 | 建议保留 | 低 |
-| O-14 | 认证 readiness | `GET/HEAD /__dufs__/ready` 要求有效会话；检查共享根仍是目录、实际可用空间扣除进程预留后满足 `min-free-space`、统一 state store 线程健康且未进入停机，失败返回 `503 {"status":"not_ready"}` | 比 liveness 更适合受控冒烟检查；它不是各业务容量或完整写入/rename/fsync 的破坏性探针 | 建议保留 | 低 |
+| O-14 | 认证 readiness | `GET/HEAD /__dufs__/ready` 要求有效会话；通过锚定根 fd 真实创建隐藏文件、写入、同步文件、删除并同步根目录，同时在现有 SQLite actor 连接执行 `BEGIN IMMEDIATE`、写入探针行并 `ROLLBACK`；还检查扣除进程预留后的 `min-free-space` 和停机状态，失败返回 `503 {"status":"not_ready"}` | 比 liveness 更适合受控冒烟检查；它证明当前根目录和状态库基本可写，但不执行 rename/介质读回，也不预测目标冲突、purge/上传容量等全部业务准入 | 建议保留 | 低 |
 
 ## 13. 内置资源、缓存和部署
 
@@ -360,15 +360,17 @@
 | T-08 | 可注入持久化边界 | `StorageDurability` 先独立注入文件 sync；替换边界返回 `Published`、`Rejected`、`NotPublished` 或 `PublishedDurabilityUnknown`，测试可区分 rename 前/rename 失败与 rename 后父目录 fsync 失败 | 删除会使真正落盘的故障路径难以自动测试，也容易把确定未发布误报为结果未知 | 开发/运维 |
 | T-09 | Rust 自动化 | 单元、集成、故障注入、不可变分页/搜索快照、退役目录归档路由、Range、认证、限流、协议、符号链接、纯 fd 清理和真实停机测试；范围与 URI 编解码另有大样本性质测试 | 删除后修改核心文件语义的风险显著上升 | 开发/运维 |
 | T-10 | 隔离 Playwright | Chromium 和 Firefox 必需、正式 Edge 可选；通过只呈现一个客户端地址的本地 HTTPS 网关运行，因此固定单 worker 串行执行，避免无关用例争抢生产登录令牌桶；失败重试 1 次且 `failOnFlakyTests: true`，所以重试通过仍会让门禁失败；每项测试使用随机目录。Rust HTTP 集成测试精确断言安全响应头；Playwright 验证 Secure Cookie、CSP violation、可访问性语义和真实浏览器交互 | 删除后无法验证真实浏览器行为及测试间状态污染；删除 Rust 断言会让响应头策略漂移失去精确回归保护 | 开发/运维 |
-| T-11 | 依赖安全审计 | `cargo audit` 和 `npm audit --audit-level=high`；发布门禁若有宿主 RustSec DB，会以无硬链接私有 clone 执行 `--no-fetch`，否则在隔离目录正常取得数据库 | 无法及时发现已知依赖漏洞；直接复用可变数据库目录或硬链接会破坏隔离 | 开发/运维 |
+| T-11 | 依赖安全审计 | `cargo audit` 固定为 0.22.2，并与 `npm audit --audit-level=high` 一起由 lockfile/manifest push、PR、每周计划及人工任务触发。发布门禁只复用 canonical origin、HEAD=FETCH_HEAD 且 7 天内检查过上游的宿主 RustSec DB；否则隔离联网刷新，离线失败关闭，并把实际 revision/fetch epoch 写入制品清单 | 无法及时发现已知依赖漏洞；直接复用可变、过期或来源不明的数据库会让绿色审计结论失去时间和来源证据 | 开发/运维 |
 | T-12 | 统一质量与部署门禁 | `scripts/check.sh` 运行 Rustfmt、Clippy `-D warnings`、全 targets/features 测试、固定 `cargo-llvm-cov 0.8.6` 且行覆盖率不低于 70%、Cargo/npm 审计、固定 Acorn 8.17.0 AST 与有界词法常量 JS 分析及正负对抗样例、TypeScript 5.9.3 strict `checkJs` 全生产源码类型检查、支持围栏代码与 symlink fail-closed 的 Markdown 链接/锚点检查、含固定 `@axe-core/playwright 4.12.1` WCAG A/AA 扫描的双浏览器测试、生产解析器 YAML 校验、systemd/nginx 语法及隔离的真实 nginx 行为测试，并执行发布 no-clobber、Git 来源替换、归档树、SPDX notice、签名算法矩阵/失败传播和 lockfile npm cache 播种自测。五个 Bash 源总是经过 `bash -n`，安装 ShellCheck 时再执行 warning 门；CI 固定安装并强制使用 0.11.0。动态 computed 解构的属性名无法静态求值时失败关闭；原生 `alert/confirm/prompt` 的直接、别名、计算属性和反射访问同样由 AST 负例门拒绝。外部/解析输入保持 `unknown` 并由类型守卫收窄，生产源码不保留显式或隐式 `any`。部署 fixture 的真实 checkout 路径包含空格、`&`、`#` 和反斜杠，运行副本再使用安全名称 | 仍可手工执行，但容易漏项或让文档/部署示例与代码漂移；Acorn 门是防御纵深静态分析，strict `checkJs` 无需迁移 `.ts`，二者仍不等价于完整跨过程污点证明、ESLint 或通用 CommonMark parser。本地缺少 ShellCheck 时会明确跳过以保持离线可用，强制性由 CI 提供 | 开发/运维 |
 | T-13 | 100000 项手工基准 | 默认忽略，按需创建真实超大目录检查第一页性能 | 删除不影响正确性，但失去大目录回归基线 | 开发/运维 |
 | T-14 | 可验证本地发布 | release profile 使用 `opt-level=3`、LTO、单 codegen unit、`panic=abort` 和 strip；脚本要求干净 worktree、Cargo 版本与精确指向 HEAD 的 tag。完整 `scripts/check.sh` 在已验证 commit archive 的无 Git 私有副本中以清空环境、独立 Cargo/npm/target/tmp 执行；Cargo vendor 后离线，npm cache 只按 lockfile HTTPS+SHA-512 播种并 prefer-offline。门禁后用 snapshot index 复验 tracked 内容/mode 并拒绝非忽略新增路径，丢弃质量树，再 fresh extract 构建；签名/发布前继续复核 exact source。所有源码树拒绝 symlink、submodule 和特殊文件，只从摘要锁定 bare façade 归档，前后构建/打包 archive 的 commit、树、mode、额外路径和 SHA-256 均复核。固定 `cargo-cyclonedx 0.5.9` 离线生成规范化 SBOM，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID；第三方 notice 要求每个 vendored 可达非开发依赖有非空、经审核的 SPDX `license` 表达式，再解析审核清单内 SPDX AST 并要求完整 permissive 分支。`license_file` 仅收集依赖自身 no-follow UTF-8 许可证文本，不能替代缺失表达式或作为分类 fallback，项目许可证也不作正文 fallback。Rust 1.97.1 标准库 notice 还须匹配审核摘要。`BUILD-ENVIRONMENT.txt` 记录完整 SHA/版本/epoch/target 和实际 Bash、Rust/Cargo、Node/npm、Git、OpenSSL、归档/coreutils 版本。该清单、SBOM、项目许可证、两类 notice 和包内文件均进 checksum；签名密钥最后才短暂打开，并只允许 Ed25519、Ed448、RSA ≥3072 bit 或 `prime256v1`/`secp384r1`/`secp521r1` ECDSA，其他算法/强度失败关闭。输出目录须为当前 UID 所有且 group/other 不可写，经目录 fd 独占锁和 `/proc/self/fd` 锚定；私有 stage 与目标必须同文件系统，并依赖支持 `--update=none --no-copy` 的 GNU `mv` 做原子 no-clobber 发布，且以 source 必须消失的后置条件把静默碰撞变为失败 | 删除会失去源码到制品的可追踪性、依赖/许可清单、密钥强度底线和隔离验收流程。npm 缺失包/审计仍可能联网，环境清单只记录事实而不钉扎宿主工具，SBOM 规范化不等于完整 CycloneDX schema 验证；晚打开只缩短同 UID 暴露面，正式签名仍需独立账号、主机或 HSM | 开发/运维 |
-| T-15 | Node、浏览器与宿主工具边界 | `package-lock.json` 精确锁定 Playwright 1.61.1、`@axe-core/playwright` 4.12.1、Acorn 8.17.0 和 TypeScript 5.9.3，`package.json` 对本地环境只要求 Node ≥18；远程 CI 固定 Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0 及 ShellCheck 归档 SHA-256，并记录 runner image 和实际工具版本。正式包另以 `BUILD-ENVIRONMENT.txt` 记录实际发布工具版本。本地 ShellCheck、npm、cargo-audit、nginx、systemd、OpenSSL、Bash、Git、curl、GNU tar/gzip/coreutils、util-linux `flock` 和可选 Edge 的版本未由仓库统一钉死 | 删除 lockfile 会让前端门禁漂移；环境清单只支持追溯，不会把“固定 CI 关键工具”或一次记录变成整条宿主链逐包可重复；仍须复验 GitHub runner 镜像和本地宿主工具 | 开发/运维 |
+| T-15 | Node、浏览器与宿主工具边界 | `package-lock.json` 精确锁定 Playwright 1.61.1、`@axe-core/playwright` 4.12.1、Acorn 8.17.0 和 TypeScript 5.9.3，`package.json` 对本地环境只要求 Node ≥18；远程 CI 固定 Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、cargo-audit 0.22.2 及 ShellCheck 归档 SHA-256，并记录 runner image 和实际工具版本。正式包另以 `BUILD-ENVIRONMENT.txt` v2 记录实际发布工具和 RustSec DB 身份。本地 ShellCheck、npm、nginx、systemd、OpenSSL、Bash、Git、curl、GNU tar/gzip/coreutils、util-linux `flock` 和可选 Edge 的版本未由仓库统一钉死 | 删除 lockfile 会让前端门禁漂移；环境清单只支持追溯，不会把“固定 CI 关键工具”或一次记录变成整条宿主链逐包可重复；仍须复验 GitHub runner 镜像和本地宿主工具 | 开发/运维 |
 | T-16 | 支持版本与私密报告策略 | 安全修复在当前源码树开发，但 dirty worktree 或仓库 HEAD 不自动成为受支持二进制；仅按 exact tag、checksum 和签名流程生成的最新正式制品受支持，正式发布前不声明任何受支持二进制。漏洞应通过供应方的私密安全/事件通道报告，提供受影响版本和 `dufs --version` 的完整 Git SHA，并对配置、路径和凭据材料脱敏；发行方必须随二进制公布实际受监控的私密联系地址，公开上游 issue 不视为保密渠道 | 删除明确策略会混淆源码审查、正式制品和下游修改版的支持责任，也可能把敏感报告泄露到公开渠道 | 开发/运维 |
 | T-17 | 只读分层远程 CI | `.github/workflows/read-only-ci.yml` 仅使用 `pull_request`、`push` 和人工触发，权限为 `contents: read`，checkout 不持久化凭据，Action 固定完整 commit SHA。静态层运行 Shell/JS/type/docs，兼容层复验 Node 18.20.8 下限，Rust 层运行 fmt/Clippy/test，质量层独立报告覆盖率、部署、发布脚本自测和 release binary smoke，浏览器层独立矩阵运行 Chromium 与 Firefox；不接收发布密钥、不创建 tag/release、不上传制品 | 删除后仍可运行权威本地门，但会失去每次远程变更的分层反馈；把该门当正式发布会绕过审计、exact-tag、签名和原子发布链 | 开发/运维 |
 
 T-14 的原子 no-clobber 保证要求发布文件系统支持 Linux `RENAME_NOREPLACE`。脚本只在 source 消失、destination 是实体目录且设备号/inode 与移动前 source 相同时确认发布；`--update=none` 静默跳过、身份不符或不完整移动都会失败。
+
+T-14 的 `BUILD-ENVIRONMENT.txt` 当前使用 `dufs-build-environment-v2`，除既有工具字段外还记录 cargo-audit 版本、RustSec advisory DB revision 和最近 fetch epoch。包内文档检查先完成，`SHA256SUMS` 才作为最后一次内容变更生成；之后只读复核递归覆盖。`--self-test` 另验证深层 sentinel、篡改失败、两次归档一致和解包往返。部署门中的 systemd 只使用占位 `ExecStart` 做静态验证，真实 nginx 连接的是 mock upstream，不等价于生产 systemd+Dufs+nginx 联合启动。
 
 ## 15. HTTP 入口总表
 
@@ -381,7 +383,7 @@ T-14 的原子 no-clobber 保证要求发布文件系统支持 Linux `RENAME_NOR
 | `POST /__dufs__/logout` | 撤销当前会话 | 是 | CSRF + 同源 |
 | `GET/HEAD /__dufs_assets_<digest>/*` | 内置 JS、CSS、图标；HEAD 与 GET 使用相同 metadata，不发送正文 | 是 | 只读 |
 | `GET/HEAD /__dufs__/health` | 不访问共享根的公开 liveness | 否 | 只读 |
-| `GET/HEAD /__dufs__/ready` | 检查共享根、空间预算、统一 state store 线程和停机状态的 readiness | 是 | 只读 |
+| `GET/HEAD /__dufs__/ready` | 以创建/写入/文件同步/删除/目录同步探针检查共享根，并以回滚写事务检查统一 state store，同时检查空间和停机状态 | 是 | 探针写入后清理/回滚 |
 | `GET /__dufs__/api/list` | 分页列表或递归搜索结果 | 是 | 只读 |
 | `POST /__dufs__/api/mkdir` | 新建目录 | 是 | CSRF + 同源 + JSON |
 | `POST /__dufs__/api/move` | 移动到目标目录并保留原名称 | 是 | CSRF + 同源 + JSON |
@@ -441,7 +443,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 1. `hash-password`、登录页面和服务端登录解析已经统一为非空且最多 1024 个 UTF-8 字节，但仍没有最低长度或复杂度要求；配置时应自行使用高熵密码。
 2. Dufs 已有正文读取全局/每 IP 并发限制、全局/每 IP token bucket、Argon2 并发上限和按“客户端 IP + 账号摘要”组合键的失败退避，但状态只在当前进程内、成功会清除对应组合记录，也不是分布式防护；公网网关仍应独立按可信真实 IP 限速。
 3. 会话空闲 30 分钟和绝对 12 小时目前是固定常量，不能通过命令行或 YAML 调整。
-4. 公开 `/__dufs__/health` 只证明进程和路由能响应；认证 `/__dufs__/ready` 还检查共享根目录、扣除进程预留后的最低空间、统一 state store 线程和停机状态，但仍不执行实际新建、rename、fsync 或介质读回，因此不能替代写入冒烟和备份恢复演练。
+4. 公开 `/__dufs__/health` 只证明进程和路由能响应；认证 `/__dufs__/ready` 会真实创建隐藏文件、写入、同步文件、删除并同步根目录，还会在当前 SQLite actor 连接中执行回滚写事务。它仍不执行 rename 或介质读回，也不预测目标冲突、上传/purge 容量等全部业务准入，因此不能替代完整 CRUD 冒烟和备份恢复演练。
 5. `$remote_addr` 始终是与 Dufs 建立 TCP 连接的 peer；登录限流仅在该 peer 是 loopback 时接受恰好一个、无逗号且能解析为 IP 的 `X-Forwarded-For`。部署示例要求网关覆盖该头；非回环直连或多值头会退回 TCP peer。
 6. CLI/YAML 的最终 bind 列表必须非空；`bind: []` 在创建 listener 或其他运行时资源前就以明确配置错误失败。多个 listener 各自先 accept，再为已接受 socket 竞争共享连接许可，因此空闲地址不会预占许可；达到上限时内核 backlog 仍可能暂存已经完成握手的连接。
 7. 成功上传任务会保留在上传队列表格中，但不会立即插入已经加载的普通目录列表，刷新页面后才会出现在常规列表。
@@ -463,7 +465,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 23. 同一共享根上的第二个 Dufs 实例会因根 fd 的非阻塞独占 `flock` 启动失败；该 advisory lock 没有 PID 文件，也不能阻止 shell、宿主机、网络文件系统另一节点或忽略 flock 的程序修改目录。多个根目录仍由多个进程分别管理。
 24. 上传总 deadline 从每次 PUT/PATCH 等待路径租约前开始，覆盖准备、正文、写入、flush、metadata 重放和等待提交结果；每次 PATCH 重试重新计时。合法头解析后依次等待路径租约、尝试上传槽、受跟踪地读取 route metadata，再进入 owner checkpoint/上传 mutation。路径或 route 超时返回绑定的 `408 not-started`，槽满直接返回 `429 not-started` 且不读旧 state；它可显示 Retry，但必须先 HEAD。只有进入受跟踪上传 mutation 后，deadline 到期才保守返回 `408 unknown`，后台继续持有租约和槽直到安全收尾。最终 rename/fsync 进入提交后不可取消，前端不提供盲目重试。
 25. mkdir、move、rename 或 DELETE 的 operation ID 在路径等待/校验前预留。已知 pre-commit 失败会记录为 `failed`，pre-commit guard 异常丢弃会移除预留并允许重试；只有越过明确 commit 边界后的异常退出才记录 `unknown`。提交可能在外层 `request-timeout` 返回 `504` 后继续；客户端用原 ID 查询一次，严格核对同一 ID 和 `running/succeeded/failed/unknown`，不自动重发。`/__dufs__/api/jobs/<uuid>` 是唯一查询路径且当前只公开 mutation operation。schema v3 文件型 store 同时存储 operation/upload/purge；必填 `state-dir` 固定使用 `state.sqlite3`，只支持从 v2 事务迁移。operation 终态 TTL 15 分钟，容量全局 4096/每账号 1024；upload TTL 7 天，容量 16384/4096；purge 容量 4096/1024 且不用 TTL 丢弃。SQLite 与文件系统没有共同事务，依靠 `unknown`、`AwaitingConfirmation` 或路径/inode reconciliation 保守恢复。
-26. 递归清理不再依赖 `/proc/self/fd`：工作状态只保存根内相对路径和 cursor，每片重新从已有父目录 fd 逐级执行 `openat/statat/unlinkat` 且不跟随符号链接，临时 fd 在片结束前关闭。purge 每片最多 256 项/25 ms，I/O 错误持久化回 `Ready` 并从 100 ms 指数退避到 30 秒，不因固定次数丢弃；状态命令瞬时失败时有界保留本地 claim，并在回读仍为 `Claimed` 后重试，重启则把 `Claimed`→`Ready`。分片 cursor 从 trash 根重建，readdir EOF 后目录仍 `ENOTEMPTY` 时从 cursor 0 重扫。维护扫描每批最多 1024 项/100 ms，只为未记账内部暂存文件与 orphan trash 兜底。
+26. 递归清理不再依赖 `/proc/self/fd`：工作状态只保存根内相对路径和 cursor，每片重新从已有父目录 fd 逐级执行 `openat/statat/unlinkat` 且不跟随符号链接，临时 fd 在片结束前关闭。purge 每片最多 256 项/25 ms，I/O 错误持久化回 `Ready` 并从 100 ms 指数退避到 30 秒，不因固定次数丢弃；状态命令瞬时失败时有界保留本地 claim，并在回读仍为 `Claimed` 后重试，重启则把 `Claimed`→`Ready`。分片 cursor 从 trash 根重建，readdir EOF 后目录仍 `ENOTEMPTY` 时从 cursor 0 重扫。维护扫描每批最多 1024 项/100 ms，只为未记账内部暂存文件与 orphan trash 兜底；`.dufs-quarantine-<uuid>.hold` 明确排除在自动扫描之外，必须停服调查后人工移除。
 27. `http/client.js` 调用 `http/response_buffer.js` 实施的 16 KiB/16 MiB 上限，是目录页 Fetch 的硬流式读取边界，不适用于浏览器原生导航或文件流式下载。分块先保留在有界 replay stream；类型化 `requestJson`/`requestNoContent` 随后直接消费该 stream，不用 `Response.clone()` 产生第二个未读 tee 分支。上传 XHR 会在响应头、下载 progress 和最终文本三个阶段拒绝超过 16 KiB 的响应，但浏览器可能在事件回调前已经内部缓冲一个网络块；因此这是客户端接受/中止边界，不是对浏览器瞬时内存分配的严格证明。
 28. move 只接受已经存在的目标目录，目标不存在返回 `404 destination_directory_not_found`，目标不是目录返回 `409 destination_not_directory`；需要新的目标目录时先使用 New folder，Move 本身不会隐式创建目录。
 29. 当前可访问性自动化覆盖原生控件、行内名称编辑器、页面内 `<dialog>` 的名称/标签/键盘关闭与焦点恢复、ARIA、至少 24 px 操作目标、320 CSS 像素回流及 `forced-colors: active` 下的关键边界；固定 `@axe-core/playwright 4.12.1` 还按 WCAG 2.0/2.1/2.2 A/AA 标签扫描登录页、文件页、打开的行内编辑器和操作对话框。但自动扫描仍不构成 WCAG 合规声明，项目尚未完成真实读屏和系统化人工对比度验收。

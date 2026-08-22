@@ -29,7 +29,13 @@ fn account_can_upload_and_overwrite(server: TestServer) -> Result<(), Error> {
 #[rstest]
 fn account_can_delete(server: TestServer) -> Result<(), Error> {
     let url = format!("{}test.html", server.url());
-    let resp = server.request(reqwest::Method::DELETE, &url).send()?;
+    let revision = preflight_upload_target(&server, "/test.html")?
+        .revision
+        .ok_or("delete target has no revision")?;
+    let resp = server
+        .request(reqwest::Method::DELETE, &url)
+        .header("If-Match", format!("\"{revision}\""))
+        .send()?;
     assert_eq!(resp.status(), 204);
     assert_eq!(server.get(url)?.status(), 404);
     Ok(())

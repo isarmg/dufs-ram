@@ -24,6 +24,107 @@ fn resumable_upload(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn full_running_checkpoint_can_reenter_commit_with_empty_patch(
+    #[with(&[
+        "--upload-idle-timeout",
+        "1",
+        "--upload-total-timeout",
+        "10",
+        "--min-free-space",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    use fixtures::{TEST_PASSWORD, TEST_USER};
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::Duration,
+    };
+
+    const UPLOAD_LENGTH: usize = 20 * 1024 * 1024;
+
+    let session = server.login(TEST_USER, TEST_PASSWORD)?;
+    let upload_id = Uuid::new_v4();
+    let mut upload = TcpStream::connect(("127.0.0.1", server.port()))?;
+    upload.set_read_timeout(Some(Duration::from_secs(10)))?;
+    upload.set_write_timeout(Some(Duration::from_secs(10)))?;
+    upload.write_all(
+        format!(
+            concat!(
+                "PUT /full-checkpoint.bin HTTP/1.1\r\n",
+                "Host: localhost:{}\r\n",
+                "Cookie: {}\r\n",
+                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-Dufs-Upload-Id: {}\r\n",
+                "X-Dufs-Upload-Length: {}\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "{:x}\r\n"
+            ),
+            server.port(),
+            session.cookie(),
+            session.csrf_token(),
+            upload_id,
+            UPLOAD_LENGTH,
+            UPLOAD_LENGTH,
+        )
+        .as_bytes(),
+    )?;
+    upload.write_all(&vec![b'x'; UPLOAD_LENGTH])?;
+    upload.write_all(b"\r\n")?;
+    upload.flush()?;
+
+    // The complete chunk is durable, but withholding the terminating zero
+    // chunk forces the request through the timeout checkpoint path.
+    let mut timeout_response = String::new();
+    upload.read_to_string(&mut timeout_response)?;
+    assert!(
+        timeout_response.starts_with("HTTP/1.1 408"),
+        "{timeout_response}"
+    );
+    assert!(!server.path().join("full-checkpoint.bin").exists());
+
+    let checkpoint = server
+        .request(
+            reqwest::Method::HEAD,
+            server.url().join("full-checkpoint.bin")?,
+        )
+        .header("X-Dufs-Upload-Id", upload_id.to_string())
+        .send()?;
+    assert_eq!(checkpoint.status(), 200);
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-operation-state").unwrap(),
+        "running"
+    );
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-upload-offset").unwrap(),
+        UPLOAD_LENGTH.to_string().as_str()
+    );
+
+    let committed = with_resume_upload_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            server.url().join("full-checkpoint.bin")?,
+        ),
+        upload_id,
+        UPLOAD_LENGTH as u64,
+        UPLOAD_LENGTH as u64,
+    )
+    .body(Vec::new())
+    .send()?;
+    assert_eq!(committed.status(), 204);
+    assert_eq!(
+        committed.headers().get("x-dufs-operation-state").unwrap(),
+        "committed"
+    );
+    let metadata = std::fs::metadata(server.path().join("full-checkpoint.bin"))?;
+    assert_eq!(metadata.len(), UPLOAD_LENGTH as u64);
+    Ok(())
+}
+
+#[rstest]
 fn resuming_an_unknown_upload_returns_a_problem_with_protocol_headers(
     server: TestServer,
 ) -> Result<(), Error> {

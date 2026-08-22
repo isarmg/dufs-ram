@@ -14,12 +14,14 @@ updates.
 ## Reporting a vulnerability
 
 Do not disclose a suspected vulnerability in a public issue, chat room, log,
-or shared document. Reports about the upstream project should use GitHub's
-[private vulnerability reporting form](https://github.com/sigoden/dufs/security/advisories/new).
-Reports about a redistributed binary should first use the private security or
-incident-response channel published by the organization that supplied it, and
-that organization should coordinate upstream through the same private GitHub
-form. Send the following information:
+or shared document. Reports about this fork should use its GitHub
+[private vulnerability reporting form](https://github.com/isarmg/dufs-ram/security/advisories/new)
+when that form is enabled. If it is unavailable, do not fall back to a public
+issue; use a private security contact published by the fork maintainer or by
+the organization that supplied the binary. A report confirmed to affect an
+unmodified upstream release may also be coordinated through the upstream
+[private form](https://github.com/sigoden/dufs/security/advisories/new).
+Send the following information:
 
 - affected version and the Git SHA printed by `dufs --version`;
 - deployment topology and relevant configuration with passwords, PHC strings,
@@ -27,13 +29,13 @@ form. Send the following information:
 - minimal reproduction steps and expected impact;
 - whether exploitation is already suspected.
 
-The upstream project targets an acknowledgement within three business days,
+The fork maintainers target an acknowledgement within three business days,
 an initial severity and scope assessment within seven business days, and a
 private status update at least every seven days until remediation or closure.
 These are response targets rather than a promise that every issue can be fixed
 on that schedule. The operator must preserve logs, restrict backend network
-access, and contact the repository maintainer through the private reporting
-form before any coordinated publication. A distributor must publish its
+access, and contact the relevant maintainer through a private reporting
+channel before any coordinated publication. A distributor must publish its
 actual monitored contact address alongside the binary; this repository does
 not promise that a public upstream issue is confidential.
 
@@ -73,11 +75,15 @@ also runs the complete quality gate in a verified, Git-metadata-free commit
 archive with a sanitized environment and private Cargo, npm, build, and
 temporary state. Cargo dependencies are vendored before offline checks; npm
 cache entries are admitted only after matching lockfile HTTPS locations and
-SHA-512 integrity, and an available local RustSec database is cloned without
-hard links before `--no-fetch` use. Missing npm packages, `npm audit`, or the
-absence of a reusable local RustSec database can still require controlled
-network access; environment isolation is not itself proof of a fully offline
-quality gate. A separate snapshot index then verifies
+SHA-512 integrity. The gate requires cargo-audit 0.22.2. A host RustSec
+database is reusable offline only when its origin is the canonical RustSec
+repository, HEAD matches the fetched revision, and its physical `FETCH_HEAD`
+shows an upstream check within seven days. Otherwise the isolated Cargo home
+must refresh the database over the network and fails closed when that is not
+possible. The accepted advisory revision and fetch epoch are recorded in the
+signed package environment manifest. Missing npm packages and `npm audit` can
+still require controlled network access; environment isolation is not itself
+proof of a fully offline quality gate. A separate snapshot index then verifies
 tracked content, modes, and unexpected non-ignored paths. That quality tree is
 discarded before a fresh extraction supplies the signed build. The exact clean
 tag/source is rechecked after the gate, before signing, and before publication.

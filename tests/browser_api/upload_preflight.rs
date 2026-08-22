@@ -271,3 +271,34 @@ fn upload_preflight_and_revision_condition_prevent_stale_overwrite(
     assert_eq!(std::fs::read(&target_path)?, b"safe-create");
     Ok(())
 }
+
+#[rstest]
+fn list_items_expose_the_same_opaque_revision_as_upload_preflight(
+    server: TestServer,
+) -> Result<(), Error> {
+    let response = server.list_api("/", &[("limit", "500")])?;
+    assert_eq!(response.status(), 200);
+    let listing = response_json(response)?;
+    let item = listing["paths"]
+        .as_array()
+        .ok_or("list response omitted paths")?
+        .iter()
+        .find(|item| item["name"] == "test.html")
+        .ok_or("list response omitted test.html")?;
+    let revision = item["revision"]
+        .as_str()
+        .ok_or("list item omitted revision")?;
+    assert_eq!(revision.len(), 64);
+    assert!(
+        revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert_eq!(
+        preflight_upload_target(&server, "/test.html")?
+            .revision
+            .as_deref(),
+        Some(revision)
+    );
+    Ok(())
+}
