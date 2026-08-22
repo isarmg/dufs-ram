@@ -269,6 +269,13 @@ function setupNewFile() {
 function redirectToLogin() {
   if (redirectingToLogin) return;
   redirectingToLogin = true;
+  // A running upload can raise a beforeunload confirmation. If the user
+  // cancels that navigation, this document remains active and must be able to
+  // react to a later authentication failure. A successful reload destroys the
+  // document before this reset matters.
+  window.setTimeout(() => {
+    redirectingToLogin = false;
+  }, 0);
   location.reload();
 }
 

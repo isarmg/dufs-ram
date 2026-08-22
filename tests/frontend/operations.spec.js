@@ -8,6 +8,7 @@ const {
   pageData,
   rotateSession,
   rowByName,
+  selectFiles,
   submitActionDialog,
   test,
 } = require("./fixtures");
@@ -1960,6 +1961,84 @@ test("会话轮换后的 CSRF 响应直接刷新且不查询未登记操作", as
   await expect(page.locator(".index-page")).toBeVisible();
   await expect(rowByName(page, "delete-me.txt")).toBeVisible();
   expect(statusQueries).toBe(0);
+});
+
+test("取消认证重载后下一次 401 仍会再次请求重载", async ({
+  appPage: page,
+}) => {
+  let releaseUpload;
+  let markUploadStarted;
+  let mkdirRequests = 0;
+  const uploadGate = new Promise(resolve => {
+    releaseUpload = resolve;
+  });
+  const uploadStarted = new Promise(resolve => {
+    markUploadStarted = resolve;
+  });
+  await page.route("**/reload-guard-upload.txt", async route => {
+    if (route.request().method() !== "PUT") {
+      await route.continue();
+      return;
+    }
+    markUploadStarted();
+    await uploadGate;
+    await route.fulfill({
+      status: 201,
+      headers: {
+        "X-Dufs-Upload-Id":
+          route.request().headers()["x-dufs-upload-id"],
+        "X-Dufs-Upload-Length":
+          route.request().headers()["x-dufs-upload-length"],
+        "X-Dufs-Upload-Offset":
+          route.request().headers()["x-dufs-upload-length"],
+        "X-Dufs-Operation-State": "committed",
+      },
+      body: "",
+    });
+  });
+  await page.route("**/__dufs__/api/mkdir", route => {
+    mkdirRequests++;
+    return route.fulfill({
+      status: 401,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        type: "urn:dufs:problem:authentication_required",
+        title: "Authentication required",
+        status: 401,
+        code: "authentication_required",
+        detail: "Sign in again",
+      }),
+    });
+  });
+
+  const browserDialogTypes = [];
+  page.on("dialog", async dialog => {
+    browserDialogTypes.push(dialog.type());
+    await dialog.dismiss();
+  });
+  await selectFiles(page, "#file", [{
+    name: "reload-guard-upload.txt",
+    buffer: Buffer.from("keep the beforeunload guard active"),
+  }]);
+  await uploadStarted;
+
+  const newFolder = page.getByRole("button", { name: "New folder" });
+  await newFolder.click();
+  await expect.poll(() => browserDialogTypes).toEqual(["beforeunload"]);
+  await expect(newFolder).not.toHaveAttribute("aria-busy", "true");
+
+  await newFolder.click();
+  await expect.poll(() => browserDialogTypes).toEqual([
+    "beforeunload",
+    "beforeunload",
+  ]);
+  expect(mkdirRequests).toBe(2);
+
+  releaseUpload();
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "reload-guard-upload.txt: upload complete",
+  );
 });
 
 test("提交结果不确定时只查询一次且不盲目重试", async ({ appPage: page }) => {
