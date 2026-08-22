@@ -78,6 +78,11 @@ const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
+        name: "modules/shared/index_data.js",
+        contents: include_str!("../../assets/modules/shared/index_data.js").as_bytes(),
+        content_type: "application/javascript; charset=UTF-8",
+    },
+    EmbeddedAsset {
         name: "modules/shared/mutation_effect.js",
         contents: include_str!("../../assets/modules/shared/mutation_effect.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
