@@ -2129,6 +2129,187 @@ test("同一页面重复逻辑目标只会排入一次", async ({ appPage: page 
   expect(putCount).toBe(1);
 });
 
+test("同路径的新上传占用期间旧失败行不能重试", async ({
+  appPage: page,
+}) => {
+  let putCount = 0;
+  let headCount = 0;
+  let releaseSecond;
+  let markSecondStarted;
+  const secondGate = new Promise(resolve => {
+    releaseSecond = resolve;
+  });
+  const secondStarted = new Promise(resolve => {
+    markSecondStarted = resolve;
+  });
+  await page.route("**/claimed-recovery-target.txt", async route => {
+    const request = route.request();
+    if (request.method() === "HEAD") {
+      headCount++;
+      await route.fulfill({
+        status: 404,
+        headers: protocolHeaders(request, "not-seen"),
+        body: "",
+      });
+      return;
+    }
+    putCount++;
+    if (putCount === 1) {
+      await route.fulfill({
+        status: 429,
+        contentType: "application/problem+json",
+        headers: protocolHeaders(request, "not-started"),
+        body: problemDetails(
+          429,
+          "upload_concurrency_limit",
+          "Upload was not started",
+          "retry",
+        ),
+      });
+      return;
+    }
+    markSecondStarted();
+    await secondGate;
+    await route.fulfill({
+      status: 201,
+      headers: protocolHeaders(request, "committed", "length"),
+      body: "",
+    });
+  });
+
+  const file = {
+    name: "claimed-recovery-target.txt",
+    buffer: Buffer.from("same logical destination"),
+  };
+  await selectFiles(page, "#file", [file]);
+  const retry = page.getByRole("button", {
+    name: "Retry upload claimed-recovery-target.txt",
+  });
+  await expect(retry).toBeVisible();
+
+  await selectFiles(page, "#file", [file]);
+  await secondStarted;
+  await retry.click();
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "Another upload already targets claimed-recovery-target.txt",
+  );
+  await expect(retry).toBeVisible();
+  expect({ putCount, headCount }).toEqual({ putCount: 2, headCount: 0 });
+
+  releaseSecond();
+  await expect(page.locator("#uploadStatus1")).toHaveAttribute(
+    "aria-label",
+    "claimed-recovery-target.txt: upload complete",
+  );
+});
+
+test("上传预检等待期间的旧失败重试仍保持目标唯一", async ({
+  appPage: page,
+}) => {
+  let preflightCount = 0;
+  let releaseSecondPreflight;
+  let markSecondPreflightStarted;
+  const secondPreflightGate = new Promise(resolve => {
+    releaseSecondPreflight = resolve;
+  });
+  const secondPreflightStarted = new Promise(resolve => {
+    markSecondPreflightStarted = resolve;
+  });
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    preflightCount++;
+    if (preflightCount === 2) {
+      markSecondPreflightStarted();
+      await secondPreflightGate;
+    }
+    const { paths } = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        targets: paths.map(path => ({
+          path,
+          exists: false,
+          revision: null,
+          replaceable: true,
+        })),
+      }),
+    });
+  });
+
+  let putCount = 0;
+  let headCount = 0;
+  let releaseRetry;
+  let markRetryStarted;
+  const retryGate = new Promise(resolve => {
+    releaseRetry = resolve;
+  });
+  const retryStarted = new Promise(resolve => {
+    markRetryStarted = resolve;
+  });
+  await page.route("**/preflight-recovery-target.txt", async route => {
+    const request = route.request();
+    if (request.method() === "HEAD") {
+      headCount++;
+      await route.fulfill({
+        status: 404,
+        headers: protocolHeaders(request, "not-seen"),
+        body: "",
+      });
+      return;
+    }
+    putCount++;
+    if (putCount === 1) {
+      await route.fulfill({
+        status: 429,
+        contentType: "application/problem+json",
+        headers: protocolHeaders(request, "not-started"),
+        body: problemDetails(
+          429,
+          "upload_concurrency_limit",
+          "Upload was not started",
+          "retry",
+        ),
+      });
+      return;
+    }
+    markRetryStarted();
+    await retryGate;
+    await route.fulfill({
+      status: 201,
+      headers: protocolHeaders(request, "committed", "length"),
+      body: "",
+    });
+  });
+
+  const file = {
+    name: "preflight-recovery-target.txt",
+    buffer: Buffer.from("preflight recovery race"),
+  };
+  await selectFiles(page, "#file", [file]);
+  const retry = page.getByRole("button", {
+    name: "Retry upload preflight-recovery-target.txt",
+  });
+  await expect(retry).toBeVisible();
+
+  await selectFiles(page, "#file", [file]);
+  await secondPreflightStarted;
+  await retry.click();
+  await retryStarted;
+  releaseSecondPreflight();
+
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "Skipped duplicate upload target preflight-recovery-target.txt",
+  );
+  await expect(page.locator(".upload-status")).toHaveCount(1);
+  expect({ putCount, headCount }).toEqual({ putCount: 2, headCount: 1 });
+
+  releaseRetry();
+  await expect(page.locator("#uploadStatus0")).toHaveAttribute(
+    "aria-label",
+    "preflight-recovery-target.txt: upload complete",
+  );
+});
+
 test("认证失效会暂停队列并允许直接刷新恢复", async ({ appPage: page }) => {
   const files = [
     {

@@ -883,7 +883,14 @@ export function createUploadManager(options) {
         showPendingLimitMessage();
         return;
       }
+      if (knownTargets.has(this.name)) {
+        queueMessage.textContent =
+          `Another upload already targets ${this.name}. Wait for it to finish before retrying this upload.`;
+        queueMessage.classList.remove("hidden");
+        return;
+      }
       if (!failed.delete(this.index)) return;
+      knownTargets.add(this.name);
       this.clearRecovery();
       if (resolvingUnknown) {
         releaseTerminalRow(this);
@@ -1441,10 +1448,21 @@ export function createUploadManager(options) {
         (selectionOrder.get(right.name) ?? 0),
     );
 
+    // The preflight request and overwrite dialog both yield to unrelated UI
+    // actions. Re-check immediately before reserving the batch so a recovery
+    // that claimed the same logical target cannot be admitted concurrently.
+    uploadEntries = uploadEntries.filter(entry => {
+      if (!knownTargets.has(entry.name)) return true;
+      duplicateName ||= entry.name;
+      return false;
+    });
+
     if (uploadEntries.length === 0) {
-      queueMessage.textContent = blockedNames.length > 0
-        ? `Skipped ${formatNameSummary(blockedNames)} because the destination cannot be replaced.`
-        : "All conflicting upload destinations were skipped.";
+      queueMessage.textContent = duplicateName
+        ? `Skipped duplicate upload target ${duplicateName}. Refresh the folder before replacing the same target again.`
+        : blockedNames.length > 0
+          ? `Skipped ${formatNameSummary(blockedNames)} because the destination cannot be replaced.`
+          : "All conflicting upload destinations were skipped.";
       queueMessage.classList.remove("hidden");
       return;
     }
@@ -1485,6 +1503,14 @@ export function createUploadManager(options) {
       queueMessage.classList.add("hidden");
     }
 
+    // Claim every logical target before the first chunking yield. Otherwise a
+    // recovery click could claim an unmaterialized tail entry. Reservations
+    // for entries cancelled before construction are released in `finally`.
+    const unmaterializedTargets = new Set(
+      uploadEntries.map(entry => entry.name),
+    );
+    for (const name of unmaterializedTargets) knownTargets.add(name);
+
     let processed = 0;
     try {
       for (const entry of uploadEntries) {
@@ -1496,14 +1522,15 @@ export function createUploadManager(options) {
           batchId,
         );
         uploader.pendingAccounted = true;
-        knownTargets.add(entry.name);
         batch.members.add(uploader);
         uploader.enqueue();
+        unmaterializedTargets.delete(entry.name);
         batch.remainingEntries--;
         processed++;
         if (processed % ENQUEUE_BATCH_SIZE === 0) await yieldToBrowser();
       }
     } finally {
+      for (const name of unmaterializedTargets) knownTargets.delete(name);
       pendingRows = Math.max(0, pendingRows - batch.remainingEntries);
       batch.remainingEntries = 0;
       batch.enqueueComplete = true;
