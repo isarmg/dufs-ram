@@ -134,6 +134,8 @@ pub(super) fn embedded_assets_prefix() -> String {
     for asset in EMBEDDED_ASSETS {
         digest.update((asset.name.len() as u64).to_be_bytes());
         digest.update(asset.name.as_bytes());
+        digest.update((asset.content_type.len() as u64).to_be_bytes());
+        digest.update(asset.content_type.as_bytes());
         digest.update((asset.contents.len() as u64).to_be_bytes());
         digest.update(asset.contents);
     }
