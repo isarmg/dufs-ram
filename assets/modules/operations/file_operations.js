@@ -372,6 +372,7 @@ export function createFileOperations(options) {
         );
         if (result.kind === "authentication") return;
         if (result.kind === "succeeded") {
+          listing.notifyMutation(MUTATION_EFFECT.COMMITTED);
           await showCreatedItem(name, "Dir", returnFocus);
           return;
         }
@@ -422,6 +423,7 @@ export function createFileOperations(options) {
             0,
             onUnauthorized,
           );
+          listing.notifyMutation(MUTATION_EFFECT.COMMITTED);
           await showCreatedItem(name, "File", returnFocus);
           return;
         } catch (error) {
@@ -440,6 +442,7 @@ export function createFileOperations(options) {
           );
           if (status?.authenticationFailed) return;
           if (status?.state === "committed") {
+            listing.notifyMutation(MUTATION_EFFECT.COMMITTED);
             await showCreatedItem(name, "File", returnFocus);
             return;
           }

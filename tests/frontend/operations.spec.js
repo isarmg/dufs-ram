@@ -786,6 +786,41 @@ test("新建空文件立即 PUT newfile 并进入原位编辑", async ({
   await expect(rowByName(page, "newfile")).toBeVisible();
 });
 
+for (const [label, createdName] of [
+  ["New folder", "newfolder"],
+  ["New empty file", "newfile"],
+]) {
+  test(`${label} 提交后无需等待 revision 查询就使列表失效`, async ({
+    appPage: page,
+  }) => {
+    let releasePreflight;
+    let markPreflightStarted;
+    const preflightGate = new Promise(resolve => {
+      releasePreflight = resolve;
+    });
+    const preflightStarted = new Promise(resolve => {
+      markPreflightStarted = resolve;
+    });
+    await page.route("**/__dufs__/api/upload/preflight", async route => {
+      markPreflightStarted();
+      await preflightGate;
+      await fulfillCreatedItemPreflight(route);
+    });
+
+    await page.getByRole("button", { name: label, exact: true }).click();
+    await preflightStarted;
+
+    const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+    await expect(refresh).toBeVisible();
+    await expect(page.locator(".list-status")).toContainText(
+      "Folder contents changed",
+    );
+
+    releasePreflight();
+    await expect(inlineNameInput(page)).toHaveValue(createdName);
+  });
+}
+
 test("文件夹默认名仅在可信冲突后递增且每个候选使用新操作 ID", async ({
   appPage: page,
 }) => {
