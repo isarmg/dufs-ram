@@ -1,21 +1,137 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+## Supported version
 
-The latest release of *dufs* is supported. The fixes for any security issues found will be included
-in the next release.
+Security fixes are developed and reviewed in the current repository source
+tree, but neither a repository `HEAD` nor a dirty worktree is automatically a
+supported binary release.
+For deployed binaries, only the latest release produced by the documented
+exact-tag, checksum, and signature workflow is supported. Until such a release
+exists, this repository makes no supported-binary claim. Older releases,
+dirty worktrees, and downstream-modified builds receive no automatic security
+updates.
 
+## Reporting a vulnerability
 
-## Reporting a Vulnerability
+Do not disclose a suspected vulnerability in a public issue, chat room, log,
+or shared document. Reports about the upstream project should use GitHub's
+[private vulnerability reporting form](https://github.com/sigoden/dufs/security/advisories/new).
+Reports about a redistributed binary should first use the private security or
+incident-response channel published by the organization that supplied it, and
+that organization should coordinate upstream through the same private GitHub
+form. Send the following information:
 
-Please [use *dufs*'s security advisory reporting tool provided by
-GitHub](https://github.com/sigoden/dufs/security/advisories/new) to report security issues.
+- affected version and the Git SHA printed by `dufs --version`;
+- deployment topology and relevant configuration with passwords, PHC strings,
+  cookies, CSRF tokens, private keys, hostnames, and personal paths removed;
+- minimal reproduction steps and expected impact;
+- whether exploitation is already suspected.
 
-We strive to fix security issues as quickly as possible. Across the industry, often the developers'
-slowness in developing and releasing a fix is the biggest delay in the process; we take pride in
-minimizing this delay as much as we practically can. We encourage you to also minimize the delay
-between when you find an issue and when you contact us. You do not need to convince us to take your
-report seriously. You don't need to create a PoC or a patch if that would slow down your reporting.
-You don't need an elaborate write-up. A short, informal note about the issue is good. We can always
-communicate later to fill in any details we need after that first note is shared with us.
+The upstream project targets an acknowledgement within three business days,
+an initial severity and scope assessment within seven business days, and a
+private status update at least every seven days until remediation or closure.
+These are response targets rather than a promise that every issue can be fixed
+on that schedule. The operator must preserve logs, restrict backend network
+access, and contact the repository maintainer through the private reporting
+form before any coordinated publication. A distributor must publish its
+actual monitored contact address alongside the binary; this repository does
+not promise that a public upstream issue is confidential.
 
+## Operational security boundary
+
+Dufs is intended for trusted accounts in a personal or controlled network. It
+must run as a dedicated unprivileged user behind an HTTPS gateway, with the
+backend port restricted to that gateway. All authenticated users can manage
+the entire shared root. Do not expose this build as a multi-tenant service for
+mutually untrusted users.
+
+The release builder and the release signer are separate security roles.
+Production signing should run under a different operating-system account, on
+an isolated signing host, or in an HSM-backed service which never executes
+project source, dependency build scripts, Cargo, rustc, Node.js, or SBOM tools.
+The repository release script deliberately opens a file-based key only after
+all such tools have exited, but processes running under the same UID can still
+read one another's readable files and inspect process metadata. Late opening
+prevents accidental descriptor inheritance; it is not an isolation boundary
+against malicious code with the signing account's UID.
+
+File-based release signing is also fail-closed on key strength. The supported
+set is Ed25519, Ed448, RSA with at least 3072 bits, and ECDSA on prime256v1,
+secp384r1, or secp521r1. DSA, weak RSA, unapproved EC curves, encryption-only
+keys, and algorithms whose type or strength cannot be determined are rejected
+before a signature can be published. This allowlist is a repository release
+policy, not a substitute for independent key custody, rotation, and revocation.
+
+Release source identity must be checked independently of mutable repository
+metadata. The documented release workflow rejects Git replacement refs,
+legacy grafts and private repository attributes, reads the commit through an
+isolated object-store facade whose minimal generated local configuration is
+checksum-locked while system/global configuration is disabled, and verifies
+each extracted tree against the declared commit. Tracked symlinks, submodules,
+special entries, and non-regular extracted entries are rejected. The workflow
+also runs the complete quality gate in a verified, Git-metadata-free commit
+archive with a sanitized environment and private Cargo, npm, build, and
+temporary state. Cargo dependencies are vendored before offline checks; npm
+cache entries are admitted only after matching lockfile HTTPS locations and
+SHA-512 integrity, and an available local RustSec database is cloned without
+hard links before `--no-fetch` use. Missing npm packages, `npm audit`, or the
+absence of a reusable local RustSec database can still require controlled
+network access; environment isolation is not itself proof of a fully offline
+quality gate. A separate snapshot index then verifies
+tracked content, modes, and unexpected non-ignored paths. That quality tree is
+discarded before a fresh extraction supplies the signed build. The exact clean
+tag/source is rechecked after the gate, before signing, and before publication.
+A signed tag alone does not neutralize local Git replacement or attribute
+rules.
+
+Release consumers should verify both the normalized CycloneDX SBOM and
+`THIRD_PARTY_LICENSES.txt` through the package `SHA256SUMS`. The notice is
+generated only from vendored, reachable non-development dependencies. Every
+package must declare a non-empty reviewed SPDX `license` expression; a
+`license_file` supplies upstream text only and cannot replace that expression
+or act as a classification fallback. Expressions are parsed as SPDX syntax and
+must offer a complete approved permissive branch; every declared or
+conventional license/notice candidate must be a non-empty UTF-8, no-follow
+regular file inside that dependency's own vendored source. Project licenses
+are never fallback text for a dependency.
+SBOM normalization accepts only an exact 40- or 64-character lowercase
+hexadecimal source revision and prevents local build-path leakage, but is not
+a complete CycloneDX schema validation.
+
+The package must also contain
+`RUST-STANDARD-LIBRARY-COPYRIGHT.html`, copied from the pinned Rust 1.97.1
+sysroot only after its regular-file, containment, and reviewed SHA-256 checks
+pass. It, the project licenses, dependency notice, and SBOM are all covered by
+the package `SHA256SUMS`; an unknown toolchain without a reviewed standard
+library notice digest is not releasable.
+
+An authenticated upload will not copy setuid/setgid bits or any
+`security.*`/`trusted.*` extended attribute onto a replacement inode; such a
+target is rejected. If those privileged attributes must be preserved, perform
+the change through a separately controlled privileged administration process.
+Non-privileged attributes are also fail-closed and bounded: the name list is
+limited to 64 KiB and 1024 entries, each value to 64 KiB, and the combined
+index, NUL-terminated names, and exact-sized values to 1 MiB. Values are sized
+before allocation rather than receiving a fixed 64 KiB buffer per attribute.
+
+Upload-state inspection opens the hidden record with no-follow and nonblocking
+flags, classifies and sizes that same descriptor, accepts only a regular file
+of at most 4096 bytes, and performs a bounded 4097-byte read so a concurrent
+append cannot bypass the limit. A symlink, FIFO, device, directory, oversized
+or malformed record is treated as not seen and cannot block a status lookup. A
+partial running checkpoint also opens the stage through the exact writable
+no-follow path used by PATCH, then checks that same descriptor is a regular,
+single-link file whose length reaches the durable offset. A full-offset
+running record remains an ambiguity barrier even when its stage is read-only,
+already renamed, missing, or otherwise abnormal; it is never downgraded to
+not-seen merely because the stage cannot be reopened.
+The response-only `not-started` state means that the current request, whose ID
+and length were parsed, stopped before any upload mutation; it does not prove
+that the same ID has no older owner-scoped record. A retry must therefore query
+the old ID before choosing PATCH, a new ID, or no replay. The server acquires
+the path lease and upload permit before tracked route metadata and owner-state
+inspection; a full upload admission returns `429 not-started` without reading
+or changing any older record.
+
+Potential credentials and file contents must never be attached to a report.
+Rotate any secret that was disclosed during investigation.

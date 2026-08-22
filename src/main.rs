@@ -1,196 +1,604 @@
-mod args;
-mod auth;
-mod http_logger;
-mod http_utils;
-mod logger;
-mod noscript;
-mod server;
-mod utils;
+use dufs::args::{Args, build_cli};
+use dufs::auth::{MAX_PASSWORD_BYTES, hash_password};
+use dufs::logger;
+use dufs::server::{Server, ServerRuntime};
 
-#[macro_use]
-extern crate log;
+use anyhow::{Context, Result, anyhow};
 
-use crate::args::{build_cli, print_completions, Args};
-use crate::server::Server;
-#[cfg(feature = "tls")]
-use crate::utils::{load_certs, load_private_key};
-
-use anyhow::{anyhow, Context, Result};
-use args::BindAddr;
-use clap_complete::Shell;
-use futures_util::future::join_all;
-
-use hyper::{body::Incoming, service::service_fn, Request};
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
-};
-use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
+use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use log::{error, info, warn};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::time::timeout;
-use tokio::{net::TcpListener, task::JoinHandle};
-#[cfg(feature = "tls")]
-use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use std::{
+    future::Future,
+    io::{self, IoSlice},
+    net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    time::{Instant, sleep, sleep_until},
+};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const FORCED_SHUTDOWN_PERIOD: Duration = Duration::from_secs(10);
+const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cmd = build_cli();
     let matches = cmd.get_matches();
-    if let Some(generator) = matches.get_one::<Shell>("completions") {
-        let mut cmd = build_cli();
-        print_completions(*generator, &mut cmd);
+    if matches.subcommand_matches("hash-password").is_some() {
+        let password = rpassword::prompt_password("Password: ")?;
+        validate_cli_password(&password)?;
+        let confirmation = rpassword::prompt_password("Confirm password: ")?;
+        if password != confirmation {
+            anyhow::bail!("Passwords do not match");
+        }
+        println!("{}", hash_password(&password)?);
         return Ok(());
     }
-    let mut args = Args::parse(matches)?;
+    let args = Args::parse(matches)?;
     logger::init(args.log_file.clone()).map_err(|e| anyhow!("Failed to init logger, {e}"))?;
-    let (new_addrs, print_addrs) = check_addrs(&args)?;
-    args.addrs = new_addrs;
-    let running = Arc::new(AtomicBool::new(true));
-    let listening = print_listening(&args, &print_addrs)?;
-    let handles = serve(args, running.clone())?;
+    let print_addrs = args.addrs.clone();
+    let mut signals = ShutdownSignals::new()?;
+    let serving = serve(args)?;
+    let listening = print_listening(&print_addrs, serving.port);
     println!("{listening}");
 
-    tokio::select! {
-        ret = join_all(handles) => {
-            for r in ret {
-                if let Err(e) = r {
-                    error!("{e}");
+    let reason = tokio::select! {
+        biased;
+        signal = signals.recv() => signal?,
+        _ = serving.listener_tasks.wait() => {
+            error!("All listener tasks exited unexpectedly");
+            "listener-exit"
+        }
+    };
+    serving.shutdown(reason, &mut signals).await?;
+    graceful_exit(&mut signals).await
+}
+
+fn validate_cli_password(password: &str) -> Result<()> {
+    if password.is_empty() {
+        anyhow::bail!("Password must not be empty");
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        anyhow::bail!("Password exceeds the {MAX_PASSWORD_BYTES}-byte limit");
+    }
+    Ok(())
+}
+
+struct Serving {
+    port: u16,
+    listener_tasks: TaskTracker,
+    connection_tasks: TaskTracker,
+    shutdown: CancellationToken,
+    runtime: ServerRuntime,
+}
+
+#[derive(Clone)]
+struct ListenerRuntime {
+    server: Arc<Server>,
+    shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
+    connection_tasks: TaskTracker,
+    connection_slots: Arc<Semaphore>,
+}
+
+impl Serving {
+    async fn shutdown(self, reason: &str, signals: &mut ShutdownSignals) -> Result<()> {
+        info!(
+            "Graceful shutdown started reason={reason} grace_seconds={}",
+            SHUTDOWN_GRACE_PERIOD.as_secs()
+        );
+
+        // Stop accepting first. Existing connections observe the same token and
+        // ask Hyper to stop HTTP/1 keep-alive admission after their active work.
+        self.shutdown.cancel();
+        self.listener_tasks.wait().await;
+        self.connection_tasks.close();
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE_PERIOD;
+        let connections_drained = tokio::select! {
+            biased;
+            signal = signals.recv() => force_exit(signal?),
+            _ = self.connection_tasks.wait() => true,
+            _ = sleep_until(deadline) => false,
+        };
+        let mut forced_deadline = None;
+
+        if !connections_drained {
+            let (active_work, active_mutations) = self.runtime.active_task_counts();
+            warn!(
+                "Graceful shutdown deadline reached; cancelling ordinary work \
+                 active_connections={} active_tasks={} active_mutations={}",
+                self.connection_tasks.len(),
+                active_work,
+                active_mutations,
+            );
+            self.runtime.request_force_shutdown();
+            let deadline = Instant::now() + FORCED_SHUTDOWN_PERIOD;
+            forced_deadline = Some(deadline);
+            tokio::select! {
+                biased;
+                signal = signals.recv() => force_exit(signal?),
+                _ = self.connection_tasks.wait() => {}
+                _ = sleep_until(deadline) => hard_deadline_exit(
+                    self.connection_tasks.len() + self.runtime.active_task_counts().0,
+                    self.runtime.active_task_counts().1,
+                ),
+            }
+        }
+
+        // A request can register a durable filesystem mutation only while its
+        // connection task is alive. Once all connection tasks have drained,
+        // ServerRuntime can close its own work and mutation trackers without
+        // racing a late registration.
+        let runtime_shutdown = self.runtime.shutdown();
+        tokio::pin!(runtime_shutdown);
+        if connections_drained {
+            let runtime_drained = tokio::select! {
+                biased;
+                signal = signals.recv() => force_exit(signal?),
+                _ = &mut runtime_shutdown => true,
+                _ = sleep_until(deadline) => false,
+            };
+            if !runtime_drained {
+                let (active_work, active_mutations) = self.runtime.active_task_counts();
+                warn!(
+                    "Graceful shutdown deadline reached while draining server runtime; \
+                     cancelling ordinary work active_tasks={} active_mutations={}",
+                    active_work, active_mutations,
+                );
+                self.runtime.request_force_shutdown();
+                let forced_deadline = Instant::now() + FORCED_SHUTDOWN_PERIOD;
+                tokio::select! {
+                    biased;
+                    signal = signals.recv() => force_exit(signal?),
+                    _ = &mut runtime_shutdown => {}
+                    _ = sleep_until(forced_deadline) => hard_deadline_exit(
+                        self.runtime.active_task_counts().0,
+                        self.runtime.active_task_counts().1,
+                    ),
                 }
             }
-            Ok(())
-        },
-        _ = shutdown_signal() => {
-            running.store(false, Ordering::SeqCst);
-            Ok(())
-        },
+        } else {
+            let forced_deadline =
+                forced_deadline.expect("forced work cancellation established a hard deadline");
+            tokio::select! {
+                biased;
+                signal = signals.recv() => force_exit(signal?),
+                _ = &mut runtime_shutdown => {}
+                _ = sleep_until(forced_deadline) => hard_deadline_exit(
+                    self.runtime.active_task_counts().0,
+                    self.runtime.active_task_counts().1,
+                ),
+            }
+        }
+
+        info!("Graceful shutdown complete");
+        Ok(())
     }
 }
 
-fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
+fn serve(args: Args) -> Result<Serving> {
     let addrs = args.addrs.clone();
-    let port = args.port;
-    let tls_config = (args.tls_cert.clone(), args.tls_key.clone());
-    let server_handle = Arc::new(Server::init(args, running)?);
-    let mut handles = vec![];
-    for bind_addr in addrs.iter() {
-        let server_handle = server_handle.clone();
-        match bind_addr {
-            BindAddr::IpAddr(ip) => {
-                let listener = create_listener(SocketAddr::new(*ip, port))
-                    .with_context(|| format!("Failed to bind `{ip}:{port}`"))?;
+    let mut port = args.port;
+    let connection_slots = Arc::new(Semaphore::new(args.max_connections));
+    let listener_tasks = TaskTracker::new();
+    let connection_tasks = TaskTracker::new();
+    let runtime = Server::builder(args).build()?;
+    let server_handle = runtime.server().clone();
+    let shutdown = runtime.shutdown_token();
+    let force_shutdown = runtime.force_shutdown_token();
 
-                match &tls_config {
-                    #[cfg(feature = "tls")]
-                    (Some(cert_file), Some(key_file)) => {
-                        let certs = load_certs(cert_file)?;
-                        let key = load_private_key(key_file)?;
-                        let mut config = ServerConfig::builder()
-                            .with_no_client_auth()
-                            .with_single_cert(certs, key)?;
-                        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-                        let config = Arc::new(config);
-                        let tls_accepter = TlsAcceptor::from(config);
-                        let handshake_timeout = Duration::from_secs(10);
+    for ip in addrs {
+        let listener = create_listener(SocketAddr::new(ip, port))
+            .with_context(|| format!("Failed to bind `{ip}:{port}`"))?;
+        if port == 0 {
+            port = listener
+                .local_addr()
+                .context("Failed to inspect the dynamically assigned listen port")?
+                .port();
+        }
 
-                        let handle = tokio::spawn(async move {
-                            loop {
-                                let Ok((stream, addr)) = listener.accept().await else {
-                                    continue;
-                                };
-                                let Some(stream) =
-                                    timeout(handshake_timeout, tls_accepter.accept(stream))
-                                        .await
-                                        .ok()
-                                        .and_then(|v| v.ok())
-                                else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
-                            }
-                        });
+        let runtime = ListenerRuntime {
+            server: server_handle.clone(),
+            shutdown: shutdown.clone(),
+            force_shutdown: force_shutdown.clone(),
+            connection_tasks: connection_tasks.clone(),
+            connection_slots: connection_slots.clone(),
+        };
+        drop(listener_tasks.spawn(async move {
+            serve_tcp_listener(listener, runtime).await;
+        }));
+    }
+    listener_tasks.close();
+    Ok(Serving {
+        port,
+        listener_tasks,
+        connection_tasks,
+        shutdown,
+        runtime,
+    })
+}
 
-                        handles.push(handle);
-                    }
-                    (None, None) => {
-                        let handle = tokio::spawn(async move {
-                            loop {
-                                let Ok((stream, addr)) = listener.accept().await else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
-                            }
-                        });
-                        handles.push(handle);
-                    }
-                    _ => {
-                        unreachable!()
-                    }
-                };
+async fn serve_tcp_listener(listener: TcpListener, runtime: ListenerRuntime) {
+    let ListenerRuntime {
+        server,
+        shutdown,
+        force_shutdown,
+        connection_tasks,
+        connection_slots,
+    } = runtime;
+    let listener_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let mut backoff = AcceptBackoff::default();
+
+    loop {
+        let Some((stream, addr)) =
+            accept_with_backoff(&listener, &listener_addr, &shutdown, &mut backoff).await
+        else {
+            break;
+        };
+        let connection_permit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            permit = connection_slots.clone().acquire_owned() => {
+                permit.expect("the connection semaphore is never closed")
             }
-            #[cfg(unix)]
-            BindAddr::SocketPath(path) => {
-                let socket_path = if path.starts_with("@")
-                    && cfg!(any(target_os = "linux", target_os = "android"))
-                {
-                    let mut path_buf = path.as_bytes().to_vec();
-                    path_buf[0] = b'\0';
-                    unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&path_buf) }
-                        .to_os_string()
-                } else {
-                    let _ = std::fs::remove_file(path);
-                    path.into()
-                };
-                let listener = tokio::net::UnixListener::bind(socket_path)
-                    .with_context(|| format!("Failed to bind `{path}`"))?;
-                let handle = tokio::spawn(async move {
-                    loop {
-                        let Ok((stream, _addr)) = listener.accept().await else {
-                            continue;
-                        };
-                        let stream = TokioIo::new(stream);
-                        tokio::spawn(handle_stream(server_handle.clone(), stream, None));
-                    }
-                });
+        };
+        let server = server.clone();
+        let connection_shutdown = shutdown.clone();
+        let connection_force_shutdown = force_shutdown.clone();
+        drop(connection_tasks.spawn(async move {
+            let _connection_permit = connection_permit;
+            handle_stream(
+                server,
+                TokioIo::new(WriteIdleTimeout::new(stream, RESPONSE_WRITE_IDLE_TIMEOUT)),
+                addr,
+                connection_shutdown,
+                connection_force_shutdown,
+            )
+            .await;
+        }));
+    }
+}
 
-                handles.push(handle);
+struct WriteIdleTimeout<T> {
+    inner: T,
+    timeout: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> WriteIdleTimeout<T> {
+    fn new(inner: T, timeout: Duration) -> Self {
+        debug_assert!(!timeout.is_zero());
+        Self {
+            inner,
+            timeout,
+            timer: None,
+        }
+    }
+
+    fn clear_timer(&mut self) {
+        self.timer = None;
+    }
+
+    fn write_is_timed_out(&mut self, context: &mut TaskContext<'_>) -> bool {
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.timeout)));
+        timer.as_mut().poll(context).is_ready()
+    }
+
+    fn timeout_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP response write made no progress before the idle deadline",
+        )
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for WriteIdleTimeout<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(result) => {
+                this.clear_timer();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.write_is_timed_out(context) => {
+                Poll::Ready(Err(Self::timeout_error()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(context, buffers) {
+            Poll::Ready(result) => {
+                this.clear_timer();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.write_is_timed_out(context) => {
+                Poll::Ready(Err(Self::timeout_error()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_flush(context) {
+            Poll::Ready(result) => {
+                this.clear_timer();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.write_is_timed_out(context) => {
+                Poll::Ready(Err(Self::timeout_error()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(context) {
+            Poll::Ready(result) => {
+                this.clear_timer();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.write_is_timed_out(context) => {
+                Poll::Ready(Err(Self::timeout_error()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+async fn accept_with_backoff(
+    listener: &TcpListener,
+    listener_addr: &str,
+    shutdown: &CancellationToken,
+    backoff: &mut AcceptBackoff,
+) -> Option<(TcpStream, SocketAddr)> {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            result = listener.accept() => result,
+        };
+
+        match result {
+            Ok(connection) => {
+                backoff.reset();
+                if shutdown.is_cancelled() {
+                    return None;
+                }
+                return Some(connection);
+            }
+            Err(err) => {
+                let retry_delay = backoff.failure_delay();
+                log_accept_error(listener_addr, &err, retry_delay);
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return None,
+                    _ = sleep(retry_delay) => {}
+                }
             }
         }
     }
-    Ok(handles)
 }
 
-async fn handle_stream<T>(handle: Arc<Server>, stream: TokioIo<T>, addr: Option<SocketAddr>)
-where
+#[derive(Debug)]
+struct AcceptBackoff {
+    next_delay: Duration,
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self {
+            next_delay: ACCEPT_BACKOFF_INITIAL,
+        }
+    }
+}
+
+impl AcceptBackoff {
+    fn failure_delay(&mut self) -> Duration {
+        let delay = self.next_delay;
+        self.next_delay = self.next_delay.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next_delay = ACCEPT_BACKOFF_INITIAL;
+    }
+}
+
+fn log_accept_error(listener_addr: &str, err: &std::io::Error, retry_delay: Duration) {
+    let category = classify_accept_error(err);
+    warn!(
+        "TCP accept error listener={listener_addr} category={category} io_kind={:?} \
+         os_error={:?} retry_ms={}",
+        err.kind(),
+        err.raw_os_error(),
+        retry_delay.as_millis()
+    );
+}
+
+fn classify_accept_error(err: &std::io::Error) -> &'static str {
+    if is_resource_exhaustion(err) {
+        "resource"
+    } else {
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => "interrupted",
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "transient",
+            std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset => {
+                "connection"
+            }
+            std::io::ErrorKind::PermissionDenied => "permission",
+            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::NotConnected => "listener",
+            _ => "io",
+        }
+    }
+}
+
+fn is_resource_exhaustion(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    // Linux ENOMEM, ENFILE, EMFILE and ENOBUFS.
+    matches!(err.raw_os_error(), Some(12 | 23 | 24 | 105))
+}
+
+async fn handle_stream<T>(
+    handle: Arc<Server>,
+    stream: TokioIo<T>,
+    addr: SocketAddr,
+    shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
+) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let hyper_service =
-        service_fn(move |request: Request<Incoming>| handle.clone().call(request, addr));
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let service_request_seen = request_seen.clone();
+    let hyper_service = service_fn(move |request: Request<Incoming>| {
+        service_request_seen.store(true, Ordering::Relaxed);
+        handle.clone().call(request, addr)
+    });
 
-    match Builder::new(TokioExecutor::new())
-        .serve_connection_with_upgrades(stream, hyper_service)
-        .await
-    {
-        Ok(()) => {}
-        Err(_err) => {
-            // This error only appears when the client doesn't send a request and terminate the connection.
-            //
-            // If client sends one request then terminate connection whenever, it doesn't appear.
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(10))
+        .max_buf_size(64 * 1024);
+    let connection = builder.serve_connection(stream, hyper_service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        biased;
+        _ = force_shutdown.cancelled() => return,
+        _ = shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            tokio::select! {
+                biased;
+                _ = force_shutdown.cancelled() => return,
+                result = &mut connection => result,
+            }
         }
+        result = &mut connection => result,
+    };
+    if let Err(err) = result {
+        log_connection_error(addr, request_seen.load(Ordering::Relaxed), &err);
     }
+}
+
+fn log_connection_error(
+    addr: SocketAddr,
+    request_seen: bool,
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    let hyper_error = err.downcast_ref::<hyper::Error>();
+    let io_error = find_io_error(err);
+    let io_kind = io_error.map(std::io::Error::kind);
+    let io_disconnect = matches!(
+        io_kind,
+        Some(
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotConnected
+        )
+    );
+    let benign_probe_close =
+        hyper_error.is_some_and(hyper::Error::is_incomplete_message) || io_disconnect;
+    if !request_seen && benign_probe_close {
+        return;
+    }
+
+    let category = if hyper_error.is_some_and(hyper::Error::is_parse) {
+        "protocol"
+    } else if hyper_error.is_some_and(hyper::Error::is_timeout)
+        || io_kind == Some(std::io::ErrorKind::TimedOut)
+    {
+        "timeout"
+    } else if hyper_error.is_some_and(|err| err.is_user() || err.is_body_write_aborted()) {
+        "service"
+    } else if hyper_error
+        .is_some_and(|err| err.is_incomplete_message() || err.is_canceled() || err.is_closed())
+        || io_disconnect
+    {
+        "disconnect"
+    } else if io_error.is_some() {
+        "io"
+    } else if hyper_error.is_some() {
+        "hyper"
+    } else {
+        "unknown"
+    };
+    let io_kind = io_kind
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "-".to_string());
+    let message = format!(
+        "HTTP connection error peer={addr} category={category} request_seen={request_seen} io_kind={io_kind} error={err:?}"
+    );
+    if category == "disconnect" {
+        info!("{message}");
+    } else {
+        warn!("{message}");
+    }
+}
+
+fn find_io_error<'a>(
+    err: &'a (dyn std::error::Error + Send + Sync + 'static),
+) -> Option<&'a std::io::Error> {
+    let mut current: Option<&'a (dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            return Some(io_error);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
@@ -208,83 +616,16 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
     Ok(listener)
 }
 
-fn check_addrs(args: &Args) -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
-    let mut new_addrs = vec![];
-    let mut print_addrs = vec![];
-    let has_unspecified = args
-        .addrs
-        .iter()
-        .any(|a| matches!(a, BindAddr::IpAddr(ip) if ip.is_unspecified()));
-    let (ipv4_addrs, ipv6_addrs) = if has_unspecified {
-        interface_addrs()?
-    } else {
-        (vec![], vec![])
-    };
-    for bind_addr in args.addrs.iter() {
-        new_addrs.push(bind_addr.clone());
-        match bind_addr {
-            BindAddr::IpAddr(ip) => match &ip {
-                IpAddr::V4(_) => {
-                    if ip.is_unspecified() {
-                        print_addrs.extend(ipv4_addrs.clone());
-                    } else {
-                        print_addrs.push(bind_addr.clone());
-                    }
-                }
-                IpAddr::V6(_) => {
-                    if ip.is_unspecified() {
-                        print_addrs.extend(ipv6_addrs.clone());
-                    } else {
-                        print_addrs.push(bind_addr.clone());
-                    }
-                }
-            },
-            #[cfg(unix)]
-            _ => {
-                new_addrs.push(bind_addr.clone());
-                print_addrs.push(bind_addr.clone())
-            }
-        }
-    }
-    print_addrs.sort_unstable();
-    Ok((new_addrs, print_addrs))
-}
-
-fn interface_addrs() -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
-    let (mut ipv4_addrs, mut ipv6_addrs) = (vec![], vec![]);
-    let ifaces =
-        if_addrs::get_if_addrs().with_context(|| "Failed to get local interface addresses")?;
-    for iface in ifaces.into_iter() {
-        let ip = iface.ip();
-        if ip.is_ipv4() {
-            ipv4_addrs.push(BindAddr::IpAddr(ip))
-        }
-        if ip.is_ipv6() {
-            ipv6_addrs.push(BindAddr::IpAddr(ip))
-        }
-    }
-    Ok((ipv4_addrs, ipv6_addrs))
-}
-
-fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
+fn print_listening(print_addrs: &[IpAddr], port: u16) -> String {
     let mut output = String::new();
     let urls = print_addrs
         .iter()
-        .map(|bind_addr| match bind_addr {
-            BindAddr::IpAddr(addr) => {
-                let addr = match addr {
-                    IpAddr::V4(_) => format!("{}:{}", addr, args.port),
-                    IpAddr::V6(_) => format!("[{}]:{}", addr, args.port),
-                };
-                let protocol = if args.tls_cert.is_some() {
-                    "https"
-                } else {
-                    "http"
-                };
-                format!("{}://{}{}", protocol, addr, args.uri_prefix)
-            }
-            #[cfg(unix)]
-            BindAddr::SocketPath(path) => path.to_string(),
+        .map(|addr| {
+            let addr = match addr {
+                IpAddr::V4(_) => format!("{addr}:{port}"),
+                IpAddr::V6(_) => format!("[{addr}]:{port}"),
+            };
+            format!("http://{addr}/")
         })
         .collect::<Vec<_>>();
 
@@ -299,11 +640,152 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
         output.push_str(&format!("Listening on:\n{info}\n"))
     }
 
-    Ok(output)
+    output
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler")
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())
+                .context("Failed to install SIGINT signal handler")?,
+            terminate: signal(SignalKind::terminate())
+                .context("Failed to install SIGTERM signal handler")?,
+        })
+    }
+
+    async fn recv(&mut self) -> Result<&'static str> {
+        tokio::select! {
+            biased;
+            value = self.interrupt.recv() => {
+                value.map(|()| "SIGINT").ok_or_else(|| anyhow!("SIGINT signal stream closed"))
+            }
+            value = self.terminate.recv() => {
+                value.map(|()| "SIGTERM").ok_or_else(|| anyhow!("SIGTERM signal stream closed"))
+            }
+        }
+    }
+}
+
+fn force_exit(signal: &str) -> ! {
+    warn!(
+        "Second shutdown signal received signal={signal}; forcing exit without waiting for cleanup"
+    );
+    let exit_code = match signal {
+        "SIGTERM" => 143,
+        _ => 130,
+    };
+    std::process::exit(exit_code)
+}
+
+async fn graceful_exit(signals: &mut ShutdownSignals) -> Result<()> {
+    // Tokio waits for every spawn_blocking worker when its runtime is dropped.
+    // A cancelled filesystem request can still be inside an uninterruptible
+    // kernel/FUSE call after all tracked request and commit guards are gone.
+    // Use a dedicated OS thread rather than Tokio's blocking pool: abnormal
+    // filesystems may already have saturated that pool with uninterruptible
+    // calls. Keep polling the installed signal streams while the logger waits
+    // for its own bounded acknowledgement.
+    let (flush_complete, mut flush_waiter) = tokio::sync::oneshot::channel();
+    if let Err(error) = std::thread::Builder::new()
+        .name("dufs-final-log-flush".to_string())
+        .spawn(move || {
+            log::logger().flush();
+            let _ = flush_complete.send(());
+        })
+    {
+        eprintln!("Failed to start final log flush thread: {error}");
+        std::process::exit(1);
+    }
+    tokio::select! {
+        biased;
+        signal = signals.recv() => force_exit(signal?),
+        result = &mut flush_waiter => {
+            if result.is_err() {
+                eprintln!("Final log flush thread ended without acknowledgement");
+            }
+            // Cleanup and logging are complete at this point, so terminate
+            // explicitly instead of allowing runtime teardown to defeat the
+            // advertised deadline.
+            std::process::exit(0)
+        }
+    }
+}
+
+fn hard_deadline_exit(active_work: usize, active_mutations: usize) -> ! {
+    error!(
+        "Forced shutdown deadline reached; exiting despite stuck tasks active_tasks={active_work} active_mutations={active_mutations}"
+    );
+    std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn accept_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = AcceptBackoff::default();
+        assert_eq!(backoff.failure_delay(), Duration::from_millis(50));
+        assert_eq!(backoff.failure_delay(), Duration::from_millis(100));
+        assert_eq!(backoff.failure_delay(), Duration::from_millis(200));
+        assert_eq!(backoff.failure_delay(), Duration::from_millis(400));
+        assert_eq!(backoff.failure_delay(), Duration::from_millis(800));
+        assert_eq!(backoff.failure_delay(), ACCEPT_BACKOFF_MAX);
+        assert_eq!(backoff.failure_delay(), ACCEPT_BACKOFF_MAX);
+
+        backoff.reset();
+        assert_eq!(backoff.failure_delay(), ACCEPT_BACKOFF_INITIAL);
+    }
+
+    #[test]
+    fn cli_password_validation_uses_the_login_byte_limit() {
+        assert!(validate_cli_password("").is_err());
+        for password in [
+            "p".repeat(MAX_PASSWORD_BYTES),
+            "é".repeat(MAX_PASSWORD_BYTES / "é".len()),
+        ] {
+            assert!(validate_cli_password(&password).is_ok());
+        }
+        for password in [
+            "p".repeat(MAX_PASSWORD_BYTES + 1),
+            format!("a{}", "é".repeat(MAX_PASSWORD_BYTES / "é".len())),
+        ] {
+            assert!(validate_cli_password(&password).is_err());
+        }
+    }
+
+    #[test]
+    fn accept_errors_are_classified_for_diagnostics() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            "interrupted"
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            "permission"
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+            "resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_write_idle_timeout_interrupts_a_stalled_peer() {
+        let (stream, _peer) = tokio::io::duplex(1);
+        let mut stream = WriteIdleTimeout::new(stream, Duration::from_millis(20));
+        let error = tokio::time::timeout(Duration::from_secs(1), stream.write_all(b"ab"))
+            .await
+            .expect("the write timeout itself did not fire")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }

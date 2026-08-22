@@ -1,38 +1,55 @@
-use anyhow::{bail, Context, Result};
-use async_deflate_zip::Compression;
-use clap::builder::{PossibleValue, PossibleValuesParser};
-use clap::{value_parser, Arg, ArgAction, ArgMatches, Command, ValueEnum};
-use clap_complete::{generate, Generator, Shell};
+use anyhow::{Context, Result, bail};
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use serde::{Deserialize, Deserializer};
-use smart_default::SmartDefault;
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::net::IpAddr;
+use std::ops::Deref;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::auth::AccessControl;
+use crate::auth::AuthConfig;
 use crate::http_logger::HttpLogger;
-use crate::utils::{encode_uri, is_ipv6_available};
+
+const DEFAULT_MAX_UPLOAD_SIZE: u64 = 100 * 1024 * 1024 * 1024;
+const DEFAULT_UPLOAD_IDLE_TIMEOUT: u64 = 60;
+const DEFAULT_UPLOAD_TOTAL_TIMEOUT: u64 = 24 * 60 * 60;
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 4;
+const DEFAULT_MIN_FREE_SPACE: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
+const MAX_SEARCH_ENTRIES: usize = 100_000;
+const DEFAULT_MAX_CONCURRENT_SEARCHES: usize = 2;
+const DEFAULT_REQUEST_TIMEOUT: u64 = 300;
+const MAX_TIMEOUT_SECONDS: u64 = 365 * 24 * 60 * 60;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_BIND_ADDRESSES: usize = 128;
+const STATE_DATABASE_FILE_NAME: &str = "state.sqlite3";
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git ",
+    env!("DUFS_BUILD_GIT_SHA"),
+    ")"
+);
 
 pub fn build_cli() -> Command {
-    let app = Command::new(env!("CARGO_CRATE_NAME"))
-        .version(env!("CARGO_PKG_VERSION"))
+    Command::new(env!("CARGO_CRATE_NAME"))
+        .version(LONG_VERSION)
+        .long_version(LONG_VERSION)
         .author(env!("CARGO_PKG_AUTHORS"))
-        .about(concat!(
-            env!("CARGO_PKG_DESCRIPTION"),
-            " - ",
-            env!("CARGO_PKG_REPOSITORY")
-        ))
+        .about(env!("CARGO_PKG_DESCRIPTION"))
+        .subcommand(
+            Command::new("hash-password").about("Interactively generate an Argon2id password hash"),
+        )
         .arg(
             Arg::new("serve-path")
-                .env("DUFS_SERVE_PATH")
-				.hide_env(true)
                 .value_parser(value_parser!(PathBuf))
-                .help("Specific path to serve [default: .]"),
+                .help("Existing directory to manage [default: .]"),
         )
         .arg(
             Arg::new("config")
-                .env("DUFS_CONFIG")
-				.hide_env(true)
                 .short('c')
                 .long("config")
                 .value_parser(value_parser!(PathBuf))
@@ -40,20 +57,24 @@ pub fn build_cli() -> Command {
                 .value_name("file"),
         )
         .arg(
+            Arg::new("state-dir")
+                .long("state-dir")
+                .value_parser(value_parser!(PathBuf))
+                .help("Specify the required private directory for persistent SQLite state")
+                .value_name("dir"),
+        )
+        .arg(
             Arg::new("bind")
-                .env("DUFS_BIND")
-				.hide_env(true)
                 .short('b')
                 .long("bind")
-                .help("Specify bind address or unix socket")
+                .value_parser(value_parser!(IpAddr))
+                .help("Specify IP address to bind [default: 127.0.0.1]")
                 .action(ArgAction::Append)
                 .value_delimiter(',')
                 .value_name("addrs"),
         )
         .arg(
             Arg::new("port")
-                .env("DUFS_PORT")
-				.hide_env(true)
                 .short('p')
                 .long("port")
                 .value_parser(value_parser!(u16))
@@ -61,261 +82,200 @@ pub fn build_cli() -> Command {
                 .value_name("port"),
         )
         .arg(
-            Arg::new("path-prefix")
-                .env("DUFS_PATH_PREFIX")
-				.hide_env(true)
-                .long("path-prefix")
-                .value_name("path")
-                .help("Specify a path prefix"),
-        )
-        .arg(
-            Arg::new("hidden")
-                .env("DUFS_HIDDEN")
-				.hide_env(true)
-                .long("hidden")
-                .action(ArgAction::Append)
-                .value_delimiter(',')
-                .help("Hide paths from directory listings, e.g. tmp,*.log,*.lock")
-                .value_name("value"),
-        )
-        .arg(
             Arg::new("auth")
-                .env("DUFS_AUTH")
-				.hide_env(true)
                 .short('a')
                 .long("auth")
-                .help("Add auth roles, e.g. user:pass@/dir1:rw,/dir2")
+                .help("Add a required full-access account as user:<argon2id PHC>")
                 .action(ArgAction::Append)
-                .value_name("rules"),
-        )
-        .arg(
-            Arg::new("auth-method")
-                .hide(true)
-                .env("DUFS_AUTH_METHOD")
-				.hide_env(true)
-                .long("auth-method")
-                .help("Select auth method")
-                .value_parser(PossibleValuesParser::new(["basic", "digest"]))
-                .default_value("digest")
-                .value_name("value"),
-        )
-        .arg(
-            Arg::new("allow-all")
-                .env("DUFS_ALLOW_ALL")
-				.hide_env(true)
-                .short('A')
-                .long("allow-all")
-                .action(ArgAction::SetTrue)
-                .help("Allow all operations"),
-        )
-        .arg(
-            Arg::new("allow-upload")
-                .env("DUFS_ALLOW_UPLOAD")
-				.hide_env(true)
-                .long("allow-upload")
-                .action(ArgAction::SetTrue)
-                .help("Allow upload files/folders"),
-        )
-        .arg(
-            Arg::new("allow-delete")
-                .env("DUFS_ALLOW_DELETE")
-				.hide_env(true)
-                .long("allow-delete")
-                .action(ArgAction::SetTrue)
-                .help("Allow delete files/folders"),
-        )
-        .arg(
-            Arg::new("allow-search")
-                .env("DUFS_ALLOW_SEARCH")
-				.hide_env(true)
-                .long("allow-search")
-                .action(ArgAction::SetTrue)
-                .help("Allow search files/folders"),
-        )
-        .arg(
-            Arg::new("allow-symlink")
-                .env("DUFS_ALLOW_SYMLINK")
-				.hide_env(true)
-                .long("allow-symlink")
-                .action(ArgAction::SetTrue)
-                .help("Allow symlink to files/folders outside root directory"),
-        )
-        .arg(
-            Arg::new("allow-archive")
-                .env("DUFS_ALLOW_ARCHIVE")
-				.hide_env(true)
-                .long("allow-archive")
-                .action(ArgAction::SetTrue)
-                .help("Allow download folders as archive file"),
-        )
-        .arg(
-            Arg::new("allow-hash")
-                .env("DUFS_ALLOW_HASH")
-                .hide_env(true)
-                .long("allow-hash")
-                .action(ArgAction::SetTrue)
-                .help("Allow ?hash query to get file sha256 hash"),
-        )
-        .arg(
-            Arg::new("enable-cors")
-                .env("DUFS_ENABLE_CORS")
-				.hide_env(true)
-                .long("enable-cors")
-                .action(ArgAction::SetTrue)
-                .help("Enable CORS, sets `Access-Control-Allow-Origin: *`"),
-        )
-        .arg(
-            Arg::new("render-index")
-                .env("DUFS_RENDER_INDEX")
-				.hide_env(true)
-                .long("render-index")
-                .action(ArgAction::SetTrue)
-                .help("Serve index.html when requesting a directory, returns 404 if not found index.html"),
-        )
-        .arg(
-            Arg::new("render-try-index")
-                .env("DUFS_RENDER_TRY_INDEX")
-				.hide_env(true)
-                .long("render-try-index")
-                .action(ArgAction::SetTrue)
-                .help("Serve index.html when requesting a directory, returns directory listing if not found index.html"),
-        )
-        .arg(
-            Arg::new("render-spa")
-                .env("DUFS_RENDER_SPA")
-				.hide_env(true)
-                .long("render-spa")
-                .action(ArgAction::SetTrue)
-                .help("Serve SPA(Single Page Application)"),
-        )
-        .arg(
-            Arg::new("assets")
-                .env("DUFS_ASSETS")
-				.hide_env(true)
-                .long("assets")
-                .help("Set the path to the assets directory for overriding the built-in assets")
-                .value_parser(value_parser!(PathBuf))
-                .value_name("path")
+                .value_name("account"),
         )
         .arg(
             Arg::new("log-format")
-                .env("DUFS_LOG_FORMAT")
-                .hide_env(true)
                 .long("log-format")
                 .value_name("format")
-                .help("Customize http log format"),
+                .help("Customize HTTP log format"),
         )
         .arg(
             Arg::new("log-file")
-                .env("DUFS_LOG_FILE")
-                .hide_env(true)
                 .long("log-file")
                 .value_name("file")
                 .value_parser(value_parser!(PathBuf))
                 .help("Specify the file to save logs to, other than stdout/stderr"),
         )
         .arg(
-            Arg::new("compress")
-                .env("DUFS_COMPRESS")
-                .hide_env(true)
-                .value_parser(clap::builder::EnumValueParser::<Compress>::new())
-                .long("compress")
-                .value_name("level")
-                .help("Set zip compress level [default: low]")
+            Arg::new("max-upload-size")
+                .long("max-upload-size")
+                .value_parser(value_parser!(u64))
+                .value_name("bytes")
+                .help("Maximum size of one upload in bytes [default: 107374182400]"),
         )
         .arg(
-            Arg::new("completions")
-                .long("completions")
-                .value_name("shell")
-                .value_parser(value_parser!(Shell))
-                .help("Print shell completion script for <shell>"),
-        );
-
-    #[cfg(feature = "tls")]
-    let app = app
-        .arg(
-            Arg::new("tls-cert")
-                .env("DUFS_TLS_CERT")
-                .hide_env(true)
-                .long("tls-cert")
-                .value_name("path")
-                .value_parser(value_parser!(PathBuf))
-                .help("Path to an SSL/TLS certificate to serve with HTTPS"),
+            Arg::new("upload-idle-timeout")
+                .long("upload-idle-timeout")
+                .value_parser(value_parser!(u64))
+                .value_name("seconds")
+                .help(
+                    "Maximum idle time while receiving an upload, up to 31536000 seconds \
+                     [default: 60]",
+                ),
         )
         .arg(
-            Arg::new("tls-key")
-                .env("DUFS_TLS_KEY")
-                .hide_env(true)
-                .long("tls-key")
-                .value_name("path")
-                .value_parser(value_parser!(PathBuf))
-                .help("Path to the SSL/TLS certificate's private key"),
-        );
-
-    app
+            Arg::new("upload-total-timeout")
+                .long("upload-total-timeout")
+                .value_parser(value_parser!(u64))
+                .value_name("seconds")
+                .help("Maximum total time for one upload, up to 31536000 seconds [default: 86400]"),
+        )
+        .arg(
+            Arg::new("max-concurrent-uploads")
+                .long("max-concurrent-uploads")
+                .value_parser(value_parser!(usize))
+                .value_name("count")
+                .help("Maximum number of concurrent uploads [default: 4]"),
+        )
+        .arg(
+            Arg::new("min-free-space")
+                .long("min-free-space")
+                .value_parser(value_parser!(u64))
+                .value_name("bytes")
+                .help("Reserved free disk space required for uploads [default: 1073741824]"),
+        )
+        .arg(
+            Arg::new("max-connections")
+                .long("max-connections")
+                .value_parser(value_parser!(usize))
+                .value_name("count")
+                .help("Maximum number of active client connections [default: 256]"),
+        )
+        .arg(
+            Arg::new("max-search-entries")
+                .long("max-search-entries")
+                .value_parser(value_parser!(usize))
+                .value_name("count")
+                .help("Maximum entries examined by one search, up to 100000 [default: 10000]"),
+        )
+        .arg(
+            Arg::new("max-concurrent-searches")
+                .long("max-concurrent-searches")
+                .value_parser(value_parser!(usize))
+                .value_name("count")
+                .help("Maximum number of concurrent directory listings and searches [default: 2]"),
+        )
+        .arg(
+            Arg::new("request-timeout")
+                .long("request-timeout")
+                .value_parser(value_parser!(u64))
+                .value_name("seconds")
+                .help(
+                    "Maximum time to process an ordinary request and produce response headers \
+                     (up to 31536000 seconds) [default: 300]",
+                ),
+        )
 }
 
-pub fn print_completions<G: Generator>(gen: G, cmd: &mut Command) {
-    generate(gen, cmd, cmd.get_name().to_string(), &mut std::io::stdout());
-}
-
-#[derive(Debug, Deserialize, SmartDefault, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "kebab-case")]
 pub struct Args {
     #[serde(default = "default_serve_path")]
-    #[default(default_serve_path())]
     pub serve_path: PathBuf,
+    pub state_dir: Option<PathBuf>,
     #[serde(deserialize_with = "deserialize_bind_addrs")]
     #[serde(rename = "bind")]
     #[serde(default = "default_addrs")]
-    #[default(default_addrs())]
-    pub addrs: Vec<BindAddr>,
+    pub addrs: Vec<IpAddr>,
     #[serde(default = "default_port")]
-    #[default(default_port())]
     pub port: u16,
-    #[serde(skip)]
-    pub path_is_file: bool,
-    pub path_prefix: String,
-    #[serde(skip)]
-    pub uri_prefix: String,
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    pub hidden: Vec<String>,
-    #[serde(deserialize_with = "deserialize_access_control")]
-    pub auth: AccessControl,
-    pub allow_all: bool,
-    pub allow_upload: bool,
-    pub allow_delete: bool,
-    pub allow_search: bool,
-    pub allow_symlink: bool,
-    pub allow_archive: bool,
-    pub allow_hash: bool,
-    pub render_index: bool,
-    pub render_spa: bool,
-    pub render_try_index: bool,
-    pub enable_cors: bool,
-    pub assets: Option<PathBuf>,
-    pub error_page: Option<PathBuf>,
+    pub auth: AuthConfig,
     #[serde(deserialize_with = "deserialize_log_http")]
     #[serde(rename = "log-format")]
     pub http_logger: HttpLogger,
     pub log_file: Option<PathBuf>,
-    pub compress: Compress,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
+    pub max_upload_size: u64,
+    pub upload_idle_timeout: u64,
+    pub upload_total_timeout: u64,
+    pub max_concurrent_uploads: usize,
+    pub min_free_space: u64,
+    pub max_connections: usize,
+    pub max_search_entries: usize,
+    pub max_concurrent_searches: usize,
+    pub request_timeout: u64,
+}
+
+/// Startup settings that have passed every cross-field and filesystem check.
+///
+/// The inner value is private so server internals can hold this type without
+/// accidentally constructing an unchecked configuration. Public CLI and
+/// library callers can keep using [`Args`]; [`TryFrom`] is available to code
+/// that wants an explicit validation boundary.
+#[derive(Debug)]
+pub struct ValidatedConfig(Args);
+
+impl TryFrom<Args> for ValidatedConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(args: Args) -> Result<Self> {
+        args.validate().map(Self)
+    }
+}
+
+impl Deref for ValidatedConfig {
+    type Target = Args;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Args> for ValidatedConfig {
+    fn as_ref(&self) -> &Args {
+        &self.0
+    }
+}
+
+impl ValidatedConfig {
+    pub(crate) fn state_database_path(&self) -> PathBuf {
+        self.0
+            .state_dir
+            .as_ref()
+            .expect("validated configuration requires a persistent state directory")
+            .join(STATE_DATABASE_FILE_NAME)
+    }
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            serve_path: default_serve_path(),
+            state_dir: None,
+            addrs: default_addrs(),
+            port: default_port(),
+            auth: AuthConfig::default(),
+            http_logger: HttpLogger::default(),
+            log_file: None,
+            max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
+            upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
+            upload_total_timeout: DEFAULT_UPLOAD_TOTAL_TIMEOUT,
+            max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
+            min_free_space: DEFAULT_MIN_FREE_SPACE,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_search_entries: DEFAULT_MAX_SEARCH_ENTRIES,
+            max_concurrent_searches: DEFAULT_MAX_CONCURRENT_SEARCHES,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 impl Args {
-    /// Parse command-line arguments.
-    ///
-    /// If a parsing error occurred, exit the process and print out informative
-    /// error message to user.
+    /// Merge command-line arguments with the optional configuration file and
+    /// validate the resulting runtime settings.
     pub fn parse(matches: ArgMatches) -> Result<Args> {
         let mut args = Self::default();
+        let config_path = matches.get_one::<PathBuf>("config").cloned();
 
-        if let Some(config_path) = matches.get_one::<PathBuf>("config") {
-            let contents = std::fs::read_to_string(config_path)
-                .with_context(|| format!("Failed to read config at {}", config_path.display()))?;
+        if let Some(config_path) = config_path.as_deref() {
+            let contents = read_config(config_path)?;
             args = serde_yaml::from_str(&contents)
                 .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
         }
@@ -324,98 +284,21 @@ impl Args {
             args.serve_path.clone_from(path)
         }
 
-        args.serve_path = Self::sanitize_path(args.serve_path)?;
+        if let Some(state_dir) = matches.get_one::<PathBuf>("state-dir") {
+            args.state_dir = Some(state_dir.clone());
+        }
 
         if let Some(port) = matches.get_one::<u16>("port") {
             args.port = *port
         }
 
-        if let Some(addrs) = matches.get_many::<String>("bind") {
-            let addrs: Vec<_> = addrs.map(|v| v.as_str()).collect();
-            args.addrs = BindAddr::parse_addrs(&addrs)?;
-        }
-
-        args.path_is_file = args.serve_path.metadata()?.is_file();
-        if let Some(path_prefix) = matches.get_one::<String>("path-prefix") {
-            args.path_prefix.clone_from(path_prefix)
-        }
-        args.path_prefix = args.path_prefix.trim_matches('/').to_string();
-
-        args.uri_prefix = if args.path_prefix.is_empty() {
-            "/".to_owned()
-        } else {
-            format!("/{}/", &encode_uri(&args.path_prefix))
-        };
-
-        if let Some(hidden) = matches.get_many::<String>("hidden") {
-            args.hidden = hidden.cloned().collect();
-        } else {
-            let mut hidden = vec![];
-            std::mem::swap(&mut args.hidden, &mut hidden);
-            args.hidden = hidden
-                .into_iter()
-                .flat_map(|v| v.split(',').map(|v| v.to_string()).collect::<Vec<String>>())
-                .collect();
-        }
-
-        if !args.enable_cors {
-            args.enable_cors = matches.get_flag("enable-cors");
+        if let Some(addrs) = matches.get_many::<IpAddr>("bind") {
+            args.addrs = addrs.copied().collect();
         }
 
         if let Some(rules) = matches.get_many::<String>("auth") {
             let rules: Vec<_> = rules.map(|v| v.as_str()).collect();
-            args.auth = AccessControl::new(&rules)?;
-        }
-
-        if !args.allow_all {
-            args.allow_all = matches.get_flag("allow-all");
-        }
-
-        let allow_all = args.allow_all;
-
-        if !args.allow_upload {
-            args.allow_upload = allow_all || matches.get_flag("allow-upload");
-        }
-        if !args.allow_delete {
-            args.allow_delete = allow_all || matches.get_flag("allow-delete");
-        }
-        if !args.allow_search {
-            args.allow_search = allow_all || matches.get_flag("allow-search");
-        }
-        if !args.allow_symlink {
-            args.allow_symlink = allow_all || matches.get_flag("allow-symlink");
-        }
-        if !args.allow_hash {
-            args.allow_hash = allow_all || matches.get_flag("allow-hash");
-        }
-        if !args.allow_archive {
-            args.allow_archive = allow_all || matches.get_flag("allow-archive");
-        }
-        if !args.render_index {
-            args.render_index = matches.get_flag("render-index");
-        }
-
-        if !args.render_try_index {
-            args.render_try_index = matches.get_flag("render-try-index");
-        }
-
-        if !args.render_spa {
-            args.render_spa = matches.get_flag("render-spa");
-        }
-
-        if let Some(assets_path) = matches.get_one::<PathBuf>("assets") {
-            args.assets = Some(assets_path.clone());
-        }
-
-        if let Some(assets_path) = &args.assets {
-            args.assets = Some(Args::sanitize_assets_path(assets_path)?);
-        }
-
-        if let Some(assets_path) = &args.assets {
-            let p = assets_path.join("404.html");
-            if p.exists() {
-                args.error_page = Some(p);
-            }
+            args.auth = AuthConfig::new(&rules)?;
         }
 
         if let Some(log_format) = matches.get_one::<String>("log-format") {
@@ -426,34 +309,140 @@ impl Args {
             args.log_file = Some(log_file.clone());
         }
 
-        if let Some(compress) = matches.get_one::<Compress>("compress") {
-            args.compress = *compress;
+        if let Some(max_upload_size) = matches.get_one::<u64>("max-upload-size") {
+            args.max_upload_size = *max_upload_size;
+        }
+        if let Some(upload_idle_timeout) = matches.get_one::<u64>("upload-idle-timeout") {
+            args.upload_idle_timeout = *upload_idle_timeout;
+        }
+        if let Some(upload_total_timeout) = matches.get_one::<u64>("upload-total-timeout") {
+            args.upload_total_timeout = *upload_total_timeout;
+        }
+        if let Some(max_concurrent_uploads) = matches.get_one::<usize>("max-concurrent-uploads") {
+            args.max_concurrent_uploads = *max_concurrent_uploads;
+        }
+        if let Some(min_free_space) = matches.get_one::<u64>("min-free-space") {
+            args.min_free_space = *min_free_space;
+        }
+        if let Some(max_connections) = matches.get_one::<usize>("max-connections") {
+            args.max_connections = *max_connections;
+        }
+        if let Some(max_search_entries) = matches.get_one::<usize>("max-search-entries") {
+            args.max_search_entries = *max_search_entries;
+        }
+        if let Some(max_concurrent_searches) = matches.get_one::<usize>("max-concurrent-searches") {
+            args.max_concurrent_searches = *max_concurrent_searches;
+        }
+        if let Some(request_timeout) = matches.get_one::<u64>("request-timeout") {
+            args.request_timeout = *request_timeout;
         }
 
-        #[cfg(feature = "tls")]
+        let args = args.validate()?;
+        if let (Some(state_db), Some(config_path)) =
+            (args.state_database_path(), config_path.as_deref())
         {
-            if let Some(tls_cert) = matches.get_one::<PathBuf>("tls-cert") {
-                args.tls_cert = Some(tls_cert.clone())
-            }
-
-            if let Some(tls_key) = matches.get_one::<PathBuf>("tls-key") {
-                args.tls_key = Some(tls_key.clone())
-            }
-
-            match (&args.tls_cert, &args.tls_key) {
-                (Some(_), Some(_)) => {}
-                (Some(_), _) => bail!("No tls-key set"),
-                (_, Some(_)) => bail!("No tls-cert set"),
-                (None, None) => {}
-            }
+            Self::ensure_no_state_db_path_conflict(&state_db, config_path, "Configuration file")?;
         }
-        #[cfg(not(feature = "tls"))]
-        {
-            args.tls_cert = None;
-            args.tls_key = None;
-        }
-
         Ok(args)
+    }
+
+    /// Validate and normalize settings supplied through either the CLI or the
+    /// reusable library API.
+    ///
+    /// Keeping this boundary on `Args` prevents embedders from bypassing the
+    /// invariants that the runtime relies on when it constructs semaphores and
+    /// computes request deadlines.
+    pub fn validate(mut self) -> Result<Self> {
+        self.serve_path = Self::sanitize_path(&self.serve_path)?;
+        if !self
+            .serve_path
+            .metadata()
+            .with_context(|| {
+                format!(
+                    "Failed to inspect shared path `{}`",
+                    self.serve_path.display()
+                )
+            })?
+            .is_dir()
+        {
+            bail!(
+                "Shared path `{}` must be a directory",
+                self.serve_path.display()
+            );
+        }
+
+        if let Some(state_dir) = self.state_dir.as_deref() {
+            self.state_dir = Some(Self::sanitize_state_dir_path(state_dir, &self.serve_path)?);
+        }
+        if let (Some(state_db), Some(log_file)) =
+            (self.state_database_path(), self.log_file.as_deref())
+        {
+            Self::ensure_no_state_db_path_conflict(&state_db, log_file, "Log file")?;
+        }
+
+        let timeout_origin = Instant::now();
+        validate_timeout(
+            "upload-idle-timeout",
+            self.upload_idle_timeout,
+            timeout_origin,
+        )?;
+        validate_timeout(
+            "upload-total-timeout",
+            self.upload_total_timeout,
+            timeout_origin,
+        )?;
+        if self.upload_total_timeout < self.upload_idle_timeout {
+            bail!("upload-total-timeout must be greater than or equal to upload-idle-timeout");
+        }
+        if self.max_concurrent_uploads == 0 {
+            bail!("max-concurrent-uploads must be greater than 0");
+        }
+        for (name, value) in [
+            ("max-connections", self.max_connections),
+            ("max-search-entries", self.max_search_entries),
+            ("max-concurrent-searches", self.max_concurrent_searches),
+        ] {
+            if value == 0 {
+                bail!("{name} must be greater than 0");
+            }
+        }
+        if self.addrs.is_empty() {
+            bail!("bind must contain at least one IP address");
+        }
+        if self.addrs.len() > MAX_BIND_ADDRESSES {
+            bail!("bind must not contain more than {MAX_BIND_ADDRESSES} IP addresses");
+        }
+        if self.max_search_entries > MAX_SEARCH_ENTRIES {
+            bail!("max-search-entries must not exceed {MAX_SEARCH_ENTRIES}");
+        }
+        for (name, value) in [
+            ("max-connections", self.max_connections),
+            ("max-concurrent-uploads", self.max_concurrent_uploads),
+            ("max-concurrent-searches", self.max_concurrent_searches),
+        ] {
+            if value > tokio::sync::Semaphore::MAX_PERMITS {
+                bail!(
+                    "{name} must not exceed {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                );
+            }
+        }
+        validate_timeout("request-timeout", self.request_timeout, timeout_origin)?;
+
+        if !self.auth.has_users() {
+            bail!(
+                "At least one account is required; generate a hash with `dufs hash-password`, \
+                 then use `--auth 'user:<argon2id PHC>'`"
+            );
+        }
+
+        if self.state_dir.is_none() {
+            bail!(
+                "A persistent SQLite state directory is required; use `--state-dir <dir>` or set `state-dir` in the configuration file"
+            );
+        }
+
+        Ok(self)
     }
 
     fn sanitize_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
@@ -470,102 +459,266 @@ impl Args {
             .with_context(|| format!("Failed to access path `{}`", path.display()))
     }
 
-    fn sanitize_assets_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
-        let path = Self::sanitize_path(path)?;
-        if !path.join("index.html").exists() {
-            bail!("Path `{}` doesn't contains index.html", path.display());
+    fn sanitize_state_dir_path(path: &Path, serve_path: &Path) -> Result<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .with_context(|| "Failed to determine the current directory")?
+                .join(path)
+        };
+        // Remove trailing separators and `.` components before lstat. On
+        // Linux, a trailing slash otherwise asks the kernel to follow a final
+        // symlink to a directory even when using symlink_metadata.
+        let absolute = absolute.components().collect::<PathBuf>();
+        let metadata = std::fs::symlink_metadata(&absolute)
+            .with_context(|| format!("Failed to inspect state directory `{}`", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "State directory `{}` must not be a symbolic link",
+                path.display()
+            );
         }
-        Ok(path)
+        if !metadata.file_type().is_dir() {
+            bail!("State directory `{}` must be a directory", path.display());
+        }
+
+        let state_dir = std::fs::canonicalize(&absolute)
+            .with_context(|| format!("Failed to access state directory `{}`", path.display()))?;
+        let metadata = state_dir.metadata().with_context(|| {
+            format!(
+                "Failed to inspect state directory `{}`",
+                state_dir.display()
+            )
+        })?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            bail!(
+                "State directory `{}` must be owned by the effective service user",
+                state_dir.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            bail!(
+                "State directory `{}` must have permissions 0700",
+                state_dir.display()
+            );
+        }
+        if state_dir.starts_with(serve_path) || serve_path.starts_with(&state_dir) {
+            bail!(
+                "State directory `{}` must not overlap shared path `{}`",
+                state_dir.display(),
+                serve_path.display()
+            );
+        }
+
+        // Inspect the fixed target now so a pre-existing symlink, directory,
+        // or other unsupported file type fails before the server starts.
+        Self::sanitize_state_db_path(&state_dir.join(STATE_DATABASE_FILE_NAME), serve_path)?;
+        Ok(state_dir)
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BindAddr {
-    IpAddr(IpAddr),
-    #[cfg(unix)]
-    SocketPath(String),
-}
+    pub(crate) fn state_database_path(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_ref()
+            .map(|path| path.join(STATE_DATABASE_FILE_NAME))
+    }
 
-impl BindAddr {
-    fn parse_addrs(addrs: &[&str]) -> Result<Vec<Self>> {
-        let mut bind_addrs = vec![];
-        #[cfg(not(unix))]
-        let mut invalid_addrs = vec![];
-        for addr in addrs {
-            match addr.parse::<IpAddr>() {
-                Ok(v) => {
-                    bind_addrs.push(BindAddr::IpAddr(v));
-                }
-                Err(_) => {
-                    #[cfg(unix)]
-                    bind_addrs.push(BindAddr::SocketPath(addr.to_string()));
-                    #[cfg(not(unix))]
-                    invalid_addrs.push(*addr);
-                }
+    fn sanitize_state_db_path(path: &Path, serve_path: &Path) -> Result<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .with_context(|| "Failed to determine the current directory")?
+                .join(path)
+        };
+        let file_name = absolute.file_name().ok_or_else(|| {
+            anyhow::anyhow!("State database path `{}` must name a file", path.display())
+        })?;
+        let parent = absolute.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "State database path `{}` must have a parent directory",
+                path.display()
+            )
+        })?;
+        let parent = std::fs::canonicalize(parent).with_context(|| {
+            format!(
+                "Failed to access state database parent directory `{}`",
+                parent.display()
+            )
+        })?;
+        if !parent
+            .metadata()
+            .with_context(|| {
+                format!(
+                    "Failed to inspect state database parent directory `{}`",
+                    parent.display()
+                )
+            })?
+            .is_dir()
+        {
+            bail!(
+                "State database parent `{}` must be a directory",
+                parent.display()
+            );
+        }
+
+        let state_db = parent.join(file_name);
+        if state_db.starts_with(serve_path) {
+            bail!(
+                "State database `{}` must not be inside shared path `{}`",
+                state_db.display(),
+                serve_path.display()
+            );
+        }
+
+        match std::fs::symlink_metadata(&state_db) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "State database `{}` must not be a symbolic link",
+                    state_db.display()
+                );
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                bail!(
+                    "State database `{}` must be a regular file",
+                    state_db.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect state database `{}`", state_db.display())
+                });
             }
         }
-        #[cfg(not(unix))]
-        if !invalid_addrs.is_empty() {
-            bail!("Invalid bind address `{}`", invalid_addrs.join(","));
+
+        Ok(state_db)
+    }
+
+    fn ensure_no_state_db_path_conflict(
+        state_db: &Path,
+        other: &Path,
+        other_name: &str,
+    ) -> Result<()> {
+        let absolute = if other.is_absolute() {
+            other.to_path_buf()
+        } else {
+            env::current_dir()
+                .with_context(|| "Failed to determine the current directory")?
+                .join(other)
+        };
+        let file_name = absolute.file_name().ok_or_else(|| {
+            anyhow::anyhow!("{other_name} path `{}` must name a file", other.display())
+        })?;
+        let parent = absolute.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{other_name} path `{}` must have a parent directory",
+                other.display()
+            )
+        })?;
+        let parent = std::fs::canonicalize(parent).with_context(|| {
+            format!(
+                "Failed to access {other_name} parent directory `{}`",
+                parent.display()
+            )
+        })?;
+        let normalized = parent.join(file_name);
+        let conflicts = std::iter::once(state_db.to_path_buf()).chain(
+            ["-journal", "-wal", "-shm"].into_iter().map(|suffix| {
+                let mut sidecar = state_db.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                PathBuf::from(sidecar)
+            }),
+        );
+        if conflicts.into_iter().any(|path| path == normalized) {
+            bail!(
+                "{other_name} `{}` conflicts with SQLite state database `{}` or one of its sidecar files",
+                normalized.display(),
+                state_db.display()
+            );
         }
-        Ok(bind_addrs)
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Compress {
-    None,
-    #[default]
-    Low,
-    Medium,
-    High,
-}
-
-impl ValueEnum for Compress {
-    fn value_variants<'a>() -> &'a [Self] {
-        &[Self::None, Self::Low, Self::Medium, Self::High]
+fn read_config(path: &Path) -> Result<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        // Opening a FIFO or device supplied in place of the config must not
+        // block startup before the descriptor type can be verified.
+        .custom_flags((rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
+        .open(path)
+        .with_context(|| format!("Failed to read config at {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to inspect config at {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("Config at {} must be a regular file", path.display());
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        bail!(
+            "Config at {} exceeds the {MAX_CONFIG_BYTES}-byte limit",
+            path.display()
+        );
     }
 
-    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        Some(match self {
-            Compress::None => PossibleValue::new("none"),
-            Compress::Low => PossibleValue::new("low"),
-            Compress::Medium => PossibleValue::new("medium"),
-            Compress::High => PossibleValue::new("high"),
-        })
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_CONFIG_BYTES) as usize);
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read config at {}", path.display()))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        bail!(
+            "Config at {} exceeds the {MAX_CONFIG_BYTES}-byte limit",
+            path.display()
+        );
     }
+    String::from_utf8(bytes)
+        .with_context(|| format!("Config at {} is not valid UTF-8", path.display()))
 }
 
-impl Compress {
-    pub fn to_compression(self) -> Compression {
-        match self {
-            Compress::None => Compression::none(),
-            Compress::Low => Compression::fast(),
-            Compress::Medium => Compression::default(),
-            Compress::High => Compression::best(),
-        }
+fn validate_timeout(name: &str, seconds: u64, origin: Instant) -> Result<()> {
+    if seconds == 0 {
+        bail!("{name} must be greater than 0");
     }
+    if seconds > MAX_TIMEOUT_SECONDS {
+        bail!("{name} must not exceed {MAX_TIMEOUT_SECONDS} seconds");
+    }
+    if origin.checked_add(Duration::from_secs(seconds)).is_none() {
+        bail!("{name} cannot be represented by the platform monotonic clock");
+    }
+    Ok(())
 }
 
-fn deserialize_bind_addrs<'de, D>(deserializer: D) -> Result<Vec<BindAddr>, D::Error>
+fn parse_bind_addrs(addrs: &[&str]) -> Result<Vec<IpAddr>> {
+    let mut bind_addrs = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let Ok(ip) = addr.parse::<IpAddr>() else {
+            bail!("Invalid bind address `{addr}`: expected an IP address");
+        };
+        bind_addrs.push(ip);
+    }
+    Ok(bind_addrs)
+}
+
+fn deserialize_bind_addrs<'de, D>(deserializer: D) -> Result<Vec<IpAddr>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct StringOrVec;
 
     impl<'de> serde::de::Visitor<'de> for StringOrVec {
-        type Value = Vec<BindAddr>;
+        type Value = Vec<IpAddr>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("string or list of strings")
+            formatter.write_str("IP address string or list of IP address strings")
         }
 
         fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            BindAddr::parse_addrs(&[s]).map_err(serde::de::Error::custom)
+            parse_bind_addrs(&[s]).map_err(serde::de::Error::custom)
         }
 
         fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
@@ -574,50 +727,11 @@ where
         {
             let addrs: Vec<&'de str> =
                 Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
-            BindAddr::parse_addrs(&addrs).map_err(serde::de::Error::custom)
+            parse_bind_addrs(&addrs).map_err(serde::de::Error::custom)
         }
     }
 
     deserializer.deserialize_any(StringOrVec)
-}
-
-fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct StringOrVec;
-
-    impl<'de> serde::de::Visitor<'de> for StringOrVec {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("string or list of strings")
-        }
-
-        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(vec![s.to_owned()])
-        }
-
-        fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: serde::de::SeqAccess<'de>,
-        {
-            Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
-        }
-    }
-
-    deserializer.deserialize_any(StringOrVec)
-}
-
-fn deserialize_access_control<'de, D>(deserializer: D) -> Result<AccessControl, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let rules: Vec<&str> = Vec::deserialize(deserializer)?;
-    AccessControl::new(&rules).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_log_http<'de, D>(deserializer: D) -> Result<HttpLogger, D::Error>
@@ -632,13 +746,8 @@ fn default_serve_path() -> PathBuf {
     PathBuf::from(".")
 }
 
-fn default_addrs() -> Vec<BindAddr> {
-    let addrs = if is_ipv6_available() {
-        ["0.0.0.0", "::"].as_slice()
-    } else {
-        ["0.0.0.0"].as_slice()
-    };
-    BindAddr::parse_addrs(addrs).unwrap()
+fn default_addrs() -> Vec<IpAddr> {
+    vec![IpAddr::from([127, 0, 0, 1])]
 }
 
 fn default_port() -> u16 {
@@ -646,126 +755,4 @@ fn default_port() -> u16 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use assert_fs::prelude::*;
-
-    #[test]
-    fn test_default() {
-        let cli = build_cli();
-        let matches = cli.try_get_matches_from(vec![""]).unwrap();
-        let args = Args::parse(matches).unwrap();
-        let cwd = Args::sanitize_path(std::env::current_dir().unwrap()).unwrap();
-        assert_eq!(args.serve_path, cwd);
-        assert_eq!(args.port, default_port());
-        assert_eq!(args.addrs, default_addrs());
-    }
-
-    #[test]
-    fn test_args_from_cli1() {
-        let tmpdir = assert_fs::TempDir::new().unwrap();
-        let cli = build_cli();
-        let matches = cli
-            .try_get_matches_from(vec![
-                "",
-                "--hidden",
-                "tmp,*.log,*.lock",
-                &tmpdir.to_string_lossy(),
-            ])
-            .unwrap();
-        let args = Args::parse(matches).unwrap();
-        assert_eq!(args.serve_path, Args::sanitize_path(&tmpdir).unwrap());
-        assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
-    }
-
-    #[test]
-    fn test_args_from_cli2() {
-        let cli = build_cli();
-        let matches = cli
-            .try_get_matches_from(vec![
-                "", "--hidden", "tmp", "--hidden", "*.log", "--hidden", "*.lock",
-            ])
-            .unwrap();
-        let args = Args::parse(matches).unwrap();
-        assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
-    }
-
-    #[test]
-    fn test_args_from_empty_config_file() {
-        let tmpdir = assert_fs::TempDir::new().unwrap();
-        let config_file = tmpdir.child("config.yaml");
-        config_file.write_str("").unwrap();
-
-        let cli = build_cli();
-        let matches = cli
-            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
-            .unwrap();
-        let args = Args::parse(matches).unwrap();
-        let cwd = Args::sanitize_path(std::env::current_dir().unwrap()).unwrap();
-        assert_eq!(args.serve_path, cwd);
-        assert_eq!(args.port, default_port());
-        assert_eq!(args.addrs, default_addrs());
-    }
-
-    #[test]
-    fn test_args_from_config_file1() {
-        let tmpdir = assert_fs::TempDir::new().unwrap();
-        let config_file = tmpdir.child("config.yaml");
-        let contents = format!(
-            r#"
-serve-path: {}
-bind: 0.0.0.0
-port: 3000
-allow-upload: true
-hidden: tmp,*.log,*.lock
-"#,
-            tmpdir.display()
-        );
-        config_file.write_str(&contents).unwrap();
-
-        let cli = build_cli();
-        let matches = cli
-            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
-            .unwrap();
-        let args = Args::parse(matches).unwrap();
-        assert_eq!(args.serve_path, Args::sanitize_path(&tmpdir).unwrap());
-        assert_eq!(
-            args.addrs,
-            vec![BindAddr::IpAddr("0.0.0.0".parse().unwrap())]
-        );
-        assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
-        assert_eq!(args.port, 3000);
-        assert!(args.allow_upload);
-    }
-
-    #[test]
-    fn test_args_from_config_file2() {
-        let tmpdir = assert_fs::TempDir::new().unwrap();
-        let config_file = tmpdir.child("config.yaml");
-        let contents = r#"
-bind:
-  - 127.0.0.1
-  - 192.168.8.10
-hidden:
-  - tmp
-  - '*.log'
-  - '*.lock'
-"#;
-        config_file.write_str(contents).unwrap();
-
-        let cli = build_cli();
-        let matches = cli
-            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
-            .unwrap();
-        let args = Args::parse(matches).unwrap();
-        assert_eq!(
-            args.addrs,
-            vec![
-                BindAddr::IpAddr("127.0.0.1".parse().unwrap()),
-                BindAddr::IpAddr("192.168.8.10".parse().unwrap())
-            ]
-        );
-        assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
-    }
-}
+mod tests;

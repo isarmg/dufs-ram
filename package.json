@@ -1,0 +1,26 @@
+{
+  "name": "dufs-browser-tests",
+  "private": true,
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check:docs": "node scripts/check-docs.mjs",
+    "check:js": "node scripts/check-js.mjs",
+    "check:types": "tsc -p assets/tsconfig.json",
+    "test:frontend:unit": "node --test tests/frontend/unit/*.test.mjs",
+    "test:frontend": "cargo build --locked --quiet && node tests/frontend/run.mjs",
+    "test:frontend:headed": "cargo build --locked --quiet && node tests/frontend/run.mjs --headed",
+    "test:frontend:edge": "cargo build --locked --quiet && node tests/frontend/run.mjs --edge --project=edge",
+    "test:frontend:install": "playwright install chromium firefox"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
+    "acorn": "8.17.0",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,22 +1,19 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Result, anyhow};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-#[cfg(feature = "tls")]
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use std::{
-    borrow::Cow,
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{borrow::Cow, path::Path};
 
-pub fn unix_now() -> Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Unable to get unix epoch time")
-}
+const URI_COMPONENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 pub fn encode_uri(v: &str) -> String {
-    let parts: Vec<_> = v.split('/').map(urlencoding::encode).collect();
-    parts.join("/")
+    v.split('/')
+        .map(|part| utf8_percent_encode(part, URI_COMPONENT_ENCODE_SET).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub fn decode_uri(v: &str) -> Option<Cow<'_, str>> {
@@ -37,93 +34,72 @@ pub fn try_get_file_name(path: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow!("Failed to get file name of `{}`", path.display()))
 }
 
-pub fn glob(pattern: &str, target: &str) -> bool {
-    let pat = match ::glob::Pattern::new(pattern) {
-        Ok(pat) => pat,
-        Err(_) => return false,
-    };
-    pat.matches(target)
-}
+pub fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-// Load public certificate from file.
-#[cfg(feature = "tls")]
-pub fn load_certs<T: AsRef<Path>>(file_name: T) -> Result<Vec<CertificateDer<'static>>> {
-    let mut certs = vec![];
-    for cert in CertificateDer::pem_file_iter(file_name.as_ref()).with_context(|| {
-        format!(
-            "Failed to load cert file at `{}`",
-            file_name.as_ref().display()
-        )
-    })? {
-        let cert = cert.with_context(|| {
-            format!(
-                "Invalid certificate data in file `{}`",
-                file_name.as_ref().display()
-            )
-        })?;
-        certs.push(cert)
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
-    if certs.is_empty() {
-        anyhow::bail!(
-            "No supported certificate in file `{}`",
-            file_name.as_ref().display()
-        );
+    output
+}
+
+pub(crate) fn decode_hex_to_slice(input: &str, output: &mut [u8]) -> bool {
+    if input.len() != output.len().saturating_mul(2) {
+        return false;
     }
-    Ok(certs)
+    for (pair, slot) in input.as_bytes().chunks_exact(2).zip(output) {
+        let Some(high) = hex_nibble(pair[0]) else {
+            return false;
+        };
+        let Some(low) = hex_nibble(pair[1]) else {
+            return false;
+        };
+        *slot = (high << 4) | low;
+    }
+    true
 }
 
-// Load private key from file.
-#[cfg(feature = "tls")]
-pub fn load_private_key<T: AsRef<Path>>(file_name: T) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(file_name.as_ref()).with_context(|| {
-        format!(
-            "Failed to load key file at `{}`",
-            file_name.as_ref().display()
-        )
-    })
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
-pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
-    let (unit, ranges) = range.split_once('=')?;
+pub fn parse_range(range: &str, size: u64) -> Option<(u64, u64)> {
+    let (unit, range) = range.split_once('=')?;
     if unit != "bytes" {
         return None;
     }
-
-    let mut result = Vec::new();
-    for range in ranges.split(',') {
-        let (start, end) = range.trim().split_once('-')?;
-        if start.is_empty() {
-            let offset = end.parse::<u64>().ok()?;
-            if offset <= size {
-                result.push((size - offset, size - 1));
-            } else {
-                return None;
-            }
-        } else {
-            let start = start.parse::<u64>().ok()?;
-            if start < size {
-                if end.is_empty() {
-                    result.push((start, size - 1));
-                } else {
-                    let end = end.parse::<u64>().ok()?;
-                    if end < size && start <= end {
-                        result.push((start, end));
-                    } else {
-                        return None;
-                    }
-                }
-            } else {
-                return None;
-            }
-        }
+    if range.contains(',') {
+        return None;
     }
-
-    Some(result)
-}
-
-pub fn is_ipv6_available() -> bool {
-    use socket2::{Domain, Protocol, Socket, Type};
-    Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).is_ok()
+    let (start, end) = range.trim().split_once('-')?;
+    if start.is_empty() {
+        let length = end.parse::<u64>().ok()?;
+        if length == 0 || size == 0 {
+            return None;
+        }
+        let length = length.min(size);
+        return Some((size - length, size - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= size {
+        return None;
+    }
+    if end.is_empty() {
+        return Some((start, size - 1));
+    }
+    let end = end.parse::<u64>().ok()?;
+    if start > end {
+        return None;
+    }
+    Some((start, end.min(size - 1)))
 }
 
 #[cfg(test)]
@@ -131,44 +107,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_glob_key() {
-        assert!(glob("", ""));
-        assert!(glob(".*", ".git"));
-        assert!(glob("abc", "abc"));
-        assert!(glob("a*c", "abc"));
-        assert!(glob("a?c", "abc"));
-        assert!(glob("a*c", "abbc"));
-        assert!(glob("*c", "abc"));
-        assert!(glob("a*", "abc"));
-        assert!(glob("?c", "bc"));
-        assert!(glob("a?", "ab"));
-        assert!(!glob("abc", "adc"));
-        assert!(!glob("abc", "abcd"));
-        assert!(!glob("a?c", "abbc"));
-        assert!(!glob("*.log", "log"));
-        assert!(glob("*.abc-cba", "xyz.abc-cba"));
-        assert!(glob("*.abc-cba", "123.xyz.abc-cba"));
-        assert!(glob("*.log", ".log"));
-        assert!(glob("*.log", "a.log"));
-        assert!(glob("*/", "abc/"));
-        assert!(!glob("*/", "abc"));
+    fn test_parse_range() {
+        assert_eq!(parse_range("bytes=0-499", 500), Some((0, 499)));
+        assert_eq!(parse_range("bytes=0-", 500), Some((0, 499)));
+        assert_eq!(parse_range("bytes=299-", 500), Some((299, 499)));
+        assert_eq!(parse_range("bytes=-500", 500), Some((0, 499)));
+        assert_eq!(parse_range("bytes=-300", 500), Some((200, 499)));
+        assert_eq!(parse_range("bytes=-501", 500), Some((0, 499)));
+        assert_eq!(parse_range("bytes=0-500", 500), Some((0, 499)));
+        assert_eq!(parse_range("bytes=499-999", 500), Some((499, 499)));
+        assert_eq!(parse_range("bytes=0-199, 100-399", 500), None);
+        assert_eq!(parse_range("bytes=500-", 500), None);
+        assert_eq!(parse_range("bytes=-0", 500), None);
+        assert_eq!(parse_range("bytes=-1", 0), None);
+        assert_eq!(parse_range("bytes=0-0", 0), None);
+        assert_eq!(parse_range("bytes=0-199,", 500), None);
+        assert_eq!(parse_range("bytes=0-199, 500-", 500), None);
     }
 
     #[test]
-    fn test_parse_range() {
-        assert_eq!(parse_range("bytes=0-499", 500), Some(vec![(0, 499)]));
-        assert_eq!(parse_range("bytes=0-", 500), Some(vec![(0, 499)]));
-        assert_eq!(parse_range("bytes=299-", 500), Some(vec![(299, 499)]));
-        assert_eq!(parse_range("bytes=-500", 500), Some(vec![(0, 499)]));
-        assert_eq!(parse_range("bytes=-300", 500), Some(vec![(200, 499)]));
-        assert_eq!(
-            parse_range("bytes=0-199, 100-399, 400-, -200", 500),
-            Some(vec![(0, 199), (100, 399), (400, 499), (300, 499)])
-        );
-        assert_eq!(parse_range("bytes=500-", 500), None);
-        assert_eq!(parse_range("bytes=-501", 500), None);
-        assert_eq!(parse_range("bytes=0-500", 500), None);
-        assert_eq!(parse_range("bytes=0-199,", 500), None);
-        assert_eq!(parse_range("bytes=0-199, 500-", 500), None);
+    fn range_parser_property_never_returns_an_out_of_bounds_interval() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for _ in 0..50_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let size = state % 4096;
+            let first = state.rotate_left(19) % 8192;
+            let second = state.rotate_left(41) % 8192;
+            for value in [
+                format!("bytes={first}-{second}"),
+                format!("bytes={first}-"),
+                format!("bytes=-{second}"),
+            ] {
+                if let Some((start, end)) = parse_range(&value, size) {
+                    assert!(size > 0, "range returned for an empty resource: {value}");
+                    assert!(start <= end, "inverted range for {value}");
+                    assert!(end < size, "out-of-bounds range for {value} size={size}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uri_component_encoding_round_trips_unicode_and_reserved_bytes() {
+        for value in [
+            "",
+            "plain",
+            "space and #fragment?",
+            "资料/子目录/file.txt",
+            r"..\windows:name ",
+            "\0\u{7f}\u{80}",
+        ] {
+            let encoded = encode_uri(value);
+            assert_eq!(decode_uri(&encoded).as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn hexadecimal_codec_matches_lowercase_wire_format_and_rejects_invalid_input() {
+        assert_eq!(encode_hex([0x00, 0x1f, 0xa5, 0xff]), "001fa5ff");
+        let mut decoded = [0_u8; 4];
+        assert!(decode_hex_to_slice("001FA5ff", &mut decoded));
+        assert_eq!(decoded, [0x00, 0x1f, 0xa5, 0xff]);
+        assert!(!decode_hex_to_slice("001fa5", &mut decoded));
+        assert!(!decode_hex_to_slice("001fa5fg", &mut decoded));
     }
 }

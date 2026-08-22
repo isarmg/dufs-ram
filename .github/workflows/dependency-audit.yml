@@ -1,0 +1,60 @@
+name: Dependency Audit
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - package-lock.json
+      - package.json
+      - .github/workflows/dependency-audit.yml
+  schedule:
+    - cron: "23 7 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24.8.0"
+  RUST_TOOLCHAIN: "1.97.1"
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_TERM_COLOR: always
+  CI: "1"
+
+jobs:
+  audit:
+    name: RustSec and npm advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the fixed Rust toolchain and cargo-audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" install cargo-audit \
+            --version "$CARGO_AUDIT_VERSION" \
+            --locked
+          cargo audit --version
+      - name: Audit the locked Rust dependency graph
+        run: cargo audit
+      - name: Use the fixed Node.js release
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Audit the locked JavaScript dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm audit --audit-level=high

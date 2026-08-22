@@ -1,0 +1,311 @@
+# 生产部署、备份、升级与回滚
+
+本文给出当前 Linux 部署的基准操作流程。程序强制同一个共享根只能由一个 Dufs 实例持锁；运维示例进一步采用一台主机一个 Dufs 进程的简化约定。示例假设：
+
+- Dufs 二进制位于 `/opt/dufs/bin/dufs`；
+- 配置位于 `/etc/dufs/dufs.yaml`；
+- 必需的 SQLite 状态目录位于 `/var/lib/dufs`，固定数据库为其中的 `state.sqlite3`；
+- 专用账号和组均为 `dufs`；
+- 唯一共享根为 `/srv/dufs`；
+- nginx 与 Dufs 位于同一主机，Dufs 只监听 `127.0.0.1:5000`。
+
+网关样例要求 nginx 1.24.0 或更高版本、HTTP SSL/HTTP2 模块，以及仍由上游或操作系统发行商提供安全更新的 OpenSSL；新部署优先使用 OpenSSL 3.5 LTS，不能把已经结束公开安全支持的上游 OpenSSL 1.1.1 作为生产基线。源码质量门不只加载语法：部署检查会从包含空格、`&`、`#` 和反斜杠的真实 checkout fixture 读取文件，复制到安全运行名后启动隔离的真实 nginx 与 mock upstream，分别验证规范重定向、Host/SNI 拒绝、固定回源头与真实客户端 IP 覆盖、登录别名 4 KiB 限制，以及连接/请求速率限制的拒绝和恢复。
+
+如果实际路径不同，必须同步修改配置、systemd 的 `ReadWritePaths`、备份任务和恢复演练，不能只替换其中一处。
+
+## 1. 首次部署
+
+1. 创建不可登录的专用服务账号，并确保共享根、其现有内容以及需要保留的 ACL 和扩展属性可由该账号管理。
+2. 在已经校验并解压的发布包根目录中，创建目标目录并安装二进制、文档、配置和网关文件：
+
+   ```sh
+   install -d -o root -g root -m 0755 /opt/dufs/bin
+   install -d -o root -g dufs -m 0750 /etc/dufs
+   install -d -o root -g root -m 0755 /etc/nginx/conf.d /etc/nginx/snippets
+   install -d -o root -g root -m 0755 /usr/share/doc/dufs
+   install -o root -g root -m 0755 dufs /opt/dufs/bin/dufs
+   install -o root -g root -m 0644 docs/operations.md /usr/share/doc/dufs/operations.md
+   install -o root -g root -m 0644 LICENSE-MIT LICENSE-APACHE \
+     BUILD-ENVIRONMENT.txt \
+     THIRD_PARTY_LICENSES.txt RUST-STANDARD-LIBRARY-COPYRIGHT.html \
+     dufs.cdx.json /usr/share/doc/dufs/
+   install -o root -g dufs -m 0640 deploy/dufs.yaml.example /etc/dufs/dufs.yaml
+   install -o root -g root -m 0644 deploy/dufs.service /etc/systemd/system/dufs.service
+   install -o root -g root -m 0644 deploy/nginx-dufs.conf /etc/nginx/conf.d/dufs.conf
+   install -o root -g root -m 0644 deploy/dufs-proxy.conf /etc/nginx/snippets/dufs-proxy.conf
+   ```
+
+3. 使用 `/opt/dufs/bin/dufs hash-password` 生成 Argon2id PHC，替换 YAML 中的占位值。配置含登录验证材料，应保持 `0640` 或更严格权限。部署样例必须提供 `state-dir: /var/lib/dufs`；对应 systemd unit 用 `StateDirectory=dufs` 和 `StateDirectoryMode=0700` 在启动命令前准备目录。若不使用该 unit，必须先创建由服务账号所有、权限为 `0700` 且不是符号链接的专用目录。状态目录不能与 `/srv/dufs` 互为祖先/后代，也不能用 bind mount 或其他挂载别名让固定的 `state.sqlite3` 从共享根内可见；启动检查普通路径关系，但不会解析管理员在运行时建立的所有挂载别名。
+4. 安装真实 TLS 证书，替换 nginx 示例域名，然后检查配置：
+
+   ```sh
+   systemd-analyze verify /etc/systemd/system/dufs.service
+   nginx -t
+   ```
+
+5. 确认后端端口没有对外监听，再启动服务：
+
+   ```sh
+   systemctl daemon-reload
+   systemctl enable --now dufs
+   systemctl enable --now nginx
+   systemctl reload-or-restart nginx
+   ss -ltnp
+   curl --fail --max-time 10 http://127.0.0.1:5000/__dufs__/health
+   ```
+
+6. 从受支持浏览器经外部 HTTPS 地址登录，完成新建、上传、单文件下载、移动和删除冒烟测试。
+
+Dufs 启动时会对共享根目录取得非阻塞独占锁。第二个管理同一根目录的实例会拒绝启动；这不是高可用选主机制，不能把多个节点指向同一共享存储。
+
+### 1.1 必需的文件型统一状态库
+
+服务只使用文件型 SQLite schema v3 的统一 state store，其中有 `operations`、`upload_sessions` 和 `purge_jobs` 三类状态。SQLite 是上传状态的唯一权威，服务不会在共享根内写入、读取或导入 JSON 上传状态文件。CLI `--state-dir` 或 YAML `state-dir` 必须提供一个目录，数据库固定使用 `<state-dir>/state.sqlite3`；没有进程内数据库或单独文件路径配置入口。
+
+operation 容量为全局 4096、每账号 1024，终态 TTL 为 15 分钟。启动恢复会删除未进入提交边界的 `Reserved`，把可能已经触碰文件系统的 operation `CommitStarted` 转为 `Completed/unknown` 并从恢复时开始新的 15 分钟终态 TTL；未过期的原有 `Completed` 只继续使用剩余 TTL。upload session 容量为全局 16384、每账号 4096，每次更新后保留 7 天；持久状态包含 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`，重启会把 upload `CommitStarted` 恢复为 `Unknown`，而 `AwaitingConfirmation` 保留完整 stage 等待明确发布或丢弃。purge job 容量为全局 4096、每账号 1024，不使用 TTL 或固定失败次数丢弃未完成回收。
+
+认证客户端应通过 `GET /__dufs__/api/jobs/<UUID>` 查询当前账号的 mutation job。响应使用 `job_id` 字段及 `running/succeeded/failed/unknown` 状态。
+
+状态库固定使用 SQLite rollback journal `DELETE` 模式和 `synchronous=EXTRA`，由单独状态线程串行访问。数据库文件以 `0600` 使用，必须位于共享根之外；已有数据库还必须是非符号链接、单硬链接普通文件，并绑定创建时共享根的设备号和 inode。现存文件先通过只读连接验证 application ID、schema、根绑定与完整性；schema v3 可直接恢复写入，合法 schema v2 是唯一允许升级的旧版本，并在一个 `BEGIN IMMEDIATE` 事务内增加上传 target revision/确认状态后迁移为 v3。其他版本的 DUFS 数据库、其他应用数据库、错误共享根或非 SQLite 文件都会在零修改下拒绝；应改用新的私有状态目录。不要绕过这些失败，也不要把同一文件复制给另一共享根复用。
+
+SQLite 提交与共享根中的 mkdir、rename、文件同步和目录 `fsync` 不属于一个共同事务。operation/upload 崩溃恢复中的 `unknown` 是保守结果，不是回滚记录。DELETE 先持久化含根内相对目标/trash 路径和源 dev/inode/类型的 `Prepared` outbox，再做 checked rename 与父目录 `fsync`，成功后才标记 `Ready`。worker 把到期 job 原子 claim 为 `Claimed`；I/O 失败持久化回 `Ready` 并从 100 ms 指数退避到最长 30 秒。若 state-store 的 defer/complete 命令瞬时失败，worker 会有界保留本地 claim，并在回读确认数据库仍为 `Claimed` 后重试；重启也会把遗留 `Claimed` 恢复为 `Ready`。独立 reconciler 在启动及运行期持续处理 `Prepared`，只依据已记录 inode 判断原目标仍在、匹配 trash 已在或局面仍有歧义；路径被复用或身份不匹配时保留对象，不做猜测删除。递归清理不会进入 trash 下的嵌套/bind mount，遇到边界会保留 job 并退避，卸载后继续。低频 maintenance 扫描只兜底未记账 orphan trash，不是新 DELETE 的正常持久化机制。
+
+不要在活跃 upload 或未完成 purge 的路径祖先上依赖 rename/unlink 来“顺手迁移”控制状态：SQLite 与文件系统无法在一个事务内原子 rebase。服务会在语义路径租约内，对 move/rename 的源与派生目标、DELETE 目标和 fresh PUT 目标执行有界 keyset 状态检查；根内符号链接别名也按目录身份识别。命中时分别返回 `409 move_state_conflict`、`409 rename_state_conflict`、`409 delete_state_conflict` 或 `409 upload_state_conflict`，待原任务完成后用新的 operation/upload ID 重试。检查本身暂不可用时不会开始 mutation，并返回带恢复建议的 `503`。
+
+### 1.2 上传预检与条件覆盖
+
+首方浏览器在批次入队前向 `POST /__dufs__/api/upload/preflight` 提交最终绝对逻辑路径。一次请求必须包含 1～512 个互不重复的路径，解码后的路径 UTF-8 总量最多 256 KiB，JSON wire body 最多 2 MiB；响应按原顺序返回 `path`、`exists`、`replaceable` 和可选 `revision`。没有已存在目标时不会弹出确认；已存在且可替换的文件才进入覆盖/跳过/取消对话框，不能替换的目标不会自动覆盖。预检是有界观察，不是锁定文件系统的事务，提交时的条件写才是权威。
+
+所有 PUT/PATCH 都使用明确的覆盖策略。缺少 `X-Dufs-Upload-Overwrite` 或值为 `false` 表示原子 no-replace；目标在提交时存在就失败，不会静默覆盖。值为 `true` 时必须同时提供 64 位小写十六进制 `X-Dufs-Target-Revision`。revision 绑定账号摘要、规范根内目标路径和完整 replacement CAS identity；服务在真正 rename 前再次验证它，旧 revision 不能授权覆盖后来出现或变化的对象。客户端不得把网络错误、`unknown`、非法响应或无法解析的 revision 降级为无条件覆盖。
+
+若完整 stage 在最后的条件检查中遇到目标出现或变化，服务保留同一 upload ID 和满 offset，并持久化为 `AwaitingConfirmation`；HEAD/冲突响应对外使用 `awaiting-confirmation`，同时给出当前 revision 和可替换提示。用户接受最新目标后，浏览器以同一 ID、满 offset、空正文 PATCH 和最新 revision 再次提交，因此通常无需重传文件；目标若再次变化会继续失败关闭并重新确认。用户跳过时，浏览器向 `POST /__dufs__/api/upload/discard` 提交同一路径和 upload ID，明确删除保留的 stage 并结束会话。
+
+有一个必须保留的 metadata 安全例外：已暂存的覆盖上传可能已经重放旧目标 uid/gid、mode 或允许的 xattr。若旧目标随后消失，服务以 `upload_metadata_preservation_refused` 拒绝用空 PATCH 把该 stage 当作全新文件发布；浏览器必须先 discard，再生成新 ID，以完整正文和 create-only PUT 重传。这样避免把旧对象的 metadata 意外赋给一个语义上新建的文件。
+
+仓库 systemd 样例的 `TimeoutStopSec=120s` 大于应用内置停机边界：首次信号后普通工作和提交共用 30 秒宽限，随后仅有 10 秒强制收尾窗；约 40 秒仍卡住时 Dufs 不再刷新日志，立即以状态 1 退出，不能保证该提交已落盘或尾部日志已写出。正常完成 tracked cleanup 后只执行一次、最多 5 秒的日志 flush，再显式 `exit(0)`；flush 由专用命名 OS thread 执行，不依赖可能被故障文件系统工作占满的 Tokio blocking pool，也不会让 runtime drop 继续等待卡在内核/FUSE 的已取消任务。主任务在 flush 期间继续优先监听第二信号，收到后跳过等待并立即以 130/143 退出。调大 systemd 超时不会延长这个应用硬截止；应监控并演练最慢文件/目录同步，使常见提交能在窗口内完成。SIGKILL 也会越过全部保证。
+
+## 2. 网关边界
+
+仓库内 nginx 示例固定 HTTP/1.1 回源，传递单值 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，关闭请求重放与缓存，并对登录路由族同时使用来源 IP 请求速率、连接数和短正文时限。未知 HTTP Host 由默认 server 拒绝，合法 HTTP server 只跳转到配置中的固定规范 HTTPS 域名；未知 HTTPS SNI/Host 在默认 server 拒绝，不能借 `$host` 形成外部跳转。Dufs 的内部路由本身也只接受规范 URI，尾斜杠、重复斜杠和非规范百分号编码不会成为绕过 exact gateway location 的等价别名。
+
+Dufs 在读取登录正文前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket；正在读取的 4 KiB 正文另受全局 32、每 IP 4 个并发许可和 10 秒总 deadline 约束。解析账号后仍继续执行“来源 IP + 账号摘要”组合键失败退避和最多两个 Argon2id 计算槽；一个来源不能借错误密码把同一账号在其他来源全局锁定。`Retry-After` 会向上取整剩余秒数，并只由 PRG 重定向后的最终 `429` 登录错误页返回；POST 的 `303` 不携带该字段。应用只在 TCP peer 为回环地址时采用合法单值 `X-Forwarded-For` 作为登录限流地址；`Host` 和 `X-Forwarded-Proto` 则参与同源校验，所以后端端口必须通过回环绑定、私网 ACL 或防火墙只允许会覆盖这些头的可信网关访问。网关若位于另一台主机，应用层只能看到网关地址，因此必须保留网关侧的真实来源 IP 限流与连接限制。
+
+Dufs 的普通文件和 Range 正文没有总时长/最低速率限制，但套接字连续 30 秒没有写入进展会关闭连接。公网网关仍应设置符合业务容量的响应总时长、最低速率和空闲策略；不能把应用的 30 秒 write-idle 当作完整慢客户端防护。
+
+后端必须由主机防火墙或网络 ACL 限制为仅网关可达。TLS 私钥、会话 Cookie、CSRF token、完整 Argon2id PHC 和文件内容均不得进入诊断工单或公开日志。
+
+## 3. 健康检查和监控
+
+- `GET` 或 `HEAD /__dufs__/health` 是公开 liveness，只表明进程仍能处理 HTTP，不访问文件内容，也不泄露账号或路径。
+- `GET` 或 `HEAD /__dufs__/ready` 是受认证 readiness；它通过启动时锚定的共享根 fd 创建一个保留形状的隐藏文件、写入并同步文件、删除该目录项，再同步根目录 fd，从而真实覆盖创建/写入/文件 `fsync`/删除/目录 `fsync` 路径。同时，统一 state-store actor 在当前 SQLite 连接上读取数据库身份和元数据，执行 `BEGIN IMMEDIATE`、写入探针行并显式 `ROLLBACK`，因此启动后变为只读、不可写或不可访问的数据库不会被缓存的 healthy 标志掩盖。readiness 还要求当前文件系统在计入进程内空间预留后满足 `min-free-space`，且进程未进入任一停机阶段；任一探针失败返回 `503`。purge 容量在 DELETE 预备阶段单独执行，readiness 不是对每种业务配额的完整接受性预测。外部负载均衡器若无法安全维护会话 Cookie，应只用 liveness，并通过独立的登录冒烟任务验证 readiness。
+- 告警至少覆盖进程重启、HTTP 5xx/429/507、登录限流、磁盘空间、inode、共享根挂载状态、备份年龄和备份恢复演练结果。
+
+普通写请求返回成功只表示其规定的原子发布和目录同步步骤已返回成功。硬件、固件、网络文件系统或宿主机错误兑现同步请求仍可能破坏数据，因此监控不能替代备份。
+
+## 4. 备份
+
+备份范围至少包括：
+
+- 共享根中的全部普通文件、目录、符号链接、所有权、模式、ACL、扩展属性和硬链接关系；
+- `/etc/dufs/dufs.yaml`；
+- 当前二进制、发布包的 `SHA256SUMS`、`BUILD-ENVIRONMENT.txt`、CycloneDX SBOM、`THIRD_PARTY_LICENSES.txt`、`RUST-STANDARD-LIBRARY-COPYRIGHT.html`、外层 checksum、签名及独立取得的公钥；
+- systemd、nginx、防火墙和备份任务配置。
+
+会话 Cookie 状态只存在内存中，不需要备份。`.dufs-upload-*` 包含内部 stage、删除 trash，以及可能遗留的严格保留形状名称；这些遗留名称不会被解析成上传状态，只会保持隐藏并由有 TTL 的孤儿扫描清理。备份仍不得单独过滤内部项，否则 stage/outbox 恢复时间点会不自洽。
+
+状态目录包含短 TTL operation 重放、7 天 upload session 和无 TTL 的未完成 purge outbox，但仍不是共享文件数据的替代备份。SQLite 与共享根没有跨域事务，因此最佳备份是在 Dufs 停止后同时复制共享根和状态目录，或对两者取同一受控时间点的存储快照；rollback journal 模式下不支持在事务进行时只复制主 `.sqlite3` 文件。恢复到新的共享根通常会得到不同的设备号或 inode，此时应使用新的空状态目录，并明确接受旧 Operation ID 不可重放、持久上传恢复记录丢失、隐藏 trash 只能由 orphan 扫描兜底；不能把绑定旧根的数据库强行接到新根。
+
+首选底层文件系统或存储提供的原子快照：
+
+1. 监控 `/__dufs__/health` 并确认共享根挂载正常。
+2. 创建单一时间点快照。
+3. 从快照复制数据，保留 numeric uid/gid、模式、ACL、xattr、稀疏文件和硬链接。
+4. 对备份清单和内容做校验，记录源主机、Git SHA、时间、快照 ID 和工具版本。
+5. 按保留策略把至少一份副本放到不同故障域，并启用不可变或离线保护。
+
+如果底层没有一致性快照，应先进入维护窗口：
+
+```sh
+systemctl stop dufs
+# 确认进程已退出，再执行能够保留 ACL/xattr/hardlink 的文件级备份。
+systemctl start dufs
+```
+
+不要用未经验证的普通 `cp -r` 作为唯一备份方式。备份成功的判据是能够恢复，而不是命令退出码为零。
+
+## 5. 恢复演练
+
+至少按季度在隔离主机或隔离挂载点做一次完整恢复：
+
+1. 校验备份清单、发布包 checksum 和签名。
+2. 恢复到新的空目录，不覆盖生产根。
+3. 比较文件数量、总字节数、内容摘要抽样、numeric uid/gid、模式、ACL、xattr、符号链接目标和硬链接 inode 关系。
+4. 用与生产相同的服务账号启动 Dufs，并为这个新根配置新的空状态目录；根目录锁、登录、分页、上传覆盖、单文件下载、移动和删除均应通过。
+5. 记录恢复点目标（RPO）、恢复耗时（RTO）、缺失项和修正措施。
+
+发生真实恢复时，先保全故障卷和日志。不要在原因未知时直接把备份覆盖回原目录。
+
+## 6. 升级
+
+仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Node 最低版本兼容、Rust、质量和 Chromium/Firefox 层不会创建 tag、release、签名或制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
+
+发布包由 `scripts/package-release.sh` 从干净 Git 提交构建。`Cargo.toml` 的版本必须存在精确的 `v<version>` tag，且该 tag 必须指向当前 HEAD。脚本强制执行完整 `scripts/check.sh`，不是依赖调用者事先声称检查通过；门禁后、签名前和发布前都会再次核对 HEAD、tag、版本与干净状态。启动检查显式拒绝 `refs/replace/*`、legacy grafts 和仓库私有 `info/attributes`。
+
+进入构建前，Git 索引和目标 commit tree 中的条目必须都是 mode `100644/100755` 的普通 blob；tracked symlink（`120000`）、submodule/gitlink（`160000`）及其他类型一律拒绝。权限为 `0700` 的私有 bare façade 只含由脚本摘要锁定的最小 local config，并通过 object alternates 读取目标对象库；所有决定源码身份的 Git 命令都清空 HOME、system/global 配置并禁用额外 attributes/replace。
+
+脚本从 façade 解析一次完整 commit ID。它先生成并验证一份质量门 archive，在没有 `.git` 的 `0700` 私有副本中运行检查；门禁结束后用独立 snapshot index 比较 tracked 内容和 mode，并拒绝任何非忽略新增路径。随后整棵质量树及其缓存被删除，再从同一 commit 分别生成全新的签名构建归档和打包归档。每份 tar 都作为独立文件保存到私有 stage 并立即验证，再解包并用目标 commit tree 建立独立临时 index；解包树会以 no-follow 方式拒绝 symlink 及任何非普通文件/目录条目，缺失、额外、类型、mode 或内容不同都会失败。后两份 tar 的 SHA-256 还必须完全相同。因此本地 replace object、private attributes、质量工具或构建期间改变 worktree/Git 元数据，不能让同一声明 SHA 对应另一棵检查、构建或打包树。只有最后一份重新验证的树提供文档和部署材料。同 UID 恶意进程仍属于必须用身份/主机隔离解决的边界。
+
+隔离质量门以 `env -i` 启动，固定 PATH、Rust 工具链和完整源码 SHA，并使用私有 HOME、Cargo home/target、npm cache、XDG 目录与临时目录。Cargo 先从锁文件 vendor，再以 offline source replacement 运行；这与之后签名构建使用的独立 vendor 树相互隔离。npm cache 播种器只接受 `package-lock.json` 中带 HTTPS resolved URL 和 SHA-512 integrity 的条目，并重新散列宿主 cache 内容后写入私有 cache；`npm ci` 使用 `prefer-offline`，缺失包以及 `npm audit` 仍可能访问网络。若宿主 Cargo home 已有 RustSec Git 数据库，脚本使用 `git clone --no-hardlinks` 复制到私有 Cargo home，验证其中没有链接/特殊文件后执行 `cargo audit --no-fetch`；若没有可用本地数据库，审计在隔离目录内按正常方式取得数据库。Playwright 只复用显式浏览器 cache，不让测试依赖用户 npm/Cargo 配置。JavaScript 安全门固定使用 Acorn 8.17.0 AST 与有界词法常量分析，并以内置正负对抗样例校验关键规则；动态 computed 解构的属性名无法静态求值时，在变量声明、赋值表达式和默认参数（含嵌套及 const alias）中都失败关闭。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript，外部/解析输入保持为 `unknown` 并经守卫收窄，生产源码不保留显式或隐式 `any`。该门无需迁移 `.ts`，但仍不等价于 ESLint 或完整跨过程污点证明。本地有 ShellCheck 时统一门执行 warning 检查，缺失时明确跳过且不联网安装；远程 CI 固定并强制执行 0.11.0。
+
+脚本严格校验 Rust/rustc/Cargo 1.97.1 与 `cargo-cyclonedx 0.5.9`。固定工具链 sysroot 的 `share/doc/rust/COPYRIGHT-library.html` 必须是 sysroot 内 no-follow 普通文件，并精确匹配已审核 SHA-256 `0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed`；未知工具链没有审核摘要时直接拒绝。验证后的副本以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 打包。签名构建另用锁文件 vendor 依赖，随后以清空环境、私有 Cargo home、离线 source replacement、关闭增量编译和显式编译器运行 release 构建；完整 Git SHA 嵌入版本字符串，私有构建路径经过 remap 并在二进制中复查。`SOURCE_DATE_EPOCH` 同时传给 Rust 构建、SBOM 和归档；未显式设置时使用提交时间。
+
+SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA 的稳定 Cargo 标识；source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID，并拒绝明文或百分号解码后出现的本地 `file:`、POSIX/Windows 绝对路径与构建根。它要求元数据中恰有一个本地 Dufs root 和一个依赖 root；这是项目所需的结构/无路径泄漏检查，不替代完整 CycloneDX schema validator。
+
+`THIRD_PARTY_LICENSES.txt` 从 Cargo metadata 中 Dufs 可达的非开发依赖生成，依赖源码必须位于本轮 vendor 根。每个包必须声明非空、经审核的 SPDX `license` 表达式；metadata `license_file` 只用于收集上游正文，不能替代表达式或作为分类 fallback。生成器按 `WITH > AND > OR` 优先级解析真实 SPDX AST，只接受审核清单内的 license identifier/exception，并要求表达式存在一条完整 permissive 选择：`OR` 任一分支可行，`AND` 两侧都必须 permissive；只对明确列出的 Cargo 遗留 `MIT/Apache-2.0` 和 `Unlicense/MIT` 写法映射为 `OR`。例如 `LGPL AND (MIT OR Apache-2.0)` 会拒绝，而 `(LGPL AND Apache-2.0) OR MIT` 可选择完整 MIT 分支。
+
+生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。项目自身 `LICENSE-MIT`/`LICENSE-APACHE` 不能替代缺失的上游文本；路径逃逸、symlink、缺失、非 UTF-8、NUL 或空文本都会失败。正文规范化换行并按 SHA-256 去重，包索引记录 SPDX 和文本摘要。
+
+包内 `BUILD-ENVIRONMENT.txt` 使用稳定的 `dufs-build-environment-v1` 键值格式，记录完整源码 SHA、源码版本、`SOURCE_DATE_EPOCH`、host target，以及本次实际使用或依赖的 Bash、rustc、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本。它与 SBOM、第三方 notice、Rust 标准库 notice 和项目双许可证均纳入包内 `SHA256SUMS`。该文件用于复现比较、故障归因和升级审计；它记录事实，不会把未固定的宿主工具变成可重复构建保证。
+
+二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。`CODE_REVIEW_REPORT.md` 是 `docs/history/code-review-report.md` 的兼容副本；新的规范链接只使用 `docs/history/`。发布脚本对除清单自身外的包内全部普通文件生成 `SHA256SUMS`，再使用包内 `scripts/check-docs.mjs` 检查最终布局；`--self-test` 复用同一装配和检查路径，避免源码树检查通过但制品链接失效。
+
+输出目录必须由当前发布账号拥有且不能让 group/other 写入；它会被解析为物理路径并通过已验证 fd 持有独占 `flock`。stage 创建、构建、清理、最终 rename 和目录同步均从锁定的目录 fd 路径派生，公开字符串路径在此后只用于身份复核和结果展示，祖先目录换绑不能重定向 mutation。发布后还会核对公开路径、锁定目录和最终 release 的 dev/inode；若公开路径被换绑则报告失败，但不会回滚已经完整提交到锁定目录的制品。
+
+签名 key 参数在构建阶段只作为尚未解析的调用输入保存。Cargo、rustc、依赖构建脚本、Node、SBOM、第三方与标准库 notice、最后一份源码验证、包内文档检查、归档和 checksum 全部完成，并再次通过 exact-source gate 后，脚本才进入短生命周期签名子进程：在其中解析并要求私钥是当前账号拥有、mode `0400`/`0600`、单硬链接的普通文件，打开 fd 后复核 dev/inode，完成签名和验签，随后由进程退出关闭 fd。密钥算法还必须属于明确的发布 allowlist：Ed25519、Ed448、至少 3072 bit 的 RSA，或曲线为 `prime256v1`、`secp384r1`、`secp521r1` 的 ECDSA。弱 RSA、DSA、`secp256k1` 等未审核曲线、X25519 等非签名密钥，以及无法确定类型/强度的 key 都在签名前失败关闭。构建工具不会继承私钥 fd。但这不是同 UID 恶意代码隔离；正式签名应在独立账号、隔离主机或 HSM 中执行。
+
+发布输出文件系统必须支持 Linux `RENAME_NOREPLACE`。脚本使用 GNU `mv --update=none --no-copy`，并且只有 source 消失、destination 是实体目录且设备号/inode 与移动前 source 相同时才确认发布；静默碰撞或身份不符都会失败。
+
+脚本在同一文件系统的 `0700` 私有 stage 中构造一个完整的 `<release-name>.release` 目录。归档、外层 checksum、签名和公钥全部写完、验签并同步后，只用一次 no-clobber 目录 rename 公开该目录，再同步输出目录；rename 与输出目录同步组成一个暂时忽略 HUP/INT/TERM 的短提交段，普通信号不会卡在两者之间。公开名称因此不会经历“只有部分 sidecar”的状态，也不会覆盖已有文件、目录或 symlink。若在 rename 前遭遇 SIGKILL 或掉电，可能留下不可见的 `.dufs-release-stage.*` 私有目录；若在 rename 后、输出目录同步确认前遭遇 SIGKILL、掉电或同步错误，公开目录仍是一次 rename 产生的完整目录，但该目录项跨重启的持久性尚未确认，必须把该次发布视为失败并人工核验，不能仅凭“已经可见”判定发布成功：
+
+```sh
+cargo install cargo-cyclonedx --version 0.5.9 --locked
+chmod 0600 /secure/offline/dufs-release-key.pem
+install -d -m 0700 ./dist
+./scripts/package-release.sh \
+  --signing-key /secure/offline/dufs-release-key.pem \
+  --output-dir ./dist
+```
+
+固定时间戳、权限、经 commit-tree 复核的源码快照、离线 Cargo vendoring、隔离 Git/Cargo/npm 质量环境、编译路径映射、审核过的标准库 notice 摘要和 SBOM 根引用消除了脚本已知的路径、时间、replace object、private attributes 和用户 Git/Cargo/npm 配置非确定性。逐字节可重复归档仍要求相同源码、`SOURCE_DATE_EPOCH`、Rust/Node/npm/cargo-cyclonedx/coreutils/OpenSSL 工具版本、host target 及相同的已验证依赖内容；应在不同长度的 checkout 路径各构建一次并比较归档 SHA-256。外层签名是否逐字节相同还取决于所用密钥算法；验收依据是签名能验证同一归档 checksum，而不是签名字节相等。
+
+生产主机验证时，公钥必须通过独立可信渠道取得并固定，不能只相信与归档从同一位置下载的临时公钥：
+
+```sh
+set -eu
+
+bundle=/secure/releases/dufs-0.48.0-x86_64-unknown-linux-gnu-0123456789ab.release
+pinned_public_key=/secure/trust/dufs-release-public.pem
+test -d "$bundle"
+test ! -L "$bundle"
+test -f "$pinned_public_key"
+test ! -L "$pinned_public_key"
+cd -- "$bundle"
+release_name="${bundle##*/}"
+release_name="${release_name%.release}"
+archive="${release_name}.tar.gz"
+checksum="${archive}.sha256"
+signature="${checksum}.sig"
+openssl dgst -sha256 -verify "$pinned_public_key" \
+  -signature "$signature" "$checksum"
+sha256sum --check "$checksum"
+
+verify_root="$(mktemp -d)"
+chmod 0700 "$verify_root"
+tar --extract --gzip --file "$archive" --directory "$verify_root"
+release_dir="$verify_root/$release_name"
+test -d "$release_dir"
+test ! -L "$release_dir"
+(cd "$release_dir" && sha256sum --check SHA256SUMS)
+
+# 从独立可信的发布记录填写完整值，不从同一下载目录自行推断。
+expected_version=0.48.0
+expected_sha=0123456789abcdef0123456789abcdef01234567
+expected_target=x86_64-unknown-linux-gnu
+test "$("$release_dir/dufs" --version)" = \
+  "dufs $expected_version (git $expected_sha)"
+grep -Fx "format=dufs-build-environment-v1" \
+  "$release_dir/BUILD-ENVIRONMENT.txt"
+grep -Fx "source_sha=$expected_sha" "$release_dir/BUILD-ENVIRONMENT.txt"
+grep -Fx "source_version=$expected_version" \
+  "$release_dir/BUILD-ENVIRONMENT.txt"
+grep -Fx "target=$expected_target" "$release_dir/BUILD-ENVIRONMENT.txt"
+grep -Eq '^source_date_epoch=[0-9]+$' "$release_dir/BUILD-ENVIRONMENT.txt"
+for key in \
+  bash rustc cargo cargo_cyclonedx node npm git openssl tar gzip mv sha256sum
+do
+  grep -Eq "^${key}=.+$" "$release_dir/BUILD-ENVIRONMENT.txt"
+done
+# 验证和升级完成后，只删除本次 mktemp 返回的精确目录。
+# rm -rf -- "$verify_root"
+```
+
+上面的 `openssl dgst` 适用于发布策略允许的 RSA（至少 3072 bit）和 ECDSA（`prime256v1`、`secp384r1`、`secp521r1`）digest 签名密钥。若固定公钥是 Ed25519 或 Ed448，发布脚本会改用 EdDSA 原始消息模式，验签命令应替换为：
+
+```sh
+openssl pkeyutl -verify -rawin -pubin \
+  -inkey "$pinned_public_key" \
+  -sigfile "$signature" \
+  -in "$checksum"
+```
+
+升级步骤：
+
+1. 阅读 `CHANGELOG.md`，确认配置、网关和文件系统行为变化。
+2. 验证签名、checksum、`BUILD-ENVIRONMENT.txt` 的 SHA/版本/target/工具字段、SBOM、`THIRD_PARTY_LICENSES.txt`、`RUST-STANDARD-LIBRARY-COPYRIGHT.html` 和二进制嵌入 SHA；在隔离环境运行完整检查及数据副本冒烟测试。
+3. 创建共享根一致性快照，并备份旧二进制和配置。
+4. `systemctl stop dufs`，确认优雅停机完成。
+5. 确认 `/opt/dufs/bin` 由 root 拥有且不允许不可信用户写入。把新二进制先安装到该目录中的私有临时路径，因此临时文件与目标必在同一文件系统；同步文件后用一次 rename 原子替换，再同步父目录。rename 与父目录同步必须作为一个暂时忽略 HUP/INT/TERM 的短提交段；配置有变化时另行生成新文件并审阅差异：
+
+   ```sh
+   set -eu
+
+   replacement="$(mktemp --tmpdir=/opt/dufs/bin .dufs.new.XXXXXXXX)"
+   cleanup_replacement() {
+     [ -n "$replacement" ] || return 0
+     rm -f -- "$replacement"
+   }
+   trap cleanup_replacement EXIT
+   trap 'exit 129' HUP
+   trap 'exit 130' INT
+   trap 'exit 143' TERM
+
+   install -o root -g root -m 0755 "$release_dir/dufs" "$replacement"
+   sync "$replacement"
+
+   commit_status=0
+   trap '' HUP INT TERM
+   if mv --no-target-directory -- "$replacement" /opt/dufs/bin/dufs; then
+     replacement=
+     sync /opt/dufs/bin || commit_status=$?
+   else
+     commit_status=$?
+   fi
+   trap 'exit 129' HUP
+   trap 'exit 130' INT
+   trap 'exit 143' TERM
+
+   if [ "$commit_status" -ne 0 ]; then
+     printf '%s\n' \
+       'Binary rename or parent-directory sync failed; keep Dufs stopped.' >&2
+     exit "$commit_status"
+   fi
+   trap - EXIT HUP INT TERM
+   ```
+
+   普通信号不会在 rename 与父目录同步之间终止这段命令；SIGKILL、掉电和真实同步错误仍无法被 shell 屏蔽。后一类故障可能留下已经可见但持久性未确认的新二进制，应保持服务停止并先核验目标 inode、内容摘要和文件系统状态。
+
+6. 启动后检查 journal、liveness、登录和文件操作，再恢复流量。
+
+## 7. 回滚
+
+如果新进程无法启动或只出现与二进制/配置有关的回归：
+
+1. 停止服务并保存新版本日志。
+2. 恢复经过 checksum 验证的旧二进制和对应配置。
+3. 启动并完成同一组冒烟测试。
+
+回滚二进制不会撤销升级后用户已经完成的文件写入、移动或删除。只有确认数据被新版本错误修改时，才应在保全现场后按恢复流程从升级前一致性快照恢复。禁止把“恢复旧程序”和“覆盖共享根”合并成一个无确认脚本。
+
+## 8. 事件响应
+
+发现疑似入侵时，先限制入口和后端网络访问，保全 journal、网关日志、配置、二进制摘要和共享根快照，再轮换网关密钥、账号密码及其他可能暴露的凭据。报告流程与支持边界见根目录的 `SECURITY.md`。
