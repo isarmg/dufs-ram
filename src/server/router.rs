@@ -230,21 +230,46 @@ impl Server {
                         || state.wire_name().to_owned(),
                     );
                 } else if let Some(upload) = profile.upload_context() {
-                    let status = if error.status() == StatusCode::GATEWAY_TIMEOUT {
-                        StatusCode::GATEWAY_TIMEOUT
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    };
+                    let (status, code, detail, recovery, state) =
+                        if mutation.outcome_can_be_unknown() {
+                            (
+                                if error.status() == StatusCode::GATEWAY_TIMEOUT {
+                                    StatusCode::GATEWAY_TIMEOUT
+                                } else {
+                                    StatusCode::INTERNAL_SERVER_ERROR
+                                },
+                                ErrorCode::UPLOAD_RESULT_UNKNOWN,
+                                "Upload result could not be confirmed",
+                                RecoveryAdvice::QueryUpload,
+                                UploadPublicState::Unknown,
+                            )
+                        } else {
+                            (
+                                if error.status() == StatusCode::GATEWAY_TIMEOUT {
+                                    StatusCode::REQUEST_TIMEOUT
+                                } else {
+                                    StatusCode::SERVICE_UNAVAILABLE
+                                },
+                                if error.status() == StatusCode::GATEWAY_TIMEOUT {
+                                    ErrorCode::REQUEST_TIMEOUT
+                                } else {
+                                    ErrorCode::UPLOAD_PRECOMMIT_FAILED
+                                },
+                                "Upload stopped before any upload mutation",
+                                RecoveryAdvice::Retry,
+                                UploadPublicState::NotStarted,
+                            )
+                        };
                     render_upload_problem(
                         &mut res,
                         status,
-                        ErrorCode::UPLOAD_RESULT_UNKNOWN,
-                        "Upload result could not be confirmed",
-                        RecoveryAdvice::QueryUpload,
+                        code,
+                        detail,
+                        recovery,
                         upload.id,
                         upload.length,
                         upload.offset,
-                        UploadPublicState::Unknown,
+                        state,
                     )
                     .expect("serializing a validated upload problem cannot fail");
                 } else if profile.is_internal_api() {

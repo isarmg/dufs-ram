@@ -1,4 +1,6 @@
-use super::super::{Response, path_coordinator::PathLease, protocol::UploadPublicState};
+use super::super::{
+    Response, path_coordinator::PathLease, protocol::UploadPublicState, router::MutationProgress,
+};
 
 use crate::utils::{decode_hex_to_slice, encode_hex};
 use anyhow::{Result, anyhow};
@@ -26,6 +28,7 @@ pub(in crate::server) struct UploadOptions {
     pub(in crate::server) overwrite: UploadOverwritePolicy,
     pub(in crate::server) deadline: Instant,
     pub(in crate::server) path_lease: PathLease,
+    pub(in crate::server) mutation: MutationProgress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
