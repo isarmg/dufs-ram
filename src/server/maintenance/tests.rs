@@ -555,6 +555,67 @@ mod sqlite_cleanup_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn quarantined_orphan_mismatch_is_not_recaptured_by_the_next_scan() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let target = temp.path().join("orphan-mismatch.bin");
+        std::fs::write(&target, b"original")?;
+        let mut trash = rooted_fs.move_to_trash(&target).await?;
+        let old_trash_path = temp.path().join(&trash.name);
+        trash.replace_entry_before_final_isolation_once_for_test();
+
+        let error = match trash
+            .purge_slice(1, Duration::from_secs(1), CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the injected final-name replacement must stop orphan purge"),
+        };
+        let (trash, source) = error.into_parts();
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!old_trash_path.exists());
+        let quarantined = temp.path().join(&trash.name);
+        assert_eq!(
+            classify_internal_name(trash.name.to_str().unwrap()),
+            Some(InternalEntryName::Quarantine)
+        );
+        drop(trash);
+
+        let state = MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO);
+        let (_, removed, scheduled, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            state,
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60),
+                upload_ttl: Duration::ZERO,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            |_| unreachable!("quarantine entries must never be rescheduled as orphan trash"),
+        );
+        assert!(complete);
+        assert!(removed.is_empty());
+        assert!(scheduled.is_empty());
+        assert!(quarantined.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.file_name().to_str().and_then(classify_internal_name)
+                        == Some(InternalEntryName::Quarantine)
+                })
+                .count(),
+            2,
+            "both the displaced original and the replacement must remain quarantined"
+        );
+        Ok(())
+    }
+
     #[test]
     fn newly_renamed_old_source_observes_the_trash_grace_period() -> Result<()> {
         let temp = assert_fs::TempDir::new()?;
