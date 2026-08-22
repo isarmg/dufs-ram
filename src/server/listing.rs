@@ -161,10 +161,10 @@ impl ListingProblem {
             }
             Self::DirectoryDepthLimit => ErrorCode::DIRECTORY_DEPTH_LIMIT,
             Self::DirectoryMemoryLimit => ErrorCode::DIRECTORY_MEMORY_LIMIT,
-            Self::SearchResultLimit | Self::ListSnapshotAllocationFailed => {
-                ErrorCode::SEARCH_RESULT_LIMIT
+            Self::SearchResultLimit => ErrorCode::SEARCH_RESULT_LIMIT,
+            Self::ListSnapshotLimit | Self::ListSnapshotAllocationFailed => {
+                ErrorCode::LIST_SNAPSHOT_LIMIT
             }
-            Self::ListSnapshotLimit => ErrorCode::LIST_SNAPSHOT_LIMIT,
             Self::DirectorySortLimit => ErrorCode::DIRECTORY_SORT_LIMIT,
             Self::DirectoryOperationFailed => ErrorCode::DIRECTORY_OPERATION_FAILED,
         }
