@@ -122,7 +122,7 @@ stateDiagram-v2
     CommitStarted --> Committed: 原子发布和状态记录成功
     CommitStarted --> AwaitingConfirmation: 目标在提交时冲突
     AwaitingConfirmation --> CommitStarted: 新 revision 的空 PATCH
-    AwaitingConfirmation --> Rejected: discard
+    AwaitingConfirmation --> Rejected: discard 先持久终态，再条件清理 stage
     Running --> Rejected: 确定未发布并清理
     CommitStarted --> Unknown: 无法证明提交结果
 ```
@@ -209,7 +209,7 @@ X-Dufs-CSRF-Token: ...
 
 ### preflight 不是锁
 
-它只说“刚才看见什么”。从对话框出现到正文传完可能经过很久，目标可以被其他请求或系统进程创建、删除或替换。真正提交必须再次做 CAS 检查。
+它只说“刚才看见什么”。从对话框出现到正文传完可能经过很久，目标可以被其他请求或系统进程创建、删除或替换。真正提交必须再次做条件检查；这个检查对 Dufs 内部并发有效，但 Existing 覆盖不是文件系统提供的原子目录项 CAS。
 
 ## 7.9 两种覆盖策略
 
@@ -217,11 +217,11 @@ X-Dufs-CSRF-Token: ...
 
 ### `NoReplace`
 
-目标必须在最终原子提交时仍不存在。预先 `stat` 只是提示，真正保证来自 no-replace rename。
+目标必须在最终原子提交时仍不存在。预先 `stat` 只是提示，真正保证来自 no-replace rename；成功后还要确认目的名称对应提交前已打开的 stage。晚到 occupant 不会被覆盖，若外部 writer 换掉 stage 名而导致发布 identity 无法证明，则报告 unknown。
 
 ### `IfUnchanged(TargetRevision)`
 
-用户明确确认覆盖某一版现有目标。最终提交时目标 identity 必须仍匹配该 revision。
+用户明确确认覆盖某一版现有目标。服务在普通 rename 紧前要求目标 identity 匹配该 revision；这不是一个系统调用内的 compare-and-replace，共享根外部 writer 仍能在复核与 rename 之间竞争。
 
 revision 绑定 owner、规范路径和完整目标身份，不能拿 `/a.txt` 的 revision 覆盖 `/b.txt`。
 
@@ -259,15 +259,18 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 1. 严格解析方法、上传头、路径、总长度和覆盖策略；
 2. 申请路径租约；
 3. 申请上传并发槽；
-4. 检查 owner + ID 是否已有会话；
-5. 检查目标 identity/revision；
-6. 从最近存在父目录执行磁盘空间准入；
-7. 必要时安全创建缺失祖先；
-8. 在目标同目录以独占方式创建隐藏 stage；
-9. 设置 mode `0600`；
-10. 同步 stage 及其目录，并在 SQLite 写 `Running(offset=0)`。
+4. 受跟踪地读取 route metadata，fresh PUT 再只读检查持久路径义务；
+5. 登记受跟踪上传 task，但仍只读检查 owner + ID 会话；
+6. 检查目标/stage identity、revision、metadata 和空间准入；
+7. 在首次文件系统或上传状态 mutation 前，与总 deadline 原子竞争 mutation boundary；
+8. task 赢得边界后，必要时安全创建缺失祖先；
+9. 在目标同目录以独占方式创建隐藏 stage；
+10. 设置 mode `0600`；
+11. 同步 stage 及其目录，并在 SQLite 写 `Running(offset=0)`。
 
 如果准备失败，代码会尽量自底向上回收仅由本请求创建、仍为空且 identity 未变的祖先目录，不会误删已经被并发请求使用的目录。
+
+这里要区分“task 已受跟踪”和“task 已能 mutation”。只读准备期间，总 deadline 可以先把原子边界关闭并 abort task；即使某个慢只读 I/O 随后返回，task 也无法再创建祖先/stage、截断旧 stage、更新 SQLite 或开始写正文。这个分支返回绑定的 `408 request_timeout + not-started + retry`。只读准备中未处理的 timeout 同样返回 `408`，其他未处理 I/O 返回 `503 upload_precommit_failed + not-started + retry`。由于同一 ID 可能已有更早检查点，Retry 仍先 HEAD。只有 task 先跨过 mutation boundary 后，外层 deadline 或未处理错误才返回 `unknown + query_upload`。
 
 ### 传输
 
@@ -333,7 +336,7 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 
 - fresh 上传创建 stage 后会先持久化 `offset=0`；这个首次 checkpoint 需要同步 stage 及其新目录项，再提交 SQLite；
 - 后续普通 checkpoint 先同步 stage 内容，再更新 SQLite，通常不重复同步已经持久化的父目录项；
-- idle、I/O 或总超时中断时，通常只有已可靠写入至少 20 MiB 且未超过声明长度的部分才保留；
+- 已跨 mutation boundary 后发生 idle、I/O 或总超时中断时，通常只有已可靠写入至少 20 MiB 且未超过声明长度的部分才保留；边界前失败不修改旧检查点；
 - 如果请求正常结束但实际正文短于声明长度，服务也可以保存小于 20 MiB 的可靠 offset，供客户端对账。
 
 因此小上传在多数异常中断场景会被清理并要求新 ID 重来，但不能把 20 MiB 写成所有状态转移的硬规则。
@@ -445,7 +448,7 @@ T5 最终 no-replace 提交发现冲突
 4. 返回最新 revision 和作为低成本提示的 replaceable；
 5. 页面只对这个文件再次询问 Overwrite、Skip file 或 Cancel remaining。
 
-这次追加确认不是要求用户手工检查文件名，而是在**真实提交冲突发生后**让用户决定如何处理最新目标。如果用户确认后目标 revision 又变化，空 PATCH 可以再次返回新的冲突，界面会针对更新后的目标继续确认；协议没有“最多两次”的上限。
+这次追加确认不是要求用户手工检查文件名，而是在**真实提交冲突发生后**让用户决定如何处理最新目标。如果用户确认后目标 revision 又变化，空 PATCH 可以再次返回新的冲突，界面会针对更新后的目标继续确认；协议没有“最多两次”的上限。每一次可信 target-change 响应都会重新发出 `refresh-required`，即使用户刚在上一轮冲突后刷新过列表，也不会继续信任那份已经再次陈旧的 snapshot。
 
 ## 7.18 空 PATCH 为什么不会创建空文件
 
@@ -464,7 +467,7 @@ Content-Length: 0
 
 服务器把它理解为：“不再追加正文，使用已完成 stage 再次尝试发布。”目标内容来自 stage，不来自本次空请求体。
 
-这既保留 CAS 覆盖确认，也避免重新传输大文件。
+这既保留 revision 条件覆盖确认，也避免重新传输大文件；Existing 目标的最终文件系统动作仍遵守前述“复核后普通 rename”的部署边界。
 
 若下一次确认前服务观察到目标已经消失，当前前端不会把携带旧目标 metadata 的 stage 直接当 create-only 文件发布。它先 discard 旧 stage，再用新 Upload ID、`NoReplace` 和完整 PUT 重传；这是避免把旧目标 uid/gid/mode/xattr 赋给语义上新文件的安全分支。
 
@@ -480,7 +483,7 @@ X-Dufs-CSRF-Token: ...
 {"path":"/docs/report.pdf","upload_id":"原UUID"}
 ```
 
-服务端只删除与 owner、ID、路径和 identity 匹配的 stage，并把会话结束为拒绝状态。discard 本身也必须得到明确结果；不能因为发出了请求就假定内部文件已删除。
+服务端先在 SQLite 事务内把 owner、ID、路径全部绑定的 `AwaitingConfirmation` 原位 CAS 为 `Rejected`，保留长度、offset 和 stage identity，再进入可取消的文件系统清理。已有 `Rejected` 的重试不写库、不延长 TTL，但会继续根据原 identity 清理；stage 已不存在或同名路径已被替换时保留当前 occupant 并仍可安全完成。这样即使第一次响应或 cleanup waiter 被取消，终态决定也不会退回可发布状态。
 
 成功响应的真实契约是：
 
@@ -492,7 +495,7 @@ X-Dufs-Upload-Offset: 123456
 X-Dufs-Operation-State: rejected
 ```
 
-这里的 `rejected` 表示上传会话已明确结束而未发布，和普通 mutation 的 `succeeded` 不是同一协议。当前前端通用 `assertResponse()` 尚未直接接受这个真实组合；普通上传会通过额外 HEAD 恢复，但新建空文件的候选名 cleanup 会误报 unknown。这个已知契约缺口及所需专用 classifier 见[第 6 章](06-frontend-guide.md#616-上传在前端架构中的位置)。
+这里的 `rejected` 表示上传会话已明确结束而未发布，和普通 mutation 的 `succeeded` 不是同一协议。前端使用专用 `assertDiscardUploadResponse()`，只接受同一 ID、精确长度、满 offset 和 `204 + rejected`；普通上传与新建空文件候选清理共用该分类器，并由真实绑定头测试锁定。`204` 还表示本次 identity-safe cleanup 已得到安全结果，可能是原 inode 已删、已不存在，或发现替换物并保留；网络歧义后仅由 HEAD 得到 `rejected` 只证明终态未发布，不证明 stage 路径物理消失。过期 maintenance 会对带 identity 的 `Rejected` stage 做相同条件清理，再以原 snapshot 且仍过期为条件删除控制行。
 
 ### metadata 安全例外
 
@@ -580,9 +583,9 @@ Problem Details 只在正确 `Content-Type` 下按有界大小解析。正文 `s
 - 磁盘写入与同步；
 - 提交确认等待。
 
-浏览器分别设置上传无进展、总时限、状态查询和提交确认预算。服务端总 deadline 覆盖进入不可取消提交点之前的阶段；越过提交点后不能为了迎合 HTTP timeout 任意终止。
+浏览器分别设置上传无进展、总时限、状态查询和提交确认预算。服务端总 deadline 覆盖进入不可取消提交点之前的阶段，但“受跟踪 task 已建立”本身不是 unknown 边界：首次文件系统/上传状态 mutation 会与总 deadline 原子竞争。deadline 先赢时边界永久关闭、task 被 abort，返回 `408 not-started + retry`；边界前未处理的只读 I/O 返回 `408/503 not-started + retry`。task 先跨界后，外层 deadline 或未处理错误才返回 `unknown + query_upload`；更晚越过不可取消提交点后，更不能为了迎合 HTTP timeout 任意终止。
 
-所以错误语义必须回答“超时发生在提交前还是提交后”，而不是把所有 timeout 都转换成同一个“可以重试”。
+所以错误语义首先要回答“服务端总 deadline 是否在首次 mutation boundary 前胜出”，再回答边界后的收尾是否得到确定状态；不能只用笼统的“提交前/提交后”，更不能把所有 timeout 都转换成同一个“可以重试”。
 
 ## 7.25 一条完整时序
 
@@ -606,13 +609,13 @@ sequenceDiagram
     end
     H->>F: fsync 完整 stage
     H->>S: CommitStarted
-    H->>F: 最终 CAS + rename + fsync parent
+    H->>F: 最终条件检查 + checked rename + fsync parent
     H->>S: Committed
     H-->>B: committed + 完整 offset
     B->>B: 列表失效，显示完成
 ```
 
-若最终 CAS 冲突，`CommitStarted` 与发布之间会转到 `AwaitingConfirmation`，用户确认后用空 PATCH 回到提交路径。
+若最终 revision/no-replace 条件冲突，`CommitStarted` 与发布之间会转到 `AwaitingConfirmation`，用户确认后用空 PATCH 回到提交路径。
 
 ## 7.26 维护上传代码时的检查表
 
@@ -628,7 +631,7 @@ sequenceDiagram
 8. 覆盖是否绑定用户真正确认的 revision？
 9. metadata 是新建语义还是覆盖语义？
 10. 前端能否根据类型化状态安全决定 retry/query/discard？
-11. 写操作是否通知列表 committed/unknown/not-committed？
+11. 写操作是否通知列表 committed/unknown/refresh-required/not-committed？
 12. 队列、路径总量、响应正文和 DOM 是否仍有上限？
 13. Rust 测试、前端单元测试和 Playwright 是否覆盖这个状态转移？
 
