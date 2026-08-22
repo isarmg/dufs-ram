@@ -30,10 +30,10 @@ mod purge;
 mod upload;
 
 pub(super) use model::{
-    OperationKey, PurgeJobKey, RootIdentity, StateBlockingPath, StatePathCursor, StatePathPage,
-    StoreBegin, StorePurgeJob, StoreStatus, StoreUploadSession, StoredFileIdentity, StoredOutcome,
-    StoredPurgeJob, StoredPurgeState, StoredTerminalState, StoredUploadSession, StoredUploadState,
-    UploadSessionKey,
+    OperationKey, PurgeJobKey, RejectUploadSession, RootIdentity, StateBlockingPath,
+    StatePathCursor, StatePathPage, StoreBegin, StorePurgeJob, StoreStatus, StoreUploadSession,
+    StoredFileIdentity, StoredOutcome, StoredPurgeJob, StoredPurgeState, StoredTerminalState,
+    StoredUploadSession, StoredUploadState, UploadSessionKey,
 };
 
 const APPLICATION_ID: i32 = 0x4455_4653; // "DUFS"
@@ -273,6 +273,13 @@ enum Command {
     LoadUploadSession {
         key: UploadSessionKey,
         reply: oneshot::Sender<Result<Option<StoredUploadSession>>>,
+    },
+    RejectUploadSession {
+        key: UploadSessionKey,
+        target_path: PathBuf,
+        stage_path: PathBuf,
+        ttl_ms: i64,
+        reply: oneshot::Sender<Result<RejectUploadSession>>,
     },
     ListExpiredUploadSessions {
         limit: i64,
@@ -626,6 +633,27 @@ impl StateStore {
         self.receive(receiver).await
     }
 
+    pub(super) async fn reject_upload_session(
+        &self,
+        key: UploadSessionKey,
+        target_path: PathBuf,
+        stage_path: PathBuf,
+        ttl: Duration,
+    ) -> Result<RejectUploadSession> {
+        model::validate_stored_path(&target_path, "Upload target")?;
+        model::validate_stored_path(&stage_path, "Upload stage")?;
+        let ttl_ms = duration_ms(ttl, "Upload session TTL")?;
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::RejectUploadSession {
+            key,
+            target_path,
+            stage_path,
+            ttl_ms,
+            reply,
+        })?;
+        self.receive(receiver).await
+    }
+
     pub(super) async fn expired_upload_sessions(
         &self,
         limit: usize,
@@ -806,7 +834,7 @@ impl StateStore {
     }
 
     #[cfg(test)]
-    async fn set_query_only(&self, enabled: bool) -> Result<()> {
+    pub(super) async fn set_query_only(&self, enabled: bool) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.send(Command::SetQueryOnly { enabled, reply })?;
         self.receive(receiver).await

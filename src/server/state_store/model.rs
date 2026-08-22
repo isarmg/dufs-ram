@@ -172,6 +172,14 @@ pub(in crate::server) struct StoredUploadSession {
     pub(in crate::server) target_revision: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::server) enum RejectUploadSession {
+    NotFound,
+    BindingConflict,
+    StateConflict(StoredUploadSession),
+    Rejected(StoredUploadSession),
+}
+
 impl StoredUploadSession {
     pub(super) fn validate(&self) -> Result<()> {
         validate_stored_path(&self.target_path, "Upload target")?;

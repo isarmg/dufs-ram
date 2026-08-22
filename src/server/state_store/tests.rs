@@ -554,6 +554,123 @@ async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() ->
 }
 
 #[tokio::test]
+async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
+    let mut awaiting = upload(11, 11, 0);
+    assert_eq!(
+        store
+            .reject_upload_session(
+                awaiting.key,
+                awaiting.target_path.clone(),
+                awaiting.stage_path.clone(),
+                TTL,
+            )
+            .await?,
+        RejectUploadSession::NotFound
+    );
+    assert_eq!(store.upload_session(awaiting.key).await?, None);
+
+    awaiting.durable_offset = awaiting.upload_length;
+    awaiting.state = StoredUploadState::AwaitingConfirmation;
+    awaiting.stage_identity = Some(StoredFileIdentity {
+        device: 51,
+        inode: 52,
+    });
+    awaiting.target_revision = Some([53; 32]);
+    assert_eq!(
+        store.save_upload_session(awaiting.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store
+            .reject_upload_session(
+                awaiting.key,
+                PathBuf::from("targets/other"),
+                awaiting.stage_path.clone(),
+                TTL,
+            )
+            .await?,
+        RejectUploadSession::BindingConflict
+    );
+    assert_eq!(
+        store.upload_session(awaiting.key).await?,
+        Some(awaiting.clone())
+    );
+
+    let running = upload(12, 12, 0);
+    assert_eq!(
+        store.save_upload_session(running.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store
+            .reject_upload_session(
+                running.key,
+                running.target_path.clone(),
+                running.stage_path.clone(),
+                TTL,
+            )
+            .await?,
+        RejectUploadSession::StateConflict(running.clone())
+    );
+    assert_eq!(store.upload_session(running.key).await?, Some(running));
+
+    store.set_query_only(true).await?;
+    assert!(
+        store
+            .reject_upload_session(
+                awaiting.key,
+                awaiting.target_path.clone(),
+                awaiting.stage_path.clone(),
+                TTL,
+            )
+            .await
+            .is_err(),
+        "a read-only state database accepted an Awaiting-to-Rejected transition"
+    );
+    store.set_query_only(false).await?;
+    assert_eq!(
+        store.upload_session(awaiting.key).await?,
+        Some(awaiting.clone()),
+        "a failed rejection changed the Awaiting row or its stage identity"
+    );
+
+    let mut rejected = awaiting.clone();
+    rejected.state = StoredUploadState::Rejected;
+    assert_eq!(
+        store
+            .reject_upload_session(
+                awaiting.key,
+                awaiting.target_path.clone(),
+                awaiting.stage_path.clone(),
+                Duration::ZERO,
+            )
+            .await?,
+        RejectUploadSession::Rejected(rejected.clone())
+    );
+    assert!(store.expired_upload_sessions(8).await?.contains(&rejected));
+
+    store.set_query_only(true).await?;
+    assert_eq!(
+        store
+            .reject_upload_session(
+                rejected.key,
+                rejected.target_path.clone(),
+                rejected.stage_path.clone(),
+                TTL,
+            )
+            .await?,
+        RejectUploadSession::Rejected(rejected.clone())
+    );
+    store.set_query_only(false).await?;
+    assert!(
+        store.expired_upload_sessions(8).await?.contains(&rejected),
+        "an idempotent rejected retry refreshed the terminal TTL"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn purge_jobs_are_idempotent_bounded_and_owner_scoped() -> Result<()> {
     let store = temporary_with_repository_limits(repository_limits(8, 4, 2, 1))?;
     let first = purge(1, 1);

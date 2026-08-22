@@ -333,12 +333,12 @@ async fn tracked_purge_trash_entries(
 
 /// Reclaim one bounded page of expired SQLite upload sessions.
 ///
-/// Database paths are treated as hostile input. A running stage
-/// is unlinked only through an fd-relative purge capability whose inode still
-/// matches the identity durably recorded at the last checkpoint. Unknown and
-/// terminal rows expire without touching either the target or a possibly
-/// renamed stage; an in-flight `CommitStarted` row remains an ambiguity
-/// barrier until restart recovery or the commit task advances it.
+/// Database paths are treated as hostile input. Running stages and rejected
+/// stages left by a cancelled discard are unlinked only through an fd-relative
+/// purge capability whose inode still matches the durable identity. Committed
+/// and unknown rows expire without touching either target or stage; an
+/// in-flight `CommitStarted` row remains an ambiguity barrier until restart
+/// recovery or the commit task advances it.
 pub(super) async fn cleanup_expired_upload_sessions_batch(
     rooted_fs: &RootedFs,
     state_store: &StateStore,
@@ -431,21 +431,27 @@ async fn cleanup_expired_upload_session(
     }
 
     // Paths and state are immutable for every transition. Recheck the exact
-    // expired snapshot before acting, then retire terminal/unknown records
-    // without opening the stage at all. A missing, inaccessible, or malicious
-    // stage must not pin those rows past their TTL. CommitStarted can still be
-    // advanced by an in-flight non-cancellable commit, so it remains an
-    // ambiguity barrier if an older database happens to return it here.
+    // expired snapshot before acting. A rejected row may retain its stage
+    // identity when a discard was cancelled after the terminal transition, so
+    // it must finish the same identity-safe cleanup before retiring the row.
+    // CommitStarted can still be advanced by an in-flight non-cancellable
+    // commit, so it remains an ambiguity barrier if an older database happens
+    // to return it here.
     match state_store.upload_session(expired.key).await? {
         Some(current) if current == *expired => {}
         Some(_) | None => return Ok(None),
     }
     match expired.state {
-        StoredUploadState::Committed | StoredUploadState::Rejected | StoredUploadState::Unknown => {
+        StoredUploadState::Committed | StoredUploadState::Unknown => {
+            return remove_expired_upload_record(state_store, expired, false).await;
+        }
+        StoredUploadState::Rejected if expired.stage_identity.is_none() => {
             return remove_expired_upload_record(state_store, expired, false).await;
         }
         StoredUploadState::CommitStarted => return Ok(None),
-        StoredUploadState::Running | StoredUploadState::AwaitingConfirmation => {}
+        StoredUploadState::Running
+        | StoredUploadState::Rejected
+        | StoredUploadState::AwaitingConfirmation => {}
     }
 
     let stage_key = match rooted_fs.entry_key(&stage_path).await {

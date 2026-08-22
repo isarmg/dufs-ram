@@ -130,6 +130,20 @@ impl StoreWorker {
                 Command::LoadUploadSession { key, reply } => {
                     let _ = reply.send(super::upload::load_upload_session(&self.connection, key));
                 }
+                Command::RejectUploadSession {
+                    key,
+                    target_path,
+                    stage_path,
+                    ttl_ms,
+                    reply,
+                } => {
+                    let _ = reply.send(self.reject_upload_session(
+                        key,
+                        &target_path,
+                        &stage_path,
+                        ttl_ms,
+                    ));
+                }
                 Command::ListExpiredUploadSessions { limit, reply } => {
                     let _ = reply.send(self.expired_upload_sessions(limit));
                 }

@@ -209,6 +209,53 @@ mod sqlite_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn rejected_expiry_finishes_cancelled_discard_cleanup() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("rejected.bin");
+        let stage = upload_temp_path(&target, upload_id)?;
+        let owner = OwnerId::persistent("rejected-owner").into_bytes();
+        let file = create_stage(&rooted_fs, &stage, b"complete").await;
+        let metadata = file.metadata().await?;
+        let mut session = stored_session(
+            &rooted_fs,
+            owner,
+            upload_id,
+            &target,
+            &stage,
+            StoredUploadState::Rejected,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        session.durable_offset = session.upload_length;
+        let key = session.key;
+        assert_eq!(
+            store.save_upload_session(session, EXPIRED_TTL).await?,
+            StoreUploadSession::Inserted
+        );
+        drop(file);
+        expire().await;
+
+        let batch = cleanup_expired_upload_sessions_batch(
+            &rooted_fs,
+            &store,
+            &Mutex::new(HashSet::new()),
+            &CancellationToken::new(),
+            8,
+        )
+        .await?;
+        assert_eq!(batch.removed_records, 1);
+        assert_eq!(batch.removed_stages, 1);
+        assert!(!stage.exists());
+        assert!(store.upload_session(key).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn running_expiry_preserves_a_reused_stage_inode() -> Result<()> {
         let temp = assert_fs::TempDir::new()?;
         let rooted_fs = RootedFs::new(temp.path())?;
