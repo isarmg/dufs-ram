@@ -483,9 +483,94 @@ validate_release_source_state() {
   }
 }
 
-validate_source_tree_entries() {
-  local repository="$1"
-  local commit="$2"
+cleanup_private_nul_stream() {
+  local status=$?
+  local cleanup_failed=false
+  local cleanup_path="${private_nul_stream_path-}"
+  local cleanup_directory="${private_nul_stream_directory-}"
+
+  trap - EXIT HUP INT TERM
+  set +e
+  if [[ -n "${private_nul_write_fd-}" ]]; then
+    if ! exec {private_nul_write_fd}>&-; then
+      cleanup_failed=true
+    fi
+    private_nul_write_fd=""
+  fi
+  if [[ -n "${private_nul_read_fd-}" ]]; then
+    if ! exec {private_nul_read_fd}<&-; then
+      cleanup_failed=true
+    fi
+    private_nul_read_fd=""
+  fi
+  if [[ -n "$cleanup_path" ]]; then
+    if [[ "${cleanup_path%/*}" != "$cleanup_directory" ||
+      "${cleanup_path##*/}" != dufs-release-verifier.* ]]
+    then
+      printf 'Refusing to remove unexpected verifier stream: %s\n' \
+        "$cleanup_path" >&2
+      cleanup_failed=true
+    elif [[ -e "$cleanup_path" || -L "$cleanup_path" ]] &&
+      ! rm -f -- "$cleanup_path"
+    then
+      cleanup_failed=true
+    fi
+  fi
+  if [[ "$cleanup_failed" == true && "$status" -eq 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+with_private_nul_stream() (
+  local consumer="$1"
+  local private_nul_stream_directory
+  local private_nul_stream_path=""
+  local private_nul_read_fd=""
+  local private_nul_write_fd=""
+  local producer_status
+  shift
+
+  trap cleanup_private_nul_stream EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  private_nul_stream_directory="$({
+    cd -P -- "${TMPDIR:-/tmp}" && pwd -P
+  })" || {
+    printf 'Unable to resolve the verifier temporary directory.\n' >&2
+    return 1
+  }
+  private_nul_stream_path="$(
+    mktemp \
+      --tmpdir="$private_nul_stream_directory" \
+      dufs-release-verifier.XXXXXXXXXX
+  )" || {
+    printf 'Unable to create a private verifier stream.\n' >&2
+    return 1
+  }
+  chmod 0600 -- "$private_nul_stream_path" || return $?
+  exec {private_nul_write_fd}> "$private_nul_stream_path" || return $?
+  exec {private_nul_read_fd}< "$private_nul_stream_path" || return $?
+  rm -f -- "$private_nul_stream_path" || return $?
+  private_nul_stream_path=""
+
+  if "$@" >&"$private_nul_write_fd"; then
+    :
+  else
+    producer_status=$?
+    printf 'Release verifier producer failed with status %s.\n' \
+      "$producer_status" >&2
+    return "$producer_status"
+  fi
+  exec {private_nul_write_fd}>&-
+  private_nul_write_fd=""
+  "$consumer" "$private_nul_read_fd"
+)
+
+validate_release_tree_entry_stream() {
+  local stream_fd="$1"
   local entry
   local metadata
   local mode
@@ -493,7 +578,7 @@ validate_source_tree_entries() {
   local object_id
   local path
 
-  while IFS= read -r -d '' entry; do
+  while IFS= read -r -d '' -u "$stream_fd" entry; do
     metadata="${entry%%$'\t'*}"
     path="${entry#*$'\t'}"
     read -r mode object_type object_id <<< "$metadata"
@@ -520,9 +605,21 @@ validate_source_tree_entries() {
       printf 'Release tree entry has no object ID: %q\n' "$path" >&2
       return 1
     }
-  done < <(
+  done
+  [[ -z "$entry" ]] || {
+    printf 'Release tree listing ended with a truncated entry: %q\n' \
+      "$entry" >&2
+    return 1
+  }
+}
+
+validate_source_tree_entries() {
+  local repository="$1"
+  local commit="$2"
+
+  with_private_nul_stream \
+    validate_release_tree_entry_stream \
     run_source_git "$repository" ls-tree -rz --full-tree "$commit"
-  )
 }
 
 run_snapshot_git() {
@@ -585,68 +682,63 @@ validate_snapshot_git_metadata() {
 
 validate_snapshot_tree_entries() {
   local commit="$1"
-  local entry
-  local metadata
-  local mode
-  local object_type
-  local object_id
-  local path
 
-  while IFS= read -r -d '' entry; do
-    metadata="${entry%%$'\t'*}"
-    path="${entry#*$'\t'}"
-    read -r mode object_type object_id <<< "$metadata"
-    case "$mode:$object_type" in
-      100644:blob|100755:blob) ;;
-      120000:blob)
-        printf 'Refusing symbolic link in release tree: %q\n' "$path" >&2
-        return 1
-        ;;
-      160000:commit)
-        printf 'Refusing submodule in release tree: %q\n' "$path" >&2
-        return 1
-        ;;
-      *)
-        printf \
-          'Refusing unsupported Git entry mode/type %s/%s at %q.\n' \
-          "$mode" \
-          "$object_type" \
-          "$path" >&2
-        return 1
-        ;;
-    esac
-    [[ -n "$object_id" ]] || {
-      printf 'Release tree entry has no object ID: %q\n' "$path" >&2
-      return 1
-    }
-  done < <(
+  with_private_nul_stream \
+    validate_release_tree_entry_stream \
     run_snapshot_git ls-tree -rz --full-tree "$commit"
-  )
+}
+
+produce_extracted_source_tree_scan() {
+  local extraction_directory="$1"
+
+  # A valid prefix makes a partial-output-then-error producer distinguishable
+  # from the safe, empty result of the unsafe-entry search below.
+  printf 'dufs-extracted-tree-scan-v1\0' || return $?
+  find \
+    -P \
+    "$extraction_directory" \
+    -xdev \
+    -mindepth 1 \
+    \( -type l -o \( ! -type f ! -type d \) \) \
+    -print0 \
+    -quit
+}
+
+validate_extracted_source_tree_stream() {
+  local stream_fd="$1"
+  local marker=""
+  local unsafe_path=""
+
+  IFS= read -r -d '' -u "$stream_fd" marker || {
+    printf 'Extracted source scan returned a truncated marker.\n' >&2
+    return 1
+  }
+  [[ "$marker" == "dufs-extracted-tree-scan-v1" ]] || {
+    printf 'Extracted source scan returned an invalid marker.\n' >&2
+    return 1
+  }
+  if IFS= read -r -d '' -u "$stream_fd" unsafe_path; then
+    printf 'Extracted source contains a link or special file: %q\n' \
+      "$unsafe_path" >&2
+    return 1
+  fi
+  [[ -z "$unsafe_path" ]] || {
+    printf 'Extracted source scan returned a truncated path: %q\n' \
+      "$unsafe_path" >&2
+    return 1
+  }
 }
 
 validate_extracted_source_tree() {
   local extraction_directory="$1"
-  local unsafe_path=""
 
   [[ -d "$extraction_directory" && ! -L "$extraction_directory" ]] || {
     printf 'Extracted source root is not a physical directory.\n' >&2
     return 1
   }
-  IFS= read -r -d '' unsafe_path < <(
-    find \
-      -P \
-      "$extraction_directory" \
-      -xdev \
-      -mindepth 1 \
-      \( -type l -o \( ! -type f ! -type d \) \) \
-      -print0 \
-      -quit
-  ) || true
-  [[ -z "$unsafe_path" ]] || {
-    printf 'Extracted source contains a link or special file: %q\n' \
-      "$unsafe_path" >&2
-    return 1
-  }
+  with_private_nul_stream \
+    validate_extracted_source_tree_stream \
+    produce_extracted_source_tree_scan "$extraction_directory"
 }
 
 install_release_support_tree() {
@@ -777,25 +869,51 @@ write_release_package_checksums() {
   )
 }
 
-verify_release_package_checksum_coverage() {
-  local package_root="$1"
+verify_release_package_checksum_stream() {
+  local stream_fd="$1"
   local checksum_line
   local package_file
   local expected_file_count=0
   local manifest_record_count=0
 
+  while IFS= read -r -d '' -u "$stream_fd" package_file; do
+    checksum_line="$(sha256sum -- "$package_file")"
+    grep -Fqx -- "$checksum_line" SHA256SUMS || {
+      printf 'Release checksum manifest omitted: %q\n' \
+        "$package_file" >&2
+      return 1
+    }
+    ((expected_file_count += 1))
+  done
+  [[ -z "$package_file" ]] || {
+    printf 'Release checksum traversal ended with a truncated path: %q\n' \
+      "$package_file" >&2
+    return 1
+  }
+  while IFS= read -r checksum_line; do
+    [[ -n "$checksum_line" ]] || {
+      printf 'Release checksum manifest contains an empty record.\n' >&2
+      return 1
+    }
+    ((manifest_record_count += 1))
+  done < SHA256SUMS
+  [[ "$manifest_record_count" -eq "$expected_file_count" ]] || {
+    printf \
+      'Release checksum manifest has %s records for %s package files.\n' \
+      "$manifest_record_count" \
+      "$expected_file_count" >&2
+    return 1
+  }
+}
+
+verify_release_package_checksum_coverage() {
+  local package_root="$1"
+
   (
     cd "$package_root"
     sha256sum --quiet --check SHA256SUMS
-    while IFS= read -r -d '' package_file; do
-      checksum_line="$(sha256sum -- "$package_file")"
-      grep -Fqx -- "$checksum_line" SHA256SUMS || {
-        printf 'Release checksum manifest omitted: %q\n' \
-          "$package_file" >&2
-        return 1
-      }
-      ((expected_file_count += 1))
-    done < <(
+    with_private_nul_stream \
+      verify_release_package_checksum_stream \
       find \
         -P \
         . \
@@ -803,21 +921,6 @@ verify_release_package_checksum_coverage() {
         -type f \
         ! -path './SHA256SUMS' \
         -print0
-    )
-    while IFS= read -r checksum_line; do
-      [[ -n "$checksum_line" ]] || {
-        printf 'Release checksum manifest contains an empty record.\n' >&2
-        return 1
-      }
-      ((manifest_record_count += 1))
-    done < SHA256SUMS
-    [[ "$manifest_record_count" -eq "$expected_file_count" ]] || {
-      printf \
-        'Release checksum manifest has %s records for %s package files.\n' \
-        "$manifest_record_count" \
-        "$expected_file_count" >&2
-      return 1
-    }
   )
 }
 
@@ -1499,6 +1602,11 @@ run_publication_self_test() {
   local freshness_expected_status
   local freshness_fetch_epoch
   local freshness_status
+  local partial_git
+  local partial_find_bin
+  local partial_find
+  local verifier_temporary_directory
+  local verifier_leak
 
   current_uid="$(id -u)"
   test_root="$(mktemp -d -t dufs-release-self-test.XXXXXXXX)"
@@ -2209,6 +2317,138 @@ EOF
   fi
   run_source_git "$test_repository" replace -d "$original_commit" >/dev/null
   rm -f -- "$repository_git_directory/info/attributes"
+
+  verifier_temporary_directory="$test_root/verifier-temporary"
+  install -d -m 0700 "$verifier_temporary_directory"
+  TMPDIR="$verifier_temporary_directory" \
+    validate_source_tree_entries "$test_repository" "$original_commit"
+  verifier_leak="$(
+    find -P "$verifier_temporary_directory" -mindepth 1 -print -quit
+  )" || {
+    printf 'release self-test could not inspect verifier cleanup\n' >&2
+    return 1
+  }
+  [[ -z "$verifier_leak" ]] || {
+    printf 'release self-test leaked a successful verifier stream\n' >&2
+    return 1
+  }
+
+  partial_git="$test_root/partial-git"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "printf '100644 blob 0123456789abcdef0123456789abcdef01234567\\ttracked.txt\\0'" \
+    "printf 'simulated partial Git listing failure\\n' >&2" \
+    'exit 73' > "$partial_git"
+  chmod 0700 "$partial_git"
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    git_command="$partial_git"
+    validate_source_tree_entries "$test_repository" "$original_commit"
+  ) 2>/dev/null
+  then
+    printf 'release self-test masked a partial source ls-tree failure\n' >&2
+    return 1
+  fi
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    git_command="$partial_git"
+    validate_snapshot_tree_entries "$original_commit"
+  ) 2>/dev/null
+  then
+    printf 'release self-test masked a partial snapshot ls-tree failure\n' >&2
+    return 1
+  fi
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "printf '100644 blob 0123456789abcdef0123456789abcdef01234567\\ttruncated.txt'" \
+    'exit 0' > "$partial_git"
+  chmod 0700 "$partial_git"
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    git_command="$partial_git"
+    validate_source_tree_entries "$test_repository" "$original_commit"
+  ) 2>/dev/null
+  then
+    printf 'release self-test accepted a truncated source ls-tree record\n' >&2
+    return 1
+  fi
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    git_command="$partial_git"
+    validate_snapshot_tree_entries "$original_commit"
+  ) 2>/dev/null
+  then
+    printf 'release self-test accepted a truncated snapshot ls-tree record\n' >&2
+    return 1
+  fi
+
+  partial_find_bin="$test_root/partial-find-bin"
+  partial_find="$partial_find_bin/find"
+  install -d -m 0700 "$partial_find_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ -f SHA256SUMS ]]; then' \
+    '  while IFS= read -r checksum_line; do' \
+    '    package_file=${checksum_line#*  }' \
+    "    printf '%s\\0' \"\$package_file\"" \
+    '  done < SHA256SUMS' \
+    'fi' \
+    "printf 'simulated partial find failure\\n' >&2" \
+    'exit 73' > "$partial_find"
+  chmod 0700 "$partial_find"
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    PATH="$partial_find_bin:/usr/bin:/bin"
+    hash -r
+    validate_extracted_source_tree "$first_source_tree"
+  ) 2>/dev/null
+  then
+    printf 'release self-test masked a partial extraction scan failure\n' >&2
+    return 1
+  fi
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    PATH="$partial_find_bin:/usr/bin:/bin"
+    hash -r
+    verify_release_package_checksum_coverage "$documentation_package"
+  ) 2>/dev/null
+  then
+    printf 'release self-test masked a partial checksum traversal failure\n' >&2
+    return 1
+  fi
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'last_package_file=' \
+    'while IFS= read -r checksum_line; do' \
+    '  package_file=${checksum_line#*  }' \
+    '  if [[ -n "$last_package_file" ]]; then' \
+    "    printf '%s\\0' \"\$last_package_file\"" \
+    '  fi' \
+    '  last_package_file=$package_file' \
+    'done < SHA256SUMS' \
+    "printf '%s' \"\$last_package_file\"" \
+    'exit 0' > "$partial_find"
+  chmod 0700 "$partial_find"
+  if (
+    TMPDIR="$verifier_temporary_directory"
+    PATH="$partial_find_bin:/usr/bin:/bin"
+    hash -r
+    verify_release_package_checksum_coverage "$documentation_package"
+  ) 2>/dev/null
+  then
+    printf 'release self-test accepted a truncated checksum traversal record\n' >&2
+    return 1
+  fi
+  verifier_leak="$(
+    find -P "$verifier_temporary_directory" -mindepth 1 -print -quit
+  )" || {
+    printf 'release self-test could not re-inspect verifier cleanup\n' >&2
+    return 1
+  }
+  [[ -z "$verifier_leak" ]] || {
+    printf 'release self-test leaked a failed verifier stream\n' >&2
+    return 1
+  }
 
   for unsafe_case in \
     'README.md|../outside-release-tree' \
