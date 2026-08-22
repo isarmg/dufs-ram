@@ -1,7 +1,21 @@
 use super::*;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tokio::io::AsyncWriteExt;
+
+fn quarantine_entries(directory: &Path) -> Vec<PathBuf> {
+    let mut entries = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_name().to_str().and_then(classify_internal_name)
+                == Some(InternalEntryName::Quarantine)
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
 
 #[test]
 fn known_directory_entry_types_avoid_the_metadata_fallback() {
@@ -945,7 +959,7 @@ async fn trash_purge_is_incremental_and_honors_cancellation() {
 }
 
 #[tokio::test]
-async fn trash_purge_identity_error_returns_the_entry_without_deleting_replacement() {
+async fn trash_purge_identity_error_quarantines_the_replacement() {
     let temp = assert_fs::TempDir::new().unwrap();
     let rooted = RootedFs::new(temp.path()).unwrap();
     let directory = temp.path().join("directory");
@@ -967,20 +981,159 @@ async fn trash_purge_identity_error_returns_the_entry_without_deleting_replaceme
     };
     let (trash, source) = error.into_parts();
     assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!trash_path.exists());
     assert_eq!(
-        std::fs::read_to_string(&trash_path).unwrap(),
+        classify_internal_name(trash.name.to_str().unwrap()),
+        Some(InternalEntryName::Quarantine)
+    );
+    let quarantined = temp.path().join(&trash.name);
+    assert_eq!(
+        std::fs::read_to_string(&quarantined).unwrap(),
         "temporary obstruction"
     );
-
-    std::fs::remove_file(&trash_path).unwrap();
-    std::fs::rename(&displaced, &trash_path).unwrap();
+    assert!(displaced.join("file.txt").exists());
     drop(trash);
-    let trash = rooted
-        .capture_any_entry_for_purge_blocking(&trash_path)
-        .unwrap()
-        .expect("orphan maintenance must recapture the restored trash revision");
-    trash.purge_all_blocking().unwrap();
+}
+
+#[tokio::test]
+async fn final_file_isolation_preserves_a_replacement_of_the_checked_name() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("file.txt");
+    std::fs::write(&target, "original").unwrap();
+
+    let mut trash = rooted.move_to_trash(&target).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.replace_entry_before_final_isolation_once_for_test();
+    let error = match trash
+        .purge_slice(1, Duration::from_secs(1), CancellationToken::new())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the checked-name replacement must stop file purge"),
+    };
+    let (trash, source) = error.into_parts();
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
     assert!(!trash_path.exists());
+    assert_eq!(
+        classify_internal_name(trash.name.to_str().unwrap()),
+        Some(InternalEntryName::Quarantine)
+    );
+
+    let quarantined = quarantine_entries(temp.path());
+    assert_eq!(quarantined.len(), 2);
+    let mut contents = quarantined
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    contents.sort();
+    assert_eq!(contents, vec![Vec::new(), b"original".to_vec()]);
+}
+
+#[tokio::test]
+async fn final_child_file_isolation_quarantines_the_whole_trash_root_on_mismatch() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("file.txt"), "original").unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.replace_entry_before_final_isolation_once_for_test();
+    let error = match trash
+        .purge_slice(16, Duration::from_secs(1), CancellationToken::new())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the checked-name replacement must stop child-file purge"),
+    };
+    let (trash, source) = error.into_parts();
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!trash_path.exists());
+
+    let quarantined_root = temp.path().join(&trash.name);
+    assert_eq!(
+        classify_internal_name(trash.name.to_str().unwrap()),
+        Some(InternalEntryName::Quarantine)
+    );
+    let quarantined_children = quarantine_entries(&quarantined_root);
+    assert_eq!(quarantined_children.len(), 2);
+    let mut contents = quarantined_children
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    contents.sort();
+    assert_eq!(contents, vec![Vec::new(), b"original".to_vec()]);
+}
+
+#[tokio::test]
+async fn final_child_rmdir_isolation_preserves_a_replacement_of_the_checked_name() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir_all(directory.join("child")).unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    let original = std::fs::metadata(trash_path.join("child")).unwrap();
+    trash.replace_entry_before_final_isolation_once_for_test();
+    let error = match trash
+        .purge_slice(16, Duration::from_secs(1), CancellationToken::new())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the checked-name replacement must stop child-directory purge"),
+    };
+    let (trash, source) = error.into_parts();
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!trash_path.exists());
+
+    let quarantined_root = temp.path().join(&trash.name);
+    let quarantined_children = quarantine_entries(&quarantined_root);
+    assert_eq!(quarantined_children.len(), 2);
+    let inodes = quarantined_children
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().ino())
+        .collect::<Vec<_>>();
+    assert!(inodes.contains(&original.ino()));
+    assert!(inodes.iter().any(|inode| *inode != original.ino()));
+}
+
+#[tokio::test]
+async fn final_root_rmdir_isolation_preserves_a_replacement_of_the_checked_name() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    let original = std::fs::metadata(&trash_path).unwrap();
+    trash.replace_entry_before_final_isolation_once_for_test();
+    let error = match trash
+        .purge_slice(16, Duration::from_secs(1), CancellationToken::new())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the checked-name replacement must stop root-directory purge"),
+    };
+    let (trash, source) = error.into_parts();
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!trash_path.exists());
+    assert_eq!(
+        classify_internal_name(trash.name.to_str().unwrap()),
+        Some(InternalEntryName::Quarantine)
+    );
+
+    let quarantined = quarantine_entries(temp.path());
+    assert_eq!(quarantined.len(), 2);
+    let inodes = quarantined
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().ino())
+        .collect::<Vec<_>>();
+    assert!(inodes.contains(&original.ino()));
+    assert!(inodes.iter().any(|inode| *inode != original.ino()));
 }
 
 #[tokio::test]
@@ -1018,8 +1171,6 @@ async fn nested_directory_replacement_is_detected_before_unlink() {
 
 #[tokio::test]
 async fn pending_child_unlink_anchor_prevents_inode_reuse_and_preserves_replacement() {
-    use std::os::unix::fs::MetadataExt;
-
     let temp = assert_fs::TempDir::new().unwrap();
     let rooted = RootedFs::new(temp.path()).unwrap();
     let directory = temp.path().join("directory");
@@ -1077,9 +1228,11 @@ async fn pending_child_unlink_rejects_an_entry_added_after_the_final_identity_ch
         .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let quarantined_children = quarantine_entries(&trash_path);
+    assert_eq!(quarantined_children.len(), 1);
     assert!(
-        trash_path
-            .join("child/.dufs-test-concurrent-entry")
+        quarantined_children[0]
+            .join(".dufs-test-concurrent-entry")
             .exists(),
         "a child entry created after EOF must be preserved"
     );
@@ -1100,8 +1253,10 @@ async fn root_unlink_rejects_an_entry_added_after_the_final_identity_check() {
         .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!trash_path.exists());
+    let quarantined = temp.path().join(&trash.name);
     assert!(
-        trash_path.join(".dufs-test-concurrent-entry").exists(),
+        quarantined.join(".dufs-test-concurrent-entry").exists(),
         "a root entry created after EOF must be preserved"
     );
 }

@@ -1,13 +1,16 @@
 use super::{
     DeleteIdentity, DirectoryCursor, ExistingReplacementTarget, ReplacementTargetIdentity,
-    replacement_target_identity,
+    quarantine_name, replacement_target_identity,
 };
-use crate::server::blocking_io::blocking_io_gate;
+use crate::server::{
+    blocking_io::blocking_io_gate,
+    internal_names::{InternalEntryName, classify_internal_name},
+};
 use rustix::{
     fd::OwnedFd,
     fs::{
-        AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, fstat, fsync, openat, openat2, statat,
-        unlinkat,
+        AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags, fstat, fsync, openat,
+        openat2, renameat_with, statat, unlinkat,
     },
     io::{Errno, dup},
 };
@@ -23,10 +26,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[cfg(test)]
+use rustix::fs::mkdirat;
 
 pub(in crate::server) struct TrashEntry {
     parent: File,
-    pub(super) name: OsString,
+    pub(in crate::server) name: OsString,
     is_dir: bool,
     identity: DeleteIdentity,
     root_anchor: OwnedFd,
@@ -38,6 +45,8 @@ pub(in crate::server) struct TrashEntry {
     pause_after_pending_unlink: bool,
     #[cfg(test)]
     inject_entry_before_directory_unlink: bool,
+    #[cfg(test)]
+    replace_entry_before_final_isolation: bool,
 }
 
 pub(super) struct PurgeDirectory {
@@ -112,6 +121,8 @@ impl TrashEntry {
             pause_after_pending_unlink: false,
             #[cfg(test)]
             inject_entry_before_directory_unlink: false,
+            #[cfg(test)]
+            replace_entry_before_final_isolation: false,
         }
     }
 
@@ -136,10 +147,18 @@ impl TrashEntry {
                 let deadline = Instant::now()
                     .checked_add(max_duration)
                     .unwrap_or_else(Instant::now);
-                worker_entry
+                let mut entry = worker_entry
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .purge_slice_blocking(max_entries.max(1), deadline, Some(&cancellation))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result =
+                    entry.purge_slice_blocking(max_entries.max(1), deadline, Some(&cancellation));
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+                {
+                    entry.quarantine_after_identity_error_blocking()?;
+                }
+                result
             })
             .await;
         let entry = match Arc::try_unwrap(entry) {
@@ -207,9 +226,27 @@ impl TrashEntry {
                     return Err(std::io::Error::from(error));
                 }
             }
+            #[cfg(test)]
+            if std::mem::take(&mut self.replace_entry_before_final_isolation) {
+                replace_entry_before_final_isolation_for_test(&self.parent, &self.name, false)?;
+            }
+            if !isolate_anchored_entry_for_unlink(
+                &self.parent,
+                &mut self.name,
+                &self.root_anchor,
+                "trash file",
+            )? {
+                fsync(&self.parent).map_err(std::io::Error::from)?;
+                return Ok(true);
+            }
             match unlinkat(&self.parent, &self.name, AtFlags::empty()) {
                 Ok(()) | Err(Errno::NOENT) => {}
-                Err(error) => return Err(std::io::Error::from(error)),
+                Err(error) => {
+                    return Err(isolated_removal_error(
+                        "trash file",
+                        std::io::Error::from(error),
+                    ));
+                }
             }
             fsync(&self.parent).map_err(std::io::Error::from)?;
             return Ok(true);
@@ -340,42 +377,35 @@ impl TrashEntry {
                 if std::mem::take(&mut self.inject_entry_before_directory_unlink) {
                     inject_entry_before_directory_unlink_for_test(pending_anchor)?;
                 }
+                #[cfg(test)]
+                if std::mem::take(&mut self.replace_entry_before_final_isolation) {
+                    replace_entry_before_final_isolation_for_test(
+                        parent_fd,
+                        &completed.name,
+                        true,
+                    )?;
+                }
+                if !isolate_anchored_entry_for_unlink(
+                    parent_fd,
+                    &mut completed.name,
+                    pending_anchor,
+                    "trash child directory",
+                )? {
+                    continue;
+                }
                 match unlinkat(parent_fd, &completed.name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(Errno::NOTEMPTY | Errno::EXIST) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            "trash child directory gained entries after its final identity check",
+                            "isolated trash child directory gained entries before removal",
                         ));
                     }
                     Err(error) => {
-                        let current_revision = replacement_target_identity(
-                            &fstat(pending_anchor).map_err(std::io::Error::from)?,
-                        );
-                        if current_revision != completed.revision_identity {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "trash child directory changed during pending unlink",
-                            ));
-                        }
-                        match statat(parent_fd, &completed.name, AtFlags::SYMLINK_NOFOLLOW) {
-                            Ok(metadata)
-                                if replacement_target_identity(&metadata) == current_revision => {}
-                            Ok(_) | Err(Errno::NOENT) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "trash child directory changed during pending unlink",
-                                ));
-                            }
-                            Err(inspect_error) => {
-                                return Err(std::io::Error::from(inspect_error));
-                            }
-                        }
-                        completed.pending_anchor = None;
-                        let parent_depth = self.purge_stack.len();
-                        self.purge_stack.push(*completed);
-                        self.retain_purge_directory(parent, parent_depth)?;
-                        return Err(std::io::Error::from(error));
+                        return Err(isolated_removal_error(
+                            "trash child directory",
+                            std::io::Error::from(error),
+                        ));
                     }
                 }
                 continue;
@@ -462,46 +492,37 @@ impl TrashEntry {
                     if std::mem::take(&mut self.inject_entry_before_directory_unlink) {
                         inject_entry_before_directory_unlink_for_test(&self.root_anchor)?;
                     }
+                    #[cfg(test)]
+                    if std::mem::take(&mut self.replace_entry_before_final_isolation) {
+                        replace_entry_before_final_isolation_for_test(
+                            &self.parent,
+                            &self.name,
+                            true,
+                        )?;
+                    }
+                    if !isolate_anchored_entry_for_unlink(
+                        &self.parent,
+                        &mut self.name,
+                        &self.root_anchor,
+                        "trash root directory",
+                    )? {
+                        fsync(&self.parent).map_err(std::io::Error::from)?;
+                        return Ok(true);
+                    }
+                    completed.name.clone_from(&self.name);
                     match unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR) {
                         Ok(()) | Err(Errno::NOENT) => {}
                         Err(Errno::NOTEMPTY | Errno::EXIST) => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                "trash root directory gained entries after its final identity check",
+                                "isolated trash root directory gained entries before removal",
                             ));
                         }
                         Err(error) => {
-                            let current_revision = replacement_target_identity(
-                                &fstat(&self.root_anchor).map_err(std::io::Error::from)?,
-                            );
-                            if current_revision != completed.revision_identity {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "trash root directory changed during final unlink",
-                                ));
-                            }
-                            match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
-                                Ok(metadata)
-                                    if replacement_target_identity(&metadata)
-                                        == current_revision => {}
-                                Ok(_) | Err(Errno::NOENT) => {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "trash root directory changed during final unlink",
-                                    ));
-                                }
-                                Err(inspect_error) => {
-                                    return Err(std::io::Error::from(inspect_error));
-                                }
-                            }
-                            self.purge_stack.push(completed);
-                            self.retain_purge_directory(
-                                directory
-                                    .as_ref()
-                                    .expect("the failed root unlink retains its directory"),
-                                1,
-                            )?;
-                            return Err(std::io::Error::from(error));
+                            return Err(isolated_removal_error(
+                                "trash root directory",
+                                std::io::Error::from(error),
+                            ));
                         }
                     }
                     fsync(&self.parent).map_err(std::io::Error::from)?;
@@ -521,7 +542,7 @@ impl TrashEntry {
                     return Err(std::io::Error::from(error));
                 }
             };
-            let name = OsString::from_vec(entry.file_name().to_bytes().to_vec());
+            let mut name = OsString::from_vec(entry.file_name().to_bytes().to_vec());
             let next_cursor = DirectoryCursor(entry.offset());
             if matches!(name.as_bytes(), b"." | b"..") {
                 self.purge_stack
@@ -679,16 +700,29 @@ impl TrashEntry {
                         "trash child identity changed before purge",
                     ));
                 }
+                #[cfg(test)]
+                if std::mem::take(&mut self.replace_entry_before_final_isolation) {
+                    replace_entry_before_final_isolation_for_test(directory_fd, &name, false)?;
+                }
+                if !isolate_anchored_entry_for_unlink(
+                    directory_fd,
+                    &mut name,
+                    &child_anchor,
+                    "trash child entry",
+                )? {
+                    self.purge_stack
+                        .last_mut()
+                        .expect("directory purge stack is non-empty")
+                        .cursor = next_cursor;
+                    continue;
+                }
                 match unlinkat(directory_fd, &name, AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(error) => {
-                        self.remember_purge_directory(
-                            directory
-                                .as_ref()
-                                .expect("a failed entry unlink retains its directory"),
-                            self.purge_stack.len(),
-                        )?;
-                        return Err(std::io::Error::from(error));
+                        return Err(isolated_removal_error(
+                            "trash child entry",
+                            std::io::Error::from(error),
+                        ));
                     }
                 }
                 self.purge_stack
@@ -866,6 +900,54 @@ impl TrashEntry {
         Ok(())
     }
 
+    /// Persistently move an identity-ambiguous purge root out of the automatic
+    /// trash namespace before returning it to any caller. This is deliberately
+    /// part of the async production boundary: durable jobs and unjournaled
+    /// maintenance entries both use `purge_slice`, while the blocking entry
+    /// point remains available only to focused unit tests.
+    fn quarantine_after_identity_error_blocking(&mut self) -> std::io::Result<()> {
+        if is_quarantine_entry_name(&self.name) {
+            fsync(&self.parent).map_err(std::io::Error::from)?;
+            return Ok(());
+        }
+
+        let old_name = self.name.clone();
+        for _ in 0..16 {
+            let quarantine = OsString::from(quarantine_name(Uuid::new_v4()));
+            match renameat_with(
+                &self.parent,
+                &self.name,
+                &self.parent,
+                &quarantine,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    // Update every retained reference immediately after the
+                    // namespace commit. No later error path may act on the old
+                    // name after the object has entered quarantine.
+                    self.name = quarantine.clone();
+                    if let Some(root) = self.purge_stack.first_mut()
+                        && root.name == old_name
+                    {
+                        root.name = quarantine;
+                    }
+                    fsync(&self.parent).map_err(std::io::Error::from)?;
+                    return Ok(());
+                }
+                Err(Errno::EXIST) => continue,
+                Err(Errno::NOENT) => {
+                    fsync(&self.parent).map_err(std::io::Error::from)?;
+                    return Ok(());
+                }
+                Err(error) => return Err(std::io::Error::from(error)),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate a unique quarantine name for ambiguous purge root",
+        ))
+    }
+
     #[cfg(test)]
     pub(in crate::server) fn purge_all_blocking(mut self) -> std::io::Result<()> {
         while !self.purge_slice_blocking(
@@ -927,6 +1009,79 @@ impl TrashEntry {
     pub(super) fn inject_entry_before_directory_unlink_once_for_test(&mut self) {
         self.inject_entry_before_directory_unlink = true;
     }
+
+    #[cfg(test)]
+    pub(in crate::server) fn replace_entry_before_final_isolation_once_for_test(&mut self) {
+        self.replace_entry_before_final_isolation = true;
+    }
+}
+
+/// Atomically take the currently named occupant out of the public trash name,
+/// then prove that the isolated object is still the already-pinned inode. A
+/// normal external writer can continue replacing the old name without putting
+/// its replacement in the following unlink/rmdir operation.
+///
+/// Linux has no conditional unlink-by-fd operation. A hostile same-credential
+/// writer that observes the random rename (for example with inotify) can still
+/// target the isolated name in the very small verification-to-unlink window.
+/// Closing that adversarial boundary requires a work directory inaccessible to
+/// such writers, not another pathname identity check.
+fn isolate_anchored_entry_for_unlink<F: AsFd>(
+    parent: F,
+    name: &mut OsString,
+    anchor: &OwnedFd,
+    description: &str,
+) -> std::io::Result<bool> {
+    for _ in 0..16 {
+        let isolated = OsString::from(quarantine_name(Uuid::new_v4()));
+        match renameat_with(&parent, &*name, &parent, &isolated, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                // The rename is the namespace commit. Publish its new name
+                // before any fallible verification so recovery never falls
+                // back to operating on the old source name.
+                *name = isolated;
+            }
+            Err(Errno::EXIST) => continue,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+
+        let anchored = fstat(anchor).map_err(|error| {
+            isolated_validation_error(description, "pinned identity could not be read", error)
+        })?;
+        let named = statat(&parent, &*name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            isolated_validation_error(description, "isolated identity could not be read", error)
+        })?;
+        if replacement_target_identity(&anchored) != replacement_target_identity(&named) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{description} changed while entering quarantine before removal"),
+            ));
+        }
+        return Ok(true);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("failed to allocate a unique isolated name for {description}"),
+    ))
+}
+
+fn isolated_validation_error(description: &str, action: &str, source: Errno) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{description} {action} after isolation: {source}"),
+    )
+}
+
+fn isolated_removal_error(description: &str, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("isolated {description} could not be removed safely: {source}"),
+    )
+}
+
+fn is_quarantine_entry_name(name: &OsString) -> bool {
+    name.to_str().and_then(classify_internal_name) == Some(InternalEntryName::Quarantine)
 }
 
 #[cfg(test)]
@@ -940,6 +1095,41 @@ fn inject_entry_before_directory_unlink_for_test(directory: &OwnedFd) -> std::io
     .map_err(std::io::Error::from)?;
     drop(entry);
     Ok(())
+}
+
+#[cfg(test)]
+fn replace_entry_before_final_isolation_for_test<F: AsFd>(
+    parent: F,
+    name: &OsString,
+    is_directory: bool,
+) -> std::io::Result<()> {
+    for _ in 0..16 {
+        let displaced = OsString::from(quarantine_name(Uuid::new_v4()));
+        match renameat_with(&parent, name, &parent, &displaced, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                if is_directory {
+                    mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+                        .map_err(std::io::Error::from)?;
+                } else {
+                    let replacement = openat(
+                        &parent,
+                        name,
+                        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+                        Mode::RUSR | Mode::WUSR,
+                    )
+                    .map_err(std::io::Error::from)?;
+                    drop(replacement);
+                }
+                return Ok(());
+            }
+            Err(Errno::EXIST) => continue,
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate a replacement-race test name",
+    ))
 }
 
 fn identity_from_stat(stat: &rustix::fs::Stat) -> DeleteIdentity {
