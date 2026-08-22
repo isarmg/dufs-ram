@@ -38,6 +38,23 @@ async fn prepared(server: &Server, target: &Path) -> (PreparedPurge, StoredPurge
     (prepared, job)
 }
 
+async fn move_to_trash_and_mark_ready(server: &Server, target: &Path, prepared: &PreparedPurge) {
+    let trash = server
+        .content
+        .rooted_fs
+        .move_to_trash_with_expected_identity(target, prepared.trash_id, prepared.source_identity)
+        .await
+        .unwrap();
+    assert!(
+        server
+            .state
+            .state_store
+            .mark_purge_job_ready(prepared.key, trash.trash_revision())
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn reconciliation_discards_an_intent_when_rename_never_started() {
     let temp = assert_fs::TempDir::new().unwrap();
@@ -61,7 +78,7 @@ async fn reconciliation_discards_an_intent_when_rename_never_started() {
 }
 
 #[tokio::test]
-async fn reconciliation_promotes_an_intent_after_the_checked_rename() {
+async fn reconciliation_quarantines_a_renamed_entry_without_a_committed_revision() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());
     let target = temp.path().join("removed.txt");
@@ -87,26 +104,6 @@ async fn reconciliation_promotes_an_intent_after_the_checked_rename() {
 
     server.reconcile_prepared_purge_job(&job).await.unwrap();
 
-    let ready = server
-        .state
-        .state_store
-        .purge_job(prepared.key)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(ready.state, StoredPurgeState::Ready);
-    let claimed = server
-        .state
-        .state_store
-        .claim_due_purge_job()
-        .await
-        .unwrap()
-        .unwrap();
-    let work = server.open_purge_work(claimed).await.unwrap().unwrap();
-    assert!(matches!(
-        server.process_purge_work(work).await,
-        PurgeWorkResult::Complete
-    ));
     assert!(!trash.exists());
     assert!(
         server
@@ -117,6 +114,16 @@ async fn reconciliation_promotes_an_intent_after_the_checked_rename() {
             .unwrap()
             .is_none()
     );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("a renamed Prepared entry must be retained in quarantine");
+    assert_eq!(std::fs::read(quarantined.path()).unwrap(), b"removed");
 }
 
 #[tokio::test]
@@ -177,26 +184,7 @@ async fn claimed_identity_mismatch_is_quarantined_instead_of_retried_or_deleted(
         .rooted_fs
         .trash_path_for_id(&target, prepared.trash_id)
         .unwrap();
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &target,
-                prepared.trash_id,
-                prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(
-        server
-            .state
-            .state_store
-            .mark_purge_job_ready(prepared.key)
-            .await
-            .unwrap()
-    );
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
     let claimed = server
         .state
         .state_store
@@ -235,6 +223,54 @@ async fn claimed_identity_mismatch_is_quarantined_instead_of_retried_or_deleted(
 }
 
 #[tokio::test]
+async fn claimed_job_without_a_committed_revision_is_quarantined_and_completed() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("claimed-without-revision.txt");
+    std::fs::write(&target, "preserved legacy trash").unwrap();
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
+    let mut claimed = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+    claimed.trash_revision = None;
+
+    assert!(server.open_purge_work(claimed).await.unwrap().is_none());
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("legacy claimed trash without a revision must be quarantined");
+    assert_eq!(
+        std::fs::read(quarantined.path()).unwrap(),
+        b"preserved legacy trash"
+    );
+}
+
+#[tokio::test]
 async fn identity_change_during_claimed_purge_quarantines_the_replacement_root() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());
@@ -246,26 +282,7 @@ async fn identity_change_during_claimed_purge_quarantines_the_replacement_root()
         .rooted_fs
         .trash_path_for_id(&target, prepared.trash_id)
         .unwrap();
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &target,
-                prepared.trash_id,
-                prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(
-        server
-            .state
-            .state_store
-            .mark_purge_job_ready(prepared.key)
-            .await
-            .unwrap()
-    );
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
     let claimed = server
         .state
         .state_store
@@ -309,6 +326,75 @@ async fn identity_change_during_claimed_purge_quarantines_the_replacement_root()
 }
 
 #[tokio::test]
+async fn partially_purged_directory_is_quarantined_after_claim_recovery() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("partial-directory");
+    std::fs::create_dir(&target).unwrap();
+    for index in 0..300 {
+        std::fs::write(target.join(format!("file-{index:03}.txt")), "content").unwrap();
+    }
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
+    let claimed = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+    let work = server.open_purge_work(claimed).await.unwrap().unwrap();
+    let pending = match server.process_purge_work(work).await {
+        PurgeWorkResult::Pending(work) => work,
+        _ => panic!("the first bounded slice must leave part of the directory"),
+    };
+    assert!(std::fs::read_dir(&trash).unwrap().count() > 0);
+    drop(pending);
+
+    assert!(
+        server
+            .state
+            .state_store
+            .retry_purge_job(prepared.key, Duration::ZERO)
+            .await
+            .unwrap()
+    );
+    let recovered = server
+        .state
+        .state_store
+        .claim_due_purge_job()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(server.open_purge_work(recovered).await.unwrap().is_none());
+    assert!(!trash.exists());
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("partially purged trash must be retained in quarantine");
+    assert!(std::fs::read_dir(quarantined.path()).unwrap().count() > 0);
+}
+
+#[tokio::test]
 async fn a_locally_retained_claim_is_reloaded_before_retrying() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());
@@ -320,26 +406,7 @@ async fn a_locally_retained_claim_is_reloaded_before_retrying() {
         .rooted_fs
         .trash_path_for_id(&target, prepared.trash_id)
         .unwrap();
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &target,
-                prepared.trash_id,
-                prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(
-        server
-            .state
-            .state_store
-            .mark_purge_job_ready(prepared.key)
-            .await
-            .unwrap()
-    );
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
     let claimed = server
         .state
         .state_store
@@ -381,26 +448,7 @@ async fn a_locally_retained_claim_is_dropped_after_a_lost_retry_reply() {
         .rooted_fs
         .trash_path_for_id(&target, prepared.trash_id)
         .unwrap();
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &target,
-                prepared.trash_id,
-                prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(
-        server
-            .state
-            .state_store
-            .mark_purge_job_ready(prepared.key)
-            .await
-            .unwrap()
-    );
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
     let claimed = server
         .state
         .state_store
@@ -439,12 +487,17 @@ async fn a_locally_retained_claim_is_dropped_after_a_lost_retry_reply() {
 }
 
 #[tokio::test]
-async fn periodic_reconciliation_recovers_a_post_rename_prepared_intent() {
+async fn periodic_reconciliation_quarantines_a_post_rename_prepared_intent() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());
     let target = temp.path().join("post-rename.txt");
     std::fs::write(&target, "removed").unwrap();
     let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
     drop(
         server
             .content
@@ -470,7 +523,7 @@ async fn periodic_reconciliation_recovers_a_post_rename_prepared_intent() {
                 .purge_job(prepared.key)
                 .await
                 .unwrap()
-                .is_some_and(|job| job.state == StoredPurgeState::Ready)
+                .is_none()
             {
                 break;
             }
@@ -478,10 +531,21 @@ async fn periodic_reconciliation_recovers_a_post_rename_prepared_intent() {
         }
     })
     .await
-    .expect("periodic reconciliation did not promote the prepared intent");
+    .expect("periodic reconciliation did not quarantine the prepared intent");
 
     server.lifecycle.shutdown.cancel();
     reconciler.await.unwrap();
+    assert!(!trash.exists());
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("periodic reconciliation must retain renamed Prepared trash");
+    assert_eq!(std::fs::read(quarantined.path()).unwrap(), b"removed");
 }
 
 #[tokio::test]
@@ -502,26 +566,7 @@ async fn reconciliation_waits_for_the_live_delete_path_lease() {
         "reconciliation bypassed the live DELETE lease"
     );
 
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &target,
-                prepared.trash_id,
-                prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(
-        server
-            .state
-            .state_store
-            .mark_purge_job_ready(prepared.key)
-            .await
-            .unwrap()
-    );
+    move_to_trash_and_mark_ready(&server, &target, &prepared).await;
     drop(lease);
     reconciliation.await.unwrap().unwrap();
 

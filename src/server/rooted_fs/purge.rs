@@ -1,4 +1,7 @@
-use super::{DeleteIdentity, DirectoryCursor};
+use super::{
+    DeleteIdentity, DirectoryCursor, ExistingReplacementTarget, ReplacementTargetIdentity,
+    replacement_target_identity,
+};
 use crate::server::blocking_io::blocking_io_gate;
 use rustix::{
     fd::OwnedFd,
@@ -26,15 +29,23 @@ pub(in crate::server) struct TrashEntry {
     pub(super) name: OsString,
     is_dir: bool,
     identity: DeleteIdentity,
+    root_anchor: OwnedFd,
+    trash_revision: [u8; 32],
     pub(super) purge_stack: Vec<PurgeDirectory>,
     pub(super) purge_resume: Option<PurgeResume>,
     pub(super) pending_unlink: Option<PurgeDirectory>,
+    #[cfg(test)]
+    pause_after_pending_unlink: bool,
+    #[cfg(test)]
+    inject_entry_before_directory_unlink: bool,
 }
 
 pub(super) struct PurgeDirectory {
     name: OsString,
     cursor: DirectoryCursor,
     identity: DeleteIdentity,
+    revision_identity: ExistingReplacementTarget,
+    pending_anchor: Option<OwnedFd>,
 }
 
 pub(super) struct PurgeResume {
@@ -80,20 +91,36 @@ impl std::error::Error for TrashPurgeError {
 }
 
 impl TrashEntry {
-    pub(super) fn new(parent: File, name: OsString, identity: DeleteIdentity) -> Self {
+    pub(super) fn new(
+        parent: File,
+        name: OsString,
+        identity: DeleteIdentity,
+        root_anchor: OwnedFd,
+        trash_revision: [u8; 32],
+    ) -> Self {
         Self {
             parent,
             name,
             is_dir: identity.is_directory,
             identity,
+            root_anchor,
+            trash_revision,
             purge_stack: Vec::new(),
             purge_resume: None,
             pending_unlink: None,
+            #[cfg(test)]
+            pause_after_pending_unlink: false,
+            #[cfg(test)]
+            inject_entry_before_directory_unlink: false,
         }
     }
 
     pub(in crate::server) fn identity(&self) -> DeleteIdentity {
         self.identity
+    }
+
+    pub(in crate::server) fn trash_revision(&self) -> [u8; 32] {
+        self.trash_revision
     }
 
     pub(in crate::server) async fn purge_slice(
@@ -144,8 +171,19 @@ impl TrashEntry {
             {
                 return Ok(false);
             }
+            let anchored_identity = replacement_target_identity(
+                &fstat(&self.root_anchor).map_err(std::io::Error::from)?,
+            );
+            if ReplacementTargetIdentity::Existing(anchored_identity).purge_revision()
+                != self.trash_revision
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trash file revision changed after durable purge capture",
+                ));
+            }
             match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(metadata) if identity_from_stat(&metadata) == self.identity => {}
+                Ok(metadata) if replacement_target_identity(&metadata) == anchored_identity => {}
                 Ok(_) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -159,7 +197,7 @@ impl TrashEntry {
                 Err(error) => {
                     if matches!(
                         statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW),
-                        Ok(metadata) if identity_from_stat(&metadata) != self.identity
+                        Ok(metadata) if replacement_target_identity(&metadata) != anchored_identity
                     ) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -217,9 +255,20 @@ impl TrashEntry {
                     return Err(std::io::Error::from(error));
                 }
             };
-            if identity_from_stat(&fstat(&directory).map_err(std::io::Error::from)?)
-                != self.identity
+            let opened_metadata = fstat(&directory).map_err(std::io::Error::from)?;
+            let opened_revision_identity = replacement_target_identity(&opened_metadata);
+            let anchored_revision_identity = replacement_target_identity(
+                &fstat(&self.root_anchor).map_err(std::io::Error::from)?,
+            );
+            if ReplacementTargetIdentity::Existing(anchored_revision_identity).purge_revision()
+                != self.trash_revision
             {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trash directory revision changed after durable purge capture",
+                ));
+            }
+            if opened_revision_identity != anchored_revision_identity {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "trash directory identity changed before purge",
@@ -229,6 +278,8 @@ impl TrashEntry {
                 name: self.name.clone(),
                 cursor: DirectoryCursor::default(),
                 identity: self.identity,
+                revision_identity: opened_revision_identity,
+                pending_anchor: None,
             });
             Some(Dir::new(directory).map_err(std::io::Error::from)?)
         } else {
@@ -258,8 +309,24 @@ impl TrashEntry {
                     .as_ref()
                     .expect("a pending unlink has an open parent directory");
                 let parent_fd = parent.fd().map_err(std::io::Error::from)?;
+                let pending_anchor = completed.pending_anchor.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pending trash child has no retained identity anchor",
+                    )
+                })?;
+                let anchored_revision = replacement_target_identity(
+                    &fstat(pending_anchor).map_err(std::io::Error::from)?,
+                );
+                if anchored_revision != completed.revision_identity {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pending trash child revision changed before unlink",
+                    ));
+                }
                 match statat(parent_fd, &completed.name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(metadata) if identity_from_stat(&metadata) == completed.identity => {}
+                    Ok(metadata) if replacement_target_identity(&metadata) == anchored_revision => {
+                    }
                     Ok(_) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -269,15 +336,45 @@ impl TrashEntry {
                     Err(Errno::NOENT) => continue,
                     Err(error) => return Err(std::io::Error::from(error)),
                 }
+                #[cfg(test)]
+                if std::mem::take(&mut self.inject_entry_before_directory_unlink) {
+                    inject_entry_before_directory_unlink_for_test(pending_anchor)?;
+                }
                 match unlinkat(parent_fd, &completed.name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
+                    Err(Errno::NOTEMPTY | Errno::EXIST) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child directory gained entries after its final identity check",
+                        ));
+                    }
                     Err(error) => {
-                        if matches!(error, Errno::NOTEMPTY | Errno::EXIST) {
-                            completed.cursor = DirectoryCursor::default();
+                        let current_revision = replacement_target_identity(
+                            &fstat(pending_anchor).map_err(std::io::Error::from)?,
+                        );
+                        if current_revision != completed.revision_identity {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "trash child directory changed during pending unlink",
+                            ));
                         }
+                        match statat(parent_fd, &completed.name, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(metadata)
+                                if replacement_target_identity(&metadata) == current_revision => {}
+                            Ok(_) | Err(Errno::NOENT) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "trash child directory changed during pending unlink",
+                                ));
+                            }
+                            Err(inspect_error) => {
+                                return Err(std::io::Error::from(inspect_error));
+                            }
+                        }
+                        completed.pending_anchor = None;
                         let parent_depth = self.purge_stack.len();
                         self.purge_stack.push(completed);
-                        self.remember_purge_directory(parent, parent_depth)?;
+                        self.retain_purge_directory(parent, parent_depth)?;
                         return Err(std::io::Error::from(error));
                     }
                 }
@@ -289,11 +386,31 @@ impl TrashEntry {
                 .expect("an active purge frame has one open directory")
                 .read();
             let Some(entry) = next else {
+                let completed_depth = self.purge_stack.len();
+                self.update_purge_directory_revision(
+                    directory
+                        .as_ref()
+                        .expect("a completed purge frame has an open directory"),
+                    completed_depth,
+                )?;
+                let pending_anchor = if completed_depth > 1 {
+                    Some(
+                        dup(directory
+                            .as_ref()
+                            .expect("a completed child purge has an open directory")
+                            .fd()
+                            .map_err(std::io::Error::from)?)
+                        .map_err(std::io::Error::from)?,
+                    )
+                } else {
+                    None
+                };
                 let mut completed = self
                     .purge_stack
                     .pop()
                     .expect("directory purge stack is non-empty");
                 if !self.purge_stack.is_empty() {
+                    completed.pending_anchor = pending_anchor;
                     drop(directory.take());
                     self.pending_unlink = Some(completed);
                     directory = self.open_current_purge_directory(
@@ -305,9 +422,30 @@ impl TrashEntry {
                     if directory.is_none() {
                         return Ok(false);
                     }
+                    #[cfg(test)]
+                    if self.pause_after_pending_unlink {
+                        self.pause_after_pending_unlink = false;
+                        self.remember_purge_directory(
+                            directory
+                                .as_ref()
+                                .expect("a paused pending unlink has an open parent directory"),
+                            self.purge_stack.len(),
+                        )?;
+                        return Ok(false);
+                    }
                 } else {
+                    let anchored_revision = replacement_target_identity(
+                        &fstat(&self.root_anchor).map_err(std::io::Error::from)?,
+                    );
+                    if anchored_revision != completed.revision_identity {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash root directory revision changed before unlink",
+                        ));
+                    }
                     match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
-                        Ok(metadata) if identity_from_stat(&metadata) == self.identity => {}
+                        Ok(metadata)
+                            if replacement_target_identity(&metadata) == anchored_revision => {}
                         Ok(_) => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -320,28 +458,49 @@ impl TrashEntry {
                         }
                         Err(error) => return Err(std::io::Error::from(error)),
                     }
+                    #[cfg(test)]
+                    if std::mem::take(&mut self.inject_entry_before_directory_unlink) {
+                        inject_entry_before_directory_unlink_for_test(&self.root_anchor)?;
+                    }
                     match unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR) {
                         Ok(()) | Err(Errno::NOENT) => {}
+                        Err(Errno::NOTEMPTY | Errno::EXIST) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "trash root directory gained entries after its final identity check",
+                            ));
+                        }
                         Err(error) => {
-                            let must_restart_scan = matches!(error, Errno::NOTEMPTY | Errno::EXIST);
-                            if must_restart_scan {
-                                completed.cursor = DirectoryCursor::default();
+                            let current_revision = replacement_target_identity(
+                                &fstat(&self.root_anchor).map_err(std::io::Error::from)?,
+                            );
+                            if current_revision != completed.revision_identity {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "trash root directory changed during final unlink",
+                                ));
+                            }
+                            match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+                                Ok(metadata)
+                                    if replacement_target_identity(&metadata)
+                                        == current_revision => {}
+                                Ok(_) | Err(Errno::NOENT) => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "trash root directory changed during final unlink",
+                                    ));
+                                }
+                                Err(inspect_error) => {
+                                    return Err(std::io::Error::from(inspect_error));
+                                }
                             }
                             self.purge_stack.push(completed);
-                            if must_restart_scan {
-                                // The retained directory stream is already at EOF. Reusing it
-                                // with a reset cursor would immediately retry rmdir forever when
-                                // another process created an entry between readdir and rmdir.
-                                // Drop it so the next slice reopens a fresh stream from offset 0.
-                                self.purge_resume = None;
-                            } else {
-                                self.remember_purge_directory(
-                                    directory
-                                        .as_ref()
-                                        .expect("the failed root unlink retains its directory"),
-                                    1,
-                                )?;
-                            }
+                            self.retain_purge_directory(
+                                directory
+                                    .as_ref()
+                                    .expect("the failed root unlink retains its directory"),
+                                1,
+                            )?;
                             return Err(std::io::Error::from(error));
                         }
                     }
@@ -398,6 +557,7 @@ impl TrashEntry {
             };
             if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
                 let child_identity = identity_from_stat(&metadata);
+                let child_revision_identity = replacement_target_identity(&metadata);
                 let child = match openat2(
                     directory_fd,
                     &name,
@@ -432,8 +592,19 @@ impl TrashEntry {
                         return Err(std::io::Error::from(error));
                     }
                 };
-                if identity_from_stat(&fstat(&child).map_err(std::io::Error::from)?)
-                    != child_identity
+                let opened_metadata = fstat(&child).map_err(std::io::Error::from)?;
+                let named_metadata = match statat(directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => metadata,
+                    Err(Errno::NOENT) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "trash child directory disappeared after it was opened",
+                        ));
+                    }
+                    Err(error) => return Err(std::io::Error::from(error)),
+                };
+                if replacement_target_identity(&opened_metadata) != child_revision_identity
+                    || replacement_target_identity(&named_metadata) != child_revision_identity
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -456,22 +627,28 @@ impl TrashEntry {
                     .last_mut()
                     .expect("directory purge stack is non-empty")
                     .cursor = next_cursor;
+                self.update_purge_directory_revision(
+                    directory
+                        .as_ref()
+                        .expect("a child descent has an open parent directory"),
+                    self.purge_stack.len(),
+                )?;
                 self.purge_stack.push(PurgeDirectory {
                     name,
                     cursor: DirectoryCursor::default(),
                     identity: child_identity,
+                    revision_identity: child_revision_identity,
+                    pending_anchor: None,
                 });
                 directory = Some(child);
             } else {
-                match statat(directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(current)
-                        if identity_from_stat(&current) == identity_from_stat(&metadata) => {}
-                    Ok(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "trash child identity changed before purge",
-                        ));
-                    }
+                let child_anchor = match openat(
+                    directory_fd,
+                    &name,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(anchor) => anchor,
                     Err(Errno::NOENT) => {
                         self.purge_stack
                             .last_mut()
@@ -480,6 +657,27 @@ impl TrashEntry {
                         continue;
                     }
                     Err(error) => return Err(std::io::Error::from(error)),
+                };
+                let opened_metadata = fstat(&child_anchor).map_err(std::io::Error::from)?;
+                let named_metadata = match statat(directory_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(current) => current,
+                    Err(Errno::NOENT) => {
+                        self.purge_stack
+                            .last_mut()
+                            .expect("directory purge stack is non-empty")
+                            .cursor = next_cursor;
+                        continue;
+                    }
+                    Err(error) => return Err(std::io::Error::from(error)),
+                };
+                let discovered_identity = replacement_target_identity(&metadata);
+                if replacement_target_identity(&opened_metadata) != discovered_identity
+                    || replacement_target_identity(&named_metadata) != discovered_identity
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "trash child identity changed before purge",
+                    ));
                 }
                 match unlinkat(directory_fd, &name, AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
@@ -515,19 +713,20 @@ impl TrashEntry {
                 (resume.directory, resume.depth)
             }
             _ => {
-                let root = self
+                let root_frame = self
                     .purge_stack
                     .first()
                     .expect("a resumable directory purge has a root frame");
                 let root = openat2(
                     &self.parent,
-                    &root.name,
+                    &root_frame.name,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
                     ResolveFlags::NO_XDEV,
                 )
                 .map_err(std::io::Error::from)?;
-                if identity_from_stat(&fstat(&root).map_err(std::io::Error::from)?) != self.identity
+                if replacement_target_identity(&fstat(&root).map_err(std::io::Error::from)?)
+                    != root_frame.revision_identity
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -537,8 +736,8 @@ impl TrashEntry {
                 (root, 1)
             }
         };
-        if identity_from_stat(&fstat(&current).map_err(std::io::Error::from)?)
-            != self.purge_stack[depth - 1].identity
+        if replacement_target_identity(&fstat(&current).map_err(std::io::Error::from)?)
+            != self.purge_stack[depth - 1].revision_identity
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -565,8 +764,21 @@ impl TrashEntry {
                 ResolveFlags::NO_XDEV,
             ) {
                 Ok(next) => {
-                    if identity_from_stat(&fstat(&next).map_err(std::io::Error::from)?)
-                        != frame.identity
+                    let opened_revision =
+                        replacement_target_identity(&fstat(&next).map_err(std::io::Error::from)?);
+                    let named_revision =
+                        match statat(&current, &frame.name, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(metadata) => replacement_target_identity(&metadata),
+                            Err(Errno::NOENT) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "trash child directory disappeared after resumed open",
+                                ));
+                            }
+                            Err(error) => return Err(std::io::Error::from(error)),
+                        };
+                    if opened_revision != frame.revision_identity
+                        || named_revision != frame.revision_identity
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -578,7 +790,8 @@ impl TrashEntry {
                 Err(error) => {
                     if matches!(
                         statat(&current, &frame.name, AtFlags::SYMLINK_NOFOLLOW),
-                        Ok(metadata) if identity_from_stat(&metadata) != frame.identity
+                        Ok(metadata)
+                            if replacement_target_identity(&metadata) != frame.revision_identity
                     ) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -611,9 +824,45 @@ impl TrashEntry {
     }
 
     fn remember_purge_directory(&mut self, directory: &Dir, depth: usize) -> std::io::Result<()> {
+        self.update_purge_directory_revision(directory, depth)?;
+        self.retain_purge_directory(directory, depth)
+    }
+
+    fn retain_purge_directory(&mut self, directory: &Dir, depth: usize) -> std::io::Result<()> {
         let directory =
             dup(directory.fd().map_err(std::io::Error::from)?).map_err(std::io::Error::from)?;
         self.purge_resume = Some(PurgeResume { directory, depth });
+        Ok(())
+    }
+
+    fn update_purge_directory_revision(
+        &mut self,
+        directory: &Dir,
+        depth: usize,
+    ) -> std::io::Result<()> {
+        let metadata =
+            fstat(directory.fd().map_err(std::io::Error::from)?).map_err(std::io::Error::from)?;
+        let frame = self
+            .purge_stack
+            .get_mut(depth.checked_sub(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "purge directory depth cannot be zero",
+                )
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "purge directory depth exceeds the retained stack",
+                )
+            })?;
+        if identity_from_stat(&metadata) != frame.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "active trash directory no longer matches its purge frame",
+            ));
+        }
+        frame.revision_identity = replacement_target_identity(&metadata);
         Ok(())
     }
 
@@ -656,13 +905,41 @@ impl TrashEntry {
         while let Some(entry) = directory.read() {
             entry.map_err(std::io::Error::from)?;
         }
+        let revision_identity = replacement_target_identity(
+            &fstat(directory.fd().map_err(std::io::Error::from)?).map_err(std::io::Error::from)?,
+        );
         self.purge_stack.push(PurgeDirectory {
             name: self.name.clone(),
             cursor: DirectoryCursor::default(),
             identity: self.identity,
+            revision_identity,
+            pending_anchor: None,
         });
         self.remember_purge_directory(&directory, 1)
     }
+
+    #[cfg(test)]
+    pub(super) fn pause_after_pending_unlink_once_for_test(&mut self) {
+        self.pause_after_pending_unlink = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_entry_before_directory_unlink_once_for_test(&mut self) {
+        self.inject_entry_before_directory_unlink = true;
+    }
+}
+
+#[cfg(test)]
+fn inject_entry_before_directory_unlink_for_test(directory: &OwnedFd) -> std::io::Result<()> {
+    let entry = openat(
+        directory,
+        ".dufs-test-concurrent-entry",
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
+    drop(entry);
+    Ok(())
 }
 
 fn identity_from_stat(stat: &rustix::fs::Stat) -> DeleteIdentity {

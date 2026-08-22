@@ -133,7 +133,7 @@ impl Server {
                     if let Some(operation) = operation.as_mut() {
                         operation.mark_commit_started().await?;
                     }
-                    let _trash = match server
+                    let trash = match server
                         .content
                         .rooted_fs
                         .move_to_trash_with_expected_identity_outcome(
@@ -203,7 +203,12 @@ impl Server {
                             return Err(error.into());
                         }
                     };
-                    if !server.state.state_store.mark_purge_job_ready(key).await? {
+                    if !server
+                        .state
+                        .state_store
+                        .mark_purge_job_ready(key, trash.trash_revision())
+                        .await?
+                    {
                         anyhow::bail!("durable purge intent disappeared after filesystem rename");
                     }
                     if let Some(operation) = operation {

@@ -37,7 +37,7 @@ pub(super) use model::{
 };
 
 const APPLICATION_ID: i32 = 0x4455_4653; // "DUFS"
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const UPLOAD_SESSION_CAPACITY: usize = 16_384;
 const UPLOAD_SESSION_PER_OWNER_CAPACITY: usize = 4_096;
@@ -305,6 +305,7 @@ enum Command {
     },
     MarkPurgeJobReady {
         key: PurgeJobKey,
+        trash_revision: [u8; 32],
         reply: oneshot::Sender<Result<bool>>,
     },
     ClaimDuePurgeJob {
@@ -684,9 +685,17 @@ impl StateStore {
         self.receive(receiver).await
     }
 
-    pub(super) async fn mark_purge_job_ready(&self, key: PurgeJobKey) -> Result<bool> {
+    pub(super) async fn mark_purge_job_ready(
+        &self,
+        key: PurgeJobKey,
+        trash_revision: [u8; 32],
+    ) -> Result<bool> {
         let (reply, receiver) = oneshot::channel();
-        self.send(Command::MarkPurgeJobReady { key, reply })?;
+        self.send(Command::MarkPurgeJobReady {
+            key,
+            trash_revision,
+            reply,
+        })?;
         self.receive(receiver).await
     }
 

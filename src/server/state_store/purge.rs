@@ -68,7 +68,8 @@ impl StoreWorker {
         query_purge_jobs(
             &self.connection,
             "SELECT owner_digest, job_id, target_path, trash_path,
-                    source_device_be, source_inode_be, is_directory, state, attempts
+                    source_device_be, source_inode_be, trash_revision,
+                    is_directory, state, attempts
                FROM purge_jobs
               WHERE state = ?1
               ORDER BY created_at_ms, owner_digest, job_id
@@ -81,7 +82,8 @@ impl StoreWorker {
         query_purge_jobs(
             &self.connection,
             "SELECT owner_digest, job_id, target_path, trash_path,
-                    source_device_be, source_inode_be, is_directory, state, attempts
+                    source_device_be, source_inode_be, trash_revision,
+                    is_directory, state, attempts
                FROM purge_jobs
               ORDER BY created_at_ms, owner_digest, job_id
               LIMIT ?1",
@@ -97,14 +99,20 @@ impl StoreWorker {
         query_state_blocking_paths(&self.connection, after, limit)
     }
 
-    pub(super) fn mark_purge_job_ready(&mut self, key: PurgeJobKey) -> Result<bool> {
+    pub(super) fn mark_purge_job_ready(
+        &mut self,
+        key: PurgeJobKey,
+        trash_revision: [u8; 32],
+    ) -> Result<bool> {
         let now = now_ms()?;
         let changed = self.connection.execute(
             "UPDATE purge_jobs
-                SET state = ?1, next_attempt_at_ms = ?2, updated_at_ms = ?2
-              WHERE owner_digest = ?3 AND job_id = ?4 AND state = ?5",
+                SET state = ?1, trash_revision = ?2,
+                    next_attempt_at_ms = ?3, updated_at_ms = ?3
+              WHERE owner_digest = ?4 AND job_id = ?5 AND state = ?6",
             params![
                 PURGE_READY,
+                trash_revision.as_slice(),
                 now,
                 key.owner.as_slice(),
                 key.id.as_slice(),
@@ -114,8 +122,9 @@ impl StoreWorker {
         if changed == 1 {
             return Ok(true);
         }
-        Ok(load_purge_job(&self.connection, key)?
-            .is_some_and(|job| job.state != StoredPurgeState::Prepared))
+        Ok(load_purge_job(&self.connection, key)?.is_some_and(|job| {
+            job.state != StoredPurgeState::Prepared && job.trash_revision == Some(trash_revision)
+        }))
     }
 
     pub(super) fn claim_due_purge_job(&mut self) -> Result<Option<StoredPurgeJob>> {
@@ -345,6 +354,7 @@ struct PurgeDatabaseRow {
     trash_path: Vec<u8>,
     source_device: Vec<u8>,
     source_inode: Vec<u8>,
+    trash_revision: Option<Vec<u8>>,
     is_directory: i64,
     state: i64,
     attempts: i64,
@@ -358,9 +368,10 @@ fn read_purge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PurgeDatabaseRow>
         trash_path: row.get(3)?,
         source_device: row.get(4)?,
         source_inode: row.get(5)?,
-        is_directory: row.get(6)?,
-        state: row.get(7)?,
-        attempts: row.get(8)?,
+        trash_revision: row.get(6)?,
+        is_directory: row.get(7)?,
+        state: row.get(8)?,
+        attempts: row.get(9)?,
     })
 }
 
@@ -396,6 +407,14 @@ fn decode_purge_row(row: PurgeDatabaseRow) -> Result<StoredPurgeJob> {
                     .map_err(|_| anyhow!("Purge source inode has an invalid length"))?,
             ),
         },
+        trash_revision: row
+            .trash_revision
+            .map(|revision| {
+                revision
+                    .try_into()
+                    .map_err(|_| anyhow!("Purge trash revision has an invalid length"))
+            })
+            .transpose()?,
         is_directory: row.is_directory == 1,
         state: StoredPurgeState::from_database(row.state)?,
         attempts: u32::try_from(row.attempts)
@@ -417,7 +436,8 @@ pub(super) fn load_purge_job(
     connection
         .query_row(
             "SELECT owner_digest, job_id, target_path, trash_path,
-                    source_device_be, source_inode_be, is_directory, state, attempts
+                    source_device_be, source_inode_be, trash_revision,
+                    is_directory, state, attempts
                FROM purge_jobs
               WHERE owner_digest = ?1 AND job_id = ?2",
             params![key.owner.as_slice(), key.id.as_slice()],

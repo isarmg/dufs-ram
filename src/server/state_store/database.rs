@@ -7,7 +7,7 @@ use std::{
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const SCHEMA_V3: &str = r#"
+const SCHEMA_V4: &str = r#"
 CREATE TABLE store_meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -85,6 +85,7 @@ CREATE TABLE purge_jobs (
     trash_path        BLOB NOT NULL UNIQUE CHECK(length(trash_path) BETWEEN 1 AND 65536),
     source_device_be  BLOB NOT NULL CHECK(length(source_device_be) = 8),
     source_inode_be   BLOB NOT NULL CHECK(length(source_inode_be) = 8),
+    trash_revision    BLOB CHECK(trash_revision IS NULL OR length(trash_revision) = 32),
     is_directory      INTEGER NOT NULL CHECK(is_directory IN (0, 1)),
     state             INTEGER NOT NULL CHECK(state IN (0, 1, 2)),
     attempts          INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 4294967295),
@@ -140,6 +141,11 @@ SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
 DROP TABLE upload_sessions;
 ALTER TABLE upload_sessions_v3 RENAME TO upload_sessions;
 CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
+"#;
+
+const MIGRATE_V3_PURGES_TO_V4: &str = r#"
+ALTER TABLE purge_jobs ADD COLUMN trash_revision BLOB
+    CHECK(trash_revision IS NULL OR length(trash_revision) = 32);
 "#;
 
 pub(super) fn prepare_database_file(path: &Path, root: &RootIdentity) -> Result<()> {
@@ -353,7 +359,7 @@ fn validate_database_before_mutation(connection: &Connection, root: RootIdentity
                 "Refusing to initialize a non-empty database without a DUFS schema version"
             );
         }
-        2 | SCHEMA_VERSION => {
+        2 | 3 | SCHEMA_VERSION => {
             ensure!(
                 application_id == APPLICATION_ID,
                 "The state database application id is invalid"
@@ -366,7 +372,7 @@ fn validate_database_before_mutation(connection: &Connection, root: RootIdentity
                 "The configured database application id belongs to another application"
             );
             bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema version 2"
+                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2 and 3"
             );
         }
     }
@@ -406,7 +412,7 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
 
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             insert_root_identity(&transaction, root)?;
@@ -420,6 +426,18 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(MIGRATE_V2_UPLOADS_TO_V3)?;
+            transaction.execute_batch(MIGRATE_V3_PURGES_TO_V4)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        3 => {
+            ensure!(
+                application_id == APPLICATION_ID,
+                "The state database application id is invalid"
+            );
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATE_V3_PURGES_TO_V4)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -435,7 +453,7 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
                 "The configured database application id belongs to another application"
             );
             bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema version 2"
+                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2 and 3"
             );
         }
     }

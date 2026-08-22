@@ -270,7 +270,7 @@ async fn changed_purge_identity_is_preserved_without_blocking_later_jobs() {
         server
             .state
             .state_store
-            .mark_purge_job_ready(bad_prepared.key)
+            .mark_purge_job_ready(bad_prepared.key, bad.trash_revision())
             .await
             .unwrap()
     );
@@ -287,26 +287,25 @@ async fn changed_purge_identity_is_preserved_without_blocking_later_jobs() {
         .rooted_fs
         .trash_path_for_id(&good_path, good_prepared.trash_id)
         .unwrap();
-    drop(
-        server
-            .content
-            .rooted_fs
-            .move_to_trash_with_expected_identity(
-                &good_path,
-                good_prepared.trash_id,
-                good_prepared.source_identity,
-            )
-            .await
-            .unwrap(),
-    );
+    let good = server
+        .content
+        .rooted_fs
+        .move_to_trash_with_expected_identity(
+            &good_path,
+            good_prepared.trash_id,
+            good_prepared.source_identity,
+        )
+        .await
+        .unwrap();
     assert!(
         server
             .state
             .state_store
-            .mark_purge_job_ready(good_prepared.key)
+            .mark_purge_job_ready(good_prepared.key, good.trash_revision())
             .await
             .unwrap()
     );
+    drop(good);
     server.notify_purge_worker();
 
     let worker = tokio::spawn(server.clone().run_purge_worker(receiver));
