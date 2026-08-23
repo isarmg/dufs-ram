@@ -4,5 +4,7 @@
 /playwright-report
 /test-results
 /.dufs-data/
+/dufs.yaml
+/dufs.log
 /dist/
 target/**
