@@ -308,7 +308,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
 ) -> Result<(), Error> {
     use fixtures::{TEST_PASSWORD, TEST_USER};
     use std::{
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::TcpStream,
         os::unix::fs::PermissionsExt,
         time::{Duration, Instant},
@@ -548,6 +548,39 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "query_upload",
     )?;
 
+    assert_eq!(std::fs::read(&target)?, b"competitor");
+    assert_eq!(std::fs::read(stage.path())?, b"abc123");
+
+    // A chunked body has no declared non-zero Content-Length, so preparation
+    // reaches the retained stage before the transfer rejects its first byte.
+    // The failed request must not rewrite the durable metadata provenance of
+    // this originally create-only stage to the requested overwrite revision.
+    let chunked_nonempty_confirmation = with_upload_overwrite_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            format!("{}changed-during-upload.txt", server.url()),
+        ),
+        upload_id,
+        6,
+        &first_revision,
+    )
+    .header("X-Dufs-Upload-Offset", "6")
+    .body(reqwest::blocking::Body::new(Cursor::new(vec![b'x'])))
+    .send()?;
+    assert_eq!(chunked_nonempty_confirmation.status(), 413);
+    assert_eq!(
+        chunked_nonempty_confirmation
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "awaiting-confirmation"
+    );
+    assert_upload_problem_body(
+        chunked_nonempty_confirmation,
+        "upload_body_exceeds_remaining_length",
+        "Request body exceeds declared remaining upload length",
+        "query_upload",
+    )?;
     assert_eq!(std::fs::read(&target)?, b"competitor");
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
 

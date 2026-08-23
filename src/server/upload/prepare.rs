@@ -861,7 +861,9 @@ impl Server {
                     }
                     file.set_len(offset).await?;
                 }
-                if checkpoint.target_revision != requested_revision {
+                if checkpoint.state == UploadRecordState::Running
+                    && checkpoint.target_revision != requested_revision
+                {
                     if !begin_upload_mutation_or_reject(
                         &mutation,
                         res,
@@ -880,21 +882,10 @@ impl Server {
                         upload_length,
                     )
                     .with_target_revision(requested_revision);
-                    match checkpoint.state {
-                        UploadRecordState::Running => {
-                            self.state
-                                .upload_records
-                                .persist_checkpoint(&mut file, record, offset)
-                                .await?;
-                        }
-                        UploadRecordState::AwaitingConfirmation => {
-                            self.state
-                                .upload_records
-                                .persist_awaiting_confirmation(&mut file, record)
-                                .await?;
-                        }
-                        _ => unreachable!("only resumable upload states reopen a stage"),
-                    }
+                    self.state
+                        .upload_records
+                        .persist_checkpoint(&mut file, record, offset)
+                        .await?;
                 }
                 (file, StatusCode::NO_CONTENT)
             }
