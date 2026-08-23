@@ -173,6 +173,12 @@ pub(in crate::server) struct StoredUploadSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::server) struct ExpiredUploadSession {
+    pub(in crate::server) session: StoredUploadSession,
+    pub(in crate::server) expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::server) enum RejectUploadSession {
     NotFound,
     BindingConflict,

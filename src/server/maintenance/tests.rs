@@ -288,6 +288,64 @@ mod sqlite_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn refreshed_expiry_snapshot_never_removes_the_live_stage() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("refreshed-race.bin");
+        let stage = upload_temp_path(&target, upload_id)?;
+        let file = create_stage(&rooted_fs, &stage, b"part").await;
+        let metadata = file.metadata().await?;
+        let session = stored_session(
+            &rooted_fs,
+            OwnerId::persistent("refreshed-race-owner").into_bytes(),
+            upload_id,
+            &target,
+            &stage,
+            StoredUploadState::Running,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        store
+            .save_upload_session(session.clone(), EXPIRED_TTL)
+            .await?;
+        drop(file);
+        expire().await;
+        let expired = store
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .into_iter()
+            .find(|snapshot| snapshot.session.key == session.key)
+            .expect("the expired session was not visible to maintenance");
+
+        assert_eq!(
+            store
+                .save_upload_session(session.clone(), Duration::from_secs(60))
+                .await?,
+            StoreUploadSession::Unchanged
+        );
+        let mut batch = UploadSessionCleanupBatch::default();
+        assert!(
+            cleanup_expired_upload_session(
+                &rooted_fs,
+                &store,
+                &Mutex::new(HashSet::new()),
+                &CancellationToken::new(),
+                &expired,
+                &mut batch,
+            )
+            .await?
+            .is_none()
+        );
+        assert_eq!(std::fs::read(&stage)?, b"part");
+        assert_eq!(store.upload_session(session.key).await?, Some(session));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejected_expiry_finishes_cancelled_discard_cleanup() -> Result<()> {
         let temp = assert_fs::TempDir::new()?;
         let rooted_fs = RootedFs::new(temp.path())?;
@@ -493,6 +551,10 @@ mod sqlite_cleanup_tests {
             target_revision: None,
         };
 
+        let expired = ExpiredUploadSession {
+            session,
+            expires_at_ms: 0,
+        };
         let mut batch = UploadSessionCleanupBatch::default();
         assert!(
             cleanup_expired_upload_session(
@@ -500,7 +562,7 @@ mod sqlite_cleanup_tests {
                 &store,
                 &Mutex::new(HashSet::new()),
                 &CancellationToken::new(),
-                &session,
+                &expired,
                 &mut batch,
             )
             .await?

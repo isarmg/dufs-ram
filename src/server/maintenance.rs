@@ -7,7 +7,7 @@ use super::{
         DirectoryCursor, DirectoryVisitProgress, RootedEntryKey, RootedFs, TrashEntry,
         TrashPurgeProgress,
     },
-    state_store::{StateStore, StoredFileIdentity, StoredUploadSession, StoredUploadState},
+    state_store::{ExpiredUploadSession, StateStore, StoredFileIdentity, StoredUploadState},
 };
 use crate::server::blocking_io::blocking_io_gate;
 
@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::internal_names::upload_temp_path;
+#[cfg(test)]
+use super::state_store::StoredUploadSession;
 
 pub(in crate::server) const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TRASH_ENTRY_TTL: Duration = Duration::from_secs(60 * 60);
@@ -487,11 +489,11 @@ pub(super) async fn cleanup_expired_upload_sessions_batch(
                 batch.skip_untracked_upload_cleanup = true;
                 warn!(
                     "Failed to clean expired upload session id={} error={error:#}",
-                    uuid::Uuid::from_bytes(session.key.id)
+                    uuid::Uuid::from_bytes(session.session.key.id)
                 );
             }
         }
-        batch.next_cursor = Some(session.key);
+        batch.next_cursor = Some(session.session.key);
     }
     batch.page_complete = batch.examined == fetched && fetched < limit;
     Ok(batch)
@@ -502,11 +504,12 @@ async fn cleanup_expired_upload_session(
     state_store: &StateStore,
     active: &Mutex<HashSet<RootedEntryKey>>,
     shutdown: &CancellationToken,
-    expired: &StoredUploadSession,
+    expired: &ExpiredUploadSession,
     batch: &mut UploadSessionCleanupBatch,
 ) -> Result<Option<bool>> {
-    let upload_id = uuid::Uuid::from_bytes(expired.key.id);
-    let target_path = match rooted_fs.resolve_state_path(&expired.target_path) {
+    let session = &expired.session;
+    let upload_id = uuid::Uuid::from_bytes(session.key.id);
+    let target_path = match rooted_fs.resolve_state_path(&session.target_path) {
         Ok(path) => path,
         Err(error) => {
             batch.skip_untracked_upload_cleanup = true;
@@ -516,7 +519,7 @@ async fn cleanup_expired_upload_session(
             return remove_expired_upload_record(state_store, expired, false).await;
         }
     };
-    let stage_path = match rooted_fs.resolve_state_path(&expired.stage_path) {
+    let stage_path = match rooted_fs.resolve_state_path(&session.stage_path) {
         Ok(path) => path,
         Err(error) => {
             batch.skip_untracked_upload_cleanup = true;
@@ -537,8 +540,8 @@ async fn cleanup_expired_upload_session(
         }
     };
     if !stage_mapping_is_valid
-        || rooted_fs.state_relative_path(&target_path)? != expired.target_path
-        || rooted_fs.state_relative_path(&stage_path)? != expired.stage_path
+        || rooted_fs.state_relative_path(&target_path)? != session.target_path
+        || rooted_fs.state_relative_path(&stage_path)? != session.stage_path
     {
         batch.skip_untracked_upload_cleanup = true;
         warn!("Discarding expired upload session with mismatched rooted paths id={upload_id}");
@@ -552,15 +555,17 @@ async fn cleanup_expired_upload_session(
     // CommitStarted can still be advanced by an in-flight non-cancellable
     // commit, so it remains an ambiguity barrier if an older database happens
     // to return it here.
-    match state_store.upload_session(expired.key).await? {
-        Some(current) if current == *expired => {}
-        Some(_) | None => return Ok(None),
+    if !state_store
+        .expired_upload_session_matches(expired.clone())
+        .await?
+    {
+        return Ok(None);
     }
-    match expired.state {
+    match session.state {
         StoredUploadState::Committed | StoredUploadState::Unknown => {
             return remove_expired_upload_record(state_store, expired, false).await;
         }
-        StoredUploadState::Rejected if expired.stage_identity.is_none() => {
+        StoredUploadState::Rejected if session.stage_identity.is_none() => {
             return remove_expired_upload_record(state_store, expired, false).await;
         }
         StoredUploadState::CommitStarted => return Ok(None),
@@ -589,9 +594,11 @@ async fn cleanup_expired_upload_session(
     batch.protected_entries.push(stage_key.clone());
     // A checkpoint may have advanced between the expiry query and acquiring
     // the maintenance claim. Only act on the exact snapshot that expired.
-    match state_store.upload_session(expired.key).await? {
-        Some(current) if current == *expired => {}
-        Some(_) | None => return Ok(None),
+    if !state_store
+        .expired_upload_session_matches(expired.clone())
+        .await?
+    {
+        return Ok(None);
     }
 
     cleanup_expired_running_upload(rooted_fs, state_store, shutdown, expired, &stage_path).await
@@ -601,10 +608,10 @@ async fn cleanup_expired_running_upload(
     rooted_fs: &RootedFs,
     state_store: &StateStore,
     shutdown: &CancellationToken,
-    expired: &StoredUploadSession,
+    expired: &ExpiredUploadSession,
     stage_path: &Path,
 ) -> Result<Option<bool>> {
-    let Some(expected_stage) = expired.stage_identity else {
+    let Some(expected_stage) = expired.session.stage_identity else {
         // Without a durable inode identity no filesystem object is safe to
         // unlink. The expired record itself is still bounded by its TTL.
         return remove_expired_upload_record(state_store, expired, false).await;
@@ -666,7 +673,7 @@ async fn purge_single_file(entry: TrashEntry, shutdown: &CancellationToken) -> R
 
 async fn remove_expired_upload_record(
     state_store: &StateStore,
-    expired: &StoredUploadSession,
+    expired: &ExpiredUploadSession,
     stage_removed: bool,
 ) -> Result<Option<bool>> {
     Ok(state_store
