@@ -205,6 +205,98 @@ fn full_running_checkpoint_can_reenter_commit_with_empty_patch(
 }
 
 #[rstest]
+fn resumed_small_checkpoint_survives_a_later_idle_timeout(
+    #[with(&[
+        "--upload-idle-timeout",
+        "1",
+        "--upload-total-timeout",
+        "10",
+        "--min-free-space",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    use fixtures::{TEST_PASSWORD, TEST_USER};
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::Duration,
+    };
+
+    let url = format!("{}small-resume.bin", server.url());
+    let upload_id = Uuid::new_v4();
+    let initial = with_upload_headers(server.request(reqwest::Method::PUT, &url), upload_id, 10)
+        .body(b"abc".to_vec())
+        .send()?;
+    assert_eq!(initial.status(), 409);
+    assert_eq!(initial.headers().get("x-dufs-upload-offset").unwrap(), "3");
+
+    let session = server.login(TEST_USER, TEST_PASSWORD)?;
+    let mut resume = TcpStream::connect(("127.0.0.1", server.port()))?;
+    resume.set_read_timeout(Some(Duration::from_secs(10)))?;
+    resume.set_write_timeout(Some(Duration::from_secs(10)))?;
+    resume.write_all(
+        format!(
+            concat!(
+                "PATCH /small-resume.bin HTTP/1.1\r\n",
+                "Host: localhost:{}\r\n",
+                "Cookie: {}\r\n",
+                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-Dufs-Upload-Id: {}\r\n",
+                "X-Dufs-Upload-Length: 10\r\n",
+                "X-Dufs-Upload-Offset: 3\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "2\r\n",
+                "de\r\n"
+            ),
+            server.port(),
+            session.cookie(),
+            session.csrf_token(),
+            upload_id,
+        )
+        .as_bytes(),
+    )?;
+    resume.flush()?;
+    let mut timeout_response = String::new();
+    resume.read_to_string(&mut timeout_response)?;
+    assert!(
+        timeout_response.starts_with("HTTP/1.1 408"),
+        "{timeout_response}"
+    );
+
+    let checkpoint = server
+        .request(reqwest::Method::HEAD, &url)
+        .header("X-Dufs-Upload-Id", upload_id.to_string())
+        .send()?;
+    assert_eq!(checkpoint.status(), 200);
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-operation-state").unwrap(),
+        "running"
+    );
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-upload-offset").unwrap(),
+        "5"
+    );
+
+    let committed = with_resume_upload_headers(
+        server.request(reqwest::Method::PATCH, &url),
+        upload_id,
+        10,
+        5,
+    )
+    .body(b"fghij".to_vec())
+    .send()?;
+    assert_eq!(committed.status(), 204);
+    assert_eq!(
+        std::fs::read(server.path().join("small-resume.bin"))?,
+        b"abcdefghij"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn resuming_an_unknown_upload_returns_a_problem_with_protocol_headers(
     server: TestServer,
 ) -> Result<(), Error> {

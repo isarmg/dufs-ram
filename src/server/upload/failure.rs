@@ -165,6 +165,7 @@ pub(super) async fn finish_precommit_io_failure(
 
 pub(super) struct UploadTimeout {
     pub(super) message: &'static str,
+    pub(super) resume_offset: Option<u64>,
     pub(super) created_ancestors: Option<CreatedAncestors>,
 }
 
@@ -186,9 +187,10 @@ pub(super) async fn finish_timed_out_upload(
 ) -> Result<()> {
     let UploadTimeout {
         message,
+        resume_offset,
         created_ancestors,
     } = timeout;
-    let fresh = created_ancestors.is_some();
+    let fresh = resume_offset.is_none();
     // A Tokio file may still be draining a queued blocking write. Keep the
     // caller's path and active-session leases alive until it is complete,
     // then apply the same checkpoint threshold as idle and I/O failures.
@@ -237,7 +239,13 @@ pub(super) async fn finish_timed_out_upload(
             return Err(error.into());
         }
     };
-    if partial_size >= RESUMABLE_UPLOAD_MIN_SIZE && partial_size <= upload_length {
+    let resume_checkpoint_is_valid = resume_offset
+        .map(|offset| partial_size >= offset)
+        .unwrap_or(true);
+    if resume_checkpoint_is_valid
+        && partial_size <= upload_length
+        && (!fresh || partial_size >= RESUMABLE_UPLOAD_MIN_SIZE)
+    {
         let checkpoint_result = if fresh {
             upload_records
                 .persist_initial_checkpoint(
@@ -298,12 +306,13 @@ pub(super) async fn finish_timed_out_upload(
             UPLOAD_OFFSET_HEADER,
             HeaderValue::from_str(&partial_size.to_string())?,
         );
-    } else {
-        // Below the resumability threshold the session is deliberately
-        // discarded, whether this was a fresh PUT or a resumed PATCH. Use the
-        // still-open descriptor as the deletion capability: the owner-scoped
-        // database row may not exist yet, and a pathname/UUID alone must never
-        // authorize removal of another owner's stage.
+    } else if fresh {
+        // The retention threshold controls admission of a new failed PUT. A
+        // resumed PATCH already owns a durable row and must never lose that
+        // checkpoint merely because the total file is still below the fresh
+        // upload threshold. Use the still-open descriptor as the deletion
+        // capability: a pathname/UUID alone must never authorize removal of
+        // another owner's stage.
         let discard_result = upload_records
             .discard_unrecorded_stage(&file, upload_path)
             .await;
@@ -318,6 +327,19 @@ pub(super) async fn finish_timed_out_upload(
             )
             .await?;
         discard_result?;
+    } else if let Some(initial_offset) = resume_offset {
+        // An externally enlarged stage can be restored to its last durable
+        // checkpoint. A shorter stage cannot be safely extended with zeros;
+        // leave its row as an ambiguity barrier for HEAD/maintenance instead
+        // of deleting the only surviving checkpoint identity.
+        if partial_size > initial_offset {
+            file.set_len(initial_offset).await?;
+            sync_file_to_storage(&file).await?;
+        }
+        res.headers_mut().insert(
+            UPLOAD_OFFSET_HEADER,
+            HeaderValue::from_str(&initial_offset.to_string())?,
+        );
     }
     apply_upload_unknown(res, upload_id, message)
 }

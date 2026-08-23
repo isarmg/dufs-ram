@@ -337,10 +337,11 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 
 - fresh 上传创建 stage 后会先持久化 `offset=0`；这个首次 checkpoint 需要同步 stage 及其新目录项，再提交 SQLite；
 - 后续普通 checkpoint 先同步 stage 内容，再更新 SQLite，通常不重复同步已经持久化的父目录项；
-- 已跨 mutation boundary 后发生 idle、I/O 或总超时中断时，通常只有已可靠写入至少 20 MiB 且未超过声明长度的部分才保留；边界前失败不修改旧检查点；
+- fresh PUT 已跨 mutation boundary 后发生 idle、I/O 或总超时中断时，通常只有已可靠写入至少 20 MiB 且未超过声明长度的部分才建立检查点；边界前失败不修改状态；
+- resumed PATCH 已经占用一条持久会话，因此 20 MiB 不再作为保留门槛：合法的新增部分即使仍很小也推进 offset，无法安全推进时至少保留请求开始前的行与 stage identity，不会因 fresh 阈值删除旧检查点；
 - 如果请求正常结束但实际正文短于声明长度，服务也可以保存小于 20 MiB 的可靠 offset，供客户端对账。
 
-因此小上传在多数异常中断场景会被清理并要求新 ID 重来，但不能把 20 MiB 写成所有状态转移的硬规则。
+因此尚未建立会话的小上传在多数异常中断场景会被清理并要求新 ID 重来；一旦客户端按已持久 offset 发起 PATCH，后续异常不会用 fresh 阈值撤销这个检查点。不能把 20 MiB 写成所有状态转移的硬规则。
 
 ## 7.15 HEAD：先问服务器，不盲目猜
 

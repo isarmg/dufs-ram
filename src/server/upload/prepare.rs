@@ -705,6 +705,7 @@ impl Server {
                         res,
                         UploadTimeout {
                             message: "Upload deadline exceeded while preparing the staging file",
+                            resume_offset: upload_offset,
                             created_ancestors: created_ancestors.take(),
                         },
                     )
@@ -878,6 +879,7 @@ impl Server {
                 res,
                 UploadTimeout {
                     message: "Upload deadline exceeded while preparing the staging file",
+                    resume_offset: upload_offset,
                     created_ancestors: created_ancestors.take(),
                 },
             )
@@ -993,6 +995,7 @@ impl Server {
                 res,
                 UploadTimeout {
                     message: "Upload deadline exceeded while reserving disk space",
+                    resume_offset: upload_offset,
                     created_ancestors: created_ancestors.take(),
                 },
             )
