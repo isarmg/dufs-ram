@@ -400,6 +400,8 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "1",
         "--upload-total-timeout",
         "20",
+        "--max-upload-size",
+        "5",
     ]);
 
     let awaiting = server
