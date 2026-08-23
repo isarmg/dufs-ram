@@ -579,6 +579,11 @@ fn recover_database(
         ],
     )?;
     transaction.execute(
+        "UPDATE upload_sessions SET expires_at_ms = ?1
+          WHERE expires_at_ms > ?1",
+        [upload_expires_at],
+    )?;
+    transaction.execute(
         "UPDATE purge_jobs
             SET state = ?1,
                 next_attempt_at_ms = ?2,

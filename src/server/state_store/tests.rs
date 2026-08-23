@@ -1099,6 +1099,65 @@ async fn restart_refreshes_an_expired_commit_started_upload_barrier() -> Result<
 }
 
 #[tokio::test]
+async fn restart_caps_future_upload_deadlines_after_a_clock_rollback() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(89, 97);
+    let store = StateStore::open_with_upload_ttl(&path, &identity, CAPACITY, PER_OWNER, TTL, TTL)?;
+
+    let running = upload(9, 1, 4);
+    let mut awaiting = upload(9, 2, 10);
+    awaiting.state = StoredUploadState::AwaitingConfirmation;
+    let mut rejected = upload(9, 3, 10);
+    rejected.state = StoredUploadState::Rejected;
+    let mut committing = upload(9, 4, 10);
+    committing.state = StoredUploadState::CommitStarted;
+    for session in [&running, &awaiting, &rejected, &committing] {
+        assert_eq!(
+            store.save_upload_session(session.clone(), TTL).await?,
+            StoreUploadSession::Inserted
+        );
+    }
+    store.shutdown_for_test();
+
+    let connection = Connection::open(&path)?;
+    assert_eq!(
+        connection.execute("UPDATE upload_sessions SET expires_at_ms = ?1", [i64::MAX])?,
+        4
+    );
+    drop(connection);
+
+    let reopened = StateStore::open_with_upload_ttl(
+        &path,
+        &identity,
+        CAPACITY,
+        PER_OWNER,
+        TTL,
+        Duration::ZERO,
+    )?;
+    let expired = reopened.expired_upload_sessions_page(None, 8).await?;
+    assert_eq!(
+        expired.len(),
+        4,
+        "persisted future upload deadlines must be bounded on restart"
+    );
+    for expected in [running, awaiting, rejected] {
+        assert!(
+            expired.iter().any(|snapshot| snapshot.session == expected),
+            "a non-committing upload state kept its future deadline: {expected:?}"
+        );
+    }
+    committing.state = StoredUploadState::Unknown;
+    assert!(
+        expired
+            .iter()
+            .any(|snapshot| snapshot.session == committing),
+        "CommitStarted recovery must still preserve its ambiguity barrier"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("state.sqlite3");
