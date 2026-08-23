@@ -67,6 +67,52 @@ fn mkdir_existing_path_conflicts(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn mkdir_does_not_replace_or_descend_through_a_resumable_upload_path(
+    server: TestServer,
+) -> Result<(), Error> {
+    let context = browser_context(&server, "")?;
+
+    for (target_name, directory_path) in [
+        ("mkdir-upload-exact.bin", "/mkdir-upload-exact.bin"),
+        (
+            "mkdir-upload-ancestor.bin",
+            "/mkdir-upload-ancestor.bin/child",
+        ),
+    ] {
+        let upload_id = Uuid::new_v4();
+        let target_url = server.url().join(target_name)?;
+        let initial = with_upload_headers(
+            server.request(Method::PUT, target_url.clone()),
+            upload_id,
+            6,
+        )
+        .body(b"abc".to_vec())
+        .send()?;
+        assert_eq!(initial.status(), 409);
+
+        let mkdir = post_json(
+            &context,
+            "mkdir",
+            json!({"path": directory_path}),
+            Some(&context.csrf_token),
+        )?;
+        assert_eq!(mkdir.status(), 409);
+        let mkdir = response_json(mkdir)?;
+        assert_eq!(mkdir["code"], "mkdir_state_conflict");
+        assert_eq!(mkdir["state"], "failed");
+        assert!(!server.path().join(target_name).exists());
+
+        let completed =
+            with_resume_upload_headers(server.request(Method::PATCH, target_url), upload_id, 6, 3)
+                .body(b"123".to_vec())
+                .send()?;
+        assert_eq!(completed.status(), 204);
+        assert_eq!(std::fs::read(server.path().join(target_name))?, b"abc123");
+    }
+    Ok(())
+}
+
+#[rstest]
 fn operation_id_makes_mkdir_idempotent_and_queryable(server: TestServer) -> Result<(), Error> {
     let context = browser_context(&server, "")?;
     let operation_id = Uuid::new_v4();

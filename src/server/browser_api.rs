@@ -272,6 +272,24 @@ fn render_relocation_state_unavailable(
     render_problem(res, &error)
 }
 
+fn render_mkdir_state_unavailable(operation_id: Option<Uuid>, res: &mut Response) -> Result<()> {
+    let mut error = ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::MKDIR_STATE_UNAVAILABLE,
+        "Directory safety state is temporarily unavailable",
+    )
+    .with_recovery(RecoveryAdvice::RetryAfterSeconds(1));
+    if let Some(operation_id) = operation_id {
+        set_operation_headers(res, operation_id, OperationPublicState::Rejected);
+        error = error.with_operation(OperationProblemContext::new(
+            operation_id.hyphenated().to_string(),
+            OperationPublicState::Rejected,
+            None,
+        ));
+    }
+    render_problem(res, &error)
+}
+
 impl Server {
     pub(super) async fn handle_browser_api(
         &self,
@@ -698,6 +716,29 @@ impl Server {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
+        }
+
+        match self.has_persisted_path_conflict(&[&path]).await {
+            Ok(false) => {}
+            Ok(true) => {
+                finish_api_error(
+                    operation.take(),
+                    res,
+                    StatusCode::CONFLICT,
+                    TrackedOperationError::MkdirStateConflict,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!(
+                    "Failed to inspect durable state before creating a directory error={error:#}"
+                );
+                let operation_id = operation.as_ref().map(|(id, _)| *id);
+                drop(operation.take());
+                render_mkdir_state_unavailable(operation_id, res)?;
+                return Ok(());
+            }
         }
 
         let rooted_fs = self.content.rooted_fs.clone();

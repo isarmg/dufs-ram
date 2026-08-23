@@ -64,6 +64,7 @@ pub(super) enum TrackedOperationError {
     DestinationDirectoryNotFound,
     DestinationNotDirectory,
     DirectoryOverwriteForbidden,
+    MkdirStateConflict,
     MoveStateConflict,
     RenameStateConflict,
     TargetNotFound,
@@ -343,6 +344,7 @@ impl TrackedOperationError {
             b"destination_directory_not_found" => Some(Self::DestinationDirectoryNotFound),
             b"destination_not_directory" => Some(Self::DestinationNotDirectory),
             b"directory_overwrite_forbidden" => Some(Self::DirectoryOverwriteForbidden),
+            b"mkdir_state_conflict" => Some(Self::MkdirStateConflict),
             b"move_state_conflict" => Some(Self::MoveStateConflict),
             b"rename_state_conflict" => Some(Self::RenameStateConflict),
             b"target_not_found" => Some(Self::TargetNotFound),
@@ -379,6 +381,7 @@ impl TrackedOperationError {
             Self::DestinationDirectoryNotFound => ErrorCode::DESTINATION_DIRECTORY_NOT_FOUND,
             Self::DestinationNotDirectory => ErrorCode::DESTINATION_NOT_DIRECTORY,
             Self::DirectoryOverwriteForbidden => ErrorCode::DIRECTORY_OVERWRITE_FORBIDDEN,
+            Self::MkdirStateConflict => ErrorCode::MKDIR_STATE_CONFLICT,
             Self::MoveStateConflict => ErrorCode::MOVE_STATE_CONFLICT,
             Self::RenameStateConflict => ErrorCode::RENAME_STATE_CONFLICT,
             Self::TargetNotFound => ErrorCode::TARGET_NOT_FOUND,
@@ -414,6 +417,9 @@ impl TrackedOperationError {
             Self::DestinationDirectoryNotFound => "Destination directory not found",
             Self::DestinationNotDirectory => "Destination path is not a directory",
             Self::DirectoryOverwriteForbidden => "Directories cannot be overwritten",
+            Self::MkdirStateConflict => {
+                "Directory path conflicts with an active upload or pending delete"
+            }
             Self::MoveStateConflict => {
                 "Source or destination conflicts with an active upload or pending delete"
             }

@@ -119,6 +119,8 @@ declare_error_codes! {
     LIST_PATH_NOT_FOUND => "list_path_not_found",
     LIST_SNAPSHOT_LIMIT => "list_snapshot_limit",
     METHOD_NOT_ALLOWED => "method_not_allowed",
+    MKDIR_STATE_CONFLICT => "mkdir_state_conflict",
+    MKDIR_STATE_UNAVAILABLE => "mkdir_state_unavailable",
     MOVE_STATE_CONFLICT => "move_state_conflict",
     MOVE_STATE_UNAVAILABLE => "move_state_unavailable",
     OPERATION_ID_CONFLICT => "operation_id_conflict",
