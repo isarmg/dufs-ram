@@ -3,6 +3,7 @@ use chrono::{Local, SecondsFormat};
 use log::{Level, LevelFilter, Metadata, Record};
 use rustix::{
     fs::{FileType, Mode, OFlags, fchmod, fstat, open},
+    io::Errno,
     process::geteuid,
 };
 use std::fs::File;
@@ -204,18 +205,28 @@ fn open_log_file(path: &Path) -> Result<File> {
 
 fn open_log_file_for_owner(path: &Path, expected_owner: u32) -> Result<File> {
     let private_mode = Mode::RUSR | Mode::WUSR;
-    let fd = open(
+    let common_flags =
+        OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let (fd, created) = match open(
         path,
-        OFlags::WRONLY
-            | OFlags::APPEND
-            | OFlags::CREATE
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | OFlags::CLOEXEC,
+        common_flags | OFlags::CREATE | OFlags::EXCL,
         private_mode,
-    )
-    .map_err(std::io::Error::from)
-    .with_context(|| format!("Failed to securely open log file '{}'", path.display()))?;
+    ) {
+        Ok(fd) => (fd, true),
+        Err(Errno::EXIST) => (
+            open(path, common_flags, Mode::empty())
+                .map_err(std::io::Error::from)
+                .with_context(|| {
+                    format!("Failed to securely open log file '{}'", path.display())
+                })?,
+            false,
+        ),
+        Err(error) => {
+            return Err(std::io::Error::from(error)).with_context(|| {
+                format!("Failed to securely create log file '{}'", path.display())
+            });
+        }
+    };
 
     let metadata = fstat(&fd)
         .map_err(std::io::Error::from)
@@ -236,14 +247,21 @@ fn open_log_file_for_owner(path: &Path, expected_owner: u32) -> Result<File> {
         );
     }
 
-    fchmod(&fd, private_mode)
-        .map_err(std::io::Error::from)
-        .with_context(|| {
-            format!(
-                "Failed to set private log permissions on '{}'",
-                path.display()
-            )
-        })?;
+    if created {
+        fchmod(&fd, private_mode)
+            .map_err(std::io::Error::from)
+            .with_context(|| {
+                format!(
+                    "Failed to set private log permissions on '{}'",
+                    path.display()
+                )
+            })?;
+    } else if Mode::from_raw_mode(metadata.st_mode) != private_mode {
+        bail!(
+            "Existing log file '{}' must already have permissions 0600; refusing to change insecure permissions after opening it",
+            path.display()
+        );
+    }
     let verified = fstat(&fd)
         .map_err(std::io::Error::from)
         .with_context(|| format!("Failed to verify log file '{}'", path.display()))?;
@@ -440,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn log_files_are_private_and_existing_files_are_appended() {
+    fn log_files_are_created_private_and_existing_private_files_are_appended() {
         let temporary = tempfile::tempdir().expect("create temporary directory");
         let path = temporary.path().join("dufs.log");
         let mut file = open_log_file(&path).expect("securely create log");
@@ -456,9 +474,6 @@ mod tests {
             0o600
         );
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("set broad initial permissions");
-
         let mut file = open_log_file(&path).expect("securely open existing log");
         file.write_all(b"appended\n").expect("append log entry");
         file.flush().expect("flush log entry");
@@ -470,6 +485,37 @@ mod tests {
             std::fs::read_to_string(&path).expect("read log"),
             "created\nappended\n"
         );
+    }
+
+    #[test]
+    fn insecure_existing_log_permissions_are_rejected_without_modification() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        for mode in [0o644, 0o660, 0o604] {
+            let path = temporary.path().join(format!("dufs-{mode:o}.log"));
+            std::fs::write(&path, b"existing\n").expect("create existing log");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set insecure initial permissions");
+
+            let error = open_log_file(&path).expect_err("insecure log mode was accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must already have permissions 0600"),
+                "unexpected error for mode {mode:o}: {error:#}"
+            );
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("inspect rejected log")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read rejected log"),
+                b"existing\n"
+            );
+        }
     }
 
     #[test]
