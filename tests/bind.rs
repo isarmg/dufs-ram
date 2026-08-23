@@ -9,16 +9,19 @@ use assert_cmd::prelude::*;
 use assert_fs::fixture::TempDir;
 use reqwest::blocking::Client;
 use rstest::rstest;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 fn private_state_dir() -> Result<TempDir, Error> {
     let state_dir = TempDir::new()?;
     std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
     Ok(state_dir)
 }
-use std::time::Duration;
-
 #[rstest]
 #[case(&["-b", "20.205.243.166"])]
 fn bind_fails(tmpdir: TempDir, #[case] args: &[&str]) -> Result<(), Error> {
@@ -92,14 +95,100 @@ fn idle_listener_does_not_starve_another_bind_when_connection_limit_is_one(
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
-    let response = client
-        .get(format!(
-            "http://127.0.0.2:{}/__dufs__/health",
-            server.port()
-        ))
-        .send()?;
-    assert_eq!(response.status(), 200);
+    for address in ["127.0.0.1", "127.0.0.2"] {
+        let response = client
+            .get(format!(
+                "http://{address}:{}/__dufs__/health",
+                server.port()
+            ))
+            .header("connection", "close")
+            .send()?;
+        assert_eq!(response.status(), 200);
+    }
     Ok(())
+}
+
+#[rstest]
+fn connection_limit_bounds_userspace_sockets_across_multiple_binds(
+    #[with(&[
+        "--bind",
+        "127.0.0.1",
+        "--bind",
+        "127.0.0.2",
+        "--max-connections",
+        "1",
+        "--auth",
+        TEST_ACCOUNT,
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let pid = server.process_id();
+    let baseline = socket_fd_count(pid)?;
+    assert!(baseline >= 2, "the fixture did not expose both listeners");
+
+    let held = TcpStream::connect(("127.0.0.1", server.port()))?;
+    wait_for_socket_fd_count(pid, baseline + 1)?;
+
+    let mut queued_first = TcpStream::connect(("127.0.0.1", server.port()))?;
+    let mut queued_second = TcpStream::connect(("127.0.0.2", server.port()))?;
+    sleep(Duration::from_millis(200));
+    assert_eq!(
+        socket_fd_count(pid)?,
+        baseline + 1,
+        "listeners accepted sockets that did not own a connection permit"
+    );
+
+    for stream in [&mut queued_first, &mut queued_second] {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(
+            format!(
+                "GET /__dufs__/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                server.port()
+            )
+            .as_bytes(),
+        )?;
+    }
+    drop(held);
+
+    for stream in [&mut queued_first, &mut queued_second] {
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "queued connection returned an unexpected response: {response:?}"
+        );
+    }
+    Ok(())
+}
+
+fn socket_fd_count(pid: u32) -> Result<usize, Error> {
+    let mut count = 0;
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let target = match fs::read_link(entry?.path()) {
+            Ok(target) => target,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if target.to_string_lossy().starts_with("socket:[") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn wait_for_socket_fd_count(pid: u32, expected: usize) -> Result<(), Error> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if socket_fd_count(pid)? == expected {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(10));
+    }
+    Err(format!(
+        "server socket fd count did not reach {expected}; observed {}",
+        socket_fd_count(pid)?
+    )
+    .into())
 }
 
 #[rstest]

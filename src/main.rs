@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use log::{error, info, warn};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -21,9 +22,10 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 use tokio::{
+    io::unix::AsyncFd,
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    net::TcpStream,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, sleep, sleep_until},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -207,6 +209,7 @@ fn serve(args: Args) -> Result<Serving> {
             .with_context(|| format!("Failed to bind `{ip}:{port}`"))?;
         if port == 0 {
             port = listener
+                .get_ref()
                 .local_addr()
                 .context("Failed to inspect the dynamically assigned listen port")?
                 .port();
@@ -233,7 +236,7 @@ fn serve(args: Args) -> Result<Serving> {
     })
 }
 
-async fn serve_tcp_listener(listener: TcpListener, runtime: ListenerRuntime) {
+async fn serve_tcp_listener(listener: AsyncFd<StdTcpListener>, runtime: ListenerRuntime) {
     let ListenerRuntime {
         server,
         shutdown,
@@ -242,23 +245,23 @@ async fn serve_tcp_listener(listener: TcpListener, runtime: ListenerRuntime) {
         connection_slots,
     } = runtime;
     let listener_addr = listener
+        .get_ref()
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
     let mut backoff = AcceptBackoff::default();
 
     loop {
-        let Some((stream, addr)) =
-            accept_with_backoff(&listener, &listener_addr, &shutdown, &mut backoff).await
+        let Some((stream, addr, connection_permit)) = accept_with_backoff(
+            &listener,
+            &listener_addr,
+            &shutdown,
+            &connection_slots,
+            &mut backoff,
+        )
+        .await
         else {
             break;
-        };
-        let connection_permit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            permit = connection_slots.clone().acquire_owned() => {
-                permit.expect("the connection semaphore is never closed")
-            }
         };
         let server = server.clone();
         let connection_shutdown = shutdown.clone();
@@ -396,36 +399,122 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<T> {
 }
 
 async fn accept_with_backoff(
-    listener: &TcpListener,
+    listener: &AsyncFd<StdTcpListener>,
     listener_addr: &str,
     shutdown: &CancellationToken,
+    connection_slots: &Arc<Semaphore>,
     backoff: &mut AcceptBackoff,
-) -> Option<(TcpStream, SocketAddr)> {
+) -> Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)> {
     loop {
-        let result = tokio::select! {
+        let readiness = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return None,
-            result = listener.accept() => result,
+            result = listener.readable() => result,
+        };
+        let mut readiness = match readiness {
+            Ok(readiness) => readiness,
+            Err(err) => {
+                if !wait_after_accept_error(listener_addr, shutdown, backoff, &err).await {
+                    return None;
+                }
+                continue;
+            }
         };
 
-        match result {
-            Ok(connection) => {
+        // AsyncFd deliberately keeps a successful readiness observation cached
+        // so callers can drain an fd. We cannot drain a listener before owning
+        // capacity, however: waiting for a permit on that stale cache would let
+        // an idle listener starve another bind. Recheck the kernel's level state
+        // without accepting; clear only the stale observation.
+        match listener_is_readable(listener.get_ref()) {
+            Ok(true) => {}
+            Ok(false) => {
+                readiness.clear_ready();
+                continue;
+            }
+            Err(err) => {
+                drop(readiness);
+                if !wait_after_accept_error(listener_addr, shutdown, backoff, &err).await {
+                    return None;
+                }
+                continue;
+            }
+        }
+
+        // Wait for a global slot only after this listener has a connection
+        // ready. An idle bind therefore cannot reserve capacity from another
+        // address, while every socket accepted into userspace already owns the
+        // permit that bounds its lifetime.
+        let connection_permit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            permit = connection_slots.clone().acquire_owned() => {
+                permit.expect("the connection semaphore is never closed")
+            }
+        };
+        if shutdown.is_cancelled() {
+            return None;
+        }
+
+        let accepted = match readiness.try_io(|listener| listener.get_ref().accept()) {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        drop(readiness);
+        match accepted {
+            Ok((stream, addr)) => {
+                if let Err(err) = stream.set_nonblocking(true) {
+                    drop(connection_permit);
+                    if !wait_after_accept_error(listener_addr, shutdown, backoff, &err).await {
+                        return None;
+                    }
+                    continue;
+                }
+                let stream = match TcpStream::from_std(stream) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        drop(connection_permit);
+                        if !wait_after_accept_error(listener_addr, shutdown, backoff, &err).await {
+                            return None;
+                        }
+                        continue;
+                    }
+                };
                 backoff.reset();
                 if shutdown.is_cancelled() {
                     return None;
                 }
-                return Some(connection);
+                return Some((stream, addr, connection_permit));
             }
             Err(err) => {
-                let retry_delay = backoff.failure_delay();
-                log_accept_error(listener_addr, &err, retry_delay);
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => return None,
-                    _ = sleep(retry_delay) => {}
+                drop(connection_permit);
+                if !wait_after_accept_error(listener_addr, shutdown, backoff, &err).await {
+                    return None;
                 }
             }
         }
+    }
+}
+
+fn listener_is_readable(listener: &StdTcpListener) -> io::Result<bool> {
+    let mut descriptors = [PollFd::new(listener, PollFlags::IN)];
+    let no_wait = Timespec::default();
+    let ready = poll(&mut descriptors, Some(&no_wait)).map_err(io::Error::from)?;
+    Ok(ready > 0 && !descriptors[0].revents().is_empty())
+}
+
+async fn wait_after_accept_error(
+    listener_addr: &str,
+    shutdown: &CancellationToken,
+    backoff: &mut AcceptBackoff,
+    err: &io::Error,
+) -> bool {
+    let retry_delay = backoff.failure_delay();
+    log_accept_error(listener_addr, err, retry_delay);
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => false,
+        _ = sleep(retry_delay) => true,
     }
 }
 
@@ -601,7 +690,7 @@ fn find_io_error<'a>(
     None
 }
 
-fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
+fn create_listener(addr: SocketAddr) -> Result<AsyncFd<StdTcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     if addr.is_ipv6() {
@@ -612,7 +701,7 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
     socket.listen(1024 /* Default backlog */)?;
     let std_listener = StdTcpListener::from(socket);
     std_listener.set_nonblocking(true)?;
-    let listener = TcpListener::from_std(std_listener)?;
+    let listener = AsyncFd::new(std_listener)?;
     Ok(listener)
 }
 

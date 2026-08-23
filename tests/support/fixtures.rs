@@ -388,6 +388,10 @@ impl TestServer {
         Url::parse(&format!("http://localhost:{}/", self.port)).unwrap()
     }
 
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         self.request_with(
             self.default_session

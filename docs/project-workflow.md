@@ -103,13 +103,16 @@ flowchart TD
     ROOT -- 失败 --> STOP
     ROOT -- 成功 --> BIND["逐个绑定 TCP/IP 地址<br/>默认仅 127.0.0.1"]
     BIND --> IP["创建 TCP listener"]
-    IP --> ACCEPT["等待 TCP accept<br/>不预占连接许可"]
-    ACCEPT -- 失败 --> ACCEPT_LOG["记录 listener、错误分类<br/>io_kind、系统错误码和 retry_ms"]
+    IP --> READY["等待 listener 可读<br/>不预占连接许可"]
+    READY -- 失败 --> ACCEPT_LOG["记录 listener、错误分类<br/>io_kind、系统错误码和 retry_ms"]
     ACCEPT_LOG --> BACKOFF["50 ms 起指数退避<br/>封顶 1 s"]
-    BACKOFF --> ACCEPT
-    ACCEPT -- 成功 --> PERMIT{"取得全局连接许可？"}
-    PERMIT -- 停机 --> DONE["关闭已接受连接"]
-    PERMIT -- 是 --> RESET["退避重置为 50 ms<br/>许可随连接进入 work task"]
+    BACKOFF --> READY
+    READY -- 可读 --> PERMIT{"取得全局连接许可？"}
+    PERMIT -- 停机 --> DONE["不接受新连接"]
+    PERMIT -- 是 --> ACCEPT["非阻塞 try_accept<br/>socket 出生即持有许可"]
+    ACCEPT -- WouldBlock --> READY
+    ACCEPT -- 失败 --> ACCEPT_LOG
+    ACCEPT -- 成功 --> RESET["退避重置为 50 ms<br/>许可随连接进入 work task"]
     RESET --> HYPER["Hyper HTTP/1.0/1.1 连接处理"]
     HYPER --> RESULT{"连接处理结果"}
     RESULT -- 正常结束 --> DONE["结束连接任务"]
@@ -128,7 +131,7 @@ flowchart TD
 
 TCP `accept` 返回的对端 `SocketAddr` 会作为必填参数依次传入 `handle_stream` 和 `Server::call`，访问日志始终记录 `remote_addr`。
 
-所有监听器共享一个连接信号量，默认最多保留 256 个活跃 TCP 连接。每个 listener 先独立等待 `accept`，只有已经接受的连接才等待并持有许可；空闲 listener 不占槽，因此多 bind 和低连接上限不会让某个已公布地址永久停在内核 backlog。停机可以同时打断 accept 和许可等待。后端使用 Hyper HTTP/1 连接处理器，接受 HTTP/1.0 和 HTTP/1.1；HTTP/2 prior knowledge 和 HTTP/1.1 `Upgrade: h2c` 均不受支持。浏览器侧 HTTP/2 或 HTTP/3 必须终止在外部 HTTPS 网关，网关固定用 HTTP/1.1 回源。全部后端连接统一使用 10 秒请求头读取时限和 64 KiB 接收缓冲上限；HTTP/1.0/1.1 单连接请求串行处理，因此一个连接不能再通过并发 HTTP/2 stream 绕过连接预算。
+所有监听器共享一个连接信号量，默认最多保留 256 个活跃 TCP 连接。每个 listener 先独立等待可读，确认已有连接进入 backlog 后才可取消地竞争许可，取得许可后立即用 `try_accept` 接收；`WouldBlock` 会释放许可并重新等待，不做错误退避。这样空闲 listener 不占槽，多 bind 和低连接上限不会让某个已公布地址确定性饥饿，而且所有进入用户态的 socket 从接受之初就计入全局上限；超额握手只留在有界内核 backlog。停机可以同时打断可读等待、许可等待和错误退避。后端使用 Hyper HTTP/1 连接处理器，接受 HTTP/1.0 和 HTTP/1.1；HTTP/2 prior knowledge 和 HTTP/1.1 `Upgrade: h2c` 均不受支持。浏览器侧 HTTP/2 或 HTTP/3 必须终止在外部 HTTPS 网关，网关固定用 HTTP/1.1 回源。全部后端连接统一使用 10 秒请求头读取时限和 64 KiB 接收缓冲上限；HTTP/1.0/1.1 单连接请求串行处理，因此一个连接不能再通过并发 HTTP/2 stream 绕过连接预算。
 
 普通请求处理并生成响应头默认限时 300 秒；普通文件和单段 Range 的响应正文没有应用内总时长或最低速率限制，但底层套接字连续 30 秒没有写入进展会超时关闭，公网网关仍应施加自己的总时长/速率策略。登录表单另有正文读取前来源 admission 和短正文总时限。上传使用独立的正文空闲时限、全生命周期总时限、并发数和声明长度预算。空间快照在 blocking 任务中、不持有共享预留 mutex 时读取，返回后只在同设备 revision 未变化时登记，最多重试 8 次，持续竞争失败关闭且其他设备变化不触发重试。上传把逻辑长度及约 1 MiB + 64 KiB 的元数据余量分别按 `f_frsize` 向上取整后预留。
 
