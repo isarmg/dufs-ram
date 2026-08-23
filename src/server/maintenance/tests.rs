@@ -529,7 +529,9 @@ mod sqlite_cleanup_tests {
         let upload_id = Uuid::new_v4();
         let target = temp.path().join("orphan-stage.bin");
         let stage = upload_temp_path(&target, upload_id)?;
-        drop(create_stage(&rooted_fs, &stage, b"orphan checkpoint").await);
+        let mut stage_file = create_stage(&rooted_fs, &stage, b"orphan checkpoint").await;
+        stage_file.flush().await?;
+        drop(stage_file);
         let old_modified = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
         std::fs::File::open(&stage)?
             .set_times(std::fs::FileTimes::new().set_modified(old_modified))?;
