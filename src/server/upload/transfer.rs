@@ -48,6 +48,60 @@ fn partial_upload_is_checkpointable(
         && (resume || partial_size >= RESUMABLE_UPLOAD_MIN_SIZE)
 }
 
+fn apply_awaiting_confirmation_transfer_error(
+    res: &mut Response,
+    upload_id: Uuid,
+    upload_length: u64,
+    error: UploadTransferError,
+) -> Result<()> {
+    let (status, code, detail) = match error {
+        UploadTransferError::Io(source) => {
+            error!(
+                "Upload confirmation body failed before publication upload_id={} error={source:#}",
+                upload_id
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::UPLOAD_PRECOMMIT_FAILED,
+                "Upload confirmation body failed before publication",
+            )
+        }
+        UploadTransferError::IdleTimeout => (
+            StatusCode::REQUEST_TIMEOUT,
+            ErrorCode::UPLOAD_IDLE_TIMEOUT,
+            "Upload confirmation body idle timeout",
+        ),
+        UploadTransferError::TotalTimeout => (
+            StatusCode::REQUEST_TIMEOUT,
+            ErrorCode::REQUEST_TIMEOUT,
+            "Upload deadline exceeded while waiting for an empty confirmation body",
+        ),
+        UploadTransferError::ExcessBody => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::UPLOAD_BODY_EXCEEDS_REMAINING_LENGTH,
+            "Request body exceeds declared remaining upload length",
+        ),
+        UploadTransferError::InsufficientStorage => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            ErrorCode::UPLOAD_INSUFFICIENT_STORAGE,
+            "Insufficient protected free disk space",
+        ),
+    };
+    apply_upload_problem(
+        res,
+        UploadErrorContext::new(
+            upload_id,
+            UploadPublicState::AwaitingConfirmation,
+            Some(upload_length),
+            Some(upload_length),
+        ),
+        status,
+        code,
+        detail,
+        RecoveryAdvice::QueryUpload,
+    )
+}
+
 impl Server {
     /// Consumes the request body while the transaction retains all rollback
     /// state. A successful transfer advances to the pre-commit stage.
@@ -99,6 +153,11 @@ impl Server {
         )
         .await;
         if let Err(err) = transfer_result {
+            if awaiting_confirmation {
+                drop(file);
+                apply_awaiting_confirmation_transfer_error(res, upload_id, upload_length, err)?;
+                return Ok(());
+            }
             if matches!(&err, UploadTransferError::TotalTimeout) {
                 finish_timed_out_upload(
                     &self.state.upload_records,
@@ -126,9 +185,7 @@ impl Server {
 
             match err {
                 UploadTransferError::ExcessBody => {
-                    if awaiting_confirmation {
-                        drop(file);
-                    } else if resume {
+                    if resume {
                         file.set_len(initial_offset).await?;
                         sync_file_to_storage(&file).await?;
                         drop(file);
@@ -149,9 +206,7 @@ impl Server {
                         res,
                         UploadErrorContext::new(
                             upload_id,
-                            if awaiting_confirmation {
-                                UploadPublicState::AwaitingConfirmation
-                            } else if resume {
+                            if resume {
                                 UploadPublicState::Running
                             } else {
                                 UploadPublicState::Rejected
@@ -162,9 +217,7 @@ impl Server {
                         StatusCode::PAYLOAD_TOO_LARGE,
                         ErrorCode::UPLOAD_BODY_EXCEEDS_REMAINING_LENGTH,
                         "Request body exceeds declared remaining upload length",
-                        if awaiting_confirmation {
-                            RecoveryAdvice::QueryUpload
-                        } else if resume {
+                        if resume {
                             RecoveryAdvice::ResumeUpload
                         } else {
                             RecoveryAdvice::RetryWithNewId
@@ -499,4 +552,65 @@ async fn write_upload_chunk(
     reservation.consume(data_len);
     *bytes_until_space_check = bytes_until_space_check.saturating_sub(data_len);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    #[tokio::test]
+    async fn awaiting_confirmation_transfer_errors_preserve_queryable_state() {
+        let cases = [
+            (
+                UploadTransferError::IdleTimeout,
+                StatusCode::REQUEST_TIMEOUT,
+                "upload_idle_timeout",
+            ),
+            (
+                UploadTransferError::TotalTimeout,
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+            ),
+            (
+                UploadTransferError::ExcessBody,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload_body_exceeds_remaining_length",
+            ),
+            (
+                UploadTransferError::InsufficientStorage,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "upload_insufficient_storage",
+            ),
+            (
+                UploadTransferError::Io(io::Error::other("private test failure")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "upload_precommit_failed",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let upload_id = Uuid::new_v4();
+            let mut response = Response::default();
+            apply_awaiting_confirmation_transfer_error(&mut response, upload_id, 17, error)
+                .unwrap();
+
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response.headers()["x-dufs-operation-state"],
+                "awaiting-confirmation"
+            );
+            assert_eq!(
+                response.headers()["x-dufs-upload-id"],
+                upload_id.to_string()
+            );
+            assert_eq!(response.headers()["x-dufs-upload-length"], "17");
+            assert_eq!(response.headers()["x-dufs-upload-offset"], "17");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["code"], expected_code);
+            assert_eq!(problem["recovery"], "query_upload");
+            assert_eq!(problem["upload_state"], "awaiting-confirmation");
+        }
+    }
 }
