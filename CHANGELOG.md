@@ -6,6 +6,7 @@
 
 ### 变更
 
+- 不再因直连 TCP peer 是回环地址而隐式信任 `X-Forwarded-For` / `X-Forwarded-Proto`；新增可重复的 `--trusted-proxy <IP[/CIDR]>` 与 YAML `trusted-proxies`，默认空并失败关闭。现有 HTTPS 反向代理部署必须显式声明直连网关地址；官方同机样例已配置 `127.0.0.1/32`。
 - 同步 `v0.48.0` GitHub Release、受保护 tag 和自动便捷二进制已经公开的文档状态。
 
 ## [0.48.0] - 2026-08-22

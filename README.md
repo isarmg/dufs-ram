@@ -263,6 +263,7 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 | `-c, --config <file>` | YAML 配置文件 |
 | `--state-dir <dir>` | 必填的 SQLite 状态目录；固定使用 `<dir>/state.sqlite3`，目录须为服务账号所有的 `0700` 非符号链接目录并与共享根分离 |
 | `-b, --bind <ips>` | 监听一个或多个 IPv4/IPv6 地址，默认 `127.0.0.1`；配置结果不能为空 |
+| `--trusted-proxy <networks>` | 信任一个或多个直连代理的 `X-Forwarded-For` / `X-Forwarded-Proto`；接受 IP 或 CIDR，默认不信任任何代理 |
 | `-p, --port <port>` | 监听端口，默认 `5000` |
 | `-a, --auth <account>` | 添加一个拥有完整共享目录权限的账号 |
 | `--log-format <format>` | 自定义 HTTP 访问日志格式 |
@@ -281,7 +282,7 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 
 当前命令为 `hash-password`，用于交互生成配置所需的 Argon2id PHC；`help` 显示顶层或子命令帮助。
 
-`--bind` 只接受 IP 地址，可以重复使用或用逗号分隔；主机名、文件路径和 Unix socket 路径会被拒绝。命令行参数覆盖 YAML 中的值。
+`--bind` 只接受 IP 地址，可以重复使用或用逗号分隔；主机名、文件路径和 Unix socket 路径会被拒绝。`--trusted-proxy` 同样可重复或用逗号分隔，裸 IP 会规范化为单地址 CIDR；最多配置 128 个网段，IPv4/IPv6 的 `/0` 会被拒绝。命令行参数会整体覆盖 YAML 中对应的列表。
 
 `--request-timeout` 在响应头生成完成时结束计时。普通文件和单段 Range 正文传输没有总时长或最低速率限制，但服务端套接字连续 30 秒没有写入进展会关闭连接；它们仍受活跃连接上限约束。公网部署仍应由网关施加符合业务需求的响应总时长、最低速率和空闲策略。
 
@@ -298,6 +299,8 @@ serve-path: /需要管理的目录
 state-dir: /var/lib/dufs
 bind:
   - 127.0.0.1
+trusted-proxies:
+  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$…'
@@ -320,7 +323,7 @@ request-timeout: 300
 ./target/release/dufs --config ./dufs.yaml
 ```
 
-YAML 会拒绝未知字段和空的 `bind` 列表。`state-dir` 必须由 YAML 或命令行提供，目录必须满足上述私有目录约束，固定数据库目标不能是符号链接或目录；命令行显式指定时会覆盖 YAML 中的值。`max-search-entries` 必须位于支持的正数范围内，硬上限与直接列表的 100000 项保护一致。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
+YAML 会拒绝未知字段和空的 `bind` 列表。`trusted-proxies` 可写成单个 IP/CIDR 字符串或列表，默认空；命令行显式提供 `--trusted-proxy` 时会整体覆盖 YAML 列表。`state-dir` 必须由 YAML 或命令行提供，目录必须满足上述私有目录约束，固定数据库目标不能是符号链接或目录；命令行显式指定时会覆盖 YAML 中的值。`max-search-entries` 必须位于支持的正数范围内，硬上限与直接列表的 100000 项保护一致。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
 
 ## 网关与反向代理
 
@@ -344,11 +347,12 @@ Dufs
 ```sh
 ./target/release/dufs \
   -p 5000 \
+  --trusted-proxy 127.0.0.1/32 \
   -a 'admin:$argon2id$…' \
   /需要管理的目录
 ```
 
-网关位于其他主机时，可显式绑定服务器内网 IP；只有确有多网卡监听需求时才使用 `0.0.0.0`，并应使用主机防火墙只允许网关访问该端口。
+网关位于其他主机时，可显式绑定服务器内网 IP，并用 `--trusted-proxy <网关IP或窄CIDR>` 声明直连网关；只有确有多网卡监听需求时才使用 `0.0.0.0`，并应使用主机防火墙只允许网关访问该端口。
 
 Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等 URL 子路径。网关必须把外部根路径原样转发到 Dufs 根路径；推荐浏览器入口形如 `https://files.example.com/`。
 
@@ -363,7 +367,7 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 - 网关到 Dufs 的回源协议必须固定为 HTTP/1.1，不能使用 h2c；浏览器到网关仍可使用 HTTP/2 或 HTTP/3；
 - 只接受配置的规范 Host；未知 HTTP/HTTPS Host 应由默认 server 在握手或请求阶段拒绝，HTTP 到 HTTPS 的跳转必须使用固定规范域名，不能把客户端 `$host` 拼入 Location；
 - 只接受规范域名，并以这个固定规范值覆盖上游 `Host`，同时把独立域名的根路径原样转发到后端，否则同源检查会失败；
-- 从可信网关传递单值 `X-Forwarded-Proto: https` 和单值真实客户端 `X-Forwarded-For`；Dufs 只在直接 peer 为回环地址时采用 `X-Forwarded-For` 作为登录限流地址。`Host` 和 `X-Forwarded-Proto` 用于同源校验，因此后端监听地址必须通过回环绑定、私网 ACL 或防火墙保证只有覆盖这些头的可信网关可达；
+- 从可信网关传递单值 `X-Forwarded-Proto: https` 和单值真实客户端 `X-Forwarded-For`，并把网关的直连 IP 或窄 CIDR 显式配置到 `--trusted-proxy` / `trusted-proxies`；Dufs 只接受匹配直连 TCP peer 的代理头。没有配置时一律忽略这些头：登录限流使用 peer 地址，经 HTTPS 网关且带 `Origin` 的登录或写请求会因外部 scheme 无法证明而失败关闭；
 - 不缓存登录、认证文件、Range、上传、API 或错误响应；
 - 保留上游的 `Cache-Control: private, no-store`；
 - 内部协议只使用规范 URI；尾斜杠、重复斜杠或非规范百分号编码不会被当成登录/API 的等价别名；
@@ -371,7 +375,7 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 - 强制把 HTTP 入口重定向到 HTTPS，并在确认域名只提供 HTTPS 后启用 HSTS；
 - 必须使用独立主机名，不能与不可信应用共享同一主机名。
 
-本项目不再提供内置 TLS。若网关不在同一主机，必须使用隔离私网、主机防火墙或等效 ACL，避免其他设备绕过 HTTPS 网关直接访问后端端口。
+本项目不再提供内置 TLS。受信网段是管理员对直连 peer 的声明，不是代理身份认证：回环绑定也不能阻止同机其他进程直连并伪造代理头。同机部署必须同时信任该主机上的进程，或使用容器/网络命名空间、进程级防火墙等操作系统隔离；跨主机部署必须使用精确 IP ACL、隔离私网或等效边界，避免客户端绕过 HTTPS 网关直连后端端口。
 
 ## 访问日志
 

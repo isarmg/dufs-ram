@@ -47,6 +47,17 @@ backend port restricted to that gateway. All authenticated users can manage
 the entire shared root. Do not expose this build as a multi-tenant service for
 mutually untrusted users.
 
+Forwarded client and scheme headers are ignored unless the immediate TCP peer
+matches an explicitly configured `--trusted-proxy` / `trusted-proxies` IP or
+CIDR. That allowlist is an operator assertion, not proxy authentication.
+Trusting `127.0.0.1/32` assumes other local processes are trusted or prevented
+from reaching the backend by operating-system isolation; a loopback bind alone
+does not distinguish nginx from another local process. A remote gateway needs
+a narrow source allowlist plus a private network, firewall, or equivalent ACL.
+Without explicit trust, rate limiting uses the TCP peer and HTTPS-origin writes
+through a cleartext gateway fail closed because the external scheme cannot be
+verified.
+
 The shared root must be writable only by the Dufs service account while the
 service is running. Path leases and identity checks coordinate this process;
 they do not make the namespace an isolation boundary against a shell, host

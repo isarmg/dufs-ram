@@ -68,6 +68,8 @@ const child = spawn(
     shareRoot,
     "--bind",
     "127.0.0.1",
+    "--trusted-proxy",
+    "127.0.0.1/32",
     "--port",
     "0",
     "--min-free-space",

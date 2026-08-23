@@ -25,6 +25,7 @@ flowchart LR
 
 - 浏览器只访问 HTTPS 网关；
 - Dufs 默认只绑定回环地址；
+- 代理头默认不受信，直连网关必须显式列入 `trusted-proxies`；
 - 防火墙或 ACL 让后端端口仅可信网关可达；
 - 一个 Dufs 实例管理一个共享根；
 - 服务使用专用、低权限 Linux 账号；
@@ -80,6 +81,8 @@ serve-path: /srv/dufs
 state-dir: /var/lib/dufs
 bind:
   - 127.0.0.1
+trusted-proxies:
+  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$REPLACE_WITH_A_REAL_HASH'
@@ -156,7 +159,9 @@ proxy_set_header X-Forwarded-Host $server_name;
 proxy_set_header X-Forwarded-Proto https;
 ```
 
-Dufs 用外部 scheme/host 做同源检查，也可能在可信回环 peer 时采用来源地址做登录限制。如果攻击者能直连后端并伪造这些头，边界就不再成立，所以后端端口必须限制来源。
+Dufs 用外部 scheme/host 做同源检查，也在直连 peer 匹配显式 `--trusted-proxy` / `trusted-proxies` 时采用来源地址做登录限制。官方同机 YAML 样例信任 `127.0.0.1/32`；远端网关应配置精确 IP 或窄 CIDR。没有显式配置时这些头被忽略，经 HTTPS 网关且带 `Origin` 的写请求会失败关闭。
+
+受信网段不是代理身份认证。回环绑定不能区分 nginx 与另一个本机进程，所以还必须让后端端口只对网关可达：同机用可信进程边界、容器/网络命名空间或进程级防火墙，跨主机用隔离私网与精确 ACL。
 
 ### 禁止代理重放写请求
 
@@ -467,7 +472,7 @@ rollback journal 模式下，不要在活跃事务中只复制 `state.sqlite3` �
 
 | 现象 | 常见原因 | 优先检查 |
 | --- | --- | --- |
-| 服务启动但浏览器登录循环 | 用 HTTP、代理 scheme/host 不一致 | HTTPS、Cookie、Host 与 `X-Forwarded-Proto` |
+| 服务启动但浏览器登录循环 | 用 HTTP、代理未列入受信列表或 scheme/host 不一致 | HTTPS、Cookie、`trusted-proxies`、Host 与 `X-Forwarded-Proto` |
 | health 200、ready 503 | 根/SQLite 不可写、空间不足、正在停机 | journal、权限、挂载、`df -h`、inode |
 | 第二实例启动失败 | 同一共享根的 flock 已被持有 | 现有进程和根真实路径 |
 | 写请求普遍 403 | CSRF 或 Origin/代理头不一致 | nginx snippet、后端是否被直连 |

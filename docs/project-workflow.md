@@ -143,7 +143,7 @@ accept 失败不会再立即热循环：日志按资源耗尽、瞬时错误、�
 ```mermaid
 flowchart LR
     B["Edge / Firefox"] -->|"外部 HTTPS"| G["网关或反向代理"]
-    G --> HOST["只接受规范 Host；未知 Host 默认拒绝<br/>传递单值 X-Forwarded-Proto 与真实客户端 IP"]
+    G --> HOST["显式列入受信直连代理；只接受规范 Host<br/>传递单值 X-Forwarded-Proto 与真实客户端 IP"]
     HOST --> LIMIT["网关 login route 限速/限连接<br/>Dufs 正文前全局/每 IP 预算 + IP/账号组合退避"]
     LIMIT -->|"回环或隔离私网 HTTP/TCP"| D["该共享根的唯一 Dufs 实例"]
     D --> F["共享目录"]
@@ -152,7 +152,7 @@ flowchart LR
 
 `__Host-dufs-session` 带有 `Secure`，因此浏览器必须从 HTTPS 入口访问。Nginx 的未知 Host 默认 server 会拒绝请求，合法 HTTP server 只重定向到配置中的固定 HTTPS 域名；登录路由族同时限制来源 IP 请求率、连接数和正文读取时间。Dufs 只接受规范的内部 URI；登录 POST 在读取正文前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket。正在读取的 4 KiB 正文还受全局 32、每 IP 4 个并发许可及 10 秒总 deadline 约束，因此尾斜杠、重复斜杠、编码等价路径或慢正文不能绕过网关 exact route 后再长期占用后端。解析表单后，只对“来源 IP + 用户名 SHA-256 摘要”组合累计失败；同一组合第 5 次失败起按 1、2、4……秒指数退避，最长 60 秒，成功登录只清除该组合，其他来源的同一账号不受影响。`Retry-After` 对剩余时间向上取整；POST 的 `303` 只执行 PRG，重定向后的最终错误页用 `429 + Retry-After` 表达等待语义。随后全局最多同时执行两个 Argon2id 校验：槽位由 blocking 任务持有到计算真正结束，请求取消不会提前释放；会话只在校验结果返回到仍存活的请求后创建。
 
-应用层只在直接 TCP peer 为回环地址时接受恰好一个、不含逗号且可解析为单个 IP 的 `X-Forwarded-For`；缺失、重复或非法时限流使用直接 peer 地址。网关必须覆盖客户端传入的同名头，只发送一个可信地址。即使 Dufs 自身已有正文前全局/每 IP 请求预算和解析后的 IP/账号组合退避，网关仍应在可信代理链上按真实客户端 IP 限速。网关还必须只接受配置的规范主机名，以这个固定规范值覆盖上游 `Host`，并传递恰好一个值为 `https` 的 `X-Forwarded-Proto`，使 `Origin` 的 scheme 与 authority 都能和外部请求匹配；重复、逗号列表或其他 scheme 会使有 `Origin` 的写请求失败。后端端口必须通过回环绑定、私网 ACL 或防火墙限制为只有网关可达。Dufs 必须独占一个主机名并固定部署在该域名的根路径 `/`；不支持 `/files/` 等 URL 子路径。
+应用层默认不信任代理头；只有直接 TCP peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才接受恰好一个、不含逗号且可解析为单个 IP 的 `X-Forwarded-For`。未匹配、缺失、重复或非法时，限流使用直接 peer 地址。网关必须覆盖客户端传入的同名头，只发送一个可信地址。即使 Dufs 自身已有正文前全局/每 IP 请求预算和解析后的 IP/账号组合退避，网关仍应在可信代理链上按真实客户端 IP 限速。网关还必须只接受配置的规范主机名，以这个固定规范值覆盖上游 `Host`，并传递恰好一个值为 `https` 的 `X-Forwarded-Proto`，使 `Origin` 的 scheme 与 authority 都能和外部请求匹配；代理未受信、头重复、包含逗号或使用其他 scheme 会使经 HTTPS 网关且带 `Origin` 的写请求失败关闭。受信列表不是身份认证：回环绑定不能区分 nginx 与其他本机进程，后端端口仍必须通过 OS 隔离、私网 ACL 或防火墙限制为只有网关可达。Dufs 必须独占一个主机名并固定部署在该域名的根路径 `/`；不支持 `/files/` 等 URL 子路径。
 
 服务器初始化时打开共享根目录，在该 fd 上取得非阻塞独占 `flock`，并试用 Linux `openat2`。根 fd 和锁会保持到进程退出；指向同一根目录的第二个本机实例无法取得锁并会明确启动失败。旧于 Linux 5.6 的内核、禁止该系统调用的 seccomp/容器策略或其他不支持场景也会启动失败；`RootedFs` 的最终文件打开和写变更不会为这些环境退回字符串路径实现。
 
@@ -279,7 +279,7 @@ cursor 带服务端随机秘密生成的校验标签，并绑定结果 ID、offs
 
 构造完成后的翻页来自同一不可变内存结果，不会混入后续新项目；但上述复核并非原子文件系统快照。检查间发生又恢复的变化、未更新目录元数据的子文件原地内容/权限变化以及最终复核后的变化仍可能不可见。需要文件系统级强一致读取时，必须从只读存储快照或等价版本化源遍历。浏览器始终只为当前页创建 DOM，不随整个结果规模创建等量节点。
 
-CSRF Token 与会话一起在服务端内存中创建和保存。除使用独立来源检查的登录表单外，所有受保护的 `POST`、`PUT`、`PATCH` 和 `DELETE` 都必须同时携带有效会话 Cookie 与 `X-Dufs-CSRF-Token`；服务端以恒定时间比较当前会话的值，并结合 `Origin`、`Host`、单值 `X-Forwarded-Proto` 和 `Sec-Fetch-Site` 执行 scheme 与 authority 都相同的来源校验。字面值 `Origin: null` 只有同时带 `Sec-Fetch-Site: same-origin` 时才作为受限浏览器场景接受。另一个账号或另一次登录得到的 CSRF Token 不能交叉使用。
+CSRF Token 与会话一起在服务端内存中创建和保存。除使用独立来源检查的登录表单外，所有受保护的 `POST`、`PUT`、`PATCH` 和 `DELETE` 都必须同时携带有效会话 Cookie 与 `X-Dufs-CSRF-Token`；服务端以恒定时间比较当前会话的值，并结合 `Origin`、`Host`、受信直连代理提供的单值 `X-Forwarded-Proto` 和 `Sec-Fetch-Site` 执行 scheme 与 authority 都相同的来源校验。字面值 `Origin: null` 只有同时带 `Sec-Fetch-Site: same-origin` 时才作为受限浏览器场景接受。另一个账号或另一次登录得到的 CSRF Token 不能交叉使用。
 
 ### 4.2 内置页面资源
 
@@ -458,7 +458,7 @@ flowchart TD
     JSON --> API_HANDLER["进入 mkdir、move 或 rename handler"]
 ```
 
-会话验证、来源检查和 CSRF 比较位于具体写操作之前。缺失、伪造或来自另一个会话的 CSRF Token 返回 `403`，不会创建、追加、移动或删除磁盘对象。除上一节所述受限的 `Origin: null` 特例外，存在 `Origin` 时服务同时比较 scheme 和 authority：authority 来自网关覆盖的固定规范 `Host`，外部 scheme 由单值 `X-Forwarded-Proto` 传递；后者重复、包含逗号或不是 `http`/`https` 时失败关闭。登录 POST 尚未建立会话，因此使用独立的同源来源检查、正文读取前 admission、短正文时限、严格表单字段和 4 KiB 正文上限。
+会话验证、来源检查和 CSRF 比较位于具体写操作之前。缺失、伪造或来自另一个会话的 CSRF Token 返回 `403`，不会创建、追加、移动或删除磁盘对象。除上一节所述受限的 `Origin: null` 特例外，存在 `Origin` 时服务同时比较 scheme 和 authority：authority 来自网关覆盖的固定规范 `Host`，外部 scheme 只从匹配显式受信代理的单值 `X-Forwarded-Proto` 取得；代理未受信、该头重复、包含逗号或不是 `http`/`https` 时失败关闭。登录 POST 尚未建立会话，因此使用独立的同源来源检查、正文读取前 admission、短正文时限、严格表单字段和 4 KiB 正文上限。
 
 ### 8.2 新建目录
 
@@ -1005,7 +1005,7 @@ JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法
 
 这里的支持边界要分成两层：`build.rs` 允许 64 位 Linux 进入编译，但自动 CI、部署样例和正式制品验收只以 `x86_64-unknown-linux-gnu` 为基线，其他架构在补齐等价矩阵前属于未验证的 best effort。部署门对 systemd 使用占位 `ExecStart` 做静态验证，真实 nginx 只连接 mock upstream；它没有启动生产 systemd+Dufs+nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是部署要求。依赖审计在 lockfile/manifest 的 push、PR、每周计划及人工触发时运行；发布门固定要求 cargo-audit 0.22.2，只把通过 canonical origin、HEAD/FETCH_HEAD、新鲜度及完整封存检查的 RustSec DB 视为“可用”，否则在任何项目/依赖代码前隔离联网刷新并在离线时失败关闭。封存时校验 seal 与新鲜度，pre-audit 后只重验 seal，完整门禁后重验 seal 与新鲜度并随即销毁该质量数据库。`BUILD-ENVIRONMENT.txt` 使用 v2 格式记录 cargo-audit 版本、advisory DB revision 和 fetch epoch，不记录内部 index/config seal 摘要。包内先完成文档检查，`SHA256SUMS` 再作为最后内容变更生成并只读复核。版本 tag 触发的自动 GitHub Release 工作流会在同一提交的完整只读 CI 成功后发布经草稿资产核验的便捷二进制和 SHA-256；`v0.48.0` 已于 2026-08-22 通过该流程发布，后续精确版本 tag 仍只能在最终源码与发布准备完成后创建。
 
-Playwright 为隔离浏览器测试而使用的端口、证书和密钥环境变量只由 Node 测试进程读取；每个测试在测试共享根下创建随机唯一子目录。Node 测试网关只呈现一个客户端地址，因此浏览器用例固定为单 worker 串行执行，避免无关用例的登录并发争抢生产全局/来源令牌桶；失败时仍进行一次诊断重试。配置同时启用 `failOnFlakyTests: true`，所以首轮失败、重试通过仍会使质量门失败，重试只用于保留诊断 trace。覆盖多次 Argon2 登录、注销和 Cookie 重放的复合认证场景单独标记为 slow test，扩展的只是该 Playwright 场景总预算，不改变登录正文、计算 admission 或其他产品 deadline。Node 在外部测试端口提供 HTTPS，并把请求代理到 Dufs 动态回环 HTTP 端口。仓库中的固定测试私钥是公开的 localhost 测试材料，绝不能部署为生产网关密钥。Dufs 二进制仍只通过显式命令行参数启动，因此这些变量不属于生产配置入口。
+Playwright 为隔离浏览器测试而使用的端口、证书和密钥环境变量只由 Node 测试进程读取；每个测试在测试共享根下创建随机唯一子目录。Node 测试网关只呈现一个客户端地址，并在启动 Dufs 时显式信任 `127.0.0.1/32`，因此浏览器用例固定为单 worker 串行执行，避免无关用例的登录并发争抢生产全局/来源令牌桶；失败时仍进行一次诊断重试。配置同时启用 `failOnFlakyTests: true`，所以首轮失败、重试通过仍会使质量门失败，重试只用于保留诊断 trace。覆盖多次 Argon2 登录、注销和 Cookie 重放的复合认证场景单独标记为 slow test，扩展的只是该 Playwright 场景总预算，不改变登录正文、计算 admission 或其他产品 deadline。Node 在外部测试端口提供 HTTPS，并把请求代理到 Dufs 动态回环 HTTP 端口。仓库中的固定测试私钥是公开的 localhost 测试材料，绝不能部署为生产网关密钥。Dufs 二进制仍只通过显式命令行参数启动，因此这些变量不属于生产配置入口。
 
 `src/server/maintenance.rs` 的 claim 单测验证 maintenance marker 保持清理排他性但不会跨文件系统 I/O 持有 registry mutex；`src/server/upload/tests.rs` 还验证等待 marker 同时遵守上传 deadline 和 force-shutdown。维护集成测试继续覆盖过期 session/trash 删除、活跃项跳过以及符号链接别名映射，确认实现没有在扫描开始时复制一份可能过期的 active 快照。
 

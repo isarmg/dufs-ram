@@ -4,6 +4,7 @@ use super::{
     status_error,
 };
 use crate::{
+    args::TrustedProxy,
     auth::{MAX_PASSWORD_BYTES, MAX_USERNAME_BYTES, session_token_from_cookie},
     http_utils::body_full,
     utils::{decode_hex_to_slice, encode_hex},
@@ -207,13 +208,18 @@ impl Server {
         peer_ip: IpAddr,
         res: &mut Response,
     ) -> Result<Option<String>> {
-        if !request_source_is_same_origin(req.headers(), req.uri(), peer_ip) {
+        if !request_source_is_same_origin(
+            req.headers(),
+            req.uri(),
+            peer_ip,
+            &self.content.args.trusted_proxies,
+        ) {
             status_error(res, StatusCode::FORBIDDEN, "Forbidden");
             self.add_private_security_headers(res);
             return Ok(None);
         }
 
-        let client_ip = login_client_ip(req.headers(), peer_ip);
+        let client_ip = login_client_ip(req.headers(), peer_ip, &self.content.args.trusted_proxies);
         if let Err(delay) = self.admission.login_rate_limiter.check_request(client_ip) {
             self.redirect_login_error(
                 res,
@@ -462,7 +468,12 @@ impl Server {
         session_token: &str,
         expected_csrf: &str,
     ) -> bool {
-        if !request_source_is_same_origin(headers, request_uri, peer_ip) {
+        if !request_source_is_same_origin(
+            headers,
+            request_uri,
+            peer_ip,
+            &self.content.args.trusted_proxies,
+        ) {
             return false;
         }
         headers
@@ -497,20 +508,26 @@ impl Server {
     }
 }
 
-fn login_client_ip(headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
-    trusted_forwarded_value(headers, "x-forwarded-for", peer_ip)
+fn login_client_ip(
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    trusted_proxies: &[TrustedProxy],
+) -> IpAddr {
+    trusted_forwarded_value(headers, "x-forwarded-for", peer_ip, trusted_proxies)
         .ok()
         .flatten()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(peer_ip)
+        .map(canonical_ip)
+        .unwrap_or_else(|| canonical_ip(peer_ip))
 }
 
 fn trusted_forwarded_value<'a>(
     headers: &'a HeaderMap,
     name: &'static str,
     peer_ip: IpAddr,
+    trusted_proxies: &[TrustedProxy],
 ) -> std::result::Result<Option<&'a str>, ()> {
-    if !peer_ip.is_loopback() {
+    if !trusted_proxy_matches(trusted_proxies, peer_ip) {
         return Ok(None);
     }
     let mut values = headers.get_all(name).iter();
@@ -525,6 +542,28 @@ fn trusted_forwarded_value<'a>(
             }
         }
         (Some(_), Some(_)) => Err(()),
+    }
+}
+
+fn trusted_proxy_matches(trusted_proxies: &[TrustedProxy], peer_ip: IpAddr) -> bool {
+    trusted_proxies.iter().any(|network| {
+        network.contains(&peer_ip)
+            || match peer_ip {
+                IpAddr::V6(address) => address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| network.contains(&IpAddr::V4(mapped))),
+                IpAddr::V4(_) => false,
+            }
+    })
+}
+
+fn canonical_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        IpAddr::V4(_) => address,
     }
 }
 
@@ -621,7 +660,12 @@ fn accept_quality_is_positive(value: &str) -> bool {
     }
 }
 
-fn request_source_is_same_origin(headers: &HeaderMap, request_uri: &Uri, peer_ip: IpAddr) -> bool {
+fn request_source_is_same_origin(
+    headers: &HeaderMap,
+    request_uri: &Uri,
+    peer_ip: IpAddr,
+    trusted_proxies: &[TrustedProxy],
+) -> bool {
     let fetch_site = headers
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok());
@@ -648,20 +692,21 @@ fn request_source_is_same_origin(headers: &HeaderMap, request_uri: &Uri, peer_ip
     let Some(origin_scheme) = origin.scheme_str() else {
         return false;
     };
-    let request_scheme = match trusted_forwarded_value(headers, "x-forwarded-proto", peer_ip) {
-        Ok(Some(value)) => {
-            if !(value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https")) {
-                return false;
+    let request_scheme =
+        match trusted_forwarded_value(headers, "x-forwarded-proto", peer_ip, trusted_proxies) {
+            Ok(Some(value)) => {
+                if !(value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https")) {
+                    return false;
+                }
+                value
             }
-            value
-        }
-        Err(()) => return false,
-        Ok(None) => request_uri
-            .scheme_str()
-            // Dufs only accepts cleartext HTTP connections. A TLS gateway
-            // must preserve the external scheme in X-Forwarded-Proto.
-            .unwrap_or("http"),
-    };
+            Err(()) => return false,
+            Ok(None) => request_uri
+                .scheme_str()
+                // Dufs only accepts cleartext HTTP connections. A TLS gateway
+                // must preserve the external scheme in X-Forwarded-Proto.
+                .unwrap_or("http"),
+        };
     origin_scheme.eq_ignore_ascii_case(request_scheme)
         && origin
             .authority()

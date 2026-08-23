@@ -4,6 +4,10 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, oneshot};
 
+fn trusted_proxies(values: &[&str]) -> Vec<TrustedProxy> {
+    values.iter().map(|value| value.parse().unwrap()).collect()
+}
+
 #[test]
 fn login_form_requires_exact_fields() {
     assert_eq!(
@@ -126,58 +130,100 @@ fn same_origin_requires_matching_external_scheme_and_authority() {
     assert!(!request_source_is_same_origin(
         &headers,
         &request_uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &[],
     ));
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    assert!(!request_source_is_same_origin(
+        &headers,
+        &request_uri,
+        "127.0.0.1".parse().unwrap(),
+        &[],
+    ));
+    let loopback_proxy = trusted_proxies(&["127.0.0.1/32"]);
     assert!(request_source_is_same_origin(
         &headers,
         &request_uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &loopback_proxy,
     ));
     assert!(
-        !request_source_is_same_origin(&headers, &request_uri, "198.51.100.7".parse().unwrap()),
+        !request_source_is_same_origin(
+            &headers,
+            &request_uri,
+            "198.51.100.7".parse().unwrap(),
+            &loopback_proxy,
+        ),
         "an untrusted peer controlled the external request scheme"
     );
+    let remote_proxy = trusted_proxies(&["198.51.100.0/24"]);
+    assert!(request_source_is_same_origin(
+        &headers,
+        &request_uri,
+        "198.51.100.7".parse().unwrap(),
+        &remote_proxy,
+    ));
 
     headers.insert("origin", HeaderValue::from_static("http://files.example"));
     assert!(!request_source_is_same_origin(
         &headers,
         &request_uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &loopback_proxy,
     ));
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
     assert!(!request_source_is_same_origin(
         &headers,
         &request_uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &loopback_proxy,
     ));
 }
 
 #[test]
-fn forwarded_login_address_is_only_trusted_from_loopback_proxy() {
+fn forwarded_login_address_requires_an_explicit_trusted_proxy() {
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.10"));
     assert_eq!(
-        login_client_ip(&headers, "127.0.0.1".parse().unwrap()),
+        login_client_ip(&headers, "127.0.0.1".parse().unwrap(), &[]),
+        "127.0.0.1".parse::<IpAddr>().unwrap()
+    );
+
+    let loopback_proxy = trusted_proxies(&["127.0.0.1/32"]);
+    assert_eq!(
+        login_client_ip(&headers, "127.0.0.1".parse().unwrap(), &loopback_proxy,),
         "192.0.2.10".parse::<IpAddr>().unwrap()
     );
     assert_eq!(
-        login_client_ip(&headers, "198.51.100.7".parse().unwrap()),
+        login_client_ip(&headers, "198.51.100.7".parse().unwrap(), &loopback_proxy,),
         "198.51.100.7".parse::<IpAddr>().unwrap()
+    );
+    let remote_proxy = trusted_proxies(&["198.51.100.0/24"]);
+    assert_eq!(
+        login_client_ip(&headers, "198.51.100.7".parse().unwrap(), &remote_proxy,),
+        "192.0.2.10".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(
+        login_client_ip(
+            &headers,
+            "::ffff:127.0.0.1".parse().unwrap(),
+            &loopback_proxy,
+        ),
+        "192.0.2.10".parse::<IpAddr>().unwrap()
     );
     headers.insert(
         "x-forwarded-for",
         HeaderValue::from_static("192.0.2.10, 127.0.0.1"),
     );
     assert_eq!(
-        login_client_ip(&headers, "127.0.0.1".parse().unwrap()),
+        login_client_ip(&headers, "127.0.0.1".parse().unwrap(), &loopback_proxy,),
         "127.0.0.1".parse::<IpAddr>().unwrap()
     );
     headers.remove("x-forwarded-for");
     headers.append("x-forwarded-for", HeaderValue::from_static("192.0.2.10"));
     headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
     assert_eq!(
-        login_client_ip(&headers, "127.0.0.1".parse().unwrap()),
+        login_client_ip(&headers, "127.0.0.1".parse().unwrap(), &loopback_proxy,),
         "127.0.0.1".parse::<IpAddr>().unwrap()
     );
 }
@@ -294,7 +340,8 @@ fn cross_site_request_is_rejected() {
     assert!(!request_source_is_same_origin(
         &headers,
         &Uri::from_static("/"),
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &[],
     ));
 }
 
@@ -307,10 +354,12 @@ fn origin_must_match_host_when_present() {
         HeaderValue::from_static("https://files.example.test"),
     );
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    let loopback_proxy = trusted_proxies(&["127.0.0.1/32"]);
     assert!(request_source_is_same_origin(
         &headers,
         &Uri::from_static("/"),
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &loopback_proxy,
     ));
     headers.insert(
         "origin",
@@ -319,7 +368,8 @@ fn origin_must_match_host_when_present() {
     assert!(!request_source_is_same_origin(
         &headers,
         &Uri::from_static("/"),
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &loopback_proxy,
     ));
 }
 
@@ -332,13 +382,15 @@ fn opaque_origin_requires_browser_same_origin_metadata() {
     assert!(request_source_is_same_origin(
         &headers,
         &uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &[],
     ));
 
     headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
     assert!(!request_source_is_same_origin(
         &headers,
         &uri,
-        "127.0.0.1".parse().unwrap()
+        "127.0.0.1".parse().unwrap(),
+        &[],
     ));
 }
