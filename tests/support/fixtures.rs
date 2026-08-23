@@ -609,14 +609,21 @@ impl TestServer {
                 .to_str()
                 .is_some_and(|value| value == "--state-dir" || value.starts_with("--state-dir="))
         });
+        let has_min_free_space = args.iter().any(|value| {
+            value.to_str().is_some_and(|value| {
+                value == "--min-free-space" || value.starts_with("--min-free-space=")
+            })
+        });
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
         command
             .arg(self.tmpdir.path())
             .arg("-p")
             .arg("0")
             .args(["--auth", TEST_ACCOUNT])
-            .args(["--min-free-space", "0"])
             .args(args);
+        if !has_min_free_space {
+            command.args(["--min-free-space", "0"]);
+        }
         if !has_state_dir {
             command.arg("--state-dir").arg(
                 self.automatic_state_dir

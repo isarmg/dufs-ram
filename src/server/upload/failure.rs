@@ -15,6 +15,29 @@ pub(super) fn apply_upload_unknown(
     )
 }
 
+pub(super) fn apply_awaiting_confirmation_problem(
+    res: &mut Response,
+    upload_id: Uuid,
+    upload_length: u64,
+    status: StatusCode,
+    code: ErrorCode,
+    message: &'static str,
+) -> Result<()> {
+    apply_upload_problem(
+        res,
+        UploadErrorContext::new(
+            upload_id,
+            UploadPublicState::AwaitingConfirmation,
+            Some(upload_length),
+            Some(upload_length),
+        ),
+        status,
+        code,
+        message,
+        RecoveryAdvice::QueryUpload,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_precommit_space_failure(
     upload_records: &UploadRecordStore,
