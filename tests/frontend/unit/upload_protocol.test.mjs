@@ -40,7 +40,7 @@ test("upload response classifier enforces the phase status-state matrix", () => 
     },
     resume: {
       running: [408, 409, 413, 500, 507],
-      "awaiting-confirmation": [409],
+      "awaiting-confirmation": [409, 413],
       committed: [200, 204],
       rejected: [408, 409, 413, 500, 507],
       "not-seen": [404],
