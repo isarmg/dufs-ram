@@ -34,6 +34,19 @@ fn get_file_range_unit_is_case_insensitive(server: TestServer) -> Result<(), Err
 }
 
 #[rstest]
+fn unknown_range_unit_is_ignored(server: TestServer) -> Result<(), Error> {
+    let resp = server
+        .request(reqwest::Method::GET, format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("items=0-6"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key(CONTENT_RANGE));
+    assert_eq!(resp.headers().get("content-length").unwrap(), "18");
+    assert_eq!(resp.text()?, "This is index.html");
+    Ok(())
+}
+
+#[rstest]
 fn get_file_range_beyond(server: TestServer) -> Result<(), Error> {
     let resp = server
         .request(reqwest::Method::GET, format!("{}index.html", server.url()))
