@@ -1,8 +1,5 @@
 use std::{io, sync::Arc, sync::OnceLock};
-use tokio::{
-    sync::Semaphore,
-    task::{self, JoinHandle},
-};
+use tokio::{sync::Semaphore, task};
 
 // Tokio's blocking pool has a deliberately high default ceiling because it
 // serves many workloads. Filesystem calls against FUSE, network mounts, or a
@@ -37,7 +34,7 @@ impl BlockingIoGate {
     /// Run blocking work after bounded asynchronous admission.
     ///
     /// The owned permit deliberately lives inside the blocking closure. A
-    /// caller may stop awaiting the JoinHandle, but Tokio cannot cancel a
+    /// caller may stop awaiting this future, but Tokio cannot cancel a
     /// blocking syscall that has started, so capacity is released only when
     /// the actual worker exits.
     pub(super) async fn run<T, F>(&self, work: F) -> io::Result<T>
@@ -66,15 +63,6 @@ impl BlockingIoGate {
     {
         self.run(work).await?
     }
-
-    pub(super) fn spawn_io<T, F>(&self, work: F) -> JoinHandle<io::Result<T>>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> io::Result<T> + Send + 'static,
-    {
-        let gate = self.clone();
-        task::spawn(async move { gate.run_io(work).await })
-    }
 }
 
 #[cfg(test)]
@@ -87,10 +75,15 @@ mod tests {
         let gate = BlockingIoGate::new(1);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let first = gate.spawn_io(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok(())
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            first_gate
+                .run_io(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
         });
         tokio::task::spawn_blocking(move || {
             entered_rx
@@ -101,7 +94,8 @@ mod tests {
         .unwrap();
 
         first.abort();
-        let mut second = gate.spawn_io(|| Ok(7_u8));
+        let second_gate = gate.clone();
+        let mut second = tokio::spawn(async move { second_gate.run_io(|| Ok(7_u8)).await });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut second)
                 .await
@@ -117,6 +111,54 @@ mod tests {
                 .expect("second admission task failed")
                 .expect("second blocking worker failed"),
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queued_future_prevents_its_blocking_work_from_starting() {
+        let gate = BlockingIoGate::new(1);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            first_gate
+                .run_io(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocking worker did not start")
+        })
+        .await
+        .unwrap();
+
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let mut queued = Box::pin(gate.run_io(move || {
+            queued_tx.send(()).unwrap();
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queued.as_mut())
+                .await
+                .is_err(),
+            "queued work unexpectedly acquired the occupied slot"
+        );
+        drop(queued);
+
+        release_tx.send(()).unwrap();
+        first
+            .await
+            .expect("first admission task failed")
+            .expect("first blocking worker failed");
+        gate.run_io(|| Ok(())).await.unwrap();
+        assert!(
+            queued_rx.try_recv().is_err(),
+            "work from a dropped queued future still started later"
         );
     }
 }
