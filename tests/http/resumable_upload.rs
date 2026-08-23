@@ -24,6 +24,86 @@ fn resumable_upload(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn chunked_excess_resume_body_preserves_the_durable_checkpoint(
+    server: TestServer,
+) -> Result<(), Error> {
+    use fixtures::{TEST_PASSWORD, TEST_USER};
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::Duration,
+    };
+
+    let url = format!("{}chunked-excess-resume.bin", server.url());
+    let upload_id = Uuid::new_v4();
+    let initial = with_upload_headers(server.request(reqwest::Method::PUT, &url), upload_id, 6)
+        .body(b"abc".to_vec())
+        .send()?;
+    assert_eq!(initial.status(), 409);
+
+    let session = server.login(TEST_USER, TEST_PASSWORD)?;
+    let mut resume = TcpStream::connect(("127.0.0.1", server.port()))?;
+    resume.set_read_timeout(Some(Duration::from_secs(10)))?;
+    resume.set_write_timeout(Some(Duration::from_secs(10)))?;
+    resume.write_all(
+        format!(
+            concat!(
+                "PATCH /chunked-excess-resume.bin HTTP/1.1\r\n",
+                "Host: localhost:{}\r\n",
+                "Cookie: {}\r\n",
+                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-Dufs-Upload-Id: {}\r\n",
+                "X-Dufs-Upload-Length: 6\r\n",
+                "X-Dufs-Upload-Offset: 3\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "4\r\n1234\r\n",
+                "0\r\n\r\n"
+            ),
+            server.port(),
+            session.cookie(),
+            session.csrf_token(),
+            upload_id,
+        )
+        .as_bytes(),
+    )?;
+    resume.flush()?;
+    let mut excess_response = String::new();
+    resume.read_to_string(&mut excess_response)?;
+    assert!(
+        excess_response.starts_with("HTTP/1.1 413"),
+        "{excess_response}"
+    );
+
+    let checkpoint = server
+        .request(reqwest::Method::HEAD, &url)
+        .header("X-Dufs-Upload-Id", upload_id.to_string())
+        .send()?;
+    assert_eq!(checkpoint.status(), 200);
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-operation-state").unwrap(),
+        "running"
+    );
+    assert_eq!(
+        checkpoint.headers().get("x-dufs-upload-offset").unwrap(),
+        "3"
+    );
+
+    let completed = with_resume_upload_headers(
+        server.request(reqwest::Method::PATCH, &url),
+        upload_id,
+        6,
+        3,
+    )
+    .body(b"123".to_vec())
+    .send()?;
+    assert_eq!(completed.status(), 204);
+    assert_eq!(server.get(url)?.text()?, "abc123");
+    Ok(())
+}
+
+#[rstest]
 fn full_running_checkpoint_can_reenter_commit_with_empty_patch(
     #[with(&[
         "--upload-idle-timeout",
