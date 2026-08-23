@@ -280,7 +280,7 @@ impl Server {
                 }
             }
         }
-        if upload_length > self.content.args.max_upload_size {
+        if existing_record.is_none() && upload_length > self.content.args.max_upload_size {
             apply_upload_problem(
                 res,
                 UploadErrorContext::new(
