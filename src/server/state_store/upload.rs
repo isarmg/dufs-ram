@@ -101,7 +101,7 @@ impl StoreWorker {
         proposed: &StoredUploadSession,
         ttl_ms: i64,
     ) -> Result<StoreUploadSession> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let expires_at = expiration_time(now, ttl_ms)?;
         let transaction = self
             .connection
@@ -211,7 +211,7 @@ impl StoreWorker {
         after: Option<UploadSessionKey>,
         limit: i64,
     ) -> Result<Vec<ExpiredUploadSession>> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         match after {
             None => query_expired_upload_sessions(
                 &self.connection,
@@ -250,7 +250,7 @@ impl StoreWorker {
         &mut self,
         expected: &ExpiredUploadSession,
     ) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         if expected.expires_at_ms > now {
             return Ok(false);
         }
@@ -280,7 +280,7 @@ impl StoreWorker {
             return Ok(RejectUploadSession::StateConflict(session));
         }
 
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let expires_at = expiration_time(now, ttl_ms)?;
         let transaction = self
             .connection
@@ -345,7 +345,7 @@ impl StoreWorker {
         &mut self,
         expected: &ExpiredUploadSession,
     ) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

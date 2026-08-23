@@ -6,7 +6,7 @@ impl StoreWorker {
         key: OperationKey,
         fingerprint: [u8; 32],
     ) -> Result<StoreBegin> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -58,7 +58,7 @@ impl StoreWorker {
     }
 
     pub(super) fn operation_status(&mut self, key: OperationKey) -> Result<StoreStatus> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -80,7 +80,7 @@ impl StoreWorker {
         key: OperationKey,
         lease: [u8; 16],
     ) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -109,7 +109,7 @@ impl StoreWorker {
         lease: [u8; 16],
         outcome: &StoredOutcome,
     ) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let expires_at = expiration_time(now, self.limits.ttl_ms)?;
         let transaction = self
             .connection
@@ -145,7 +145,7 @@ impl StoreWorker {
     }
 
     pub(super) fn abandon_operation(&mut self, key: OperationKey, lease: [u8; 16]) -> Result<()> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let expires_at = expiration_time(now, self.limits.ttl_ms)?;
         let transaction = self
             .connection

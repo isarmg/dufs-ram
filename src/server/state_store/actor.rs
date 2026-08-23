@@ -31,12 +31,22 @@ pub(super) fn run(runtime: ActorRuntime) {
         ready,
     } = runtime;
     let _health_on_exit = HealthOnExit(healthy.clone());
-    let connection =
-        database::open_initialized_connection(&path, root, limits.ttl_ms, limits.upload_ttl_ms)
-            .with_context(|| "Failed to initialize the state database");
+    let initialized = (|| {
+        let mut clock = StoreClock::new()?;
+        let recovery_now = clock.now_ms()?;
+        let connection = database::open_initialized_connection(
+            &path,
+            root,
+            limits.ttl_ms,
+            limits.upload_ttl_ms,
+            recovery_now,
+        )?;
+        Ok::<_, anyhow::Error>((connection, clock))
+    })()
+    .with_context(|| "Failed to initialize the state database");
 
-    let connection = match connection {
-        Ok(connection) => connection,
+    let (connection, clock) = match initialized {
+        Ok(initialized) => initialized,
         Err(err) => {
             let _ = ready.send(Err(err));
             return;
@@ -50,6 +60,7 @@ pub(super) fn run(runtime: ActorRuntime) {
 
     StoreWorker {
         connection,
+        clock,
         limits,
         deferred_abandons: VecDeque::new(),
     }

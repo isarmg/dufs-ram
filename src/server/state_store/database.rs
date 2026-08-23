@@ -242,9 +242,16 @@ pub(super) fn open_initialized_connection(
     root: RootIdentity,
     operation_ttl_ms: i64,
     upload_ttl_ms: i64,
+    recovery_now_ms: i64,
 ) -> Result<Connection> {
     let mut connection = open_connection(path)?;
-    initialize_database(&mut connection, root, operation_ttl_ms, upload_ttl_ms)?;
+    initialize_database(
+        &mut connection,
+        root,
+        operation_ttl_ms,
+        upload_ttl_ms,
+        recovery_now_ms,
+    )?;
     Ok(connection)
 }
 
@@ -323,13 +330,14 @@ fn initialize_database(
     root: RootIdentity,
     operation_ttl_ms: i64,
     upload_ttl_ms: i64,
+    recovery_now_ms: i64,
 ) -> Result<()> {
     // Repeat the read-only path preflight on the actor connection before the
     // first persistent pragma, schema mutation, or recovery write.
     validate_database_before_mutation(connection, root)?;
     configure_validated_connection(connection)?;
     initialize_schema(connection, root)?;
-    recover_database(connection, operation_ttl_ms, upload_ttl_ms)
+    recover_database(connection, operation_ttl_ms, upload_ttl_ms, recovery_now_ms)
 }
 
 fn preflight_existing_database(path: &Path, root: RootIdentity) -> Result<()> {
@@ -523,8 +531,8 @@ fn recover_database(
     connection: &mut Connection,
     operation_ttl_ms: i64,
     upload_ttl_ms: i64,
+    now: i64,
 ) -> Result<()> {
-    let now = now_ms()?;
     let operation_expires_at = expiration_time(now, operation_ttl_ms)?;
     let upload_expires_at = expiration_time(now, upload_ttl_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
