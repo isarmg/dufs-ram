@@ -133,6 +133,13 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     assert_eq!(args.serve_path, std::fs::canonicalize(tmpdir.path())?);
     assert_eq!(args.state_dir.as_deref(), Some(state_dir.path()));
     assert_eq!(args.addrs, [std::net::IpAddr::from([127, 0, 0, 1])]);
+    assert_eq!(
+        args.trusted_proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["127.0.0.1/32"]
+    );
     assert_eq!(args.port, 5000);
     assert!(args.auth.has_users());
     Ok(())

@@ -297,7 +297,13 @@ fn login_form_uses_one_time_prg_errors_and_sets_cookie_only_on_success(
 
 #[rstest]
 fn login_backoff_is_scoped_to_the_source_and_account_pair(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[
+        "--auth",
+        USER_ACCOUNT,
+        "--trusted-proxy",
+        "127.0.0.1/32"
+    ])]
+    server: TestServer,
 ) -> Result<(), Error> {
     let client = client_without_redirects()?;
     let first_ip = "192.0.2.10";
@@ -367,7 +373,13 @@ fn login_backoff_is_scoped_to_the_source_and_account_pair(
 
 #[rstest]
 fn successful_login_clears_the_pair_failure_history(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[
+        "--auth",
+        USER_ACCOUNT,
+        "--trusted-proxy",
+        "127.0.0.1/32"
+    ])]
+    server: TestServer,
 ) -> Result<(), Error> {
     let client_ip = "192.0.2.20";
     for _ in 0..4 {
@@ -388,6 +400,26 @@ fn successful_login_clears_the_pair_failure_history(
     assert_eq!(second_success.status(), StatusCode::SEE_OTHER);
     assert!(second_success.headers().contains_key(SET_COOKIE));
     assert!(!second_success.headers().contains_key(RETRY_AFTER));
+    Ok(())
+}
+
+#[rstest]
+fn untrusted_forwarded_addresses_do_not_split_login_backoff(
+    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+) -> Result<(), Error> {
+    for _ in 0..5 {
+        let rejected = login_form_response_from(&server, "user", "wrong", Some("192.0.2.30"))?;
+        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        assert!(!rejected.headers().contains_key(SET_COOKIE));
+    }
+
+    let blocked = login_form_response_from(&server, "user", TEST_PASSWORD, Some("192.0.2.31"))?;
+    assert_eq!(blocked.status(), StatusCode::SEE_OTHER);
+    assert!(!blocked.headers().contains_key(SET_COOKIE));
+    let page = client_without_redirects()?
+        .get(login_error_url(&server, &blocked)?)
+        .send()?;
+    assert_eq!(page.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
 }
 

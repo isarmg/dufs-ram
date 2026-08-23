@@ -187,7 +187,7 @@ nginx 负责：
 
 URI 和业务路径是否规范由 Dufs 自己校验；nginx 样例不会替后端证明文件路径安全。
 
-仓库提供 [nginx 示例](../../deploy/nginx-dufs.conf) 和 [代理头片段](../../deploy/dufs-proxy.conf)。测试环境则由 [tests/frontend/server.mjs](../../tests/frontend/server.mjs) 建立本地 HTTPS 代理。
+仓库提供 [nginx 示例](../../deploy/nginx-dufs.conf) 和 [代理头片段](../../deploy/dufs-proxy.conf)。测试环境则由 [tests/frontend/server.mjs](../../tests/frontend/server.mjs) 建立本地 HTTPS 代理，并在启动后端时显式把 `127.0.0.1/32` 配为受信代理；生产部署必须按真实网关地址设置同一边界。
 
 不要把测试证书直接用于生产，也不要为了省事删除 `Secure` Cookie 或来源校验。
 
@@ -259,6 +259,8 @@ serve-path: /tmp/dufs-learning.ABCDEFGH/shared
 state-dir: /tmp/dufs-learning.ABCDEFGH/state
 bind:
   - 127.0.0.1
+trusted-proxies:
+  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$v=19$...'
@@ -277,7 +279,7 @@ target/debug/dufs --config "$tutorial_root/dufs.yaml"
 
 YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项会直接失败，不会静默忽略。这样升级时更吵，但能防止操作者误以为某个安全限制仍然生效。
 
-配置优先级是“内置默认值 → YAML → 命令行中明确给出的参数”。因此命令行值会覆盖 YAML；重复的 `--bind` 和 `--auth` 会分别整体替换 YAML 中的对应列表，而不是追加合并。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
+配置优先级是“内置默认值 → YAML → 命令行中明确给出的参数”。因此命令行值会覆盖 YAML；重复的 `--bind`、`--trusted-proxy` 和 `--auth` 会分别整体替换 YAML 中的对应列表，而不是追加合并。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
 
 配置文件本身必须是不超过 1 MiB 的普通 UTF-8 文件，不能是符号链接、FIFO 或设备。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量；测试脚本中名字相似的环境变量只控制测试工具，不会成为服务配置。
 
@@ -291,6 +293,7 @@ YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项
 | `state-dir` | 无，必须显式配置 | 位于共享根之外、权限和属主受校验的持久状态目录 |
 | `auth` | 无账号，启动校验失败 | 至少一个 `user:<argon2id PHC>` 全权限账号 |
 | `bind` | `127.0.0.1` | 监听地址，可重复指定 |
+| `trusted-proxies` | 空 | 可声明代理头的直连网关 IP/CIDR；默认不信任任何代理 |
 | `port` | `5000` | HTTP 后端端口 |
 | `max-upload-size` | 100 GiB | 单文件声明长度上限 |
 | `upload-idle-timeout` | 60 秒 | 上传没有进展的允许时间 |

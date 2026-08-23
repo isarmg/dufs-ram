@@ -94,11 +94,11 @@ SQLite 提交与共享根中的 mkdir、rename、文件同步和目录 `fsync` �
 
 仓库内 nginx 示例固定 HTTP/1.1 回源，传递单值 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，关闭请求重放与缓存，并对登录路由族同时使用来源 IP 请求速率、连接数和短正文时限。未知 HTTP Host 由默认 server 拒绝，合法 HTTP server 只跳转到配置中的固定规范 HTTPS 域名；未知 HTTPS SNI/Host 在默认 server 拒绝，不能借 `$host` 形成外部跳转。Dufs 的内部路由本身也只接受规范 URI，尾斜杠、重复斜杠和非规范百分号编码不会成为绕过 exact gateway location 的等价别名。
 
-Dufs 在读取登录正文前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket；正在读取的 4 KiB 正文另受全局 32、每 IP 4 个并发许可和 10 秒总 deadline 约束。解析账号后仍继续执行“来源 IP + 账号摘要”组合键失败退避和最多两个 Argon2id 计算槽；一个来源不能借错误密码把同一账号在其他来源全局锁定。`Retry-After` 会向上取整剩余秒数，并只由 PRG 重定向后的最终 `429` 登录错误页返回；POST 的 `303` 不携带该字段。应用只在 TCP peer 为回环地址时采用合法单值 `X-Forwarded-For` 作为登录限流地址；`Host` 和 `X-Forwarded-Proto` 则参与同源校验，所以后端端口必须通过回环绑定、私网 ACL 或防火墙只允许会覆盖这些头的可信网关访问。网关若位于另一台主机，应用层只能看到网关地址，因此必须保留网关侧的真实来源 IP 限流与连接限制。
+Dufs 在读取登录正文前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket；正在读取的 4 KiB 正文另受全局 32、每 IP 4 个并发许可和 10 秒总 deadline 约束。解析账号后仍继续执行“来源 IP + 账号摘要”组合键失败退避和最多两个 Argon2id 计算槽；一个来源不能借错误密码把同一账号在其他来源全局锁定。`Retry-After` 会向上取整剩余秒数，并只由 PRG 重定向后的最终 `429` 登录错误页返回；POST 的 `303` 不携带该字段。应用只在直连 TCP peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才采用合法单值 `X-Forwarded-For` 作为登录限流地址并用单值 `X-Forwarded-Proto` 证明外部 scheme；默认列表为空。网关若位于另一台主机，必须同时配置其窄来源网段并保留网关侧真实来源 IP 限流。
 
 Dufs 的普通文件和 Range 正文没有总时长/最低速率限制，但套接字连续 30 秒没有写入进展会关闭连接。公网网关仍应设置符合业务容量的响应总时长、最低速率和空闲策略；不能把应用的 30 秒 write-idle 当作完整慢客户端防护。
 
-后端必须由主机防火墙或网络 ACL 限制为仅网关可达。TLS 私钥、会话 Cookie、CSRF token、完整 Argon2id PHC 和文件内容均不得进入诊断工单或公开日志。
+后端必须由主机防火墙或网络 ACL 限制为仅网关可达。受信代理列表不是身份验证；`127.0.0.1/32` 仍允许任何能连接该回环端口的本机进程声明代理头，所以不可信本机进程必须再由容器/网络命名空间、进程级防火墙或等效机制隔离。TLS 私钥、会话 Cookie、CSRF token、完整 Argon2id PHC 和文件内容均不得进入诊断工单或公开日志。
 
 ## 3. 健康检查和监控
 

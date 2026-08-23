@@ -80,6 +80,7 @@
 | C-03 | `-c, --config` | 不指定则只用命令行 | 加载严格 YAML；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
+| C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝 `/0` | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
 | C-08 | `-a, --auth` / `auth` | 至少一个账号；可重复 | 配置完整权限账号；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
 | C-10 | `--log-file` / `log-file` | 不指定时输出到 stdout/stderr；文件必须是当前服务用户拥有的单链接普通文件 | 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开并固定 `0600`；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
@@ -99,8 +100,8 @@
 
 其他配置语义：
 
-- YAML 的 `bind` 接受单个字符串或非空字符串列表，`auth` 使用列表；
-- 命令行显式提供 `bind` 或 `auth` 时会整体替换 YAML 中的对应值，不是追加；
+- YAML 的 `bind` 与 `trusted-proxies` 接受单个字符串或字符串列表，`bind` 列表非空，`auth` 使用列表；
+- 命令行显式提供 `bind`、`trusted-proxy` 或 `auth` 时会整体替换 YAML 中的对应值，不是追加；
 - 大小和时限使用裸字节、裸秒数，不接受 `10GiB`、`5m` 等单位文本；
 - 服务固定挂载在独立主机名的根路径 `/`，不支持 URL 子路径部署；
 - 配置账号、路径、监听地址或其他启动项发生变化后必须重启，没有运行时配置管理 API。
@@ -121,7 +122,7 @@
 | A-10 | 安全 Cookie | `__Host-dufs-session`，`Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/`、无 `Domain` 和 `Max-Age`，因此是浏览器会话 Cookie | 依赖浏览器 HTTPS 入口；弱化属性会扩大攻击面 | 保障 | 低 |
 | A-11 | 主动注销 | `POST /__dufs__/logout` 立即撤销服务端会话并清 Cookie | 删除后只能等待过期或手工清 Cookie | 建议保留 | 低 |
 | A-12 | CSRF 令牌 | 每个会话独立 256 位令牌；除公开登录 POST 外，所有受保护的 `POST/PUT/PATCH/DELETE` 必须携带并常量时间比较 | 删除后，同一浏览器中的恶意站点可能借会话执行写操作 | 保障 | 高 |
-| A-13 | 请求来源检查 | 明确拒绝 `Sec-Fetch-Site: cross-site`；存在普通 `Origin` 时同时比较 scheme 与 authority：authority 来自 `Host`，外部 scheme 来自唯一且只含 `http` 或 `https` 的 `X-Forwarded-Proto`，直连默认 `http`；多值、逗号列表、非法 scheme 和不匹配都拒绝。缺少 `Origin` 且未标为跨站时仍接受 | 网关必须覆盖而不是追加 `Host`、`X-Forwarded-Proto`；来源检查与每会话 CSRF 共同构成写保护 | 保障 | 中 |
+| A-13 | 请求来源检查 | 明确拒绝 `Sec-Fetch-Site: cross-site`；存在普通 `Origin` 时同时比较 scheme 与 authority：authority 来自 `Host`，外部 scheme 只在直连 peer 匹配显式受信代理 IP/CIDR 时来自唯一且只含 `http` 或 `https` 的 `X-Forwarded-Proto`，否则默认 `http`；多值、逗号列表、非法 scheme 和不匹配都拒绝。缺少 `Origin` 且未标为跨站时仍接受 | 网关必须显式列入受信代理并覆盖而不是追加 `Host`、`X-Forwarded-Proto`；来源检查与每会话 CSRF 共同构成写保护 | 保障 | 中 |
 | A-14 | 认证响应不缓存 | 默认 `Cache-Control: private, no-store`；认证文件、Range、API 和错误都不进入共享缓存 | 删除可能造成认证内容被浏览器或网关错误复用 | 保障 | 中 |
 | A-15 | 页面安全响应头 | CSP、`nosniff`、禁止 frame、`no-referrer`、限制 camera/microphone/geolocation/payment/USB | 删除不增加文件功能，只降低浏览器侧防护 | 保障 | 低 |
 | A-16 | 认证后才记录用户名 | `$remote_user` 只来自已经验证的表单登录或会话 | 删除会使访问日志中的用户名不可作为可信审计信息 | 保障 | 低 |
@@ -444,7 +445,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 2. Dufs 已有正文读取全局/每 IP 并发限制、全局/每 IP token bucket、Argon2 并发上限和按“客户端 IP + 账号摘要”组合键的失败退避，但状态只在当前进程内、成功会清除对应组合记录，也不是分布式防护；公网网关仍应独立按可信真实 IP 限速。
 3. 会话空闲 30 分钟和绝对 12 小时目前是固定常量，不能通过命令行或 YAML 调整。
 4. 公开 `/__dufs__/health` 只证明进程和路由能响应；认证 `/__dufs__/ready` 会真实创建隐藏文件、写入、同步文件、删除并同步根目录，还会在当前 SQLite actor 连接中执行回滚写事务。它仍不执行 rename 或介质读回，也不预测目标冲突、上传/purge 容量等全部业务准入，因此不能替代完整 CRUD 冒烟和备份恢复演练。
-5. `$remote_addr` 始终是与 Dufs 建立 TCP 连接的 peer；登录限流仅在该 peer 是 loopback 时接受恰好一个、无逗号且能解析为 IP 的 `X-Forwarded-For`。部署示例要求网关覆盖该头；非回环直连或多值头会退回 TCP peer。
+5. `$remote_addr` 始终是与 Dufs 建立 TCP 连接的 peer；登录限流仅在该 peer 匹配显式 `trusted-proxies` IP/CIDR 时接受恰好一个、无逗号且能解析为 IP 的 `X-Forwarded-For`。默认列表为空；未匹配、重复、多值或非法头会退回 TCP peer。受信列表只是来源地址声明，不能区分 nginx 与能直连同一回环端口的其他本机进程，仍需 OS/网络隔离。
 6. CLI/YAML 的最终 bind 列表必须非空；`bind: []` 在创建 listener 或其他运行时资源前就以明确配置错误失败。多个 listener 各自先 accept，再为已接受 socket 竞争共享连接许可，因此空闲地址不会预占许可；达到上限时内核 backlog 仍可能暂存已经完成握手的连接。
 7. 成功上传任务会保留在上传队列表格中，但不会立即插入已经加载的普通目录列表，刷新页面后才会出现在常规列表。
 8. 应用自定义文案为英文；浏览器原生 `Error.message` 仍可能按浏览器语言显示英文或其他语言。
@@ -460,7 +461,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 18. `upload/manager.js` 返回对象中的 `isBusy()` 当前没有生产或测试调用，可作为不改变功能的微型代码清理。
 19. 固定 localhost Playwright 私钥和证书只供自动化测试，不能用于生产网关。
 20. 本地发布脚本提供强制完整门禁、反复 exact-source 检查、来源隔离、源码 SHA、实际构建环境清单、固定工具生成的规范化 SBOM、第三方许可证 notice、校验和和签名制品，并拒绝 symlink、submodule 与特殊源/归档条目；环境清单记录本次工具事实但不钉扎宿主链，SBOM 规范化也不代表完整 schema 验证。项目仍没有远程托管发布、自动升级、包管理器或密钥托管；晚打开私钥不能隔离同 UID 恶意进程，管理员仍须使用独立账号、主机或 HSM。
-21. 同源检查明确拒绝 `Sec-Fetch-Site: cross-site`；`Origin: null` 只在 Fetch Metadata 明确为 same-origin 时接受；普通 Origin 同时比较 scheme 与 authority。生产网关必须只接受固定规范主机名，以固定值覆盖上游 `Host`，并写入唯一、无逗号的 `X-Forwarded-Proto: https`；Origin 缺失时不会单独拒绝，整体安全仍依赖每会话 CSRF token。
+21. 同源检查明确拒绝 `Sec-Fetch-Site: cross-site`；`Origin: null` 只在 Fetch Metadata 明确为 same-origin 时接受；普通 Origin 同时比较 scheme 与 authority。生产网关必须列入显式受信代理、只接受固定规范主机名，以固定值覆盖上游 `Host`，并写入唯一、无逗号的 `X-Forwarded-Proto: https`；未配置受信代理时经 HTTPS 网关的带 Origin 写请求失败关闭。Origin 缺失时不会单独拒绝，整体安全仍依赖每会话 CSRF token。
 22. 会话 Cookie 固定为 `__Host-dufs-session; Path=/`，Cookie 不按端口隔离：同一主机名下的应用共享 host/path 作用域；若还共用 scheme 和端口，则浏览器也会把它们视为同源。同主机再部署另一份 Dufs 还会发生 Cookie 名冲突。因此 Dufs 必须独占一个主机名，并固定部署在该域名的根路径 `/`。
 23. 同一共享根上的第二个 Dufs 实例会因根 fd 的非阻塞独占 `flock` 启动失败；该 advisory lock 没有 PID 文件，也不能阻止 shell、宿主机、网络文件系统另一节点或忽略 flock 的程序修改目录。多个根目录仍由多个进程分别管理。
 24. 上传总 deadline 从每次 PUT/PATCH 等待路径租约前开始，覆盖准备、正文、写入、flush、metadata 重放和等待提交结果；每次 PATCH 重试重新计时。合法头解析后依次等待路径租约、尝试上传槽、受跟踪地读取 route metadata；fresh PUT 随后在同一 deadline 内分页检查目标及后代的 durable upload/purge obligations，才进入 owner checkpoint/上传准备，PATCH 不重复扫描自身会话。路径、route 或状态检查超时返回绑定的 `408 not-started`，持久状态冲突/不可用分别返回 `409/503 not-started`，槽满直接返回 `429 not-started` 且不读旧 state；这些分支都不创建 stage/SQLite 行。后续 tracked upload task 的只读准备也不等于 unknown：首次 filesystem/upload-state mutation 与总 deadline 原子竞争，deadline 先赢会关闭边界、abort 并返回 `408 not-started + retry`，边界前未处理只读 I/O 为 `408/503 not-started + retry`；task 先越界后的外层 deadline/未处理错误才保守返回 `unknown + query_upload`，后台继续持有租约和槽安全收尾。两类可重试响应都必须先 HEAD；最终 rename/fsync 进入提交后不可取消，前端不提供盲目重试。

@@ -315,7 +315,7 @@ readiness 是一个容易混淆的例外：它在认证成功后由 API 分发�
 1. 来源检查没有发现显式 cross-site，且存在 `Origin` 时其外部 scheme/authority 匹配；
 2. `X-Dufs-CSRF-Token` 与当前 session 绑定的 token 匹配。
 
-同源检查会考虑 `Origin`、`Host`、`Sec-Fetch-Site`。只有连接来自 loopback 网关时，才信任规范的单值 `X-Forwarded-Proto` 等代理信息。这与推荐的“浏览器 HTTPS → nginx → 回环 HTTP Dufs”拓扑相配合。
+同源检查会考虑 `Origin`、`Host`、`Sec-Fetch-Site`。代理信息默认不受信；只有直连 peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才采用规范的单值 `X-Forwarded-Proto`。推荐的“浏览器 HTTPS → nginx → 回环 HTTP Dufs”拓扑因此还要显式配置 `127.0.0.1/32`，并通过 OS 隔离保证其他本机进程不能冒充网关。
 
 GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公共路由。公共登录 POST 也已在到达此阶段前完成。CSRF 失败时，内部 API 返回带稳定错误代码的 problem JSON；普通内容路由返回拒绝响应。
 
