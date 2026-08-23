@@ -30,10 +30,10 @@ mod purge;
 mod upload;
 
 pub(super) use model::{
-    OperationKey, PurgeJobKey, RejectUploadSession, RootIdentity, StateBlockingPath,
-    StatePathCursor, StatePathPage, StoreBegin, StorePurgeJob, StoreStatus, StoreUploadSession,
-    StoredFileIdentity, StoredOutcome, StoredPurgeJob, StoredPurgeState, StoredTerminalState,
-    StoredUploadSession, StoredUploadState, UploadSessionKey,
+    ExpiredUploadSession, OperationKey, PurgeJobKey, RejectUploadSession, RootIdentity,
+    StateBlockingPath, StatePathCursor, StatePathPage, StoreBegin, StorePurgeJob, StoreStatus,
+    StoreUploadSession, StoredFileIdentity, StoredOutcome, StoredPurgeJob, StoredPurgeState,
+    StoredTerminalState, StoredUploadSession, StoredUploadState, UploadSessionKey,
 };
 
 const APPLICATION_ID: i32 = 0x4455_4653; // "DUFS"
@@ -303,14 +303,18 @@ enum Command {
     ListExpiredUploadSessions {
         after: Option<UploadSessionKey>,
         limit: i64,
-        reply: oneshot::Sender<Result<Vec<StoredUploadSession>>>,
+        reply: oneshot::Sender<Result<Vec<ExpiredUploadSession>>>,
+    },
+    MatchExpiredUploadSession {
+        expected: ExpiredUploadSession,
+        reply: oneshot::Sender<Result<bool>>,
     },
     RemoveUploadSessionIfMatches {
         expected: StoredUploadSession,
         reply: oneshot::Sender<Result<bool>>,
     },
     RemoveExpiredUploadSessionIfMatches {
-        expected: StoredUploadSession,
+        expected: ExpiredUploadSession,
         reply: oneshot::Sender<Result<bool>>,
     },
     PreparePurgeJob {
@@ -755,7 +759,7 @@ impl StateStore {
         &self,
         after: Option<UploadSessionKey>,
         limit: usize,
-    ) -> Result<Vec<StoredUploadSession>> {
+    ) -> Result<Vec<ExpiredUploadSession>> {
         let limit = query_limit(limit)?;
         let (reply, receiver) = oneshot::channel();
         self.send(Command::ListExpiredUploadSessions {
@@ -763,6 +767,16 @@ impl StateStore {
             limit,
             reply,
         })?;
+        self.receive(receiver).await
+    }
+
+    pub(super) async fn expired_upload_session_matches(
+        &self,
+        expected: ExpiredUploadSession,
+    ) -> Result<bool> {
+        expected.session.validate()?;
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::MatchExpiredUploadSession { expected, reply })?;
         self.receive(receiver).await
     }
 
@@ -778,9 +792,9 @@ impl StateStore {
 
     pub(super) async fn remove_expired_upload_session_if_matches(
         &self,
-        expected: StoredUploadSession,
+        expected: ExpiredUploadSession,
     ) -> Result<bool> {
-        expected.validate()?;
+        expected.session.validate()?;
         let (reply, receiver) = oneshot::channel();
         self.send(Command::RemoveExpiredUploadSessionIfMatches { expected, reply })?;
         self.receive(receiver).await

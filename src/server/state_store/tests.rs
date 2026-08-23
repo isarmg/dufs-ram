@@ -468,10 +468,9 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
             .await?,
         StoreUploadSession::Updated
     );
-    assert_eq!(
-        store.expired_upload_sessions_page(None, 8).await?,
-        vec![first.clone()]
-    );
+    let expired = store.expired_upload_sessions_page(None, 8).await?;
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].session, first.clone());
 
     // Insertion purges expired terminal sessions before applying quotas.
     assert_eq!(
@@ -595,12 +594,23 @@ async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() ->
         .expired_upload_sessions_page(None, 8)
         .await?
         .into_iter()
-        .find(|session| session.key == refreshed.key)
+        .find(|snapshot| snapshot.session.key == refreshed.key)
         .expect("the zero-TTL upload was not visible to maintenance");
-    assert_eq!(expired_snapshot, refreshed);
+    assert_eq!(expired_snapshot.session, refreshed);
+    assert!(
+        store
+            .expired_upload_session_matches(expired_snapshot.clone())
+            .await?
+    );
     assert_eq!(
         store.save_upload_session(refreshed.clone(), TTL).await?,
         StoreUploadSession::Unchanged
+    );
+    assert!(
+        !store
+            .expired_upload_session_matches(expired_snapshot.clone())
+            .await?,
+        "an old expiry snapshot still matched after its TTL was refreshed"
     );
     assert!(
         !store
@@ -759,7 +769,8 @@ async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl
         store
             .expired_upload_sessions_page(None, 8)
             .await?
-            .contains(&rejected)
+            .iter()
+            .any(|snapshot| snapshot.session == rejected)
     );
 
     store.set_query_only(true).await?;
@@ -779,7 +790,8 @@ async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl
         store
             .expired_upload_sessions_page(None, 8)
             .await?
-            .contains(&rejected),
+            .iter()
+            .any(|snapshot| snapshot.session == rejected),
         "an idempotent rejected retry refreshed the terminal TTL"
     );
     Ok(())

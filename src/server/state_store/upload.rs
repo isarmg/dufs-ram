@@ -210,23 +210,25 @@ impl StoreWorker {
         &mut self,
         after: Option<UploadSessionKey>,
         limit: i64,
-    ) -> Result<Vec<StoredUploadSession>> {
+    ) -> Result<Vec<ExpiredUploadSession>> {
         let now = now_ms()?;
         match after {
-            None => query_upload_sessions(
+            None => query_expired_upload_sessions(
                 &self.connection,
                 "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-                        durable_offset, state, stage_device_be, stage_inode_be, target_revision
+                        durable_offset, state, stage_device_be, stage_inode_be, target_revision,
+                        expires_at_ms
                    FROM upload_sessions
                   WHERE expires_at_ms <= ?1 AND state != ?2
                   ORDER BY owner_digest, upload_id
                   LIMIT ?3",
                 params![now, UPLOAD_COMMIT_STARTED, limit],
             ),
-            Some(after) => query_upload_sessions(
+            Some(after) => query_expired_upload_sessions(
                 &self.connection,
                 "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-                        durable_offset, state, stage_device_be, stage_inode_be, target_revision
+                        durable_offset, state, stage_device_be, stage_inode_be, target_revision,
+                        expires_at_ms
                    FROM upload_sessions
                   WHERE expires_at_ms <= ?1 AND state != ?2
                     AND (owner_digest > ?3
@@ -242,6 +244,20 @@ impl StoreWorker {
                 ],
             ),
         }
+    }
+
+    pub(super) fn expired_upload_session_matches(
+        &mut self,
+        expected: &ExpiredUploadSession,
+    ) -> Result<bool> {
+        let now = now_ms()?;
+        if expected.expires_at_ms > now {
+            return Ok(false);
+        }
+        Ok(
+            load_expired_upload_session(&self.connection, expected.session.key)?.as_ref()
+                == Some(expected),
+        )
     }
 
     pub(super) fn reject_upload_session(
@@ -327,22 +343,27 @@ impl StoreWorker {
 
     pub(super) fn remove_expired_upload_session_if_matches(
         &mut self,
-        expected: &StoredUploadSession,
+        expected: &ExpiredUploadSession,
     ) -> Result<bool> {
         let now = now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if load_upload_session(&transaction, expected.key)?.as_ref() != Some(expected) {
+        if expected.expires_at_ms > now
+            || load_expired_upload_session(&transaction, expected.session.key)?.as_ref()
+                != Some(expected)
+        {
             transaction.commit()?;
             return Ok(false);
         }
         let removed = transaction.execute(
             "DELETE FROM upload_sessions
-              WHERE owner_digest = ?1 AND upload_id = ?2 AND expires_at_ms <= ?3",
+              WHERE owner_digest = ?1 AND upload_id = ?2
+                AND expires_at_ms = ?3 AND expires_at_ms <= ?4",
             params![
-                expected.key.owner.as_slice(),
-                expected.key.id.as_slice(),
+                expected.session.key.owner.as_slice(),
+                expected.session.key.id.as_slice(),
+                expected.expires_at_ms,
                 now,
             ],
         )?;
@@ -506,4 +527,46 @@ fn query_upload_sessions<P: rusqlite::Params>(
     let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map(parameters, read_upload_row)?;
     rows.map(|row| decode_upload_row(row?)).collect()
+}
+
+fn load_expired_upload_session(
+    connection: &Connection,
+    key: UploadSessionKey,
+) -> Result<Option<ExpiredUploadSession>> {
+    connection
+        .query_row(
+            "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
+                    durable_offset, state, stage_device_be, stage_inode_be, target_revision,
+                    expires_at_ms
+               FROM upload_sessions
+              WHERE owner_digest = ?1 AND upload_id = ?2",
+            params![key.owner.as_slice(), key.id.as_slice()],
+            read_expired_upload_row,
+        )
+        .optional()?
+        .map(decode_expired_upload_row)
+        .transpose()
+}
+
+fn query_expired_upload_sessions<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    parameters: P,
+) -> Result<Vec<ExpiredUploadSession>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(parameters, read_expired_upload_row)?;
+    rows.map(|row| decode_expired_upload_row(row?)).collect()
+}
+
+fn read_expired_upload_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(UploadDatabaseRow, i64)> {
+    Ok((read_upload_row(row)?, row.get(10)?))
+}
+
+fn decode_expired_upload_row(
+    (row, expires_at_ms): (UploadDatabaseRow, i64),
+) -> Result<ExpiredUploadSession> {
+    Ok(ExpiredUploadSession {
+        session: decode_upload_row(row)?,
+        expires_at_ms,
+    })
 }
