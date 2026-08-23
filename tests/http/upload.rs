@@ -504,6 +504,47 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "Upload offset changed; query it again",
         "query_upload",
     )?;
+
+    let nonempty_confirmation = with_upload_overwrite_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            format!("{}changed-during-upload.txt", server.url()),
+        ),
+        upload_id,
+        6,
+        &first_revision,
+    )
+    .header("X-Dufs-Upload-Offset", "6")
+    .body(b"x".to_vec())
+    .send()?;
+    assert_eq!(nonempty_confirmation.status(), 413);
+    assert_eq!(
+        nonempty_confirmation
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "awaiting-confirmation"
+    );
+    assert_eq!(
+        nonempty_confirmation
+            .headers()
+            .get("x-dufs-upload-length")
+            .unwrap(),
+        "6"
+    );
+    assert_eq!(
+        nonempty_confirmation
+            .headers()
+            .get("x-dufs-upload-offset")
+            .unwrap(),
+        "6"
+    );
+    assert_upload_problem_body(
+        nonempty_confirmation,
+        "upload_body_exceeds_remaining_length",
+        "Request body exceeds declared remaining upload length",
+        "query_upload",
+    )?;
     assert_eq!(std::fs::read(&target)?, b"competitor");
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
 

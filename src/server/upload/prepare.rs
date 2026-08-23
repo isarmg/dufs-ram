@@ -557,10 +557,13 @@ impl Server {
             anyhow!("Upload offset {initial_offset} exceeds total length {upload_length}")
         })?;
         if request_body_length.is_some_and(|body_length| body_length > remaining) {
-            let state = if resume {
-                UploadPublicState::Running
-            } else {
-                UploadPublicState::Rejected
+            let (state, recovery) = match session_checkpoint.as_ref().map(|record| record.state) {
+                Some(UploadRecordState::AwaitingConfirmation) => (
+                    UploadPublicState::AwaitingConfirmation,
+                    RecoveryAdvice::QueryUpload,
+                ),
+                Some(_) => (UploadPublicState::Running, RecoveryAdvice::ResumeUpload),
+                None => (UploadPublicState::Rejected, RecoveryAdvice::RetryWithNewId),
             };
             apply_upload_problem(
                 res,
@@ -573,11 +576,7 @@ impl Server {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::UPLOAD_BODY_EXCEEDS_REMAINING_LENGTH,
                 "Request body exceeds declared remaining upload length",
-                if resume {
-                    RecoveryAdvice::ResumeUpload
-                } else {
-                    RecoveryAdvice::RetryWithNewId
-                },
+                recovery,
             )?;
             return Ok(None);
         }
