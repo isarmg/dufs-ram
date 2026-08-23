@@ -1690,7 +1690,16 @@ mod record_store_tests {
             .unwrap()
             .unwrap();
         let release_actor = state_store.block_actor_for_test().unwrap();
-        let mut reject = Box::pin(records.reject_for_discard(owner, upload_id, &target, &stage));
+        // Enqueue the mutating command itself before cancelling its reply.
+        // Polling `reject_for_discard` here would only enqueue that helper's
+        // preliminary read, so dropping it could never exercise a committed
+        // rejection whose delivery was cancelled.
+        let mut reject = Box::pin(state_store.reject_upload_session(
+            upload_session_key(owner, upload_id),
+            rooted_fs.state_relative_path(&target).unwrap(),
+            rooted_fs.state_relative_path(&stage).unwrap(),
+            TEST_TTL,
+        ));
         assert!(
             matches!(poll!(reject.as_mut()), Poll::Pending),
             "the reject command did not wait behind the blocked actor"
