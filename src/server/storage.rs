@@ -192,10 +192,15 @@ mod tests {
         let gate = BlockingIoGate::with_capacity_for_test(1);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let blocker = gate.spawn_io(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok(())
+        let blocker_gate = gate.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .run_io(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
         });
         tokio::task::spawn_blocking(move || {
             entered_rx

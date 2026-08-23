@@ -10,7 +10,6 @@ use std::{
     os::fd::AsFd,
     sync::{Arc, Mutex},
 };
-use tokio::task::JoinHandle;
 
 const MAX_CAPACITY_SNAPSHOT_RETRIES: usize = 8;
 // Streaming writers commonly consume reservations in small chunks. Keep
@@ -55,41 +54,17 @@ impl DiskSpaceTracker {
         self.reserve_on_device(device, requested, minimum_free, || available_space(file))
     }
 
-    pub(super) fn spawn_reservation<F: AsFd>(
-        &self,
-        file: &F,
-        requested: u64,
-        minimum_free: u64,
-    ) -> io::Result<JoinHandle<io::Result<Option<DiskSpaceReservation>>>> {
-        let file = File::from(dup(file).map_err(io::Error::from)?);
-        let tracker = self.clone();
-        Ok(blocking_io_gate().spawn_io(move || tracker.reserve(&file, requested, minimum_free)))
-    }
-
     pub(super) async fn reserve_async<F: AsFd>(
         &self,
         file: &F,
         requested: u64,
         minimum_free: u64,
     ) -> io::Result<Option<DiskSpaceReservation>> {
-        self.spawn_reservation(file, requested, minimum_free)?
-            .await
-            .map_err(io::Error::other)?
-    }
-
-    pub(super) fn spawn_allocated_reservation<F: AsFd>(
-        &self,
-        file: &F,
-        logical_bytes: u64,
-        metadata_bytes: u64,
-        minimum_free: u64,
-    ) -> io::Result<JoinHandle<io::Result<Option<DiskSpaceReservation>>>> {
         let file = File::from(dup(file).map_err(io::Error::from)?);
         let tracker = self.clone();
-        Ok(blocking_io_gate().spawn_io(move || {
-            let requested = allocated_reservation_bytes(&file, logical_bytes, metadata_bytes)?;
-            tracker.reserve(&file, requested, minimum_free)
-        }))
+        blocking_io_gate()
+            .run_io(move || tracker.reserve(&file, requested, minimum_free))
+            .await
     }
 
     pub(super) async fn reserve_allocated_async<F: AsFd>(
@@ -99,9 +74,14 @@ impl DiskSpaceTracker {
         metadata_bytes: u64,
         minimum_free: u64,
     ) -> io::Result<Option<DiskSpaceReservation>> {
-        self.spawn_allocated_reservation(file, logical_bytes, metadata_bytes, minimum_free)?
+        let file = File::from(dup(file).map_err(io::Error::from)?);
+        let tracker = self.clone();
+        blocking_io_gate()
+            .run_io(move || {
+                let requested = allocated_reservation_bytes(&file, logical_bytes, metadata_bytes)?;
+                tracker.reserve(&file, requested, minimum_free)
+            })
             .await
-            .map_err(io::Error::other)?
     }
 
     fn reserve_locked(
