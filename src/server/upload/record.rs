@@ -325,9 +325,14 @@ impl UploadRecordStore {
             Err(error) => return Err(error.into()),
         };
         let metadata = file.metadata().await?;
+        let invalid_length = match expected_state {
+            UploadRecordState::Running => metadata.len() < durable_offset,
+            UploadRecordState::AwaitingConfirmation => metadata.len() != durable_offset,
+            _ => true,
+        };
         if !metadata.file_type().is_file()
             || metadata.nlink() != 1
-            || metadata.len() < durable_offset
+            || invalid_length
             || metadata.dev() != expected_identity.device
             || metadata.ino() != expected_identity.inode
         {
@@ -1507,6 +1512,66 @@ mod record_store_tests {
             )
             .state,
             UploadRecordState::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn awaiting_confirmation_requires_the_exact_durable_stage_length() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let upload_id = Uuid::new_v4();
+        let owner_id = OwnerId::persistent("awaiting-length-owner");
+        let (target, stage) = upload_paths(temp.path(), "awaiting-length.bin", upload_id);
+        let mut file = create_stage(&rooted_fs, &stage, b"complete").await;
+        let record = UploadRecordContext::new(owner_id, upload_id, &target, &stage, 8);
+
+        records
+            .persist_checkpoint(&mut file, record, 8)
+            .await
+            .unwrap();
+        records
+            .persist_commit_started(&mut file, record)
+            .await
+            .unwrap();
+        records
+            .persist_awaiting_confirmation(&mut file, record)
+            .await
+            .unwrap();
+
+        file.write_all(b"x").await.unwrap();
+        file.flush().await.unwrap();
+        assert!(
+            records
+                .open_resumable_stage(record, 8, UploadRecordState::AwaitingConfirmation)
+                .await
+                .unwrap()
+                .is_none(),
+            "an enlarged awaiting-confirmation stage must not be reopened"
+        );
+        assert_eq!(
+            state_store
+                .upload_session(upload_session_key(owner_id, upload_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            StoredUploadState::AwaitingConfirmation,
+            "rejecting the descriptor must preserve the durable ambiguity barrier"
+        );
+
+        file.set_len(8).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert!(
+            records
+                .open_resumable_stage(record, 8, UploadRecordState::AwaitingConfirmation)
+                .await
+                .unwrap()
+                .is_some(),
+            "the exact durable awaiting-confirmation stage must still reopen"
         );
     }
 

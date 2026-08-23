@@ -352,6 +352,8 @@ Retry 会先对同一目标和 upload ID 发 HEAD。服务器以已认证 owner 
 - 至少达到 durable offset；
 - device/inode 与最后检查点一致。
 
+`Running` 可以带有尚未形成新检查点的尾部，因此 PATCH 会在同一可写 fd 上把它截回 durable offset。`AwaitingConfirmation` 已代表完整且只读打开的 stage，实际长度必须精确等于完整 offset；变短或变长都只会被判为无效 stage，不会尝试截断或把状态降回 `Running`。
+
 HEAD 请求本身不携带客户端文件总长度。服务端返回记录中的 length/offset；浏览器随后用 `parseBoundUploadProtocol()` 把它们与仍由用户选中的同一 `File` 长度进行绑定校验。完整 `running` 记录可能已经跨过 rename 边界，因此不能只因当前 stage 名称缺失就把歧义降格为 `not-seen`。
 
 请求示例：
