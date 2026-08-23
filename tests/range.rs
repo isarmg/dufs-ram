@@ -47,6 +47,21 @@ fn unknown_range_unit_is_ignored(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+#[case("bytes=0-6")]
+#[case("bytes=999-999")]
+fn head_ignores_range(server: TestServer, #[case] range: &str) -> Result<(), Error> {
+    let resp = server
+        .request(reqwest::Method::HEAD, format!("{}index.html", server.url()))
+        .header("range", range)
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key(CONTENT_RANGE));
+    assert_eq!(resp.headers().get("content-length").unwrap(), "18");
+    assert!(resp.bytes()?.is_empty());
+    Ok(())
+}
+
+#[rstest]
 fn get_file_range_beyond(server: TestServer) -> Result<(), Error> {
     let resp = server
         .request(reqwest::Method::GET, format!("{}index.html", server.url()))
