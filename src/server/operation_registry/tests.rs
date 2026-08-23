@@ -87,6 +87,11 @@ fn tracked_operation_errors_round_trip_stable_wire_metadata() {
             "Directories cannot be overwritten",
         ),
         (
+            TrackedOperationError::MkdirStateConflict,
+            "mkdir_state_conflict",
+            "Directory path conflicts with an active upload or pending delete",
+        ),
+        (
             TrackedOperationError::MoveStateConflict,
             "move_state_conflict",
             "Source or destination conflicts with an active upload or pending delete",
