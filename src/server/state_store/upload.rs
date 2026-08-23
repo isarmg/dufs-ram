@@ -204,19 +204,40 @@ impl StoreWorker {
 
     pub(super) fn expired_upload_sessions(
         &mut self,
+        after: Option<UploadSessionKey>,
         limit: i64,
     ) -> Result<Vec<StoredUploadSession>> {
         let now = now_ms()?;
-        query_upload_sessions(
-            &self.connection,
-            "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-                    durable_offset, state, stage_device_be, stage_inode_be, target_revision
-               FROM upload_sessions
-              WHERE expires_at_ms <= ?1 AND state != ?2
-              ORDER BY expires_at_ms, owner_digest, upload_id
-              LIMIT ?3",
-            params![now, UPLOAD_COMMIT_STARTED, limit],
-        )
+        match after {
+            None => query_upload_sessions(
+                &self.connection,
+                "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
+                        durable_offset, state, stage_device_be, stage_inode_be, target_revision
+                   FROM upload_sessions
+                  WHERE expires_at_ms <= ?1 AND state != ?2
+                  ORDER BY owner_digest, upload_id
+                  LIMIT ?3",
+                params![now, UPLOAD_COMMIT_STARTED, limit],
+            ),
+            Some(after) => query_upload_sessions(
+                &self.connection,
+                "SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
+                        durable_offset, state, stage_device_be, stage_inode_be, target_revision
+                   FROM upload_sessions
+                  WHERE expires_at_ms <= ?1 AND state != ?2
+                    AND (owner_digest > ?3
+                         OR (owner_digest = ?3 AND upload_id > ?4))
+                  ORDER BY owner_digest, upload_id
+                  LIMIT ?5",
+                params![
+                    now,
+                    UPLOAD_COMMIT_STARTED,
+                    after.owner.as_slice(),
+                    after.id.as_slice(),
+                    limit
+                ],
+            ),
+        }
     }
 
     pub(super) fn reject_upload_session(

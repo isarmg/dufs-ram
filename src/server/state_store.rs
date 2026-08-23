@@ -297,6 +297,7 @@ enum Command {
         reply: oneshot::Sender<Result<RejectUploadSession>>,
     },
     ListExpiredUploadSessions {
+        after: Option<UploadSessionKey>,
         limit: i64,
         reply: oneshot::Sender<Result<Vec<StoredUploadSession>>>,
     },
@@ -731,13 +732,18 @@ impl StateStore {
         self.receive(receiver).await
     }
 
-    pub(super) async fn expired_upload_sessions(
+    pub(super) async fn expired_upload_sessions_page(
         &self,
+        after: Option<UploadSessionKey>,
         limit: usize,
     ) -> Result<Vec<StoredUploadSession>> {
         let limit = query_limit(limit)?;
         let (reply, receiver) = oneshot::channel();
-        self.send(Command::ListExpiredUploadSessions { limit, reply })?;
+        self.send(Command::ListExpiredUploadSessions {
+            after,
+            limit,
+            reply,
+        })?;
         self.receive(receiver).await
     }
 
