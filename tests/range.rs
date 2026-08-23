@@ -22,6 +22,18 @@ fn get_file_range(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn get_file_range_unit_is_case_insensitive(server: TestServer) -> Result<(), Error> {
+    let resp = server
+        .request(reqwest::Method::GET, format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("Bytes=0-6"))
+        .send()?;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 0-6/18");
+    assert_eq!(resp.text()?, "This is");
+    Ok(())
+}
+
+#[rstest]
 fn get_file_range_beyond(server: TestServer) -> Result<(), Error> {
     let resp = server
         .request(reqwest::Method::GET, format!("{}index.html", server.url()))
