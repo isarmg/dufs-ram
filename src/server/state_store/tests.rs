@@ -1158,6 +1158,86 @@ async fn restart_caps_future_upload_deadlines_after_a_clock_rollback() -> Result
 }
 
 #[tokio::test]
+async fn restart_makes_future_purge_retries_due_after_a_clock_rollback() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(101, 103);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+
+    let claimed = purge(10, 1);
+    assert_eq!(
+        store.prepare_purge_job(claimed.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(claimed.key, [1; 32]).await?);
+    assert_eq!(
+        store
+            .claim_due_purge_job()
+            .await?
+            .expect("the first purge should be claimed")
+            .key,
+        claimed.key
+    );
+
+    let retried = purge(10, 2);
+    assert_eq!(
+        store.prepare_purge_job(retried.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    assert!(store.mark_purge_job_ready(retried.key, [2; 32]).await?);
+    assert_eq!(
+        store
+            .claim_due_purge_job()
+            .await?
+            .expect("the second purge should be claimed")
+            .key,
+        retried.key
+    );
+    assert!(
+        store
+            .retry_purge_job(retried.key, Duration::from_secs(30))
+            .await?
+    );
+
+    let prepared = purge(10, 3);
+    assert_eq!(
+        store.prepare_purge_job(prepared.clone()).await?,
+        StorePurgeJob::Inserted
+    );
+    store.shutdown_for_test();
+
+    let connection = Connection::open(&path)?;
+    assert_eq!(
+        connection.execute(
+            "UPDATE purge_jobs SET next_attempt_at_ms = ?1 WHERE state IN (?2, ?3)",
+            params![i64::MAX, PURGE_READY, PURGE_CLAIMED]
+        )?,
+        2
+    );
+    drop(connection);
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    let recovered_claimed = reopened
+        .claim_due_purge_job()
+        .await?
+        .expect("a recovered Claimed purge must be immediately due");
+    assert_eq!(recovered_claimed.key, claimed.key);
+    assert_eq!(recovered_claimed.attempts, 0);
+    assert!(reopened.complete_purge_job(claimed.key).await?);
+
+    let recovered_retry = reopened
+        .claim_due_purge_job()
+        .await?
+        .expect("a future Ready purge must be made due on restart");
+    assert_eq!(recovered_retry.key, retried.key);
+    assert_eq!(recovered_retry.attempts, 1);
+    assert!(reopened.complete_purge_job(retried.key).await?);
+    assert_eq!(reopened.claim_due_purge_job().await?, None);
+    assert_eq!(reopened.purge_job(prepared.key).await?, Some(prepared));
+    Ok(())
+}
+
+#[tokio::test]
 async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("state.sqlite3");
