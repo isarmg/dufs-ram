@@ -23,6 +23,9 @@ pub const TEST_USER: &str = "test-user";
 pub const TEST_PASSWORD: &str = "test-password";
 pub const TEST_ACCOUNT: &str = "test-user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 #[allow(dead_code)]
+pub const UPLOAD_STAGE_DIRECTORY: &str =
+    ".dufs-quarantine-00000000-0000-0000-0000-000000000000.hold";
+#[allow(dead_code)]
 pub const USER_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 #[allow(dead_code)]
 pub const ADMIN_ACCOUNT: &str = "admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";

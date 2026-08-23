@@ -274,7 +274,7 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 
 ## 5.13 数据库中保存什么
 
-固定文件是 `<state-dir>/state.sqlite3`，当前 schema v4 主要包含：
+固定文件是 `<state-dir>/state.sqlite3`，当前 schema v5 主要包含：
 
 | 表/概念 | 保存什么 | 不保存什么 |
 | --- | --- | --- |
@@ -300,7 +300,7 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 - application ID、schema version、quick check；
 - 数据库绑定的共享根 device/inode。
 
-空白数据库直接建立 schema v4。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内依次完成 v3 上传字段和 v4 purge revision 迁移；v3 只增加 v4 的 purge revision。其他 schema 版本在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
+空白数据库直接建立 schema v5。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内依次完成 v3 上传字段、v4 purge revision 并提升到 v5；v3 完成 purge revision 后提升到 v5；v4 在事务中只提升版本。v5 改变的是上传 stage 路径的持久语义：数据库先提升，随后启动恢复按记录的 dev/inode 把旧版同目录 stage rename 到私有 `0700` 子目录，同步两个父目录后再用全行 CAS 改写路径。这样迁移中断可以重入，旧二进制也不能在部分移动后降级打开。其他 schema 版本在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
 
 数据库不能随意复制给另一个共享根继续使用，因为里面的路径、对象身份和未完成动作都绑定旧根。
 
@@ -359,7 +359,7 @@ stateDiagram-v2
 
 若进程在第 7～9 步附近崩溃，重启时可能看到 `Prepared`。它只有 rename 前捕获的弱源身份，没有 live DELETE 在 rename 和父目录同步后提交的 trash revision；当前 target 名或 trash occupant 都不能证明哪个对象经历了原 checked rename。
 
-因此 `Prepared` 恢复规则刻意简单而保守：永远不触碰 target；trash 路径若存在任何 occupant，就原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`；随后释放 intent，绝不把它补写为 `Ready`。schema v4 迁移不会改写旧 purge 行的原状态：旧 `Prepared` 走上述 reconciler；旧 `Claimed` 启动时先恢复为 `Ready`，再与旧 `Ready` 一样由 worker 因 NULL revision 失败关闭，quarantine 当前 trash occupant 并释放 job。只有 live 提交写入的完整 revision 才能授权 `Ready/Claimed` 自动回收。
+因此 `Prepared` 恢复规则刻意简单而保守：永远不触碰 target；trash 路径若存在任何 occupant，就原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`；随后释放 intent，绝不把它补写为 `Ready`。v2/v3 的结构迁移和 v4→v5 的版本迁移都不会改写旧 purge 行的原状态：旧 `Prepared` 走上述 reconciler；旧 `Claimed` 启动时先恢复为 `Ready`，再与旧 `Ready` 一样由 worker 因 NULL revision 失败关闭，quarantine 当前 trash occupant 并释放 job。只有 live 提交写入的完整 revision 才能授权 `Ready/Claimed` 自动回收。
 
 worker 还持有 trash 根的 `O_PATH` 锚点，并在每个最终 unlink/rmdir 前把候选移入随机 quarantine/disposal 名，再比较名称与 fd 的完整 identity。缺失 revision、身份不一致、最终 `ENOTEMPTY/EXIST` 或其他 `InvalidData` 都会使整棵 trash 根进入永久 quarantine 并释放 job，不从 cursor 0 重扫；普通瞬时 I/O 才保留 job 并退避。未记账 orphan 在兜底通道满、取消或普通 I/O 失败时保持隐藏，等待以后 maintenance 重新发现；若 purge 返回 `InvalidData`，整棵根立即永久 quarantine，不再进入扫描。quarantine 永不自动清理，运维人员必须先停止 Dufs，结合日志和状态库检查对象后再手工移除。
 

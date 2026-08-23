@@ -37,7 +37,7 @@ pub(super) use model::{
 };
 
 const APPLICATION_ID: i32 = 0x4455_4653; // "DUFS"
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const UPLOAD_SESSION_CAPACITY: usize = 16_384;
 const UPLOAD_SESSION_PER_OWNER_CAPACITY: usize = 4_096;
@@ -273,6 +273,21 @@ enum Command {
     LoadUploadSession {
         key: UploadSessionKey,
         reply: oneshot::Sender<Result<Option<StoredUploadSession>>>,
+    },
+    ListUploadSessionsPageBlocking {
+        after: Option<UploadSessionKey>,
+        limit: i64,
+        reply: SyncSender<Result<Vec<StoredUploadSession>>>,
+    },
+    ListUploadSessionsPage {
+        after: Option<UploadSessionKey>,
+        limit: i64,
+        reply: oneshot::Sender<Result<Vec<StoredUploadSession>>>,
+    },
+    ReplaceUploadStagePathBlocking {
+        expected: StoredUploadSession,
+        replacement: PathBuf,
+        reply: SyncSender<Result<bool>>,
     },
     RejectUploadSession {
         key: UploadSessionKey,
@@ -631,6 +646,68 @@ impl StateStore {
         let (reply, receiver) = oneshot::channel();
         self.send(Command::LoadUploadSession { key, reply })?;
         self.receive(receiver).await
+    }
+
+    /// Startup-only keyset page used before listeners and maintenance tasks
+    /// are started. The small fixed upper bound prevents valid maximum-length
+    /// stored paths from turning reconciliation into a multi-gigabyte Vec.
+    pub(super) fn upload_sessions_page_blocking(
+        &self,
+        after: Option<UploadSessionKey>,
+        limit: usize,
+    ) -> Result<Vec<StoredUploadSession>> {
+        ensure!(
+            (1..=64).contains(&limit),
+            "Upload startup page size must be between 1 and 64"
+        );
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(Command::ListUploadSessionsPageBlocking {
+            after,
+            limit: i64::try_from(limit).context("Upload startup page size is too large")?,
+            reply,
+        })?;
+        receiver
+            .recv()
+            .context("The state store thread exited while listing upload sessions")?
+    }
+
+    pub(super) async fn upload_sessions_page(
+        &self,
+        after: Option<UploadSessionKey>,
+        limit: usize,
+    ) -> Result<Vec<StoredUploadSession>> {
+        ensure!(
+            (1..=64).contains(&limit),
+            "Upload snapshot page size must be between 1 and 64"
+        );
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::ListUploadSessionsPage {
+            after,
+            limit: i64::try_from(limit).context("Upload snapshot page size is too large")?,
+            reply,
+        })?;
+        self.receive(receiver).await
+    }
+
+    /// Replace only the immutable stage path of an exact startup snapshot.
+    /// The filesystem rename is made durable first; this CAS then closes the
+    /// crash window without refreshing the session TTL or altering its state.
+    pub(super) fn replace_upload_stage_path_blocking(
+        &self,
+        expected: StoredUploadSession,
+        replacement: PathBuf,
+    ) -> Result<bool> {
+        expected.validate()?;
+        model::validate_stored_path(&replacement, "Replacement upload stage")?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(Command::ReplaceUploadStagePathBlocking {
+            expected,
+            replacement,
+            reply,
+        })?;
+        receiver
+            .recv()
+            .context("The state store thread exited while migrating an upload stage")?
     }
 
     pub(super) async fn reject_upload_session(

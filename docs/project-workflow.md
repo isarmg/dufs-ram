@@ -548,7 +548,7 @@ flowchart LR
 
 提交任务本身持有 operation guard，并在真正调用不可逆文件系统变更前显式 `mark_commit_started`。明确的 pre-commit 业务校验失败登记 `failed`；若 future/guard 在仍为 `Reserved` 时意外丢弃，记录会被移除，状态查询变为不存在且请求可安全重试，不会泄漏虚假 `running`。只有越过 commit 边界后异常丢弃或发生无法分类的提交错误，guard 才保守登记 `unknown/outcome_uncertain`；最终父目录同步完成才登记 `succeeded`。
 
-统一 state store 当前使用 SQLite schema v4 的文件数据库，包含 `operations`、`upload_sessions` 和 `purge_jobs` 表。CLI `--state-dir <dir>` 或 YAML `state-dir: <dir>` 必须提供，固定使用 `<dir>/state.sqlite3`；目录必须已经存在、由有效服务账号所有、权限为 `0700`、不是符号链接，且与共享根不重叠；固定 DB 及 SQLite sidecar 不能与日志或配置文件重名。store 绑定共享根设备号/inode，使用 rollback journal `DELETE` 和 `synchronous=EXTRA`。空白库直接创建 v4；通过只读 application ID、根绑定和完整性预检的 v2 库会在写连接的单一 `BEGIN IMMEDIATE` 事务中依次完成 v2→v3 上传迁移和 v3→v4 purge trash revision 迁移，v3 库在一个事务中迁移到 v4，其他 schema 仍在零修改下拒绝。
+统一 state store 当前使用 SQLite schema v5 的文件数据库，包含 `operations`、`upload_sessions` 和 `purge_jobs` 表。CLI `--state-dir <dir>` 或 YAML `state-dir: <dir>` 必须提供，固定使用 `<dir>/state.sqlite3`；目录必须已经存在、由有效服务账号所有、权限为 `0700`、不是符号链接，且与共享根不重叠；固定 DB 及 SQLite sidecar 不能与日志或配置文件重名。store 绑定共享根设备号/inode，使用 rollback journal `DELETE` 和 `synchronous=EXTRA`。空白库直接创建 v5；通过只读 application ID、根绑定和完整性预检的 v2 库会在写连接的单一 `BEGIN IMMEDIATE` 事务中依次完成 v2→v3 上传迁移、v3→v4 purge trash revision 迁移并提升到 v5，v3 完成 purge 迁移后提升到 v5，v4 则只原子提升版本。随后启动恢复按持久 stage identity 把旧版同目录 stage 迁入私有目录，并在目录同步后精确 CAS 路径；其他 schema 仍在零修改下拒绝。
 
 文件型 store 恢复 operation 时先删除尚未越过文件系统提交边界的 `Reserved`，再把 operation `CommitStarted` 转为带 `outcome_uncertain` 的 `Completed/unknown`；原 `Completed` 只在尚未用完的 15 分钟 TTL 内继续按账号、ID 和指纹重放。upload session 持久化 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`，容量为全局 16384、每账号 4096，每次实际更新延长到 7 天 TTL；重启把 upload `CommitStarted` 转为 `Unknown`，而完整 stage 对应的 `AwaitingConfirmation` 保持可查询、可条件发布或可明确丢弃。首次 discard 将完全绑定的 `AwaitingConfirmation` 原位改为 `Rejected` 并设置终态 TTL；已有 `Rejected` 的重试不写库、不续 TTL，只继续 identity-safe cleanup。SQLite 是上传状态的唯一权威，共享根内不写入、读取或导入 JSON 上传状态文件。
 
@@ -678,9 +678,9 @@ flowchart TD
     PUT_BUDGET -- 否 --> NO_SPACE["507；未创建祖先/stage<br/>或上传控制记录"]
     PUT_BUDGET -- 是 --> PUT_BOUNDARY{"首次实际 filesystem/state mutation<br/>与总 deadline 原子竞争"}
     PUT_BOUNDARY -- deadline 先关闭 --> BOUNDARY_TIMEOUT["408 request_timeout + not-started + retry<br/>abort task；禁止稍后越界写入"]
-    PUT_BOUNDARY -- task 先越界 --> ENSURE_PARENT["补建缺失祖先并记录身份<br/>登记 active 语义租约"]
+    PUT_BOUNDARY -- task 先越界 --> ENSURE_PARENT["原子补建缺失祖先并记录身份<br/>创建 0700 私有 stage 目录及 0600 文件"]
     ENSURE_PARENT --> RESET["清理同 ID 的 DB 记录<br/>及已绑定 stage"]
-    RESET --> CREATE["在目标同目录 create_private_new stage<br/>显式 fchmod 为 0600"]
+    RESET --> CREATE["在目标父目录的 0700 私有保留目录内<br/>独占创建并显式 fchmod 为 0600"]
     CREATE --> ZERO["同步空 stage<br/>提交 durable_offset=0 的 Running 记录"]
     METHOD -- PATCH --> LOAD["读取并校验 state 与 stage"]
     LOAD --> OFFSET{"总长度和请求 offset<br/>与 durable state 一致？"}
@@ -709,7 +709,7 @@ flowchart TD
 
 `PUT` 必须携带恰好一个 UUID 格式的 `X-Dufs-Upload-Id` 和恰好一个十进制 `X-Dufs-Upload-Length`；`PATCH` 还必须携带恰好一个十进制 `X-Dufs-Upload-Offset`。`X-Dufs-Upload-Overwrite` 缺省或精确为 `false` 都表示 no-replace，且不得携带 revision；只有精确为 `true` 时才接受恰好一个 `X-Dufs-Target-Revision`，值必须是 64 位小写十六进制。缺少、重复、宽松变体或自相矛盾的请求头返回 `400`，不会把旧客户端的普通 PUT 默认解释为允许覆盖。合法头已经解析后，保留/越界路径、路径或 route metadata 超时、上传槽满，以及 fresh PUT 的持久路径义务冲突/失败/超时都会回显同一 ID/长度和 response-only `not-started`；槽满为 `429 + Retry-After`，义务检查分别使用 `409 upload_state_conflict`、`503 upload_state_unavailable` 和 `408 request_timeout`。这些分支除只读检查外不会改变旧检查点，也不会创建本次 stage/SQLite 行。进入受跟踪上传 task 后，owner state、目标 identity/metadata、stage identity 与空间探针仍可保持只读；这些准备步骤中未处理的 timeout 映射为绑定的 `408 request_timeout + not-started + retry`，其他未处理 I/O 映射为 `503 upload_precommit_failed + not-started + retry`。首次创建祖先/stage、截断 stage、更新上传记录或接收正文前，task 必须通过原子 mutation boundary；deadline 先关闭边界就 abort task，后续 continuation 无法再越界写入。`not-started` 只证明当前尝试未进入上传 mutation，Retry 必须先 HEAD 才能发现原 ID 是否已有 partial/terminal state。进入上传处理后，状态不存在或属于其他账号时返回不泄露差异的 `404 not-seen`；总长度或 PATCH offset 与持久化状态不一致时返回 `409`。声明长度超过上限返回 `413 rejected`，保留空间水位无法满足返回 `507`。
 
-上传状态在 SQLite schema v4 的 `upload_sessions` 表中以认证账号摘要和 UUID 为键，持久化根内相对目标/stage 路径、声明长度、durable offset、stage dev/inode、target revision 与 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`。记录容量为全局 16384、每账号 4096，每次实际更新后按 7 天 TTL 计时。对外响应使用 `running/awaiting-confirmation/committed/rejected/not-seen/not-started/unknown`；内部 `CommitStarted` 和 `Unknown` 都对外归为 `unknown`。`committed` 的同长度 PUT/PATCH 可安全重放，`rejected` 的旧 ID 必须换新 ID，部分 `running` 才可续传，`awaiting-confirmation` 只允许满 offset 空 PATCH 条件发布或 discard。服务在 rename 前先同步完整 stage，再持久化 `CommitStarted`；发布及父目录同步后才持久化 `Committed`。该提交边界记录是歧义屏障：重启会把遗留 `CommitStarted` 恢复为 `Unknown`，不会因 stage 已被 rename、缺失或路径被复用而降格为 `not-seen`；`AwaitingConfirmation` 则在重启后保留完整 stage 与条件身份。普通确定的 pre-publication 拒绝会清理旧 stage/控制记录并尽力写入 `Rejected`；显式 discard 是例外，它先原位持久化 `Rejected`，再以保留的 stage identity 做可重入清理。更早的策略拒绝可能只有本次绑定响应，因此前端对任何可重试失败仍先 HEAD。
+上传状态在 SQLite schema v5 的 `upload_sessions` 表中以认证账号摘要和 UUID 为键，持久化根内相对目标/stage 路径、声明长度、durable offset、stage dev/inode、target revision 与 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`。记录容量为全局 16384、每账号 4096，每次实际更新后按 7 天 TTL 计时。对外响应使用 `running/awaiting-confirmation/committed/rejected/not-seen/not-started/unknown`；内部 `CommitStarted` 和 `Unknown` 都对外归为 `unknown`。`committed` 的同长度 PUT/PATCH 可安全重放，`rejected` 的旧 ID 必须换新 ID，部分 `running` 才可续传，`awaiting-confirmation` 只允许满 offset 空 PATCH 条件发布或 discard。服务在 rename 前先同步完整 stage，再持久化 `CommitStarted`；发布及父目录同步后才持久化 `Committed`。该提交边界记录是歧义屏障：重启会把遗留 `CommitStarted` 恢复为 `Unknown`，不会因 stage 已被 rename、缺失或路径被复用而降格为 `not-seen`；`AwaitingConfirmation` 则在重启后保留完整 stage 与条件身份。普通确定的 pre-publication 拒绝会清理旧 stage/控制记录并尽力写入 `Rejected`；显式 discard 是例外，它先原位持久化 `Rejected`，再以保留的 stage identity 做可重入清理。更早的策略拒绝可能只有本次绑定响应，因此前端对任何可重试失败仍先 HEAD。
 
 target revision 是 SHA-256 摘要，绑定 owner 摘要、规范根内相对路径和当前 no-follow 目标的完整 replacement identity（设备/inode/类型/链接数/长度/uid/gid/mode/纳秒时间戳）；它是不透明条件令牌，不是客户端可自行构造的文件版本。预检只改善 UX：上传 admission 会重新校验 revision。目标应不存在时，最终 checked rename 使用 `RENAME_NOREPLACE` 并在发布后核对目的名称与已打开 stage；已有目标覆盖则在普通 rename 紧前复核完整 identity，但不是对外部 writer 的原子 compare-and-replace。因此过期预检不会让另一个 Dufs 请求盲目覆盖，而共享根仍必须由 Dufs 独占写入。
 
@@ -719,7 +719,7 @@ fresh PUT 先从最近存在的祖先目录 fd 读取 `st_dev`/`fstatvfs`，把�
 
 `fstat`/`fstatvfs` 不阻塞 Tokio runtime worker；内核查询在 mutex 外完成，返回后只在该 `st_dev` 的 revision 未变化时提交，最多重取 8 次，持续同盘竞争以 `WouldBlock` 失败关闭，其他设备 revision 不会使本次查询失效。文件系统报告的 available blocks 与 fragment size 相乘、分配单元取整或预算相加若发生整数溢出，都会失败关闭而不会把异常大值折返成可用小值。接收器最多写入声明的剩余字节，并继续确认正文确实结束；多出的任意字节返回 `413` 且不发布目标。预留成功后，新 PUT 为目标补建的祖先目录会逐级记录身份；若随后的会话准备或其他正文前步骤失败，服务先持久化移除 SQLite 上传会话并安全清理匹配的 stage，再按逆序只删除仍为空且身份未变的本次新建目录。
 
-上传 stage 使用严格的内部名称结构，目录列表、搜索和普通 URL 解析会排除它。已停用的严格 state/state-temp 名称也继续保留，以免历史孤儿意外暴露；服务不解析其内容、不把它们导入 SQLite，也不用于恢复上传，只允许有预算的 TTL 扫描把它们当作孤儿清理。stage 通过父目录 fd 上的 `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` 以 `0600` 原子创建；首个 durable offset 只有在 stage 文件及其父目录依次 `fsync` 后才提交 SQLite。活跃 stage 相对路径在所有 owner 间唯一，UUID 或 owner-scoped DB miss 本身都不构成删除权限；失败清理必须由仍打开的 stage fd 或库中已记录的 dev/inode 证明身份。状态查询只读 SQLite，并把库内根内相对目标/stage 路径当作不可信字节重新解析。部分 offset 的 `Running` 还用 PATCH 实际采用的同一个 `O_RDWR|O_NOFOLLOW` stage fd 校验普通文件、`nlink == 1`、长度不少于 durable offset，并与数据库中最后一次已同步 stage dev/inode 一致，再在该 fd 上截断/seek。新建目标没有旧 metadata 可重放，最终文件继续保持 `0600`；覆盖目标只在不可取消提交段中恢复允许的非特权 metadata。仅有 `.dufs-upload-` 前缀但不符合当前严格结构的名称按普通用户文件处理。
+上传 stage 使用严格的内部名称结构，目录列表、搜索和普通 URL 解析会排除它。每个目标父目录下保留一个精确名为 `.dufs-quarantine-00000000-0000-0000-0000-000000000000.hold` 的私有目录；该 nil-quarantine 形状在旧版本中已被隐藏并且绝不递归，新版本把这个唯一常量优先分类为 stage 目录。它必须是服务 euid 所有的真实目录、与目标父目录同设备且精确为 `0700`。stage 通过该目录 fd 上的 `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` 以 `0600` 原子创建；覆盖上传随后重放旧目标 mode/ACL/xattr 时，即使 stage 文件权限被放宽，未提交内容仍受不可遍历的私有父目录隔离。首个 durable offset 只有在 stage 文件及其父目录依次 `fsync` 后才提交 SQLite。已停用的严格 state/state-temp 名称也继续保留，以免历史孤儿意外暴露；服务不解析其内容、不把它们导入 SQLite，也不用于恢复上传，只允许有预算的 TTL 扫描把它们当作孤儿清理。活跃 stage 相对路径在所有 owner 间唯一，UUID 或 owner-scoped DB miss 本身都不构成删除权限；失败清理必须由仍打开的 stage fd 或库中已记录的 dev/inode 证明身份。状态查询只读 SQLite，并把库内根内相对目标/stage 路径当作不可信字节重新解析。部分 offset 的 `Running` 还用 PATCH 实际采用的同一个 `O_RDWR|O_NOFOLLOW` stage fd 校验普通文件、`nlink == 1`、长度不少于 durable offset，并与数据库中最后一次已同步 stage dev/inode 一致，再在该 fd 上截断/seek。新建目标没有旧 metadata 可重放，最终文件继续保持 `0600`；覆盖目标只在不可取消提交段中恢复允许的非特权 metadata。仅有 `.dufs-upload-` 前缀但不符合当前严格结构的名称按普通用户文件处理。schema v5 启动恢复会在打开监听器前，以 16 行 keyset 页把旧版直接位于目标父目录中的已记录 stage 按 dev/inode 以 no-replace rename 迁入私有目录，并在文件系统双父目录同步后精确 CAS 更新 SQLite；文件移动已完成而 DB 尚未更新的崩溃窗可继续收敛。活跃记录的旧名/新名冲突、身份不符或无 identity 占用失败关闭；陈旧终态记录只在 inode 精确匹配时迁移，不会阻塞后来 owner 的活跃 stage。维护 orphan 扫描也会在下钻前分页快照所有活跃 DB stage 的路径和身份，SQLite TTL 已刷新但 mtime 较旧的 stage 不会被误删。
 
 上传会话的 7 天 TTL 以 state store 的 `expires_at` 为权威值。后台维护在服务启动时立即处理一批过期 DB 会话，此后每小时重试；`Running/AwaitingConfirmation` 只在根内路径、已记录 dev/inode/类型和当前活跃租约均复核通过后才删除 stage。运行期的 `CommitStarted` 不进入过期查询，始终保留发布歧义屏障；文件型 store 重启时先把它转成 `Unknown`，随后 `Unknown/Committed` 到期只移除控制记录，不由 stage 路径推断目标是否已发布。过期 `Rejected` 若保留 stage identity，则先执行与 discard 相同的条件清理，再用原 DB snapshot 且“仍过期”谓词删除控制行；身份不符只保留路径 occupant，不把它当作删除能力。独立的根内扫描器仍以相对目录路径和 `readdir` cursor 分片，每批最多检查 1024 个目录项或运行 100 ms，但它只兜底数据库中没有行的 orphan stage、停用的严格状态形状名称和 orphan trash，不是新上传/删除的正常状态机制，也不从文件内容恢复控制状态。
 
@@ -777,7 +777,7 @@ setuid 或 setgid 位会使覆盖被拒绝，而不是复制到由上传内容�
 
 原子性和持久性是两个不同目标：
 
-- 同目录临时文件加 rename 让读者只看到旧文件或完整新文件；
+- 同一文件系统内从私有 stage 子目录 rename 到目标父目录，让读者只看到旧文件或完整新文件；
 - `flush` 只保证 Tokio 的待处理写入完成，不等于物理落盘；
 - Linux `sync_all` 要求操作系统把暂存文件数据和元数据同步到存储；
 - Linux 同文件系统 `rename` 原子发布最终文件；
@@ -959,7 +959,7 @@ flowchart TD
     C --> D["4. server.rs + server/{identity,path_policy,protocol,problem}.rs<br/>内容/状态/准入/生命周期组合，身份与公开协议"]
     D --> R["5. server/router.rs + router/{request,dispatch}.rs + assets.rs<br/>一次请求分类、生命周期/超时策略、端点分发与资源摘要"]
     R --> G["6. server/session.rs + login_rate_limit.rs<br/>登录限流、Cookie、注销与写请求同源防护"]
-    G --> OP["7. server/operation_registry.rs + state_store/{actor,database,model,operation,upload,purge}.rs<br/>schema v4 分域仓储、v2/v3 迁移、live 探针与恢复"]
+    G --> OP["7. server/operation_registry.rs + state_store/{actor,database,model,operation,upload,purge}.rs<br/>schema v5 分域仓储、v2/v3/v4 迁移、live 探针与恢复"]
     OP --> H["8. server/browser_api.rs<br/>mkdir/move/rename 与 upload preflight/discard JSON API"]
     H --> E["9. server/path_coordinator.rs<br/>同路径与祖先/后代写租约"]
     E --> F["10. server/rooted_fs.rs + rooted_fs/{purge,tests}.rs<br/>根 flock、openat2、父 fd、*at、分片递归删除及单元测试"]

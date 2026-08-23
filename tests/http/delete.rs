@@ -137,8 +137,9 @@ fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
     upload.flush()?;
 
     let upload_dir = server.path().join("locked");
+    let stage_dir = upload_dir.join(UPLOAD_STAGE_DIRECTORY);
     let start = Instant::now();
-    while !std::fs::read_dir(&upload_dir).ok().is_some_and(|entries| {
+    while !std::fs::read_dir(&stage_dir).ok().is_some_and(|entries| {
         entries.filter_map(Result::ok).any(|entry| {
             entry
                 .file_name()

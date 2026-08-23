@@ -25,7 +25,7 @@ use std::{
 };
 use uuid::Uuid;
 
-use fixtures::{TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, read_bound_url};
+use fixtures::{TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, UPLOAD_STAGE_DIRECTORY, read_bound_url};
 
 const FILE_SIZE: usize = 8 * 1024 * 1024;
 static SHUTDOWN_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -268,7 +268,7 @@ fn login(port: u16) -> Result<BrowserSession, Box<dyn Error>> {
 }
 
 fn staged_upload_path(root: &std::path::Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let stage = std::fs::read_dir(root)?
+    let stage = std::fs::read_dir(root.join(UPLOAD_STAGE_DIRECTORY))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {

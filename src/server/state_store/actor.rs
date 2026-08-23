@@ -130,6 +130,28 @@ impl StoreWorker {
                 Command::LoadUploadSession { key, reply } => {
                     let _ = reply.send(super::upload::load_upload_session(&self.connection, key));
                 }
+                Command::ListUploadSessionsPageBlocking {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let _ = reply.send(self.upload_sessions_page(after, limit));
+                }
+                Command::ListUploadSessionsPage {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let _ = reply.send(self.upload_sessions_page(after, limit));
+                }
+                Command::ReplaceUploadStagePathBlocking {
+                    expected,
+                    replacement,
+                    reply,
+                } => {
+                    let _ = reply
+                        .send(self.replace_upload_stage_path_if_matches(&expected, &replacement));
+                }
                 Command::RejectUploadSession {
                     key,
                     target_path,

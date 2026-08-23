@@ -7,7 +7,7 @@ use std::{
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const SCHEMA_V4: &str = r#"
+const SCHEMA_V5: &str = r#"
 CREATE TABLE store_meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -359,7 +359,7 @@ fn validate_database_before_mutation(connection: &Connection, root: RootIdentity
                 "Refusing to initialize a non-empty database without a DUFS schema version"
             );
         }
-        2 | 3 | SCHEMA_VERSION => {
+        2 | 3 | 4 | SCHEMA_VERSION => {
             ensure!(
                 application_id == APPLICATION_ID,
                 "The state database application id is invalid"
@@ -372,7 +372,7 @@ fn validate_database_before_mutation(connection: &Connection, root: RootIdentity
                 "The configured database application id belongs to another application"
             );
             bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2 and 3"
+                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2, 3, and 4"
             );
         }
     }
@@ -412,7 +412,7 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
 
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             insert_root_identity(&transaction, root)?;
@@ -441,6 +441,20 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
+        4 => {
+            ensure!(
+                application_id == APPLICATION_ID,
+                "The state database application id is invalid"
+            );
+            // Schema v5 changes the durable meaning of upload stage paths:
+            // the listener-start reconciliation moves v4 stages into their
+            // private directory. Bump first so an older binary can never open
+            // a database after any part of that filesystem migration.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
         SCHEMA_VERSION => {
             ensure!(
                 application_id == APPLICATION_ID,
@@ -453,7 +467,7 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
                 "The configured database application id belongs to another application"
             );
             bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2 and 3"
+                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2, 3, and 4"
             );
         }
     }

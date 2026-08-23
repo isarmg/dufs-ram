@@ -100,7 +100,7 @@ mod sqlite_cleanup_tests {
     }
 
     async fn create_stage(rooted_fs: &RootedFs, stage: &Path, contents: &[u8]) -> tokio::fs::File {
-        let (mut file, _) = rooted_fs.create_private_new(stage).await.unwrap();
+        let (mut file, _) = rooted_fs.create_private_upload_stage(stage).await.unwrap();
         file.write_all(contents).await.unwrap();
         file
     }
@@ -321,7 +321,7 @@ mod sqlite_cleanup_tests {
             let target = temp.path().join(format!("ambiguous-{index}.bin"));
             let stage = upload_temp_path(&target, upload_id)?;
             std::fs::write(&target, b"published")?;
-            std::fs::write(&stage, b"stage")?;
+            drop(create_stage(&rooted_fs, &stage, b"stage").await);
             let session = stored_session(
                 &rooted_fs,
                 [index as u8 + 1; 32],
@@ -440,6 +440,7 @@ mod sqlite_cleanup_tests {
         let upload_id = Uuid::new_v4();
         let target = temp.path().join("protected.bin");
         let stage = upload_temp_path(&target, upload_id)?;
+        std::fs::create_dir(upload_stage_directory(&stage).unwrap())?;
         std::fs::write(&stage, b"do-not-delete")?;
         let stage_key = rooted_fs.entry_key_blocking(&stage)?;
         let mut state = MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO);
@@ -463,6 +464,96 @@ mod sqlite_cleanup_tests {
         assert!(complete);
         assert!(removed.is_empty());
         assert_eq!(std::fs::read(stage)?, b"do-not-delete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refreshed_live_session_protects_an_old_private_stage_from_orphan_scan() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("refreshed.bin");
+        let stage = upload_temp_path(&target, upload_id)?;
+        let file = create_stage(&rooted_fs, &stage, b"live checkpoint").await;
+        let metadata = file.metadata().await?;
+        let old_modified = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::open(&stage)?
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))?;
+        let session = stored_session(
+            &rooted_fs,
+            [8; 32],
+            upload_id,
+            &target,
+            &stage,
+            StoredUploadState::Running,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        store
+            .save_upload_session(session, Duration::from_secs(9 * 24 * 60 * 60))
+            .await?;
+
+        let mut state = MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO);
+        load_tracked_upload_snapshot_page(&rooted_fs, &store, &mut state).await;
+        assert!(state.upload_session_snapshot_complete);
+        assert!(!state.skip_untracked_upload_cleanup);
+
+        let (_, removed, _, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            state,
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now(),
+                upload_ttl: UPLOAD_SESSION_TTL,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            |_| unreachable!("a protected upload stage is not delete trash"),
+        );
+        assert!(complete);
+        assert!(removed.is_empty());
+        assert_eq!(std::fs::read(stage)?, b"live checkpoint");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_removes_the_empty_private_stage_directory() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("orphan-stage.bin");
+        let stage = upload_temp_path(&target, upload_id)?;
+        drop(create_stage(&rooted_fs, &stage, b"orphan checkpoint").await);
+        let old_modified = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::open(&stage)?
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))?;
+
+        let (_, removed, _, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO),
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now(),
+                upload_ttl: UPLOAD_SESSION_TTL,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            |_| unreachable!("an upload stage is not delete trash"),
+        );
+
+        assert!(complete);
+        assert_eq!(removed, vec![stage.clone()]);
+        assert!(!stage.exists());
+        assert!(!stage.parent().unwrap().exists());
         Ok(())
     }
 
@@ -762,7 +853,7 @@ mod sqlite_cleanup_tests {
         std::fs::write(&trash, b"preserve")?;
         let stage_target = temp.path().join("stale-stage.bin");
         let stage = upload_temp_path(&stage_target, Uuid::new_v4())?;
-        std::fs::write(&stage, b"stale")?;
+        drop(create_stage(&rooted_fs, &stage, b"stale").await);
         let mut state =
             MaintenanceScanState::new(temp.path().to_path_buf(), Duration::from_secs(60 * 60));
         load_tracked_purge_snapshot(&rooted_fs, &store, &mut state).await;

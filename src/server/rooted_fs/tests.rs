@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::internal_names::{legacy_upload_temp_path, upload_temp_path};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tokio::io::AsyncWriteExt;
@@ -119,6 +120,136 @@ async fn private_files_are_created_with_exact_owner_only_permissions() {
     assert_eq!(
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[tokio::test]
+async fn upload_stage_creation_is_private_atomic_and_rollback_aware() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("new/deep/file.bin");
+    let stage = upload_temp_path(&target, Uuid::new_v4()).unwrap();
+    let stage_directory = stage.parent().unwrap().to_path_buf();
+
+    let (mut file, created) = rooted.create_private_upload_stage(&stage).await.unwrap();
+    file.write_all(b"private staged content").await.unwrap();
+    file.flush().await.unwrap();
+
+    let directory_metadata = std::fs::symlink_metadata(&stage_directory).unwrap();
+    let parent_metadata = std::fs::metadata(target.parent().unwrap()).unwrap();
+    let stage_metadata = std::fs::symlink_metadata(&stage).unwrap();
+    assert!(directory_metadata.is_dir());
+    assert_eq!(directory_metadata.uid(), geteuid().as_raw());
+    assert_eq!(directory_metadata.permissions().mode() & 0o7777, 0o700);
+    assert_eq!(directory_metadata.dev(), parent_metadata.dev());
+    assert!(stage_metadata.is_file());
+    assert_eq!(stage_metadata.nlink(), 1);
+    assert_eq!(stage_metadata.uid(), geteuid().as_raw());
+    assert_eq!(stage_metadata.permissions().mode() & 0o7777, 0o600);
+    assert!(
+        !rooted
+            .remove_empty_upload_stage_directory(&stage)
+            .await
+            .unwrap(),
+        "a staging directory with a live stage must not be removed"
+    );
+
+    drop(file);
+    std::fs::remove_file(&stage).unwrap();
+    assert!(
+        rooted
+            .remove_empty_upload_stage_directory(&stage)
+            .await
+            .unwrap()
+    );
+    rooted.rollback_created_ancestors(created).await.unwrap();
+    assert!(!temp.path().join("new").exists());
+}
+
+#[tokio::test]
+async fn upload_stage_creation_rejects_a_symlinked_private_directory() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("target.bin");
+    let stage = upload_temp_path(&target, Uuid::new_v4()).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, stage.parent().unwrap()).unwrap();
+
+    assert!(rooted.create_private_upload_stage(&stage).await.is_err());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[test]
+fn legacy_upload_stage_migration_is_identity_safe_and_crash_resumable() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("folder/file.bin");
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    let upload_id = Uuid::new_v4();
+    let legacy = legacy_upload_temp_path(&target, upload_id).unwrap();
+    let private = upload_temp_path(&target, upload_id).unwrap();
+    std::fs::write(&legacy, b"legacy staged content").unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o440)).unwrap();
+    let opened = std::fs::File::open(&legacy).unwrap();
+    fsetxattr(
+        &opened,
+        "user.dufs-migration-metadata",
+        b"preserved",
+        XattrFlags::empty(),
+    )
+    .unwrap();
+    let metadata = opened.metadata().unwrap();
+    let identity = StoredFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+
+    assert_eq!(
+        rooted
+            .migrate_legacy_upload_stage(&legacy, &private, Some(identity))
+            .unwrap(),
+        LegacyUploadStageMigration::Moved
+    );
+    assert!(!legacy.exists());
+    assert_eq!(std::fs::read(&private).unwrap(), b"legacy staged content");
+    let migrated = std::fs::metadata(&private).unwrap();
+    assert_eq!(migrated.permissions().mode() & 0o7777, 0o440);
+    let attributes = read_all_xattrs(std::fs::File::open(&private).unwrap()).unwrap();
+    assert!(attributes.iter().any(|(name, value)| {
+        name.as_bytes() == b"user.dufs-migration-metadata" && value == b"preserved"
+    }));
+    std::fs::write(&legacy, b"foreign legacy occupant").unwrap();
+    assert_eq!(
+        rooted
+            .migrate_legacy_upload_stage(&legacy, &private, Some(identity))
+            .unwrap(),
+        LegacyUploadStageMigration::AlreadyMoved
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"foreign legacy occupant");
+}
+
+#[test]
+fn identityless_legacy_migration_only_accepts_two_missing_stage_names() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let target = temp.path().join("file.bin");
+    let upload_id = Uuid::new_v4();
+    let legacy = legacy_upload_temp_path(&target, upload_id).unwrap();
+    let private = upload_temp_path(&target, upload_id).unwrap();
+
+    assert_eq!(
+        rooted
+            .migrate_legacy_upload_stage(&legacy, &private, None)
+            .unwrap(),
+        LegacyUploadStageMigration::Missing
+    );
+    std::fs::write(&legacy, b"unproven occupant").unwrap();
+    assert_eq!(
+        rooted
+            .migrate_legacy_upload_stage(&legacy, &private, None)
+            .unwrap(),
+        LegacyUploadStageMigration::IdentityMismatch
     );
 }
 

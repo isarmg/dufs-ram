@@ -2,7 +2,7 @@
 
 上传是当前项目状态最多的功能。它同时跨越浏览器 `File`、HTTP 流、目标目录中的 stage、SQLite 会话、覆盖确认和最终原子发布。
 
-先用一句话建立直觉：**Dufs 不把正文直接写进目标文件，而是先可靠写完一个同目录暂存文件，确认目标仍满足用户选择后，再原子发布。**
+先用一句话建立直觉：**Dufs 不把正文直接写进目标文件，而是先在目标父目录的私有子目录中可靠写完暂存文件，确认目标仍满足用户选择后，再在同一文件系统内原子发布。**
 
 ## 7.1 三个容易混淆的概念
 
@@ -263,9 +263,9 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 5. 登记受跟踪上传 task，但仍只读检查 owner + ID 会话；
 6. 检查目标/stage identity、revision、metadata 和空间准入；
 7. 在首次文件系统或上传状态 mutation 前，与总 deadline 原子竞争 mutation boundary；
-8. task 赢得边界后，必要时安全创建缺失祖先；
-9. 在目标同目录以独占方式创建隐藏 stage；
-10. 设置 mode `0600`；
+8. task 赢得边界后，原子补建必要祖先；
+9. 在目标父目录下建立或验证服务账号所有、旧版本也会隐藏并保留的 nil-quarantine 形状私有目录（`0700`）；
+10. 在该目录内以独占方式创建隐藏 stage，并设置 mode `0600`；
 11. 同步 stage 及其目录，并在 SQLite 写 `Running(offset=0)`。
 
 如果准备失败，代码会尽量自底向上回收仅由本请求创建、仍为空且 identity 未变的祖先目录，不会误删已经被并发请求使用的目录。
@@ -296,17 +296,18 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 
 只有第 7 步成功后，服务才向客户端确定报告 committed。
 
-## 7.12 stage 为什么放在目标同目录
+## 7.12 stage 为什么放在目标父目录的私有子目录
 
 隐藏 stage 名称形如项目保留的 `.dufs-upload-...part`，实际形状由 [internal_names.rs](../../src/server/internal_names.rs) 统一定义。
 
-同目录有几个关键好处：
+这个私有子目录仍与目标处在同一个父目录和文件系统中，有几个关键好处：
 
 - stage 和目标确定在同一文件系统；
 - 最终 rename 可以是原子的；
 - 不需要把巨大文件从状态目录复制到目标卷；
 - 空间准入针对真实目标卷；
 - 崩溃后可用 SQLite 的相对路径与 identity 对账。
+- 覆盖上传重放较宽的 mode 或 ACL 后，其他本机账号仍不能穿越 `0700` 父目录读取未提交内容。
 
 代价是备份共享根时不能盲目排除所有内部项，否则 stage、trash 和 SQLite 时点可能不一致。
 
@@ -601,7 +602,7 @@ sequenceDiagram
     H->>F: 观察目标 identity
     H-->>B: exists/revision/replaceable
     B->>H: PUT + ID + length + body
-    H->>F: 创建同目录 stage
+    H->>F: 在目标父目录的私有子目录创建 stage
     H->>S: Running(offset=0)
     loop 流式传输
         B->>H: 正文块
@@ -646,7 +647,7 @@ sequenceDiagram
 - **“HTTP 200 就成功。”** 错；上传协议头也必须完整一致。
 - **“revision 是内容 SHA-256。”** 错；它是绑定目标身份的不透明 token。
 - **“上传文件夹会保留空目录。”** 错；浏览器只返回文件条目。
-- **“stage 在 state-dir。”** 错；stage 在目标同目录，SQLite 在 state-dir。
+- **“stage 在 state-dir。”** 错；stage 在目标父目录的 `0700` 私有保留子目录，SQLite 在 state-dir。
 
 ## 7.28 动手阅读和测试
 

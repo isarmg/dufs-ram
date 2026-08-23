@@ -491,6 +491,63 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
 }
 
 #[tokio::test]
+async fn startup_stage_path_migration_is_an_exact_snapshot_cas() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
+    let session = upload(4, 5, 3);
+    assert_eq!(
+        store.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store.upload_sessions_page_blocking(None, 16)?,
+        vec![session.clone()]
+    );
+
+    let replacement = PathBuf::from("targets/private-stages/4-5");
+    assert!(store.replace_upload_stage_path_blocking(session.clone(), replacement.clone())?);
+    let mut migrated = session.clone();
+    migrated.stage_path = replacement;
+    assert_eq!(store.upload_session(session.key).await?, Some(migrated));
+    assert!(
+        !store.replace_upload_stage_path_blocking(
+            session,
+            PathBuf::from("targets/private-stages/stale")
+        )?,
+        "a stale startup snapshot changed a newer binding"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_upload_snapshot_is_bounded_and_keyset_paginated() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(32, 32, 8, 4))?;
+    let mut expected = Vec::new();
+    for owner in 1..=17 {
+        let session = upload(owner, 1, 0);
+        assert_eq!(
+            store.save_upload_session(session.clone(), TTL).await?,
+            StoreUploadSession::Inserted
+        );
+        expected.push(session);
+    }
+
+    let mut after = None;
+    let mut actual = Vec::new();
+    loop {
+        let page = store.upload_sessions_page_blocking(after, 5)?;
+        assert!(page.len() <= 5);
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|session| session.key);
+        actual.extend(page);
+    }
+    assert_eq!(actual, expected);
+    assert!(store.upload_sessions_page_blocking(None, 65).is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() -> Result<()> {
     let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
     let original = upload(9, 9, 0);
@@ -1044,6 +1101,34 @@ async fn v3_purge_rows_migrate_with_an_untrusted_null_trash_revision() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn v4_stage_path_semantics_migrate_to_v5_before_reopen() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(233, 239);
+    let session = upload(13, 17, 5);
+
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        store.save_upload_session(session.clone(), TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    store.shutdown_for_test();
+
+    let connection = Connection::open(&path)?;
+    connection.pragma_update(None, "user_version", 4_i32)?;
+    drop(connection);
+
+    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    assert_eq!(
+        migrated.inspect_pragmas().await?.user_version,
+        i64::from(SCHEMA_VERSION)
+    );
+    assert_eq!(migrated.upload_session(session.key).await?, Some(session));
+    migrated.shutdown_for_test();
+    Ok(())
+}
+
 #[test]
 fn rejects_foreign_database_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
     let directory = tempdir()?;
@@ -1110,8 +1195,8 @@ fn rejects_v1_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
         "unexpected error: {message}"
     );
     assert!(
-        message.contains("requires schema version 4")
-            && message.contains("migration only from schema versions 2 and 3"),
+        message.contains("requires schema version 5")
+            && message.contains("migration only from schema versions 2, 3, and 4"),
         "unexpected error: {message}"
     );
 

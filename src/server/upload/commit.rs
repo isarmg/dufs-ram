@@ -453,7 +453,20 @@ impl Server {
         )
         .await
         {
-            CommitStagedFileOutcome::Published => {}
+            CommitStagedFileOutcome::Published => {
+                if let Err(error) = self
+                    .content
+                    .rooted_fs
+                    .remove_empty_upload_stage_directory(&upload_path)
+                    .await
+                {
+                    warn!(
+                        "Failed to remove an empty upload staging directory target={} upload_id={} error={error:#}",
+                        path.display(),
+                        upload_id
+                    );
+                }
+            }
             CommitStagedFileOutcome::Rejected(mut file) => {
                 warn!(
                     "Upload commit rejected because a filesystem entry changed target={} upload_id={}",
@@ -587,6 +600,18 @@ impl Server {
                         "Failed to persist unknown upload publication target={} upload_id={} error={record_error:#}",
                         path.display(),
                         upload_id,
+                    );
+                }
+                if let Err(cleanup_error) = self
+                    .content
+                    .rooted_fs
+                    .remove_empty_upload_stage_directory(&upload_path)
+                    .await
+                {
+                    warn!(
+                        "Failed to remove a possibly empty upload staging directory target={} upload_id={} error={cleanup_error:#}",
+                        path.display(),
+                        upload_id
                     );
                 }
                 apply_upload_problem(

@@ -132,11 +132,7 @@ fn upload_rejects_configured_and_declared_length_overflow(
             .send()?;
     assert_eq!(excess_body.status(), 413);
     assert_eq!(std::fs::read(&target)?, original);
-    assert!(
-        !std::fs::read_dir(server.path())?
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
-    );
+    assert!(!server.path().join(UPLOAD_STAGE_DIRECTORY).exists());
     Ok(())
 }
 
@@ -244,13 +240,15 @@ fn upload_concurrency_and_idle_time_are_bounded(
     first.flush()?;
 
     let start = Instant::now();
-    while !std::fs::read_dir(server.path())?
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".dufs-upload-")
+    while !std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))
+        .ok()
+        .is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".dufs-upload-")
+            })
         })
     {
         if start.elapsed() > Duration::from_secs(5) {
@@ -347,9 +345,13 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
 
     let start = Instant::now();
     let stage = loop {
-        let stage = std::fs::read_dir(server.path())?
-            .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().ends_with(".part"));
+        let stage = std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            });
         if let Some(stage) = stage {
             break stage;
         }
@@ -598,9 +600,13 @@ fn staged_existing_target_metadata_cannot_be_reused_as_a_create(
 
     let start = Instant::now();
     let stage = loop {
-        let stage = std::fs::read_dir(server.path())?
-            .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().ends_with(".part"));
+        let stage = std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            });
         if let Some(stage) = stage {
             break stage;
         }
@@ -626,6 +632,15 @@ fn staged_existing_target_metadata_cannot_be_reused_as_a_create(
         "{response}"
     );
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
+    assert_eq!(stage.metadata()?.permissions().mode() & 0o777, 0o440);
+    assert_eq!(
+        std::fs::metadata(stage.path().parent().unwrap())?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "metadata replay must remain isolated behind an owner-only directory"
+    );
 
     std::fs::remove_file(&target)?;
     let refused = with_upload_headers(

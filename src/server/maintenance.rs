@@ -1,6 +1,8 @@
 use super::{
     Server,
-    internal_names::{InternalEntryName, classify_internal_name, upload_temp_path},
+    internal_names::{
+        InternalEntryName, classify_internal_name, is_upload_temp_path, upload_stage_directory,
+    },
     rooted_fs::{
         DirectoryCursor, DirectoryVisitProgress, RootedEntryKey, RootedFs, TrashEntry,
         TrashPurgeProgress,
@@ -20,6 +22,9 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use super::internal_names::upload_temp_path;
+
 pub(in crate::server) const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TRASH_ENTRY_TTL: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -27,6 +32,7 @@ const MAINTENANCE_CONTINUATION_DELAY: Duration = Duration::from_millis(25);
 const MAINTENANCE_ENTRY_BUDGET: usize = 1024;
 const MAINTENANCE_TIME_BUDGET: Duration = Duration::from_millis(100);
 const UPLOAD_SESSION_CLEANUP_BATCH: usize = 64;
+const UPLOAD_SESSION_SNAPSHOT_PAGE: usize = 16;
 const PURGE_JOB_SNAPSHOT_LIMIT: usize = 4096;
 
 pub(super) fn claim_changes() -> &'static watch::Sender<u64> {
@@ -46,6 +52,8 @@ pub(super) struct MaintenanceScanState {
     pub(super) pending_purge: Option<TrashEntry>,
     trash_ttl: Duration,
     upload_session_cleanup_complete: bool,
+    upload_session_snapshot_complete: bool,
+    upload_session_snapshot_cursor: Option<super::state_store::UploadSessionKey>,
     protected_upload_entries: HashSet<RootedEntryKey>,
     skip_untracked_upload_cleanup: bool,
     purge_job_snapshot_complete: bool,
@@ -130,6 +138,8 @@ impl MaintenanceScanState {
             pending_purge: None,
             trash_ttl,
             upload_session_cleanup_complete: false,
+            upload_session_snapshot_complete: false,
+            upload_session_snapshot_cursor: None,
             protected_upload_entries: HashSet::new(),
             skip_untracked_upload_cleanup: false,
             purge_job_snapshot_complete: false,
@@ -225,6 +235,17 @@ impl Server {
             // checks above.
             return Ok((state, false));
         }
+        if !state.upload_session_snapshot_complete {
+            load_tracked_upload_snapshot_page(
+                &self.content.rooted_fs,
+                &self.state.state_store,
+                &mut state,
+            )
+            .await;
+        }
+        if !state.upload_session_snapshot_complete {
+            return Ok((state, false));
+        }
         if !state.purge_job_snapshot_complete {
             load_tracked_purge_snapshot(
                 &self.content.rooted_fs,
@@ -275,6 +296,91 @@ impl Server {
         let complete = complete && state.upload_session_cleanup_complete;
         Ok((state, complete))
     }
+}
+
+async fn load_tracked_upload_snapshot_page(
+    rooted_fs: &RootedFs,
+    state_store: &StateStore,
+    state: &mut MaintenanceScanState,
+) {
+    match tracked_upload_entries_page(rooted_fs, state_store, state.upload_session_snapshot_cursor)
+        .await
+    {
+        Ok((entries, next, complete)) => {
+            state.protected_upload_entries.extend(entries);
+            state.upload_session_snapshot_cursor = next;
+            state.upload_session_snapshot_complete = complete;
+        }
+        Err(error) => {
+            warn!("Failed to snapshot tracked upload stages error={error:#}");
+            state.skip_untracked_upload_cleanup = true;
+            state.upload_session_snapshot_complete = true;
+        }
+    }
+}
+
+async fn tracked_upload_entries_page(
+    rooted_fs: &RootedFs,
+    state_store: &StateStore,
+    after: Option<super::state_store::UploadSessionKey>,
+) -> Result<(
+    Vec<RootedEntryKey>,
+    Option<super::state_store::UploadSessionKey>,
+    bool,
+)> {
+    let sessions = state_store
+        .upload_sessions_page(after, UPLOAD_SESSION_SNAPSHOT_PAGE)
+        .await?;
+    let complete = sessions.len() < UPLOAD_SESSION_SNAPSHOT_PAGE;
+    let next = sessions.last().map(|session| session.key);
+    let mut entries = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if session.state.is_terminal() {
+            continue;
+        }
+        let upload_id = uuid::Uuid::from_bytes(session.key.id);
+        let target = rooted_fs
+            .resolve_state_path(&session.target_path)
+            .with_context(|| format!("invalid tracked upload target for {upload_id}"))?;
+        let stage = rooted_fs
+            .resolve_state_path(&session.stage_path)
+            .with_context(|| format!("invalid tracked upload stage for {upload_id}"))?;
+        ensure!(
+            rooted_fs.state_relative_path(&target)? == session.target_path
+                && rooted_fs.state_relative_path(&stage)? == session.stage_path
+                && is_upload_temp_path(&target, upload_id, &stage)?,
+            "tracked upload paths are not canonical for {upload_id}"
+        );
+        let metadata = match rooted_fs.metadata_nofollow(&stage).await {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let identity = session.stage_identity.ok_or_else(|| {
+            anyhow!("tracked upload {upload_id} has a named stage without a durable identity")
+        })?;
+        ensure!(
+            metadata.file_type().is_file()
+                && metadata.nlink() == 1
+                && metadata.dev() == identity.device
+                && metadata.ino() == identity.inode,
+            "tracked upload {upload_id} stage does not match its durable identity"
+        );
+        entries.push(
+            rooted_fs
+                .entry_key(&stage)
+                .await
+                .with_context(|| format!("failed to key tracked upload stage {upload_id}"))?,
+        );
+    }
+    Ok((entries, next, complete))
 }
 
 async fn load_tracked_purge_snapshot(
@@ -411,8 +517,8 @@ async fn cleanup_expired_upload_session(
             return remove_expired_upload_record(state_store, expired, false).await;
         }
     };
-    let canonical_stage = match upload_temp_path(&target_path, upload_id) {
-        Ok(path) => path,
+    let stage_mapping_is_valid = match is_upload_temp_path(&target_path, upload_id, &stage_path) {
+        Ok(valid) => valid,
         Err(error) => {
             batch.skip_untracked_upload_cleanup = true;
             warn!(
@@ -421,7 +527,7 @@ async fn cleanup_expired_upload_session(
             return remove_expired_upload_record(state_store, expired, false).await;
         }
     };
-    if canonical_stage != stage_path
+    if !stage_mapping_is_valid
         || rooted_fs.state_relative_path(&target_path)? != expired.target_path
         || rooted_fs.state_relative_path(&stage_path)? != expired.stage_path
     {
@@ -520,6 +626,11 @@ async fn cleanup_expired_running_upload(
     } else {
         false
     };
+    if upload_stage_directory(stage_path).is_some() {
+        rooted_fs
+            .remove_empty_upload_stage_directory(stage_path)
+            .await?;
+    }
     remove_expired_upload_record(state_store, expired, stage_removed).await
 }
 
@@ -643,6 +754,13 @@ where
                 if internal_name == InternalEntryName::Quarantine {
                     return Ok(true);
                 }
+                if internal_name == InternalEntryName::StageDirectory {
+                    if is_dir {
+                        descend = Some(entry.path);
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
                 let is_trash = internal_name == InternalEntryName::DeleteTrash;
                 if is_dir && !is_trash {
                     warn!(
@@ -747,6 +865,19 @@ where
         match progress {
             Ok(DirectoryVisitProgress::Complete) => {
                 state.directories.pop();
+                if directory_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(classify_internal_name)
+                    == Some(InternalEntryName::StageDirectory)
+                    && let Err(error) =
+                        rooted_fs.remove_empty_upload_stage_directory_blocking(&directory_path)
+                {
+                    warn!(
+                        "Failed to remove an empty upload staging directory path={} error={error}",
+                        directory_path.display()
+                    );
+                }
             }
             Ok(DirectoryVisitProgress::Paused(cursor)) => {
                 state.directories[directory_index].cursor = cursor;
