@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{Local, SecondsFormat};
-use hyper::header::HeaderName;
+use hyper::{Method, Version, header::HeaderName};
 
 use crate::{logger::BoundedLogLine, server::Request, utils::decode_uri};
 
@@ -75,15 +75,14 @@ impl HttpLogger {
         let mut data = HashMap::default();
         if self.needs.contains(LogNeeds::REQUEST) || self.needs.contains(LogNeeds::REQUEST_URI) {
             let uri = req.uri().to_string();
-            let decoded_uri = sanitize_request_uri(&uri);
             if self.needs.contains(LogNeeds::REQUEST) {
                 data.insert(
                     "request".to_string(),
-                    format!("{} {decoded_uri}", req.method()),
+                    format_request_line(req.method(), &uri, req.version()),
                 );
             }
             if self.needs.contains(LogNeeds::REQUEST_URI) {
-                data.insert("request_uri".to_string(), decoded_uri);
+                data.insert("request_uri".to_string(), sanitize_request_uri(&uri));
             }
         }
         if self.needs.contains(LogNeeds::REQUEST_METHOD) {
@@ -300,6 +299,10 @@ fn sanitize_log_value(s: &str) -> String {
     output
 }
 
+fn format_request_line(method: &Method, uri: &str, version: Version) -> String {
+    format!("{method} {} {version:?}", sanitize_log_value(uri))
+}
+
 fn sanitize_request_uri(uri: &str) -> String {
     decode_uri(uri).map_or_else(
         || sanitize_log_value(uri),
@@ -333,6 +336,7 @@ fn append_sanitized_log_value(output: &mut BoundedLogLine, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::Uri;
 
     #[test]
     fn request_header_variables_have_one_canonical_identity() {
@@ -419,6 +423,20 @@ mod tests {
         assert_eq!(
             sanitize_log_value("line 1\r\n\"line 2\"\\tail"),
             "line 1\\r\\n\\\"line 2\\\"\\\\tail"
+        );
+    }
+
+    #[test]
+    fn complete_request_line_preserves_encoded_target_and_version() {
+        let method = Method::GET;
+        let uri = "/a%2Fb?value=%2F".parse::<Uri>().unwrap();
+        assert_eq!(
+            format_request_line(&method, &uri.to_string(), Version::HTTP_10),
+            "GET /a%2Fb?value=%2F HTTP/1.0"
+        );
+        assert_eq!(
+            format_request_line(&method, &uri.to_string(), Version::HTTP_11),
+            "GET /a%2Fb?value=%2F HTTP/1.1"
         );
     }
 
