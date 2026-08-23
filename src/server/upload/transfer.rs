@@ -111,29 +111,43 @@ impl Server {
 
             match err {
                 UploadTransferError::ExcessBody => {
-                    drop(file);
-                    self.state
-                        .upload_records
-                        .reset_and_ancestors(
-                            owner_id,
-                            upload_id,
-                            path,
-                            &upload_path,
-                            created_ancestors.take(),
-                        )
-                        .await?;
+                    if resume {
+                        file.set_len(initial_offset).await?;
+                        sync_file_to_storage(&file).await?;
+                        drop(file);
+                    } else {
+                        drop(file);
+                        self.state
+                            .upload_records
+                            .reset_and_ancestors(
+                                owner_id,
+                                upload_id,
+                                path,
+                                &upload_path,
+                                created_ancestors.take(),
+                            )
+                            .await?;
+                    }
                     apply_upload_problem(
                         res,
                         UploadErrorContext::new(
                             upload_id,
-                            UploadPublicState::Rejected,
+                            if resume {
+                                UploadPublicState::Running
+                            } else {
+                                UploadPublicState::Rejected
+                            },
                             Some(upload_length),
-                            None,
+                            resume.then_some(initial_offset),
                         ),
                         StatusCode::PAYLOAD_TOO_LARGE,
                         ErrorCode::UPLOAD_BODY_EXCEEDS_REMAINING_LENGTH,
                         "Request body exceeds declared remaining upload length",
-                        RecoveryAdvice::RetryWithNewId,
+                        if resume {
+                            RecoveryAdvice::ResumeUpload
+                        } else {
+                            RecoveryAdvice::RetryWithNewId
+                        },
                     )?;
                     return Ok(());
                 }
