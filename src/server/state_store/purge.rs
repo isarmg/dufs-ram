@@ -3,7 +3,7 @@ use super::*;
 
 impl StoreWorker {
     pub(super) fn prepare_purge_job(&mut self, proposed: &StoredPurgeJob) -> Result<StorePurgeJob> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -104,7 +104,7 @@ impl StoreWorker {
         key: PurgeJobKey,
         trash_revision: [u8; 32],
     ) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let changed = self.connection.execute(
             "UPDATE purge_jobs
                 SET state = ?1, trash_revision = ?2,
@@ -128,7 +128,7 @@ impl StoreWorker {
     }
 
     pub(super) fn claim_due_purge_job(&mut self) -> Result<Option<StoredPurgeJob>> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -168,7 +168,7 @@ impl StoreWorker {
     }
 
     pub(super) fn retry_purge_job(&mut self, key: PurgeJobKey, delay_ms: i64) -> Result<bool> {
-        let now = now_ms()?;
+        let now = self.now_ms()?;
         let next_attempt = expiration_time(now, delay_ms)?;
         Ok(self.connection.execute(
             "UPDATE purge_jobs

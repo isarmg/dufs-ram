@@ -17,7 +17,7 @@ use std::{
         mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -1045,8 +1045,58 @@ fn query_limit(limit: usize) -> Result<i64> {
 
 struct StoreWorker {
     connection: Connection,
+    clock: StoreClock,
     limits: Limits,
     deferred_abandons: VecDeque<(OperationKey, [u8; 16])>,
+}
+
+struct StoreClock {
+    wall_anchor_ms: i64,
+    monotonic_anchor: Instant,
+    last_ms: i64,
+}
+
+impl StoreClock {
+    fn new() -> Result<Self> {
+        let wall_anchor_ms = system_time_ms()?;
+        Ok(Self {
+            wall_anchor_ms,
+            monotonic_anchor: Instant::now(),
+            last_ms: wall_anchor_ms,
+        })
+    }
+
+    fn now_ms(&mut self) -> Result<i64> {
+        self.observe(system_time_ms().ok(), Instant::now())
+    }
+
+    fn observe(&mut self, wall_now_ms: Option<i64>, monotonic_now: Instant) -> Result<i64> {
+        let elapsed = monotonic_now
+            .checked_duration_since(self.monotonic_anchor)
+            .ok_or_else(|| anyhow!("The monotonic clock moved backwards"))?;
+        let elapsed_ms = i64::try_from(elapsed.as_millis())
+            .context("The monotonic clock cannot be represented in milliseconds")?;
+        let mut candidate = self
+            .wall_anchor_ms
+            .checked_add(elapsed_ms)
+            .ok_or_else(|| anyhow!("The state store clock overflowed"))?;
+
+        if let Some(wall_now_ms) = wall_now_ms.filter(|wall_now_ms| *wall_now_ms > candidate) {
+            self.wall_anchor_ms = wall_now_ms;
+            self.monotonic_anchor = monotonic_now;
+            candidate = wall_now_ms;
+        }
+
+        candidate = candidate.max(self.last_ms);
+        self.last_ms = candidate;
+        Ok(candidate)
+    }
+}
+
+impl StoreWorker {
+    fn now_ms(&mut self) -> Result<i64> {
+        self.clock.now_ms()
+    }
 }
 
 #[cfg(test)]
@@ -1078,7 +1128,7 @@ impl StoreWorker {
     }
 }
 
-fn now_ms() -> Result<i64> {
+fn system_time_ms() -> Result<i64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("The system clock is before the Unix epoch")?;

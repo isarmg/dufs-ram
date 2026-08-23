@@ -1444,6 +1444,38 @@ async fn disk_database_has_expected_identity_permissions_and_pragmas() -> Result
 }
 
 #[test]
+fn store_clock_keeps_advancing_across_wall_clock_changes() -> Result<()> {
+    let anchor = Instant::now();
+    let mut clock = StoreClock {
+        wall_anchor_ms: 1_000,
+        monotonic_anchor: anchor,
+        last_ms: 1_000,
+    };
+
+    assert_eq!(
+        clock.observe(Some(100), anchor + Duration::from_millis(100))?,
+        1_100,
+        "a wall-clock rollback must not freeze relative deadlines"
+    );
+    assert_eq!(
+        clock.observe(None, anchor + Duration::from_millis(200))?,
+        1_200,
+        "a transient wall-clock read failure must use monotonic time"
+    );
+    assert_eq!(
+        clock.observe(Some(10_000), anchor + Duration::from_millis(300))?,
+        10_000,
+        "a forward correction should advance persisted timestamps"
+    );
+    assert_eq!(
+        clock.observe(Some(500), anchor + Duration::from_millis(450))?,
+        10_150,
+        "a rollback after a forward correction must resume from the correction"
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_symbolic_link_database() -> Result<()> {
     let directory = tempdir()?;
     let target = directory.path().join("target.sqlite3");
