@@ -7,6 +7,7 @@ use super::{
         apply_registry_full, apply_registry_unavailable, apply_running,
         parse_canonical_operation_id, parse_operation_id, set_operation_headers,
     },
+    path_policy::BROWSER_COMPONENT_BYTES_LIMIT,
     problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
     protocol::OperationPublicState,
     rooted_fs::{CheckedRelocationOutcome, ReplacementTargetIdentity, RootedFs},
@@ -576,9 +577,7 @@ impl Server {
             };
             let target_exists = match self.route_metadata(&path).await {
                 Ok(metadata) => metadata.is_some(),
-                Err(error)
-                    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-                {
+                Err(error) if is_invalid_preflight_path_error(&error) => {
                     status_api_error(
                         res,
                         StatusCode::BAD_REQUEST,
@@ -590,11 +589,24 @@ impl Server {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if self
+            let has_untraversable_ancestor = match self
                 .upload_preflight_has_untraversable_ancestor(&path)
-                .await?
-                || (!target_exists && self.guard_root_contained(&path).await?)
+                .await
             {
+                Ok(invalid) => invalid,
+                Err(error) if is_invalid_preflight_path_error(&error) => true,
+                Err(error) => return Err(error.into()),
+            };
+            let escapes_root = if target_exists {
+                false
+            } else {
+                match self.guard_root_contained(&path).await {
+                    Ok(escapes) => escapes,
+                    Err(error) if is_invalid_preflight_path_error(&error) => true,
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if has_untraversable_ancestor || escapes_root {
                 status_api_error(
                     res,
                     StatusCode::BAD_REQUEST,
@@ -1420,11 +1432,20 @@ pub(in crate::server) fn apply_revision_header(
 
 fn is_single_browser_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 255
+        && name.len() <= BROWSER_COMPONENT_BYTES_LIMIT
         && name != "."
         && name != ".."
         && !name.contains('/')
         && !name.contains('\0')
+}
+
+fn is_invalid_preflight_path_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == rustix::io::Errno::LOOP.raw_os_error()
+                || code == rustix::io::Errno::NAMETOOLONG.raw_os_error()
+    )
 }
 
 fn logical_child(directory: &str, name: &str) -> String {

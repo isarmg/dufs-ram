@@ -70,6 +70,41 @@ fn upload_preflight_rejects_ambiguous_or_oversized_requests(
         "invalid_path",
     )?;
 
+    let overlong_component = upload_preflight_raw(
+        &context,
+        Method::POST,
+        Some("application/json"),
+        serde_json::to_vec(&json!({
+            "paths": [format!("/{}", "a".repeat(256))]
+        }))?,
+    )?;
+    assert_api_problem(
+        overlong_component,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid_path",
+    )?;
+
+    let overlong_relative = [
+        std::iter::repeat_n("a".repeat(255), 15)
+            .collect::<Vec<_>>()
+            .join("/"),
+        "b".repeat(254),
+        "c".to_string(),
+    ]
+    .join("/");
+    assert_eq!(overlong_relative.len(), 4096);
+    let overlong_path = upload_preflight_raw(
+        &context,
+        Method::POST,
+        Some("application/json"),
+        serde_json::to_vec(&json!({ "paths": [format!("/{overlong_relative}")] }))?,
+    )?;
+    assert_api_problem(
+        overlong_path,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid_path",
+    )?;
+
     let wrong_content_type = upload_preflight_raw(
         &context,
         Method::POST,
