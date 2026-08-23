@@ -394,6 +394,7 @@ impl Server {
                 deadline,
                 target_identity,
                 target_revision,
+                checkpoint_state,
                 target_metadata,
                 created_ancestors,
                 file,

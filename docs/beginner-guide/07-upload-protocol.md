@@ -400,6 +400,7 @@ HEAD 没有响应正文；这里的标准 `Content-Length` 等于 durable offset
 `awaiting-confirmation` 的 target revision/replaceable 组合由上传编排层继续严格验证，不只靠这张基础矩阵。
 空确认 PATCH 在传输层明确判定正文空闲/总超时、读取失败或收到非空正文时，仍保留完整 stage 和 `awaiting-confirmation`；该响应携带完整 offset，并要求客户端查询原上传，不能把它降格成普通 `running` 续传。若请求外层的同一总预算先结束，响应会更保守地报告 `unknown + query_upload`，后续 HEAD 仍可恢复真实的 `awaiting-confirmation`。
 同样地，空确认在打开完整 stage 后若无法取得或复核磁盘空间预留，会返回 `507 awaiting-confirmation + query_upload`；它不会截断只读 stage，也不会把持久状态伪报或降回 `running`。
+正文被确认为空后、metadata 重放开始前的 flush、空间、文件 metadata、精确长度和 deadline 复核也沿用这一不变量：已知失败关闭当前 fd 并保留 `AwaitingConfirmation`，绝不保存普通 `Running` 检查点或删除完整 stage。请求外层总预算先结束时仍可保守报告 `unknown`。
 
 客户端根据权威状态决定：
 

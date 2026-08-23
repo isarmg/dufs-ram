@@ -1,7 +1,7 @@
 use super::{
     failure::{
-        UploadTimeout, apply_upload_unknown, finish_precommit_io_failure,
-        finish_precommit_space_failure, finish_timed_out_upload,
+        UploadTimeout, apply_awaiting_confirmation_problem, apply_upload_unknown,
+        finish_precommit_io_failure, finish_precommit_space_failure, finish_timed_out_upload,
     },
     *,
 };
@@ -22,6 +22,7 @@ impl Server {
             deadline,
             target_identity,
             target_revision,
+            checkpoint_state,
             target_metadata,
             mut created_ancestors,
             mut file,
@@ -31,6 +32,8 @@ impl Server {
             _active_upload_files: active_upload_files,
         } = upload;
         let resume = mode.is_resume();
+        let awaiting_confirmation =
+            checkpoint_state == Some(UploadRecordState::AwaitingConfirmation);
         let initial_offset = mode.offset().unwrap_or_default();
 
         // Tokio may still have a blocking write queued after `write_all`
@@ -38,6 +41,22 @@ impl Server {
         // the outer tracked-upload deadline reports `unknown` to the client
         // while this task retains all leases until the queue is drained.
         if let Err(error) = file.flush().await {
+            if awaiting_confirmation {
+                error!(
+                    "Upload confirmation staging flush failed before commit upload_id={} error={error:#}",
+                    upload_id
+                );
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::UPLOAD_PRECOMMIT_FAILED,
+                    "Upload staging flush failed before commit",
+                )?;
+                return Ok(());
+            }
             finish_precommit_io_failure(
                 &self.state.upload_records,
                 file,
@@ -62,6 +81,18 @@ impl Server {
         {
             Ok(true) => {}
             Ok(false) | Err(_) => {
+                if awaiting_confirmation {
+                    drop(file);
+                    apply_awaiting_confirmation_problem(
+                        res,
+                        upload_id,
+                        upload_length,
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        ErrorCode::UPLOAD_INSUFFICIENT_STORAGE,
+                        "Protected free disk space could not be confirmed before commit",
+                    )?;
+                    return Ok(());
+                }
                 finish_precommit_space_failure(
                     &self.state.upload_records,
                     file,
@@ -81,6 +112,18 @@ impl Server {
             }
         }
         if Instant::now() >= deadline {
+            if awaiting_confirmation {
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::REQUEST_TIMEOUT,
+                    "Upload timed out before durable commit",
+                )?;
+                return Ok(());
+            }
             finish_timed_out_upload(
                 &self.state.upload_records,
                 file,
@@ -99,8 +142,39 @@ impl Server {
             .await?;
             return Ok(());
         }
-        let actual_length = file.metadata().await?.len();
+        let actual_length = match file.metadata().await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if awaiting_confirmation => {
+                error!(
+                    "Upload confirmation staging metadata failed before commit upload_id={} error={error:#}",
+                    upload_id
+                );
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::UPLOAD_PRECOMMIT_FAILED,
+                    "Upload staging metadata failed before commit",
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if Instant::now() >= deadline {
+            if awaiting_confirmation {
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::REQUEST_TIMEOUT,
+                    "Upload timed out before durable commit",
+                )?;
+                return Ok(());
+            }
             finish_timed_out_upload(
                 &self.state.upload_records,
                 file,
@@ -120,6 +194,22 @@ impl Server {
             return Ok(());
         }
         if actual_length != upload_length {
+            if awaiting_confirmation {
+                error!(
+                    "Upload confirmation staging length changed before commit upload_id={} expected={} actual={}",
+                    upload_id, upload_length, actual_length
+                );
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::CONFLICT,
+                    ErrorCode::UPLOAD_STAGE_INVALID,
+                    "Upload staging file changed before commit",
+                )?;
+                return Ok(());
+            }
             if actual_length < upload_length {
                 self.state
                     .upload_records
@@ -182,6 +272,18 @@ impl Server {
         }
 
         if Instant::now() >= deadline {
+            if awaiting_confirmation {
+                drop(file);
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::REQUEST_TIMEOUT,
+                    "Upload timed out before durable commit",
+                )?;
+                return Ok(());
+            }
             finish_timed_out_upload(
                 &self.state.upload_records,
                 file,
