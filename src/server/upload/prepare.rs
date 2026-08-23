@@ -207,9 +207,7 @@ impl Server {
                     return Ok(None);
                 }
                 UploadRecordState::Running => {}
-                UploadRecordState::AwaitingConfirmation
-                    if !resume || upload_offset != Some(record.upload_length) =>
-                {
+                UploadRecordState::AwaitingConfirmation if !resume => {
                     self.render_upload_target_conflict(
                         path,
                         owner_id,
@@ -222,6 +220,45 @@ impl Server {
                         res,
                     )
                     .await?;
+                    return Ok(None);
+                }
+                UploadRecordState::AwaitingConfirmation
+                    if record.upload_length != upload_length =>
+                {
+                    apply_upload_problem(
+                        res,
+                        UploadErrorContext::new(
+                            upload_id,
+                            UploadPublicState::AwaitingConfirmation,
+                            Some(record.upload_length),
+                            Some(record.durable_offset),
+                        ),
+                        StatusCode::CONFLICT,
+                        ErrorCode::UPLOAD_LENGTH_CHANGED,
+                        format!(
+                            "Upload length changed: expected {}, received {upload_length}",
+                            record.upload_length,
+                        ),
+                        RecoveryAdvice::QueryUpload,
+                    )?;
+                    return Ok(None);
+                }
+                UploadRecordState::AwaitingConfirmation
+                    if upload_offset != Some(record.durable_offset) =>
+                {
+                    apply_upload_problem(
+                        res,
+                        UploadErrorContext::new(
+                            upload_id,
+                            UploadPublicState::AwaitingConfirmation,
+                            Some(record.upload_length),
+                            Some(record.durable_offset),
+                        ),
+                        StatusCode::CONFLICT,
+                        ErrorCode::UPLOAD_OFFSET_CHANGED,
+                        "Upload offset changed; query it again",
+                        RecoveryAdvice::QueryUpload,
+                    )?;
                     return Ok(None);
                 }
                 UploadRecordState::AwaitingConfirmation => {}
@@ -476,12 +513,16 @@ impl Server {
         }
         let initial_offset = upload_offset.unwrap_or_default();
         if let Some(checkpoint) = session_checkpoint.as_ref() {
+            let public_state = match checkpoint.state {
+                UploadRecordState::AwaitingConfirmation => UploadPublicState::AwaitingConfirmation,
+                _ => UploadPublicState::Running,
+            };
             if checkpoint.upload_length != upload_length {
                 apply_upload_problem(
                     res,
                     UploadErrorContext::new(
                         upload_id,
-                        UploadPublicState::Running,
+                        public_state,
                         Some(checkpoint.upload_length),
                         Some(checkpoint.durable_offset),
                     ),
@@ -500,7 +541,7 @@ impl Server {
                     res,
                     UploadErrorContext::new(
                         upload_id,
-                        UploadPublicState::Running,
+                        public_state,
                         Some(checkpoint.upload_length),
                         Some(checkpoint.durable_offset),
                     ),

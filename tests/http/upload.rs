@@ -425,6 +425,88 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "true"
     );
 
+    let changed_length = with_upload_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            format!("{}changed-during-upload.txt", server.url()),
+        ),
+        upload_id,
+        7,
+    )
+    .header("X-Dufs-Upload-Offset", "6")
+    .body(Vec::new())
+    .send()?;
+    assert_eq!(changed_length.status(), 409);
+    assert_eq!(
+        changed_length
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "awaiting-confirmation"
+    );
+    assert_eq!(
+        changed_length
+            .headers()
+            .get("x-dufs-upload-length")
+            .unwrap(),
+        "6"
+    );
+    assert_eq!(
+        changed_length
+            .headers()
+            .get("x-dufs-upload-offset")
+            .unwrap(),
+        "6"
+    );
+    assert_upload_problem_body(
+        changed_length,
+        "upload_length_changed",
+        "Upload length changed: expected 6, received 7",
+        "query_upload",
+    )?;
+
+    let changed_offset = with_upload_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            format!("{}changed-during-upload.txt", server.url()),
+        ),
+        upload_id,
+        6,
+    )
+    .header("X-Dufs-Upload-Offset", "5")
+    .body(Vec::new())
+    .send()?;
+    assert_eq!(changed_offset.status(), 409);
+    assert_eq!(
+        changed_offset
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "awaiting-confirmation"
+    );
+    assert_eq!(
+        changed_offset
+            .headers()
+            .get("x-dufs-upload-length")
+            .unwrap(),
+        "6"
+    );
+    assert_eq!(
+        changed_offset
+            .headers()
+            .get("x-dufs-upload-offset")
+            .unwrap(),
+        "6"
+    );
+    assert_upload_problem_body(
+        changed_offset,
+        "upload_offset_changed",
+        "Upload offset changed; query it again",
+        "query_upload",
+    )?;
+    assert_eq!(std::fs::read(&target)?, b"competitor");
+    assert_eq!(std::fs::read(stage.path())?, b"abc123");
+
     // A second writer changes the target after the conflict prompt. Confirming
     // the stale revision must fail without discarding or retransmitting stage.
     std::fs::write(&target, b"new competitor")?;
