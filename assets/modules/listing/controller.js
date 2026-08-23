@@ -473,7 +473,11 @@ export function createDirectoryListing(options) {
   function showPreviousWindow() {
     renderWindow(renderedStart - MAX_RENDERED_ITEMS);
     updateVisibility();
-    (renderedStart === 0 ? listStatus : showPrevious).focus();
+    if (renderedStart === 0) {
+      focusListStatus();
+    } else {
+      showPrevious.focus();
+    }
   }
 
   function showNextWindow() {
@@ -482,7 +486,11 @@ export function createDirectoryListing(options) {
     const focusTarget = renderedEnd < items.length
       ? showNext
       : nextCursor === null ? listStatus : loadMore;
-    focusTarget.focus();
+    if (focusTarget === listStatus) {
+      focusListStatus();
+    } else {
+      focusTarget.focus();
+    }
   }
 
   /**
