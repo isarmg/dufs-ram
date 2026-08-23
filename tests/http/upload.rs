@@ -397,7 +397,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
 
     server.restart_with_default_auth_args([
         "--upload-idle-timeout",
-        "5",
+        "1",
         "--upload-total-timeout",
         "20",
     ]);
@@ -624,6 +624,60 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
 
     let chunked_session = server.login(TEST_USER, TEST_PASSWORD)?;
+    let mut stalled_confirmation = TcpStream::connect(("127.0.0.1", server.port()))?;
+    stalled_confirmation.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stalled_confirmation.write_all(
+        format!(
+            concat!(
+                "PATCH /changed-during-upload.txt HTTP/1.1\r\n",
+                "Host: localhost:{}\r\n",
+                "Cookie: {}\r\n",
+                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-Dufs-Upload-Id: {}\r\n",
+                "X-Dufs-Upload-Length: 6\r\n",
+                "X-Dufs-Upload-Offset: 6\r\n",
+                "X-Dufs-Upload-Overwrite: false\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n"
+            ),
+            server.port(),
+            chunked_session.cookie(),
+            chunked_session.csrf_token(),
+            upload_id,
+        )
+        .as_bytes(),
+    )?;
+    stalled_confirmation.flush()?;
+    let mut stalled_response = String::new();
+    stalled_confirmation.read_to_string(&mut stalled_response)?;
+    assert!(
+        stalled_response.starts_with("HTTP/1.1 408"),
+        "{stalled_response}"
+    );
+    assert!(
+        stalled_response
+            .to_ascii_lowercase()
+            .contains("x-dufs-operation-state: awaiting-confirmation"),
+        "{stalled_response}"
+    );
+    assert!(
+        stalled_response
+            .to_ascii_lowercase()
+            .contains("x-dufs-upload-offset: 6"),
+        "{stalled_response}"
+    );
+    assert!(
+        stalled_response.contains("\"code\":\"upload_idle_timeout\""),
+        "{stalled_response}"
+    );
+    assert!(
+        stalled_response.contains("\"recovery\":\"query_upload\""),
+        "{stalled_response}"
+    );
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(stage.path())?, b"abc123");
+
     let mut chunked_confirmation = TcpStream::connect(("127.0.0.1", server.port()))?;
     chunked_confirmation.set_read_timeout(Some(Duration::from_secs(5)))?;
     chunked_confirmation.write_all(

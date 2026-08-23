@@ -29,7 +29,7 @@ export const FRESH_UPLOAD_ERROR_STATUSES = Object.freeze({
 });
 export const RESUME_UPLOAD_ERROR_STATUSES = Object.freeze({
   running: Object.freeze([408, 409, 413, 500, 507]),
-  "awaiting-confirmation": Object.freeze([409, 413]),
+  "awaiting-confirmation": Object.freeze([408, 409, 413, 500, 507]),
   rejected: Object.freeze([408, 409, 413, 500, 507]),
   "not-seen": Object.freeze([404]),
   "not-started": Object.freeze([403, 404, 408, 409, 429, 503]),

@@ -379,7 +379,7 @@ HEAD 没有响应正文；这里的标准 `Content-Length` 等于 durable offset
 | upload state | fresh PUT | resume PATCH | checkpoint HEAD |
 | --- | --- | --- | --- |
 | `running` | 408、409 | 408、409、413、500、507 | 200 |
-| `awaiting-confirmation` | 409 | 409 | 409 |
+| `awaiting-confirmation` | 409 | 408、409、413、500、507 | 409 |
 | `committed` | 200、201 | 200、204 | 200 |
 | `rejected` | 408、409、413、500、507 | 408、409、413、500、507 | 409 |
 | `not-seen` | 404 | 404 | 404 |
@@ -396,6 +396,7 @@ HEAD 没有响应正文；这里的标准 `Content-Length` 等于 durable offset
 | `unknown` | 可选 | 可选；若存在仍要满足绑定和范围 |
 
 `awaiting-confirmation` 的 target revision/replaceable 组合由上传编排层继续严格验证，不只靠这张基础矩阵。
+空确认 PATCH 在传输层明确判定正文空闲/总超时、读取失败或收到非空正文时，仍保留完整 stage 和 `awaiting-confirmation`；该响应携带完整 offset，并要求客户端查询原上传，不能把它降格成普通 `running` 续传。若请求外层的同一总预算先结束，响应会更保守地报告 `unknown + query_upload`，后续 HEAD 仍可恢复真实的 `awaiting-confirmation`。
 
 客户端根据权威状态决定：
 
