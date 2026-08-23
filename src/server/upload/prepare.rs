@@ -501,6 +501,9 @@ impl Server {
         } else {
             None
         };
+        let checkpoint_state = session_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.state);
         if upload_deadline_expired_before_mutation(
             deadline,
             res,
@@ -1064,6 +1067,7 @@ impl Server {
             deadline,
             target_identity,
             target_revision: requested_revision,
+            checkpoint_state,
             target_metadata,
             created_ancestors,
             file: Some(file),

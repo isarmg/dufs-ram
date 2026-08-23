@@ -67,6 +67,7 @@ impl Server {
             deadline,
             target_identity,
             target_revision,
+            checkpoint_state,
             target_metadata,
             mut created_ancestors,
             file,
@@ -76,6 +77,8 @@ impl Server {
             _active_upload_files: active_upload_files,
         } = upload;
         let resume = mode.is_resume();
+        let awaiting_confirmation =
+            checkpoint_state == Some(UploadRecordState::AwaitingConfirmation);
         let initial_offset = mode.offset().unwrap_or_default();
         let remaining = upload_length
             .checked_sub(initial_offset)
@@ -123,7 +126,9 @@ impl Server {
 
             match err {
                 UploadTransferError::ExcessBody => {
-                    if resume {
+                    if awaiting_confirmation {
+                        drop(file);
+                    } else if resume {
                         file.set_len(initial_offset).await?;
                         sync_file_to_storage(&file).await?;
                         drop(file);
@@ -144,7 +149,9 @@ impl Server {
                         res,
                         UploadErrorContext::new(
                             upload_id,
-                            if resume {
+                            if awaiting_confirmation {
+                                UploadPublicState::AwaitingConfirmation
+                            } else if resume {
                                 UploadPublicState::Running
                             } else {
                                 UploadPublicState::Rejected
@@ -155,7 +162,9 @@ impl Server {
                         StatusCode::PAYLOAD_TOO_LARGE,
                         ErrorCode::UPLOAD_BODY_EXCEEDS_REMAINING_LENGTH,
                         "Request body exceeds declared remaining upload length",
-                        if resume {
+                        if awaiting_confirmation {
+                            RecoveryAdvice::QueryUpload
+                        } else if resume {
                             RecoveryAdvice::ResumeUpload
                         } else {
                             RecoveryAdvice::RetryWithNewId

@@ -545,6 +545,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "Request body exceeds declared remaining upload length",
         "query_upload",
     )?;
+
     assert_eq!(std::fs::read(&target)?, b"competitor");
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
 
@@ -619,6 +620,63 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
     assert!(!now_missing.headers().contains_key("x-dufs-target-revision"));
     let problem: serde_json::Value = serde_json::from_str(&now_missing.text()?)?;
     assert_eq!(problem["code"], "upload_target_changed");
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(stage.path())?, b"abc123");
+
+    let chunked_session = server.login(TEST_USER, TEST_PASSWORD)?;
+    let mut chunked_confirmation = TcpStream::connect(("127.0.0.1", server.port()))?;
+    chunked_confirmation.set_read_timeout(Some(Duration::from_secs(5)))?;
+    chunked_confirmation.write_all(
+        format!(
+            concat!(
+                "PATCH /changed-during-upload.txt HTTP/1.1\r\n",
+                "Host: localhost:{}\r\n",
+                "Cookie: {}\r\n",
+                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-Dufs-Upload-Id: {}\r\n",
+                "X-Dufs-Upload-Length: 6\r\n",
+                "X-Dufs-Upload-Offset: 6\r\n",
+                "X-Dufs-Upload-Overwrite: false\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "1\r\nx\r\n",
+                "0\r\n\r\n"
+            ),
+            server.port(),
+            chunked_session.cookie(),
+            chunked_session.csrf_token(),
+            upload_id,
+        )
+        .as_bytes(),
+    )?;
+    chunked_confirmation.flush()?;
+    let mut chunked_response = String::new();
+    chunked_confirmation.read_to_string(&mut chunked_response)?;
+    assert!(
+        chunked_response.starts_with("HTTP/1.1 413"),
+        "{chunked_response}"
+    );
+    assert!(
+        chunked_response
+            .to_ascii_lowercase()
+            .contains("x-dufs-operation-state: awaiting-confirmation"),
+        "{chunked_response}"
+    );
+    assert!(
+        chunked_response
+            .to_ascii_lowercase()
+            .contains("x-dufs-upload-offset: 6"),
+        "{chunked_response}"
+    );
+    assert!(
+        chunked_response.contains("\"code\":\"upload_body_exceeds_remaining_length\""),
+        "{chunked_response}"
+    );
+    assert!(
+        chunked_response.contains("\"recovery\":\"query_upload\""),
+        "{chunked_response}"
+    );
     assert!(!target.exists());
     assert_eq!(std::fs::read(stage.path())?, b"abc123");
 

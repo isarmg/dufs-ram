@@ -114,6 +114,7 @@ struct UploadTransaction<'a> {
     deadline: Instant,
     target_identity: ReplacementTargetIdentity,
     target_revision: Option<[u8; 32]>,
+    checkpoint_state: Option<UploadRecordState>,
     target_metadata: Option<PreservedFileMetadata>,
     created_ancestors: Option<CreatedAncestors>,
     file: Option<fs::File>,
