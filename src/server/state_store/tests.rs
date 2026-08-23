@@ -1000,6 +1000,49 @@ async fn upload_and_purge_state_survive_restart_with_unix_path_bytes() -> Result
 }
 
 #[tokio::test]
+async fn restart_refreshes_an_expired_commit_started_upload_barrier() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(79, 83);
+    let recovery_ttl = Duration::from_secs(60);
+    let store =
+        StateStore::open_with_upload_ttl(&path, &identity, CAPACITY, PER_OWNER, TTL, recovery_ttl)?;
+
+    let mut committing = upload(8, 9, 10);
+    committing.state = StoredUploadState::CommitStarted;
+    assert_eq!(
+        store
+            .save_upload_session(committing.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Inserted
+    );
+    assert!(
+        store
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .is_empty(),
+        "CommitStarted must remain excluded even after its original TTL elapsed"
+    );
+    store.shutdown_for_test();
+
+    let reopened =
+        StateStore::open_with_upload_ttl(&path, &identity, CAPACITY, PER_OWNER, TTL, recovery_ttl)?;
+    committing.state = StoredUploadState::Unknown;
+    assert_eq!(
+        reopened.upload_session(committing.key).await?,
+        Some(committing)
+    );
+    assert!(
+        reopened
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .is_empty(),
+        "recovery must grant the ambiguity barrier a fresh upload-session TTL"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("state.sqlite3");

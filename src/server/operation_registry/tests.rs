@@ -476,7 +476,7 @@ async fn persistent_registry_replays_completed_outcome_after_restart() {
     let outcome =
         OperationOutcome::failure(StatusCode::CONFLICT, TrackedOperationError::PathExists);
 
-    let registry = OperationRegistry::open(&path, identity).unwrap();
+    let registry = OperationRegistry::open(&path, identity, RESULT_TTL).unwrap();
     let BeginOperation::Started(guard) = registry
         .begin("alice", operation_id, operation_fingerprint)
         .await
@@ -488,7 +488,7 @@ async fn persistent_registry_replays_completed_outcome_after_restart() {
     registry.store.clone().shutdown_for_test();
     drop(registry);
 
-    let reopened = OperationRegistry::open(&path, identity).unwrap();
+    let reopened = OperationRegistry::open(&path, identity, RESULT_TTL).unwrap();
     assert!(matches!(
         reopened
             .begin("alice", operation_id, operation_fingerprint)

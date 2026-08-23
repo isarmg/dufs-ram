@@ -150,14 +150,16 @@ impl OperationRegistry {
     pub(super) fn open(
         path: &Path,
         root_identity: super::state_store::RootIdentity,
+        upload_ttl: Duration,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            store: StateStore::open(
+            store: StateStore::open_with_upload_ttl(
                 path,
                 &root_identity,
                 REGISTRY_CAPACITY,
                 PER_OWNER_CAPACITY,
                 RESULT_TTL,
+                upload_ttl,
             )?,
         })
     }

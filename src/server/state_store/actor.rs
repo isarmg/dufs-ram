@@ -31,8 +31,9 @@ pub(super) fn run(runtime: ActorRuntime) {
         ready,
     } = runtime;
     let _health_on_exit = HealthOnExit(healthy.clone());
-    let connection = database::open_initialized_connection(&path, root, limits.ttl_ms)
-        .with_context(|| "Failed to initialize the state database");
+    let connection =
+        database::open_initialized_connection(&path, root, limits.ttl_ms, limits.upload_ttl_ms)
+            .with_context(|| "Failed to initialize the state database");
 
     let connection = match connection {
         Ok(connection) => connection,
