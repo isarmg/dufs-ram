@@ -1,7 +1,7 @@
 use super::{
     failure::{
-        UploadTimeout, finish_precommit_space_failure, finish_timed_out_upload,
-        upload_deadline_expired, upload_deadline_expired_before_mutation,
+        UploadTimeout, apply_awaiting_confirmation_problem, finish_precommit_space_failure,
+        finish_timed_out_upload, upload_deadline_expired, upload_deadline_expired_before_mutation,
         wait_for_maintenance_claim_change,
     },
     target::{inspect_target_identity, target_revision},
@@ -504,6 +504,8 @@ impl Server {
         let checkpoint_state = session_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.state);
+        let awaiting_confirmation =
+            checkpoint_state == Some(UploadRecordState::AwaitingConfirmation);
         if upload_deadline_expired_before_mutation(
             deadline,
             res,
@@ -936,6 +938,17 @@ impl Server {
         };
         let Some(mut space_lease) = reservation else {
             drop(file);
+            if awaiting_confirmation {
+                apply_awaiting_confirmation_problem(
+                    res,
+                    upload_id,
+                    upload_length,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    ErrorCode::UPLOAD_INSUFFICIENT_STORAGE,
+                    "Insufficient protected free disk space",
+                )?;
+                return Ok(None);
+            }
             if !resume {
                 self.state
                     .upload_records
@@ -978,6 +991,18 @@ impl Server {
         {
             Ok(true) => {}
             Ok(false) | Err(_) => {
+                if awaiting_confirmation {
+                    drop(file);
+                    apply_awaiting_confirmation_problem(
+                        res,
+                        upload_id,
+                        upload_length,
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        ErrorCode::UPLOAD_INSUFFICIENT_STORAGE,
+                        "Protected free disk space could not be confirmed after staging preparation",
+                    )?;
+                    return Ok(None);
+                }
                 if !begin_upload_mutation_or_reject(
                     &mutation,
                     res,

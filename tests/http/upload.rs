@@ -402,6 +402,8 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         "20",
         "--max-upload-size",
         "5",
+        "--min-free-space",
+        "18446744073709551615",
     ]);
 
     let awaiting = server
@@ -426,6 +428,51 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
         awaiting.headers().get("x-dufs-target-replaceable").unwrap(),
         "true"
     );
+
+    let no_space_confirmation = with_upload_overwrite_headers(
+        server.request(
+            reqwest::Method::PATCH,
+            format!("{}changed-during-upload.txt", server.url()),
+        ),
+        upload_id,
+        6,
+        &first_revision,
+    )
+    .header("X-Dufs-Upload-Offset", "6")
+    .body(Vec::new())
+    .send()?;
+    assert_eq!(no_space_confirmation.status(), 507);
+    assert_eq!(
+        no_space_confirmation
+            .headers()
+            .get("x-dufs-operation-state")
+            .unwrap(),
+        "awaiting-confirmation"
+    );
+    assert_eq!(
+        no_space_confirmation
+            .headers()
+            .get("x-dufs-upload-offset")
+            .unwrap(),
+        "6"
+    );
+    assert_upload_problem_body(
+        no_space_confirmation,
+        "upload_insufficient_storage",
+        "Insufficient protected free disk space",
+        "query_upload",
+    )?;
+    assert_eq!(std::fs::read(&target)?, b"competitor");
+    assert_eq!(std::fs::read(stage.path())?, b"abc123");
+
+    server.restart_with_default_auth_args([
+        "--upload-idle-timeout",
+        "1",
+        "--upload-total-timeout",
+        "20",
+        "--max-upload-size",
+        "5",
+    ]);
 
     let changed_length = with_upload_headers(
         server.request(
