@@ -320,6 +320,41 @@ impl Server {
                 .apply_replacement_metadata(&file, metadata)
                 .await;
             if let Err(error) = metadata_result {
+                if awaiting_confirmation {
+                    let policy_refusal = matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Unsupported
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::InvalidData
+                    );
+                    error!(
+                        "Upload confirmation metadata replay failed before commit target={} upload_id={} error={error:#}",
+                        path.display(),
+                        upload_id
+                    );
+                    drop(file);
+                    apply_awaiting_confirmation_problem(
+                        res,
+                        upload_id,
+                        upload_length,
+                        if policy_refusal {
+                            StatusCode::CONFLICT
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        },
+                        if policy_refusal {
+                            ErrorCode::UPLOAD_METADATA_PRESERVATION_REFUSED
+                        } else {
+                            ErrorCode::UPLOAD_PRECOMMIT_FAILED
+                        },
+                        if policy_refusal {
+                            "Cannot preserve target metadata; overwrite was refused"
+                        } else {
+                            "Target metadata replay failed before commit"
+                        },
+                    )?;
+                    return Ok(());
+                }
                 drop(file);
                 self.state
                     .upload_records
@@ -361,6 +396,18 @@ impl Server {
         {
             Ok(true) => {}
             Ok(false) | Err(_) => {
+                if awaiting_confirmation {
+                    drop(file);
+                    apply_awaiting_confirmation_problem(
+                        res,
+                        upload_id,
+                        upload_length,
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        ErrorCode::UPLOAD_INSUFFICIENT_STORAGE,
+                        "Insufficient protected free disk space before publication",
+                    )?;
+                    return Ok(());
+                }
                 drop(file);
                 let cleanup = self
                     .state
