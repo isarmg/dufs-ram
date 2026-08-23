@@ -576,14 +576,14 @@ SQLite transaction 和文件系统 transaction 不是同一个原子提交域。
 flowchart TD
     SELECT["通过文件或文件夹选择器<br/>选择一个或多个文件"] --> BOUNDS{"≤512 个文件且<br/>UTF-8 路径合计 ≤256 KiB？"}
     BOUNDS -- 否 --> SELECT_ERROR["整批拒绝；不创建任务或 DOM"]
-    BOUNDS -- 是 --> PREFLIGHT["POST upload/preflight<br/>按最终绝对逻辑路径原顺序绑定"]
+    BOUNDS -- 是 --> PENDING{"本批同步预留后<br/>预准入文件 + pending 行 ≤512？"}
+    PENDING -- 否 --> SELECT_ERROR
+    PENDING -- 是 --> PREFLIGHT["POST upload/preflight<br/>按最终绝对逻辑路径原顺序绑定"]
     PREFLIGHT --> CONFLICTS{"存在可替换的重名目标？"}
-    CONFLICTS -- 否 --> PENDING{"加入后 pending 行 ≤512？"}
+    CONFLICTS -- 否 --> ID["把实际准入数原子转为 pending 行<br/>为每个 File 对象生成新 UUID Upload ID"]
     CONFLICTS -- 是 --> CONFIRM["只列出冲突文件<br/>覆盖若未变 / 跳过冲突 / 取消整批"]
     CONFIRM -- 取消 --> SELECT
-    CONFIRM -- 覆盖或跳过 --> PENDING
-    PENDING -- 否 --> SELECT_ERROR
-    PENDING -- 是 --> ID["为每个 File 对象生成新 UUID Upload ID"]
+    CONFIRM -- 覆盖或跳过 --> ID
     ID --> QUEUE["加入支持 O(1) 取消的内存队列<br/>终态仅保留最近 200 行"]
     QUEUE --> SLOT{"有并发槽位？"}
     SLOT -- 否 --> WAIT["等待"]
@@ -632,7 +632,7 @@ flowchart TD
 
 浏览器不再把上传 ID 或续传身份写入 `localStorage`。文件名、相对路径、大小和 `lastModified` 不能证明两个文件内容相同；跨刷新按这些属性复用旧 ID 可能把不同内容拼接成一个最终文件。当前实现只允许同一页面、同一个仍在内存中的 `File` 对象在结果可确认失败后重试。HEAD 只信任服务端已经持久化的 owner、终态、offset 和首次绑定的总长度；记录绑定认证账号摘要，另一个账号查询同一 ID 与不存在一样得到 `404 not-seen`。PUT/PATCH 的 `not-started` 仅证明当前尝试没有进入上传 mutation，不证明旧 ID 没有检查点；它可显示 Retry，但点击后仍先 HEAD 原 ID，HEAD 本身不会返回 `not-started`。
 
-文件选择在创建 uploader、UUID 或 DOM 行之前整体校验：单批最多 512 个文件，全部规范逻辑路径的 UTF-8 字节合计最多 256 KiB；任一无效项或超限会拒绝整批。前端再把最终绝对逻辑路径以相同 512/256 KiB 边界发送到预检 API；服务端还有 2 MiB wire-body 上限，严格拒绝空集、重复路径、非规范或越界路径。响应的数量、顺序和每个 path 必须与请求精确绑定，否则整批不入队。只有预检为已存在、可替换且携带合法 revision 的项才弹覆盖确认；无冲突批次零弹窗。pending（排队或执行）任务最多 512 行，终态历史只保留最近 200 行并通过状态区报告已隐藏数量。DELETE、MOVE、RENAME、MKDIR、空 PUT 和普通上传共用 `committed/outcome-unknown/refresh-required/not-committed` 四值失效契约：前两者分别表示已确认写入和仍可能写入；`refresh-required` 表示服务器已经证明当前 snapshot 陈旧，但不声称本次写入成功；只有 `not-committed` 才确认列表未变。前三者会递增列表 revision、使已有分页视图失效并通过 live status 显示刷新提示。上传每一次可信 target-change/reset-stage 和 tracked DELETE/MOVE/RENAME 的确定 revision 冲突都使用 `refresh-required`；uploader 不缓存“已经失效过”，所以两次冲突之间完成 Refresh 后，第二次响应仍会使新 snapshot 失效。非法名称等能证明目录未变的拒绝及分发前取消才保持 snapshot。用户下一次加载会清空旧页并从第一页请求，迟到的旧 revision 响应也不会提交到 DOM。
+文件选择在创建 uploader、UUID 或 DOM 行之前整体校验：单批最多 512 个文件，全部规范逻辑路径的 UTF-8 字节合计最多 256 KiB；任一无效项或超限会拒绝整批。合法非空选择会在串入异步队列前，按原始 `File` 数同步预留全局容量；预检/覆盖确认中的预准入文件与排队或执行中的 pending 行始终合计不超过 512，失败、取消或全量跳过会释放预留，实际准入则在无异步间隙的片段内把预留原子转为 pending 行。超限的新选择不会加入 Promise 链，也不会保留其 `File` 引用。前端再把最终绝对逻辑路径以相同 512/256 KiB 边界发送到预检 API；服务端还有 2 MiB wire-body 上限，严格拒绝空集、重复路径、非规范或越界路径。响应的数量、顺序和每个 path 必须与请求精确绑定，否则整批不入队。只有预检为已存在、可替换且携带合法 revision 的项才弹覆盖确认；无冲突批次零弹窗。终态历史只保留最近 200 行并通过状态区报告已隐藏数量。DELETE、MOVE、RENAME、MKDIR、空 PUT 和普通上传共用 `committed/outcome-unknown/refresh-required/not-committed` 四值失效契约：前两者分别表示已确认写入和仍可能写入；`refresh-required` 表示服务器已经证明当前 snapshot 陈旧，但不声称本次写入成功；只有 `not-committed` 才确认列表未变。前三者会递增列表 revision、使已有分页视图失效并通过 live status 显示刷新提示。上传每一次可信 target-change/reset-stage 和 tracked DELETE/MOVE/RENAME 的确定 revision 冲突都使用 `refresh-required`；uploader 不缓存“已经失效过”，所以两次冲突之间完成 Refresh 后，第二次响应仍会使新 snapshot 失效。非法名称等能证明目录未变的拒绝及分发前取消才保持 snapshot。用户下一次加载会清空旧页并从第一页请求，迟到的旧 revision 响应也不会提交到 DOM。
 
 刷新、重新登录或关闭页面会失去旧任务关联；重新选择文件始终生成新 ID 并完整 PUT。正文完成发送后，前端会清除传输 idle/total 计时器，进入最长 5 分钟的独立提交等待阶段。XHR 只在 fresh PUT 返回 `200/201` 或 PATCH 返回 `200/204`、状态为 `committed` 且精确长度/满 offset 同时成立时报告成功。XHR 发出后的网络错误、用户停止等待或客户端超时，以及直接响应的 `not-seen`、显式 `unknown`、缺失/非法状态或 committed 不匹配，都显示不可重试的结果未知。直接响应的 `running/rejected/not-started` 可进入人工 Retry，但不在该响应上立即信任长度/offset；Retry 始终先 HEAD 原 ID，只有 HEAD 严格确认 `rejected/not-seen` 才换新 ID，确认部分 `running` 且长度/offset 与原 `File` 一致才从该 offset PATCH，满 offset `running` 则转为 unknown。HEAD 还可以用 `409 awaiting-confirmation`、满 offset、当前 revision 和 replaceable 标志重建二次冲突选择；HEAD 本身的网络、取消或超时失败保留 Retry，已收到却无法安全解释的 HTTP/协议响应转为 unknown 并暂停队列。
 

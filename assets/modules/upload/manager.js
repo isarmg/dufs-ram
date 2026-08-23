@@ -141,6 +141,8 @@ const UNKNOWN_UPLOAD_RESULT_MESSAGE =
  * }} TerminalUploadRow
  */
 
+/** @typedef {{ count: number, active: boolean }} PreflightReservation */
+
 /** @param {UploadManagerOptions} options */
 export function createUploadManager(options) {
   const {
@@ -167,6 +169,7 @@ export function createUploadManager(options) {
   const knownTargets = new Set();
   let running = 0;
   let pendingRows = 0;
+  let preflightReservedRows = 0;
   let nextIndex = 0;
   let nextBatchId = 0;
   /** @type {Map<number, {
@@ -202,7 +205,10 @@ export function createUploadManager(options) {
 
   /** @param {BeforeUnloadEvent} event */
   const beforeUnload = event => {
-    if (queueState === "running" && (queue.size > 0 || running > 0)) {
+    if (
+      queueState === "running" &&
+      (preflightReservedRows > 0 || queue.size > 0 || running > 0)
+    ) {
       event.preventDefault();
       event.returnValue = "";
       return "";
@@ -256,7 +262,52 @@ export function createUploadManager(options) {
 
   /** @param {number} [additionalRows] */
   function hasPendingCapacity(additionalRows = 1) {
-    return pendingRows + additionalRows <= UPLOAD_PENDING_ROW_LIMIT;
+    return pendingRows + preflightReservedRows + additionalRows <=
+      UPLOAD_PENDING_ROW_LIMIT;
+  }
+
+  /** @param {number} count @returns {PreflightReservation | null} */
+  function reservePreflightRows(count) {
+    if (!hasPendingCapacity(count)) return null;
+    preflightReservedRows += count;
+    return { count, active: true };
+  }
+
+  /** @param {PreflightReservation | null} reservation */
+  function releasePreflightRows(reservation) {
+    if (!reservation?.active) return;
+    if (preflightReservedRows < reservation.count) {
+      throw new Error("Upload preflight reservation accounting underflowed");
+    }
+    preflightReservedRows -= reservation.count;
+    reservation.active = false;
+  }
+
+  /**
+   * @param {PreflightReservation | null} reservation
+   * @param {number} admittedRows
+   */
+  function transferPreflightRows(reservation, admittedRows) {
+    if (
+      !reservation?.active ||
+      !Number.isSafeInteger(admittedRows) ||
+      admittedRows < 1 ||
+      admittedRows > reservation.count ||
+      preflightReservedRows < reservation.count
+    ) {
+      throw new Error("Upload preflight reservation is invalid");
+    }
+    const remainingReserved = preflightReservedRows - reservation.count;
+    if (
+      pendingRows + remainingReserved + admittedRows >
+        UPLOAD_PENDING_ROW_LIMIT
+    ) {
+      return false;
+    }
+    preflightReservedRows = remainingReserved;
+    pendingRows += admittedRows;
+    reservation.active = false;
+    return true;
   }
 
   function showPendingLimitMessage() {
@@ -1334,8 +1385,13 @@ export function createUploadManager(options) {
   /**
    * @param {ReturnType<typeof prepareUploadSelection>} selection
    * @param {Element | null} returnFocus
+   * @param {PreflightReservation | null} reservation
    */
-  async function enqueueSelection(selection, returnFocus) {
+  async function enqueueReservedSelection(
+    selection,
+    returnFocus,
+    reservation,
+  ) {
     if (!selection.ok) {
       queueMessage.textContent = selection.error;
       queueMessage.classList.remove("hidden");
@@ -1466,15 +1522,14 @@ export function createUploadManager(options) {
       queueMessage.classList.remove("hidden");
       return;
     }
-    if (!hasPendingCapacity(uploadEntries.length)) {
+    if (!transferPreflightRows(reservation, uploadEntries.length)) {
       showPendingLimitMessage();
       return;
     }
 
-    // Reserve the entire batch before yielding between DOM chunks. Recovery
-    // clicks and later selections therefore cannot race the global row cap.
-    pendingRows += uploadEntries.length;
-
+    // Convert the selection reservation into accounting for every admitted
+    // row before yielding between DOM chunks. Recovery clicks and later
+    // selections therefore cannot race the global cap.
     const batchId = nextBatchId++;
     const batch = {
       members: new Set(),
@@ -1538,6 +1593,19 @@ export function createUploadManager(options) {
     }
   }
 
+  /**
+   * @param {ReturnType<typeof prepareUploadSelection>} selection
+   * @param {Element | null} returnFocus
+   * @param {PreflightReservation | null} reservation
+   */
+  async function enqueueSelection(selection, returnFocus, reservation) {
+    try {
+      await enqueueReservedSelection(selection, returnFocus, reservation);
+    } finally {
+      releasePreflightRows(reservation);
+    }
+  }
+
   return Object.freeze({
     /**
      * @param {FileList | File[] | null | undefined} files
@@ -1547,15 +1615,27 @@ export function createUploadManager(options) {
       // Capture the live FileList before the input is reset. Validation is
       // bounded and creates no uploader state or DOM.
       const selection = prepareUploadSelection(files);
+      if (!selection.ok) {
+        queueMessage.textContent = selection.error;
+        queueMessage.classList.remove("hidden");
+        return Promise.resolve();
+      }
+      if (selection.entries.length === 0) return Promise.resolve();
+      const reservation = reservePreflightRows(selection.entries.length);
+      if (!reservation) {
+        showPendingLimitMessage();
+        return Promise.resolve();
+      }
       const enqueue = () => enqueueSelection(
         selection,
         addOptions.returnFocus || document.activeElement,
+        reservation,
       );
       enqueueTail = enqueueTail.then(enqueue, enqueue);
       return enqueueTail;
     },
     isBusy() {
-      return running > 0 || queue.size > 0;
+      return preflightReservedRows > 0 || running > 0 || queue.size > 0;
     },
   });
 }

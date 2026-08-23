@@ -1020,6 +1020,126 @@ test("多个合法批次合计超过全局上限时不创建额外上传行", as
   })).toBeHidden();
 });
 
+test("预检中的文件会同步占用全局上传容量", async ({ appPage: page }) => {
+  test.setTimeout(60_000);
+  await page.evaluate(() => {
+    XMLHttpRequest.prototype.send = function () {
+      // Keep admitted rows non-terminal without sending file data.
+    };
+  });
+
+  let preflightCount = 0;
+  let markFirstPreflightStarted;
+  let releaseFirstPreflight;
+  const firstPreflightStarted = new Promise(resolve => {
+    markFirstPreflightStarted = resolve;
+  });
+  const firstPreflightGate = new Promise(resolve => {
+    releaseFirstPreflight = resolve;
+  });
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    preflightCount++;
+    if (preflightCount === 1) {
+      markFirstPreflightStarted();
+      await firstPreflightGate;
+    }
+    const { paths } = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        targets: paths.map(path => ({
+          path,
+          exists: false,
+          revision: null,
+          replaceable: true,
+        })),
+      }),
+    });
+  });
+
+  const firstBatch = Array.from({ length: 300 }, (_, index) => ({
+    name: `reserved-first-${index}.txt`,
+    buffer: Buffer.from("a"),
+  }));
+  await selectFiles(page, "#file", firstBatch);
+  await firstPreflightStarted;
+
+  const secondBatch = Array.from({ length: 213 }, (_, index) => ({
+    name: `reserved-second-${index}.txt`,
+    buffer: Buffer.from("b"),
+  }));
+  try {
+    await selectFiles(page, "#file", secondBatch);
+    await expect(page.locator(".upload-queue-message")).toContainText(
+      "At most 512 uploads may be pending at once",
+    );
+    expect(preflightCount).toBe(1);
+    await expect(page.locator("#upload0")).toHaveCount(0);
+  } finally {
+    releaseFirstPreflight();
+  }
+
+  await expect(page.locator(".upload-status")).toHaveCount(300);
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  expect(preflightCount).toBe(1);
+  await expect(page.locator("#upload300")).toHaveCount(0);
+});
+
+test("预检失败会释放为该选择预留的上传容量", async ({ appPage: page }) => {
+  await page.evaluate(() => {
+    XMLHttpRequest.prototype.send = function () {
+      // Keep the later admitted row non-terminal without sending file data.
+    };
+  });
+  let preflightCount = 0;
+  await page.route("**/__dufs__/api/upload/preflight", async route => {
+    preflightCount++;
+    if (preflightCount === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: problemDetails(
+          503,
+          "state_store_unavailable",
+          "Injected preflight failure",
+        ),
+      });
+      return;
+    }
+    const { paths } = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        targets: paths.map(path => ({
+          path,
+          exists: false,
+          revision: null,
+          replaceable: true,
+        })),
+      }),
+    });
+  });
+
+  const rejectedBatch = Array.from({ length: 512 }, (_, index) => ({
+    name: `released-reservation-${index}.txt`,
+    buffer: Buffer.from("x"),
+  }));
+  await selectFiles(page, "#file", rejectedBatch);
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "Unable to check upload destinations",
+  );
+  await selectFiles(page, "#file", [{
+    name: "after-reservation-release.txt",
+    buffer: Buffer.from("ok"),
+  }]);
+  await expect(page.locator(".upload-status")).toHaveCount(1);
+  expect(preflightCount).toBe(2);
+});
+
 test("终态历史淘汰聚焦行时把焦点移到相邻结果或历史摘要", async ({
   appPage: page,
 }) => {
