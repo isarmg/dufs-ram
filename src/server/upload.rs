@@ -338,8 +338,6 @@ impl Server {
                 return Ok(());
             }
         };
-        res.headers_mut()
-            .typed_insert(ContentLength(checkpoint.durable_offset));
         apply_upload_record_headers(
             res,
             upload_id,

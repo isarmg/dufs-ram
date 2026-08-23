@@ -367,7 +367,7 @@ fn durable_resumable_upload_keeps_old_file_until_commit(
         .header("X-Dufs-Upload-Id", upload_id.to_string())
         .send()?;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers().get("content-length").unwrap(), "3");
+    assert!(!resp.headers().contains_key("content-length"));
     assert_eq!(resp.headers().get("x-dufs-upload-offset").unwrap(), "3");
     assert_eq!(resp.headers().get("x-dufs-upload-length").unwrap(), "6");
 
