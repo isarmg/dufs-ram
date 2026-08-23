@@ -71,35 +71,52 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-pub fn parse_range(range: &str, size: u64) -> Option<(u64, u64)> {
-    let (unit, range) = range.split_once('=')?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedRange {
+    Ignore,
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+}
+
+pub fn parse_range(range: &str, size: u64) -> ParsedRange {
+    let Some((unit, range)) = range.split_once('=') else {
+        return ParsedRange::Unsatisfiable;
+    };
     if !unit.eq_ignore_ascii_case("bytes") {
-        return None;
+        return ParsedRange::Ignore;
     }
     if range.contains(',') {
-        return None;
+        return ParsedRange::Unsatisfiable;
     }
-    let (start, end) = range.trim().split_once('-')?;
+    let Some((start, end)) = range.trim().split_once('-') else {
+        return ParsedRange::Unsatisfiable;
+    };
     if start.is_empty() {
-        let length = end.parse::<u64>().ok()?;
+        let Ok(length) = end.parse::<u64>() else {
+            return ParsedRange::Unsatisfiable;
+        };
         if length == 0 || size == 0 {
-            return None;
+            return ParsedRange::Unsatisfiable;
         }
         let length = length.min(size);
-        return Some((size - length, size - 1));
+        return ParsedRange::Satisfiable(size - length, size - 1);
     }
-    let start = start.parse::<u64>().ok()?;
+    let Ok(start) = start.parse::<u64>() else {
+        return ParsedRange::Unsatisfiable;
+    };
     if start >= size {
-        return None;
+        return ParsedRange::Unsatisfiable;
     }
     if end.is_empty() {
-        return Some((start, size - 1));
+        return ParsedRange::Satisfiable(start, size - 1);
     }
-    let end = end.parse::<u64>().ok()?;
+    let Ok(end) = end.parse::<u64>() else {
+        return ParsedRange::Unsatisfiable;
+    };
     if start > end {
-        return None;
+        return ParsedRange::Unsatisfiable;
     }
-    Some((start, end.min(size - 1)))
+    ParsedRange::Satisfiable(start, end.min(size - 1))
 }
 
 #[cfg(test)]
@@ -108,23 +125,26 @@ mod tests {
 
     #[test]
     fn test_parse_range() {
-        assert_eq!(parse_range("bytes=0-499", 500), Some((0, 499)));
-        assert_eq!(parse_range("Bytes=0-499", 500), Some((0, 499)));
-        assert_eq!(parse_range("BYTES=0-499", 500), Some((0, 499)));
-        assert_eq!(parse_range("bytes=0-", 500), Some((0, 499)));
-        assert_eq!(parse_range("bytes=299-", 500), Some((299, 499)));
-        assert_eq!(parse_range("bytes=-500", 500), Some((0, 499)));
-        assert_eq!(parse_range("bytes=-300", 500), Some((200, 499)));
-        assert_eq!(parse_range("bytes=-501", 500), Some((0, 499)));
-        assert_eq!(parse_range("bytes=0-500", 500), Some((0, 499)));
-        assert_eq!(parse_range("bytes=499-999", 500), Some((499, 499)));
-        assert_eq!(parse_range("bytes=0-199, 100-399", 500), None);
-        assert_eq!(parse_range("bytes=500-", 500), None);
-        assert_eq!(parse_range("bytes=-0", 500), None);
-        assert_eq!(parse_range("bytes=-1", 0), None);
-        assert_eq!(parse_range("bytes=0-0", 0), None);
-        assert_eq!(parse_range("bytes=0-199,", 500), None);
-        assert_eq!(parse_range("bytes=0-199, 500-", 500), None);
+        use ParsedRange::{Ignore, Satisfiable, Unsatisfiable};
+
+        assert_eq!(parse_range("bytes=0-499", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("Bytes=0-499", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("BYTES=0-499", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("bytes=0-", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("bytes=299-", 500), Satisfiable(299, 499));
+        assert_eq!(parse_range("bytes=-500", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("bytes=-300", 500), Satisfiable(200, 499));
+        assert_eq!(parse_range("bytes=-501", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("bytes=0-500", 500), Satisfiable(0, 499));
+        assert_eq!(parse_range("bytes=499-999", 500), Satisfiable(499, 499));
+        assert_eq!(parse_range("items=0-499", 500), Ignore);
+        assert_eq!(parse_range("bytes=0-199, 100-399", 500), Unsatisfiable);
+        assert_eq!(parse_range("bytes=500-", 500), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 500), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-1", 0), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-199,", 500), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-199, 500-", 500), Unsatisfiable);
     }
 
     #[test]
@@ -142,7 +162,7 @@ mod tests {
                 format!("bytes={first}-"),
                 format!("bytes=-{second}"),
             ] {
-                if let Some((start, end)) = parse_range(&value, size) {
+                if let ParsedRange::Satisfiable(start, end) = parse_range(&value, size) {
                     assert!(size > 0, "range returned for an empty resource: {value}");
                     assert!(start <= end, "inverted range for {value}");
                     assert!(end < size, "out-of-bounds range for {value} size={size}");

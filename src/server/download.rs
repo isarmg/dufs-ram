@@ -1,5 +1,5 @@
 use super::{BUF_SIZE, Response, Server, set_content_disposition, status_not_found};
-use crate::utils::{parse_range, try_get_file_name};
+use crate::utils::{ParsedRange, parse_range, try_get_file_name};
 
 use crate::utils::encode_hex;
 use anyhow::{Result, anyhow};
@@ -102,12 +102,11 @@ async fn send_open_file(
         let mut ranges = headers.get_all(RANGE).iter();
         ranges.next().map(|range| {
             if ranges.next().is_some() {
-                return None;
+                return ParsedRange::Unsatisfiable;
             }
             range
                 .to_str()
-                .ok()
-                .and_then(|range| parse_range(range, size))
+                .map_or(ParsedRange::Unsatisfiable, |range| parse_range(range, size))
         })
     } else {
         None
@@ -123,8 +122,8 @@ async fn send_open_file(
 
     res.headers_mut().typed_insert(AcceptRanges::bytes());
 
-    if let Some(range) = range {
-        if let Some((start, end)) = range {
+    match range {
+        Some(ParsedRange::Satisfiable(start, end)) => {
             file.seek(SeekFrom::Start(start)).await?;
             let range_size = end - start + 1;
             *res.status_mut() = StatusCode::PARTIAL_CONTENT;
@@ -144,27 +143,29 @@ async fn send_open_file(
                     .map_err(|err| anyhow!("{err}")),
             );
             *res.body_mut() = stream_body.boxed();
-        } else {
+        }
+        Some(ParsedRange::Unsatisfiable) => {
             *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
             res.headers_mut()
                 .insert(CONTENT_RANGE, format!("bytes */{size}").parse()?);
         }
-    } else {
-        res.headers_mut()
-            .insert(CONTENT_LENGTH, format!("{size}").parse()?);
-        if head_only {
-            return Ok(());
-        }
+        None | Some(ParsedRange::Ignore) => {
+            res.headers_mut()
+                .insert(CONTENT_LENGTH, format!("{size}").parse()?);
+            if head_only {
+                return Ok(());
+            }
 
-        // Keep the body framed to the representation whose metadata produced
-        // Content-Length, even if another writer appends to the same inode.
-        let reader_stream = ReaderStream::with_capacity(file.take(size), BUF_SIZE);
-        let stream_body = StreamBody::new(
-            reader_stream
-                .map_ok(Frame::data)
-                .map_err(|err| anyhow!("{err}")),
-        );
-        *res.body_mut() = stream_body.boxed();
+            // Keep the body framed to the representation whose metadata produced
+            // Content-Length, even if another writer appends to the same inode.
+            let reader_stream = ReaderStream::with_capacity(file.take(size), BUF_SIZE);
+            let stream_body = StreamBody::new(
+                reader_stream
+                    .map_ok(Frame::data)
+                    .map_err(|err| anyhow!("{err}")),
+            );
+            *res.body_mut() = stream_body.boxed();
+        }
     }
     Ok(())
 }

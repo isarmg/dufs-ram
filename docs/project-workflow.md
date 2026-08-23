@@ -424,6 +424,7 @@ flowchart TD
     CACHE -- 是 --> CONDITIONAL["304 或 412"]
     CACHE -- 否 --> RANGE{"Range"}
     RANGE -- 无 --> FULL["200，正文限长至打开时 metadata size"]
+    RANGE -- 未知单位 --> FULL
     RANGE -- 单段有效 --> SINGLE["206，seek 后限长发送"]
     RANGE -- 重复头、多段或非法 --> BAD["416 Range Not Satisfiable"]
 ```
@@ -434,7 +435,7 @@ flowchart TD
 
 ETag 使用设备号、inode、长度及纳秒级 mtime/ctime 生成，并明确带 `W/`，它用于区分通常的文件版本但不是内容摘要。条件请求按 HTTP 优先级执行：`If-Match` 优先于 `If-Unmodified-Since`，`If-None-Match` 优先于 `If-Modified-Since`。相同 `If-None-Match` 可按弱比较得到 `304`；`If-Match` 要求强比较，回放服务端发出的弱 ETag 会得到 `412`，而存在文件上的 `If-Match: *` 仍可通过。
 
-弱 ETag 不能满足 `If-Range` 的强比较，秒级 `Last-Modified` 也不能安全区分快速原子替换，所以只要请求携带 `If-Range`，服务端就忽略 Range 并发送完整 `200`。没有 `If-Range` 时，只接受一个 `Range` 请求头中的一个范围；合法单段返回 `206`，重复请求头、逗号多段、非法、溢出或不可满足范围返回 `416`。超出文件尾的 end 会截断，超过文件长度的 suffix 会把完整表示作为 `206` 返回。
+弱 ETag 不能满足 `If-Range` 的强比较，秒级 `Last-Modified` 也不能安全区分快速原子替换，所以只要请求携带 `If-Range`，服务端就忽略 Range 并发送完整 `200`。没有 `If-Range` 时，只接受一个 `Range` 请求头中的一个字节范围，单位按 ASCII 大小写不敏感；合法单段返回 `206`，重复请求头、逗号多段、非法、溢出或不可满足的 `bytes` 范围返回 `416`，不支持的范围单位被忽略并返回完整 `200`。超出文件尾的 end 会截断，超过文件长度的 suffix 会把完整表示作为 `206` 返回。
 
 服务端在最终响应出口对所有登录和认证响应强制设置 `Cache-Control: private, no-store`，覆盖完整文件、HEAD、`206`、`304`、`412`、`416`、上传、API 和错误响应，也不依赖 ETag 或 Last-Modified 是否成功生成。只有成功返回的版本化内置脚本、样式和图标进入明确的公共缓存白名单；未知资源和错误响应不可长期缓存。`no-store` 有意放弃认证文件的浏览器缓存和自动条件复用，以换取最严格的缓存边界。网关须关闭认证路径缓存并保留上游 `Cache-Control`。
 
