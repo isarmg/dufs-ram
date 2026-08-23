@@ -6,6 +6,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(super) const BROWSER_COMPONENT_BYTES_LIMIT: usize = 255;
+pub(super) const BROWSER_RELATIVE_PATH_BYTES_LIMIT: usize = 4095;
+
 /// Normalized path used for HTTP route selection. Construction is the only
 /// place where percent decoding and reserved-namespace canonicalization occur.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,13 +82,16 @@ impl PathPolicy {
                 return None;
             };
             let value = value.to_string_lossy();
-            if is_internal_name(&value) {
+            if value.len() > BROWSER_COMPONENT_BYTES_LIMIT || is_internal_name(&value) {
                 return None;
             }
             parts.push(value);
         }
 
         let normalized = parts.join("/");
+        if normalized.len() > BROWSER_RELATIVE_PATH_BYTES_LIMIT {
+            return None;
+        }
         if normalized
             .split('/')
             .next()
@@ -102,7 +108,10 @@ impl PathPolicy {
     /// silently normalized because these values identify mutation targets.
     pub(super) fn parse_browser_target(&self, value: &str) -> Option<RootedPath> {
         let relative = value.strip_prefix('/')?;
-        if relative.is_empty() || relative.contains('\0') {
+        if relative.is_empty()
+            || relative.len() > BROWSER_RELATIVE_PATH_BYTES_LIMIT
+            || relative.contains('\0')
+        {
             return None;
         }
 
@@ -111,6 +120,7 @@ impl PathPolicy {
             if component.is_empty()
                 || component == "."
                 || component == ".."
+                || component.len() > BROWSER_COMPONENT_BYTES_LIMIT
                 || is_internal_name(component)
                 || (index == 0 && self.is_reserved_component(component))
             {
@@ -224,5 +234,57 @@ mod tests {
         ] {
             assert!(policy.parse_list_target(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn rooted_paths_fit_linux_openat_pathname_limits() {
+        let policy = policy();
+        let longest_component = "a".repeat(BROWSER_COMPONENT_BYTES_LIMIT);
+        assert!(
+            policy
+                .parse_browser_target(&format!("/{longest_component}"))
+                .is_some()
+        );
+        assert!(
+            policy
+                .parse_browser_target(&format!(
+                    "/{}",
+                    "a".repeat(BROWSER_COMPONENT_BYTES_LIMIT + 1)
+                ))
+                .is_none()
+        );
+
+        let longest_relative = std::iter::repeat_n(longest_component.as_str(), 16)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert_eq!(longest_relative.len(), BROWSER_RELATIVE_PATH_BYTES_LIMIT);
+        assert!(
+            policy
+                .parse_browser_target(&format!("/{longest_relative}"))
+                .is_some()
+        );
+
+        let overlong_relative = [
+            std::iter::repeat_n(longest_component.as_str(), 15)
+                .collect::<Vec<_>>()
+                .join("/"),
+            "b".repeat(254),
+            "c".to_string(),
+        ]
+        .join("/");
+        assert_eq!(
+            overlong_relative.len(),
+            BROWSER_RELATIVE_PATH_BYTES_LIMIT + 1
+        );
+        assert!(
+            policy
+                .parse_browser_target(&format!("/{overlong_relative}"))
+                .is_none()
+        );
+        assert!(
+            policy
+                .parse_route(&format!("/{overlong_relative}"))
+                .is_none()
+        );
     }
 }
