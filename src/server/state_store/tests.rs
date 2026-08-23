@@ -617,6 +617,50 @@ async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() ->
 }
 
 #[tokio::test]
+async fn opportunistic_terminal_purge_preserves_rejected_cleanup_identity() -> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
+    let mut rejected = upload(11, 11, 10);
+    rejected.state = StoredUploadState::Rejected;
+    rejected.stage_identity = Some(StoredFileIdentity {
+        device: 51,
+        inode: 52,
+    });
+    assert_eq!(
+        store
+            .save_upload_session(rejected.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Inserted
+    );
+
+    let mut identity_free = upload(12, 12, 10);
+    identity_free.state = StoredUploadState::Rejected;
+    assert_eq!(
+        store
+            .save_upload_session(identity_free.clone(), Duration::ZERO)
+            .await?,
+        StoreUploadSession::Inserted
+    );
+
+    let unrelated = upload(13, 13, 0);
+    assert_eq!(
+        store.save_upload_session(unrelated, TTL).await?,
+        StoreUploadSession::Inserted
+    );
+    assert_eq!(
+        store.upload_session(rejected.key).await?,
+        Some(rejected.clone()),
+        "an unrelated save discarded the identity needed to finish rejected-stage cleanup"
+    );
+    assert_eq!(
+        store.upload_session(identity_free.key).await?,
+        None,
+        "an identity-free rejected session did not release expired capacity"
+    );
+    assert!(store.remove_upload_session_if_matches(rejected).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl() -> Result<()> {
     let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
     let mut awaiting = upload(11, 11, 0);

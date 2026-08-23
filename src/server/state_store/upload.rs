@@ -108,7 +108,11 @@ impl StoreWorker {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM upload_sessions
-              WHERE state IN (?1, ?2, ?3) AND expires_at_ms <= ?4",
+              WHERE expires_at_ms <= ?4
+                AND (state IN (?1, ?3)
+                     OR (state = ?2
+                         AND stage_device_be IS NULL
+                         AND stage_inode_be IS NULL))",
             params![UPLOAD_COMMITTED, UPLOAD_REJECTED, UPLOAD_UNKNOWN, now],
         )?;
         let existing = load_upload_session(&transaction, proposed.key)?;
