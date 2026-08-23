@@ -202,6 +202,7 @@ struct Limits {
     capacity: i64,
     per_owner: i64,
     ttl_ms: i64,
+    upload_ttl_ms: i64,
     upload_capacity: i64,
     upload_per_owner: i64,
     purge_capacity: i64,
@@ -214,6 +215,7 @@ struct StateStoreOptions {
     capacity: usize,
     per_owner: usize,
     ttl: Duration,
+    upload_ttl: Duration,
     command_queue_capacity: usize,
     repository_limits: RepositoryLimits,
     temporary_directory: Option<tempfile::TempDir>,
@@ -226,6 +228,7 @@ impl StateStoreOptions {
         capacity: usize,
         per_owner: usize,
         ttl: Duration,
+        upload_ttl: Duration,
     ) -> Self {
         Self {
             path,
@@ -233,6 +236,7 @@ impl StateStoreOptions {
             capacity,
             per_owner,
             ttl,
+            upload_ttl,
             command_queue_capacity: COMMAND_QUEUE_CAPACITY,
             repository_limits: REPOSITORY_LIMITS,
             temporary_directory: None,
@@ -433,12 +437,24 @@ impl Drop for ReservationCleanup {
 }
 
 impl StateStore {
+    #[cfg(test)]
     pub(super) fn open(
         path: &Path,
         root: &RootIdentity,
         capacity: usize,
         per_owner: usize,
         ttl: Duration,
+    ) -> Result<Self> {
+        Self::open_with_upload_ttl(path, root, capacity, per_owner, ttl, ttl)
+    }
+
+    pub(super) fn open_with_upload_ttl(
+        path: &Path,
+        root: &RootIdentity,
+        capacity: usize,
+        per_owner: usize,
+        ttl: Duration,
+        upload_ttl: Duration,
     ) -> Result<Self> {
         database::prepare_database_file(path, root)?;
         Self::start(StateStoreOptions::production(
@@ -447,6 +463,7 @@ impl StateStore {
             capacity,
             per_owner,
             ttl,
+            upload_ttl,
         ))
     }
 
@@ -472,6 +489,7 @@ impl StateStore {
             capacity,
             per_owner,
             ttl,
+            upload_ttl,
             command_queue_capacity,
             repository_limits,
             temporary_directory,
@@ -480,7 +498,7 @@ impl StateStore {
             command_queue_capacity > 0,
             "State store command queue capacity must be positive"
         );
-        let limits = validate_limits(capacity, per_owner, ttl, repository_limits)?;
+        let limits = validate_limits(capacity, per_owner, ttl, upload_ttl, repository_limits)?;
         let (command_sender, command_receiver) = mpsc::sync_channel(command_queue_capacity);
         let (control_sender, control_receiver) = mpsc::channel();
         let channels = ActorChannels {
@@ -555,6 +573,7 @@ impl StateStore {
             capacity,
             per_owner,
             ttl,
+            upload_ttl: ttl,
             command_queue_capacity,
             repository_limits,
             temporary_directory: Some(directory),
@@ -962,6 +981,7 @@ fn validate_limits(
     capacity: usize,
     per_owner: usize,
     ttl: Duration,
+    upload_ttl: Duration,
     repository: RepositoryLimits,
 ) -> Result<Limits> {
     ensure!(capacity > 0, "State store capacity must be positive");
@@ -973,6 +993,7 @@ fn validate_limits(
     let per_owner =
         i64::try_from(per_owner).context("Per-owner state store capacity is too large")?;
     let ttl_ms = i64::try_from(ttl.as_millis()).context("State store result TTL is too large")?;
+    let upload_ttl_ms = duration_ms(upload_ttl, "Upload session recovery TTL")?;
     ensure!(
         repository.upload_capacity > 0
             && (1..=repository.upload_capacity).contains(&repository.upload_per_owner),
@@ -987,6 +1008,7 @@ fn validate_limits(
         capacity,
         per_owner,
         ttl_ms,
+        upload_ttl_ms,
         upload_capacity: i64::try_from(repository.upload_capacity)
             .context("Upload session capacity is too large")?,
         upload_per_owner: i64::try_from(repository.upload_per_owner)

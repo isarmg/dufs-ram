@@ -299,6 +299,7 @@ impl Server {
         let operation_registry = OperationRegistry::open(
             &state_database_path,
             state_store::RootIdentity { device, inode },
+            UPLOAD_SESSION_TTL,
         )?;
         let state_store = operation_registry.state_store();
         let upload_records =

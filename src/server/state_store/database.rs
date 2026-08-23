@@ -240,10 +240,11 @@ pub(super) fn prepare_database_file(path: &Path, root: &RootIdentity) -> Result<
 pub(super) fn open_initialized_connection(
     path: &Path,
     root: RootIdentity,
-    ttl_ms: i64,
+    operation_ttl_ms: i64,
+    upload_ttl_ms: i64,
 ) -> Result<Connection> {
     let mut connection = open_connection(path)?;
-    initialize_database(&mut connection, root, ttl_ms)?;
+    initialize_database(&mut connection, root, operation_ttl_ms, upload_ttl_ms)?;
     Ok(connection)
 }
 
@@ -317,13 +318,18 @@ fn configure_validated_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn initialize_database(connection: &mut Connection, root: RootIdentity, ttl_ms: i64) -> Result<()> {
+fn initialize_database(
+    connection: &mut Connection,
+    root: RootIdentity,
+    operation_ttl_ms: i64,
+    upload_ttl_ms: i64,
+) -> Result<()> {
     // Repeat the read-only path preflight on the actor connection before the
     // first persistent pragma, schema mutation, or recovery write.
     validate_database_before_mutation(connection, root)?;
     configure_validated_connection(connection)?;
     initialize_schema(connection, root)?;
-    recover_database(connection, ttl_ms)
+    recover_database(connection, operation_ttl_ms, upload_ttl_ms)
 }
 
 fn preflight_existing_database(path: &Path, root: RootIdentity) -> Result<()> {
@@ -513,9 +519,14 @@ fn load_meta(connection: &Connection, key: &str) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("State database metadata `{key}` is missing"))
 }
 
-fn recover_database(connection: &mut Connection, ttl_ms: i64) -> Result<()> {
+fn recover_database(
+    connection: &mut Connection,
+    operation_ttl_ms: i64,
+    upload_ttl_ms: i64,
+) -> Result<()> {
     let now = now_ms()?;
-    let expires_at = expiration_time(now, ttl_ms)?;
+    let operation_expires_at = expiration_time(now, operation_ttl_ms)?;
+    let upload_expires_at = expiration_time(now, upload_ttl_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     super::operation::purge_expired(&transaction, now)?;
     transaction.execute(
@@ -537,21 +548,27 @@ fn recover_database(connection: &mut Connection, ttl_ms: i64) -> Result<()> {
             i64::from(UNKNOWN_STATUS),
             UNKNOWN_CODE,
             now,
-            expires_at,
+            operation_expires_at,
             OPERATION_COMMIT_STARTED,
         ],
     )?;
     transaction.execute(
         "UPDATE operations SET expires_at_ms = ?1
           WHERE state = ?2 AND expires_at_ms > ?1",
-        params![expires_at, OPERATION_COMPLETED],
+        params![operation_expires_at, OPERATION_COMPLETED],
     )?;
     transaction.execute(
         "UPDATE upload_sessions
             SET state = ?1,
-                updated_at_ms = ?2
-          WHERE state = ?3",
-        params![UPLOAD_UNKNOWN, now, UPLOAD_COMMIT_STARTED],
+                updated_at_ms = ?2,
+                expires_at_ms = ?3
+          WHERE state = ?4",
+        params![
+            UPLOAD_UNKNOWN,
+            now,
+            upload_expires_at,
+            UPLOAD_COMMIT_STARTED
+        ],
     )?;
     transaction.execute(
         "UPDATE purge_jobs
