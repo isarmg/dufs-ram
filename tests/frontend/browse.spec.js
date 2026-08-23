@@ -271,7 +271,7 @@ test("大量目录项使用可访问窗口限制 DOM 数量", async ({ appPage: 
       contentType: "application/json",
       body: JSON.stringify({
         paths,
-        next_cursor: current < 1 ? `cursor-${current + 1}` : null,
+        next_cursor: current < 2 ? `cursor-${current + 1}` : null,
       }),
     });
   });
@@ -284,8 +284,10 @@ test("大量目录项使用可访问窗口限制 DOM 数量", async ({ appPage: 
   }
   await expect(page.locator(".paths-table tbody tr")).toHaveCount(200);
   const previous = page.getByRole("button", { name: "Show previous items" });
+  const listStatus = page.locator(".list-status");
   await expect(previous).toBeVisible();
   await previous.click();
+  await expect(listStatus).toBeFocused();
   await expect(page.getByRole("link", {
     name: "window-0.txt",
     exact: true,
