@@ -591,6 +591,13 @@ fn recover_database(
           WHERE state = ?3",
         params![PURGE_READY, now, PURGE_CLAIMED],
     )?;
+    transaction.execute(
+        "UPDATE purge_jobs
+            SET next_attempt_at_ms = ?1,
+                updated_at_ms = ?1
+          WHERE state = ?2 AND next_attempt_at_ms > ?1",
+        params![now, PURGE_READY],
+    )?;
     transaction.commit()?;
     Ok(())
 }
