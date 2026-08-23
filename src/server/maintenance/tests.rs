@@ -135,13 +135,14 @@ mod sqlite_cleanup_tests {
             );
             expire().await;
         }
-        assert_eq!(store.expired_upload_sessions(8).await?.len(), 3);
+        assert_eq!(store.expired_upload_sessions_page(None, 8).await?.len(), 3);
 
         let first = cleanup_expired_upload_sessions_batch(
             &rooted_fs,
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             2,
         )
         .await?;
@@ -159,11 +160,82 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             2,
         )
         .await?;
         assert_eq!(second.examined, 1);
         assert_eq!(second.removed_records, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_expired_page_does_not_starve_later_sessions() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let mut sessions = Vec::new();
+        let active = Mutex::new(HashSet::new());
+        for owner_byte in 1..=3 {
+            let upload_id = Uuid::new_v4();
+            let target = temp.path().join(format!("blocked-{owner_byte}.bin"));
+            let stage = upload_temp_path(&target, upload_id)?;
+            let mut file = create_stage(&rooted_fs, &stage, b"expired").await;
+            file.flush().await?;
+            let metadata = file.metadata().await?;
+            let session = stored_session(
+                &rooted_fs,
+                [owner_byte; 32],
+                upload_id,
+                &target,
+                &stage,
+                StoredUploadState::Running,
+                Some(StoredFileIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                }),
+            );
+            store
+                .save_upload_session(session.clone(), EXPIRED_TTL)
+                .await?;
+            if owner_byte <= 2 {
+                let stage_key = rooted_fs.entry_key(&stage).await?;
+                active.lock().unwrap().insert(stage_key);
+            }
+            sessions.push((session, stage));
+        }
+        expire().await;
+
+        let first = cleanup_expired_upload_sessions_batch(
+            &rooted_fs,
+            &store,
+            &active,
+            &CancellationToken::new(),
+            None,
+            2,
+        )
+        .await?;
+        assert_eq!(first.examined, 2);
+        assert_eq!(first.removed_records, 0);
+        assert!(first.should_continue());
+        assert_eq!(first.next_cursor, Some(sessions[1].0.key));
+
+        let second = cleanup_expired_upload_sessions_batch(
+            &rooted_fs,
+            &store,
+            &active,
+            &CancellationToken::new(),
+            first.next_cursor,
+            2,
+        )
+        .await?;
+        assert_eq!(second.examined, 1);
+        assert_eq!(second.removed_records, 1);
+        assert!(!second.should_continue());
+        assert!(store.upload_session(sessions[0].0.key).await?.is_some());
+        assert!(store.upload_session(sessions[1].0.key).await?.is_some());
+        assert!(store.upload_session(sessions[2].0.key).await?.is_none());
+        assert!(!sessions[2].1.exists());
         Ok(())
     }
 
@@ -203,6 +275,7 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             8,
         )
         .await?;
@@ -251,6 +324,7 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             8,
         )
         .await?;
@@ -297,6 +371,7 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             8,
         )
         .await?;
@@ -341,6 +416,7 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             8,
         )
         .await?;
@@ -385,6 +461,7 @@ mod sqlite_cleanup_tests {
             &store,
             &Mutex::new(HashSet::new()),
             &CancellationToken::new(),
+            None,
             8,
         )
         .await?;

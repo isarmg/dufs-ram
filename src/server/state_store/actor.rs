@@ -166,8 +166,12 @@ impl StoreWorker {
                         ttl_ms,
                     ));
                 }
-                Command::ListExpiredUploadSessions { limit, reply } => {
-                    let _ = reply.send(self.expired_upload_sessions(limit));
+                Command::ListExpiredUploadSessions {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let _ = reply.send(self.expired_upload_sessions(after, limit));
                 }
                 Command::RemoveUploadSessionIfMatches { expected, reply } => {
                     let _ = reply.send(self.remove_upload_session_if_matches(&expected));

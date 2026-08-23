@@ -52,6 +52,7 @@ pub(super) struct MaintenanceScanState {
     pub(super) pending_purge: Option<TrashEntry>,
     trash_ttl: Duration,
     upload_session_cleanup_complete: bool,
+    upload_session_cleanup_cursor: Option<super::state_store::UploadSessionKey>,
     upload_session_snapshot_complete: bool,
     upload_session_snapshot_cursor: Option<super::state_store::UploadSessionKey>,
     protected_upload_entries: HashSet<RootedEntryKey>,
@@ -86,11 +87,13 @@ pub(super) struct UploadSessionCleanupBatch {
     pub(super) removed_stages: usize,
     protected_entries: Vec<RootedEntryKey>,
     skip_untracked_upload_cleanup: bool,
+    next_cursor: Option<super::state_store::UploadSessionKey>,
+    page_complete: bool,
 }
 
 impl UploadSessionCleanupBatch {
-    fn should_continue(&self, limit: usize) -> bool {
-        self.examined == limit && self.removed_records != 0
+    fn should_continue(&self) -> bool {
+        !self.page_complete
     }
 }
 
@@ -138,6 +141,7 @@ impl MaintenanceScanState {
             pending_purge: None,
             trash_ttl,
             upload_session_cleanup_complete: false,
+            upload_session_cleanup_cursor: None,
             upload_session_snapshot_complete: false,
             upload_session_snapshot_cursor: None,
             protected_upload_entries: HashSet::new(),
@@ -198,19 +202,18 @@ impl Server {
                 &self.state.state_store,
                 &self.admission.active_upload_files,
                 &self.lifecycle.shutdown,
+                state.upload_session_cleanup_cursor,
                 UPLOAD_SESSION_CLEANUP_BATCH,
             )
             .await
             {
                 Ok(batch) => {
-                    state.upload_session_cleanup_complete =
-                        !batch.should_continue(UPLOAD_SESSION_CLEANUP_BATCH);
+                    state.upload_session_cleanup_cursor = batch.next_cursor;
+                    state.upload_session_cleanup_complete = !batch.should_continue();
                     state
                         .protected_upload_entries
                         .extend(batch.protected_entries.iter().cloned());
-                    state.skip_untracked_upload_cleanup |= batch.skip_untracked_upload_cleanup
-                        || (batch.examined == UPLOAD_SESSION_CLEANUP_BATCH
-                            && batch.removed_records == 0);
+                    state.skip_untracked_upload_cleanup |= batch.skip_untracked_upload_cleanup;
                     if batch.removed_records != 0 {
                         info!(
                             "Removed expired upload session records={} stages={}",
@@ -450,9 +453,13 @@ pub(super) async fn cleanup_expired_upload_sessions_batch(
     state_store: &StateStore,
     active: &Mutex<HashSet<RootedEntryKey>>,
     shutdown: &CancellationToken,
+    after: Option<super::state_store::UploadSessionKey>,
     limit: usize,
 ) -> Result<UploadSessionCleanupBatch> {
-    let sessions = state_store.expired_upload_sessions(limit).await?;
+    let sessions = state_store
+        .expired_upload_sessions_page(after, limit)
+        .await?;
+    let fetched = sessions.len();
     let mut batch = UploadSessionCleanupBatch::default();
     for session in sessions {
         if shutdown.is_cancelled() {
@@ -484,7 +491,9 @@ pub(super) async fn cleanup_expired_upload_sessions_batch(
                 );
             }
         }
+        batch.next_cursor = Some(session.key);
     }
+    batch.page_complete = batch.examined == fetched && fetched < limit;
     Ok(batch)
 }
 

@@ -455,7 +455,10 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
         StoreUploadSession::Updated
     );
     assert!(
-        store.expired_upload_sessions(8).await?.is_empty(),
+        store
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .is_empty(),
         "an in-flight publication must not be expired while the process is alive"
     );
     first.state = StoredUploadState::Committed;
@@ -465,7 +468,10 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
             .await?,
         StoreUploadSession::Updated
     );
-    assert_eq!(store.expired_upload_sessions(8).await?, vec![first.clone()]);
+    assert_eq!(
+        store.expired_upload_sessions_page(None, 8).await?,
+        vec![first.clone()]
+    );
 
     // Insertion purges expired terminal sessions before applying quotas.
     assert_eq!(
@@ -586,7 +592,7 @@ async fn conditional_upload_removal_preserves_newer_and_refreshed_snapshots() ->
         StoreUploadSession::Inserted
     );
     let expired_snapshot = store
-        .expired_upload_sessions(8)
+        .expired_upload_sessions_page(None, 8)
         .await?
         .into_iter()
         .find(|session| session.key == refreshed.key)
@@ -705,7 +711,12 @@ async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl
             .await?,
         RejectUploadSession::Rejected(rejected.clone())
     );
-    assert!(store.expired_upload_sessions(8).await?.contains(&rejected));
+    assert!(
+        store
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .contains(&rejected)
+    );
 
     store.set_query_only(true).await?;
     assert_eq!(
@@ -721,7 +732,10 @@ async fn upload_rejection_is_update_only_bound_and_does_not_refresh_terminal_ttl
     );
     store.set_query_only(false).await?;
     assert!(
-        store.expired_upload_sessions(8).await?.contains(&rejected),
+        store
+            .expired_upload_sessions_page(None, 8)
+            .await?
+            .contains(&rejected),
         "an idempotent rejected retry refreshed the terminal TTL"
     );
     Ok(())
