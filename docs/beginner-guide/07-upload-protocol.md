@@ -367,14 +367,13 @@ HEAD 是只读查询，不携带 CSRF header。一个 running checkpoint 响应�
 
 ```http
 HTTP/1.1 200 OK
-Content-Length: 20971520
 X-Dufs-Upload-Id: 原UUID
 X-Dufs-Upload-Length: 123456789
 X-Dufs-Upload-Offset: 20971520
 X-Dufs-Operation-State: running
 ```
 
-HEAD 没有响应正文；这里的标准 `Content-Length` 等于 durable offset，不是响应体长度，也不是完整文件总长度。完整声明长度看 `X-Dufs-Upload-Length`。
+HEAD 没有响应正文，也不复用标准 `Content-Length` 表示检查点，因为该字段只能描述同一 URI 的 GET 表示长度。完整声明长度看 `X-Dufs-Upload-Length`，可靠检查点只看 `X-Dufs-Upload-Offset`。
 
 前端使用的 status/state 矩阵是：
 
