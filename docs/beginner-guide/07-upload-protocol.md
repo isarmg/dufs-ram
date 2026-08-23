@@ -471,6 +471,7 @@ Content-Length: 0
 服务器把它理解为：“不再追加正文，使用已完成 stage 再次尝试发布。”目标内容来自 stage，不来自本次空请求体。
 
 这既保留 revision 条件覆盖确认，也避免重新传输大文件；Existing 目标的最终文件系统动作仍遵守前述“复核后普通 rename”的部署边界。
+请求携带的新 revision 在正文被确认为空且提交真正进入 `CommitStarted` 前只属于本次请求；空闲、读取失败或实际收到非空正文都不能改写 `AwaitingConfirmation` 记录。记录中原有 revision 描述 stage 已承载的目标 metadata 来源，尤其不能把原本 create-only 的 stage 仅因一次失败确认伪装成覆盖 stage。
 
 若下一次确认前服务观察到目标已经消失，当前前端不会把携带旧目标 metadata 的 stage 直接当 create-only 文件发布。它先 discard 旧 stage，再用新 Upload ID、`NoReplace` 和完整 PUT 重传；这是避免把旧目标 uid/gid/mode/xattr 赋给语义上新文件的安全分支。
 
