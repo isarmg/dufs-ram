@@ -240,6 +240,38 @@ fn mixed_case_non_sensitive_request_header_variable_is_logged(
 }
 
 #[rstest]
+fn complete_request_line_keeps_raw_target_and_http_version(tmpdir: TempDir) -> Result<(), Error> {
+    let _test_guard = serialize_http_logger_test();
+    let (mut child, port, _state_dir) = spawn_logged_server(
+        &tmpdir,
+        &["--auth", TEST_ACCOUNT, "--log-format", "REQUEST $request"],
+    )?;
+    let session = login(port, TEST_USER, TEST_PASSWORD)?;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(
+        format!(
+            "GET /a%2Fb?value=%2F HTTP/1.0\r\nHost: localhost:{port}\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+            session.cookie
+        )
+        .as_bytes(),
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    assert!(response.starts_with("HTTP/1.0 "));
+
+    let output = stop_and_read(&mut child)?;
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "REQUEST GET /a%2Fb?value=%2F HTTP/1.0"),
+        "raw HTTP/1.0 request line was not preserved:\n{output}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn authenticated_operation_id_is_available_to_access_logs(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
     let (mut child, port, _state_dir) = spawn_logged_server(

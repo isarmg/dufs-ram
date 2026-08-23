@@ -389,7 +389,8 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 | `$log_level` | 本条访问日志的级别 |
 | `$remote_addr` | 与 Dufs 建立 TCP 连接的客户端地址；经网关时通常是网关地址 |
 | `$remote_user` | 已成功认证的用户名；未认证或认证失败时为 `-` |
-| `$request` | 完整请求行 |
+| `$request` | 完整请求行：方法、保留百分号编码的原始 request-target 和 HTTP 版本；控制字符会转义 |
+| `$request_uri` | 百分号解码后的 URI；仅用于便于阅读，精确协议审计应使用 `$request` |
 | `$status` | HTTP 状态码 |
 | `$operation_id` | 写操作的规范 UUID；没有时为 `-` |
 | `$operation_state` | 普通 operation 或上传响应的状态，可为 `running/succeeded/failed/rejected/unknown/committed/not-seen/not-started`；没有时为 `-` |
