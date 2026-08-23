@@ -62,7 +62,7 @@ async fn send_open_file(
     let size = meta.len();
     res.headers_mut()
         .typed_insert(CacheControl::new().with_private().with_no_store());
-    let mut use_range = true;
+    let mut use_range = !head_only;
     if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
         res.headers_mut().typed_insert(last_modified);
         res.headers_mut().typed_insert(etag.clone());
@@ -95,7 +95,7 @@ async fn send_open_file(
         // and second-granularity Last-Modified is not a safe strong validator
         // for rapid atomic replacements. Send the complete representation
         // whenever If-Range is present.
-        use_range = headers.contains_key(RANGE) && !headers.contains_key(IF_RANGE);
+        use_range = !head_only && headers.contains_key(RANGE) && !headers.contains_key(IF_RANGE);
     }
 
     let range = if use_range {

@@ -351,7 +351,7 @@ flowchart TD
 | GET | `/__dufs__/api/list` | 要求会话；fd 根锚定的目录/搜索快照分页 JSON |
 | GET/HEAD | `/__dufs__/ready` | 要求会话；在锚定根 fd 上执行创建/写入/文件同步/删除/目录同步，并在 SQLite actor 上执行 `BEGIN IMMEDIATE` 写探针后 `ROLLBACK`，同时检查最低磁盘水位和停机状态；未就绪返回 `503` |
 | GET | `/__dufs__/api/jobs/<UUID>` | 要求会话；统一查询当前账号的 mutation job，返回 `job_id` 及 `running/succeeded/failed/unknown` 状态 |
-| GET/HEAD | 文件 | 要求会话；同一打开句柄生成附件响应和弱 ETag，支持无 `If-Range` 的单段 Range |
+| GET/HEAD | 文件 | 要求会话；同一打开句柄生成附件响应和弱 ETag；只有 GET 支持无 `If-Range` 的单段 Range，HEAD 忽略 Range |
 | GET/HEAD | 版本化内置资源 | 要求会话；已知摘要资源成功时允许公共长期缓存，HEAD 保留 GET 头并省略正文 |
 | POST | `/__dufs__/api/mkdir` | 要求会话、CSRF、同源校验和 Operation ID；JSON 新建目录 |
 | POST | `/__dufs__/api/move` | 要求会话、CSRF、同源校验和 Operation ID；JSON `{ source, directory, overwrite, source_revision, destination_revision? }`，移动到已经存在的目标目录并保留原名称；覆盖时 destination revision 必填 |
@@ -435,7 +435,7 @@ flowchart TD
 
 ETag 使用设备号、inode、长度及纳秒级 mtime/ctime 生成，并明确带 `W/`，它用于区分通常的文件版本但不是内容摘要。条件请求按 HTTP 优先级执行：`If-Match` 优先于 `If-Unmodified-Since`，`If-None-Match` 优先于 `If-Modified-Since`。相同 `If-None-Match` 可按弱比较得到 `304`；`If-Match` 要求强比较，回放服务端发出的弱 ETag 会得到 `412`，而存在文件上的 `If-Match: *` 仍可通过。
 
-弱 ETag 不能满足 `If-Range` 的强比较，秒级 `Last-Modified` 也不能安全区分快速原子替换，所以只要请求携带 `If-Range`，服务端就忽略 Range 并发送完整 `200`。没有 `If-Range` 时，只接受一个 `Range` 请求头中的一个字节范围，单位按 ASCII 大小写不敏感；合法单段返回 `206`，重复请求头、逗号多段、非法、溢出或不可满足的 `bytes` 范围返回 `416`，不支持的范围单位被忽略并返回完整 `200`。超出文件尾的 end 会截断，超过文件长度的 suffix 会把完整表示作为 `206` 返回。
+HEAD 始终忽略 `Range` 并返回完整表示的 `200` metadata。对于 GET，弱 ETag 不能满足 `If-Range` 的强比较，秒级 `Last-Modified` 也不能安全区分快速原子替换，所以只要请求携带 `If-Range`，服务端就忽略 Range 并发送完整 `200`。没有 `If-Range` 时，只接受一个 `Range` 请求头中的一个字节范围，单位按 ASCII 大小写不敏感；合法单段返回 `206`，重复请求头、逗号多段、非法、溢出或不可满足的 `bytes` 范围返回 `416`，不支持的范围单位被忽略并返回完整 `200`。超出文件尾的 end 会截断，超过文件长度的 suffix 会把完整表示作为 `206` 返回。
 
 服务端在最终响应出口对所有登录和认证响应强制设置 `Cache-Control: private, no-store`，覆盖完整文件、HEAD、`206`、`304`、`412`、`416`、上传、API 和错误响应，也不依赖 ETag 或 Last-Modified 是否成功生成。只有成功返回的版本化内置脚本、样式和图标进入明确的公共缓存白名单；未知资源和错误响应不可长期缓存。`no-store` 有意放弃认证文件的浏览器缓存和自动条件复用，以换取最严格的缓存边界。网关须关闭认证路径缓存并保留上游 `Cache-Control`。
 
