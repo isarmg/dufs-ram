@@ -29,7 +29,7 @@ fn sqlite_state_dir_resumes_upload_after_restart() -> Result<(), Error> {
     );
     assert_eq!(first.headers().get("x-dufs-upload-offset").unwrap(), "3");
 
-    let stage_path = std::fs::read_dir(server.path())?
+    let stage_path = std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
@@ -42,11 +42,15 @@ fn sqlite_state_dir_resumes_upload_after_restart() -> Result<(), Error> {
     let stage_name = stage_path
         .file_name()
         .ok_or("upload stage has no file name")?;
+    let expected_stage_path = std::path::Path::new(UPLOAD_STAGE_DIRECTORY).join(stage_name);
     assert!(stage_path.is_file());
 
     let checkpoint = sqlite_upload_checkpoint(&state_db, upload_id)?;
     assert_eq!(checkpoint.0, target_name.as_bytes());
-    assert_eq!(checkpoint.1, stage_name.as_bytes());
+    assert_eq!(
+        checkpoint.1,
+        expected_stage_path.as_os_str().as_encoded_bytes()
+    );
     assert_eq!(checkpoint.2, upload_length as i64);
     assert_eq!(checkpoint.3, 3);
     assert_eq!(checkpoint.4, 0, "checkpoint must be in the running state");
@@ -79,7 +83,10 @@ fn sqlite_state_dir_resumes_upload_after_restart() -> Result<(), Error> {
 
     let committed = sqlite_upload_checkpoint(&state_db, upload_id)?;
     assert_eq!(committed.0, target_name.as_bytes());
-    assert_eq!(committed.1, stage_name.as_bytes());
+    assert_eq!(
+        committed.1,
+        expected_stage_path.as_os_str().as_encoded_bytes()
+    );
     assert_eq!(committed.2, upload_length as i64);
     assert_eq!(committed.3, upload_length as i64);
     assert_eq!(committed.4, 2, "completed upload must be committed");

@@ -2,8 +2,9 @@ use super::{
     blocking_io::blocking_io_gate,
     internal_names::{
         InternalEntryName, classify_internal_name, delete_trash_name, quarantine_name,
-        upload_readiness_probe_name,
+        upload_readiness_probe_name, upload_stage_directory,
     },
+    state_store::StoredFileIdentity,
 };
 use anyhow::{Context, Result, anyhow};
 use rustix::{
@@ -14,11 +15,11 @@ use rustix::{
         fsync, mkdirat, openat, openat2, renameat, renameat_with, statat, unlinkat,
     },
     io::{Errno, dup},
-    process::{Gid, Uid},
+    process::{Gid, Uid, geteuid},
 };
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::{CStr, CString, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     fs::File,
     io::Write,
     os::fd::AsFd,
@@ -73,6 +74,21 @@ struct CreatedAncestor {
 #[derive(Debug)]
 pub(super) struct CreatedAncestors {
     entries: Vec<CreatedAncestor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LegacyUploadStageMigration {
+    Moved,
+    AlreadyMoved,
+    Missing,
+    IdentityMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrivateUploadStageValidation {
+    Present,
+    Missing,
+    IdentityMismatch,
 }
 
 #[derive(Debug)]
@@ -873,9 +889,443 @@ impl RootedFs {
             .await
     }
 
+    /// Atomically creates the ordinary target ancestors, the owner-only upload
+    /// staging directory, and a new owner-only stage file. Keeping all three
+    /// steps under `ancestor_creation` prevents an empty-directory cleanup from
+    /// removing the private directory between validation and file creation.
+    pub(super) async fn create_private_upload_stage(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<(tokio::fs::File, CreatedAncestors)> {
+        let this = self.clone();
+        let path = path.to_path_buf();
+        let (file, created_ancestors) = run_blocking(move || {
+            let _ancestor_creation = this
+                .inner
+                .ancestor_creation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            this.create_private_upload_stage_blocking(&path)
+        })
+        .await?;
+        Ok((
+            tokio::fs::File::from_std(file),
+            CreatedAncestors {
+                entries: created_ancestors,
+            },
+        ))
+    }
+
+    fn create_private_upload_stage_blocking(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<(File, Vec<CreatedAncestor>)> {
+        let (stage_directory_path, stage_name) = self.validated_upload_stage_path(path)?;
+        let mut parent = self.open_parent_blocking(stage_directory_path, true)?;
+        let (stage_directory, created_directory) =
+            match ensure_private_upload_stage_directory_at(&parent.fd, &parent.name) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    let _ = self.rollback_created_ancestors_blocking(&parent.created_ancestors);
+                    return Err(error);
+                }
+            };
+        if let Some(identity) = created_directory {
+            parent.created_ancestors.push(CreatedAncestor {
+                path: stage_directory_path.to_path_buf(),
+                identity,
+            });
+        }
+
+        let fd = match openat(
+            &stage_directory,
+            &stage_name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => fd,
+            Err(error) => {
+                let error = std::io::Error::from(error);
+                let _ = self.rollback_created_ancestors_blocking(&parent.created_ancestors);
+                return Err(error);
+            }
+        };
+        let prepare_result = (|| {
+            fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)?;
+            let stat = fstat(&fd).map_err(std::io::Error::from)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || stat.st_nlink != 1
+                || stat.st_uid != geteuid().as_raw()
+                || stat.st_mode & 0o7777 != 0o600
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "new upload stage is not a private single-link regular file",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare_result {
+            let _ = unlinkat(&stage_directory, &stage_name, AtFlags::empty());
+            let _ = fsync(&stage_directory);
+            let _ = self.rollback_created_ancestors_blocking(&parent.created_ancestors);
+            return Err(error);
+        }
+        Ok((File::from(fd), parent.created_ancestors))
+    }
+
+    /// Removes the exact private staging directory only when it is empty. The
+    /// operation is serialized with stage creation, so an uploader cannot keep
+    /// an open directory descriptor and subsequently create an unreachable
+    /// stage in a directory that cleanup has already unlinked.
+    pub(super) async fn remove_empty_upload_stage_directory(
+        &self,
+        stage_path: &Path,
+    ) -> std::io::Result<bool> {
+        let this = self.clone();
+        let stage_path = stage_path.to_path_buf();
+        run_blocking(move || {
+            let (directory_path, _) = this.validated_upload_stage_path(&stage_path)?;
+            this.remove_empty_upload_stage_directory_blocking(directory_path)
+        })
+        .await
+    }
+
+    /// Post-order maintenance uses the directory path directly after scanning
+    /// its children. The shared creation lock makes empty removal and the next
+    /// stage creation linearizable; the latter either observes the directory
+    /// or recreates and syncs it before publishing a child checkpoint.
+    pub(super) fn remove_empty_upload_stage_directory_blocking(
+        &self,
+        directory_path: &Path,
+    ) -> std::io::Result<bool> {
+        self.relative_path(directory_path)?;
+        if directory_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(classify_internal_name)
+            != Some(InternalEntryName::StageDirectory)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "upload staging directory path is not canonical",
+            ));
+        }
+        let _ancestor_creation = self
+            .inner
+            .ancestor_creation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = match self.open_parent_blocking(directory_path, false) {
+            Ok(parent) => parent,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let directory = match open_private_upload_stage_directory_at(&parent.fd, &parent.name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let opened = fstat(&directory).map_err(std::io::Error::from)?;
+        let named = statat(&parent.fd, &parent.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
+        if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "upload staging directory identity changed before cleanup",
+            ));
+        }
+        match unlinkat(&parent.fd, &parent.name, AtFlags::REMOVEDIR) {
+            Ok(()) => {
+                fsync(&parent.fd).map_err(std::io::Error::from)?;
+                Ok(true)
+            }
+            Err(Errno::NOENT | Errno::NOTEMPTY | Errno::EXIST) => Ok(false),
+            Err(error) => Err(std::io::Error::from(error)),
+        }
+    }
+
+    /// Validates an already-persisted private stage binding without creating
+    /// or repairing anything. Startup uses this before opening a listener so
+    /// an externally replaced or newly traversable staging directory cannot
+    /// silently weaken the confidentiality boundary recorded by schema v5.
+    pub(super) fn validate_private_upload_stage(
+        &self,
+        path: &Path,
+        expected: Option<StoredFileIdentity>,
+    ) -> std::io::Result<PrivateUploadStageValidation> {
+        let _ancestor_creation = self
+            .inner
+            .ancestor_creation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (directory_path, stage_name) = self.validated_upload_stage_path(path)?;
+        let parent = match self.open_parent_blocking(directory_path, false) {
+            Ok(parent) => parent,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(PrivateUploadStageValidation::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let directory = match open_private_upload_stage_directory_at(&parent.fd, &parent.name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PrivateUploadStageValidation::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(expected) = expected else {
+            return match statat(&directory, &stage_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => Ok(PrivateUploadStageValidation::Missing),
+                Ok(_) => Ok(PrivateUploadStageValidation::IdentityMismatch),
+                Err(error) => Err(std::io::Error::from(error)),
+            };
+        };
+        match open_expected_upload_stage_at(&directory, &stage_name, expected)? {
+            ExpectedUploadStage::Match(_stage) => Ok(PrivateUploadStageValidation::Present),
+            ExpectedUploadStage::Missing => Ok(PrivateUploadStageValidation::Missing),
+            ExpectedUploadStage::Mismatch => Ok(PrivateUploadStageValidation::IdentityMismatch),
+        }
+    }
+
+    /// Moves one v0.48 stage into the private per-parent namespace. Filesystem
+    /// publication precedes the caller's SQLite path update. If a crash happens
+    /// in that gap, a retry recognizes the already-moved inode by its durable
+    /// identity and completes the database side without retransmitting data.
+    pub(super) fn migrate_legacy_upload_stage(
+        &self,
+        legacy_path: &Path,
+        private_path: &Path,
+        expected: Option<StoredFileIdentity>,
+    ) -> std::io::Result<LegacyUploadStageMigration> {
+        let _ancestor_creation = self
+            .inner
+            .ancestor_creation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.migrate_legacy_upload_stage_blocking(legacy_path, private_path, expected)
+    }
+
+    fn migrate_legacy_upload_stage_blocking(
+        &self,
+        legacy_path: &Path,
+        private_path: &Path,
+        expected: Option<StoredFileIdentity>,
+    ) -> std::io::Result<LegacyUploadStageMigration> {
+        let (stage_directory_path, private_name) =
+            self.validated_upload_stage_path(private_path)?;
+        self.relative_path(legacy_path)?;
+        let legacy_name = legacy_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy upload stage has no file name",
+            )
+        })?;
+        if legacy_path.parent() != stage_directory_path.parent()
+            || legacy_name != private_name
+            || legacy_name.to_str().and_then(classify_internal_name)
+                != Some(InternalEntryName::Stage)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy and private upload stage paths do not describe the same parent and name",
+            ));
+        }
+
+        let legacy_parent = match self.open_parent_blocking(legacy_path, false) {
+            Ok(parent) => parent,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(LegacyUploadStageMigration::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(expected) = expected else {
+            let legacy_absent = match statat(
+                &legacy_parent.fd,
+                &legacy_parent.name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(Errno::NOENT) => true,
+                Ok(_) => false,
+                Err(error) => return Err(std::io::Error::from(error)),
+            };
+            let private_absent = match statat(
+                &legacy_parent.fd,
+                stage_directory_path
+                    .file_name()
+                    .expect("validated stage directory"),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(Errno::NOENT) => true,
+                Ok(_) => {
+                    let directory = open_private_upload_stage_directory_at(
+                        &legacy_parent.fd,
+                        stage_directory_path
+                            .file_name()
+                            .expect("validated stage directory"),
+                    )?;
+                    match statat(&directory, &private_name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Err(Errno::NOENT) => true,
+                        Ok(_) => false,
+                        Err(error) => return Err(std::io::Error::from(error)),
+                    }
+                }
+                Err(error) => return Err(std::io::Error::from(error)),
+            };
+            if legacy_absent && private_absent {
+                return Ok(LegacyUploadStageMigration::Missing);
+            }
+            return Ok(LegacyUploadStageMigration::IdentityMismatch);
+        };
+        let existing_private_directory = match open_private_upload_stage_directory_at(
+            &legacy_parent.fd,
+            stage_directory_path
+                .file_name()
+                .expect("validated stage directory"),
+        ) {
+            Ok(directory) => Some(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(stage_directory) = existing_private_directory {
+            match open_expected_upload_stage_at(
+                &stage_directory,
+                private_name.as_os_str(),
+                expected,
+            )? {
+                ExpectedUploadStage::Match(_private) => {
+                    fsync(&stage_directory).map_err(std::io::Error::from)?;
+                    fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
+                    return Ok(LegacyUploadStageMigration::AlreadyMoved);
+                }
+                ExpectedUploadStage::Mismatch => {
+                    return Ok(LegacyUploadStageMigration::IdentityMismatch);
+                }
+                ExpectedUploadStage::Missing => {}
+            }
+        }
+
+        let legacy = match open_expected_upload_stage_at(
+            &legacy_parent.fd,
+            &legacy_parent.name,
+            expected,
+        )? {
+            ExpectedUploadStage::Match(legacy) => legacy,
+            ExpectedUploadStage::Missing => return Ok(LegacyUploadStageMigration::Missing),
+            ExpectedUploadStage::Mismatch => {
+                return Ok(LegacyUploadStageMigration::IdentityMismatch);
+            }
+        };
+
+        let (stage_directory, _) = ensure_private_upload_stage_directory_at(
+            &legacy_parent.fd,
+            stage_directory_path
+                .file_name()
+                .expect("validated stage directory"),
+        )?;
+        match statat(&stage_directory, &private_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => {}
+            Ok(_) => {
+                return Ok(LegacyUploadStageMigration::IdentityMismatch);
+            }
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+        verify_named_upload_stage(&legacy_parent.fd, &legacy_parent.name, &legacy, expected)?;
+
+        let rename_result = renameat_with(
+            &legacy_parent.fd,
+            &legacy_parent.name,
+            &stage_directory,
+            &private_name,
+            RenameFlags::NOREPLACE,
+        );
+        if let Err(rename_error) = rename_result {
+            let legacy_after =
+                open_expected_upload_stage_at(&legacy_parent.fd, &legacy_parent.name, expected);
+            let private_after =
+                open_expected_upload_stage_at(&stage_directory, &private_name, expected);
+            if matches!(legacy_after, Ok(ExpectedUploadStage::Missing))
+                && let Ok(ExpectedUploadStage::Match(_private)) = private_after
+            {
+                fsync(&stage_directory).map_err(std::io::Error::from)?;
+                fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
+                return Ok(LegacyUploadStageMigration::AlreadyMoved);
+            }
+            return Err(std::io::Error::new(
+                std::io::Error::from(rename_error).kind(),
+                format!(
+                    "failed to move legacy upload stage into its private directory: {rename_error}"
+                ),
+            ));
+        }
+
+        verify_named_upload_stage(&stage_directory, &private_name, &legacy, expected)?;
+        match statat(
+            &legacy_parent.fd,
+            &legacy_parent.name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(Errno::NOENT) => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "legacy upload stage name still exists after rename",
+                ));
+            }
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+        fsync(&stage_directory).map_err(std::io::Error::from)?;
+        fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
+        Ok(LegacyUploadStageMigration::Moved)
+    }
+
+    fn validated_upload_stage_path<'a>(
+        &self,
+        path: &'a Path,
+    ) -> std::io::Result<(&'a Path, OsString)> {
+        self.relative_path(path)?;
+        let directory = upload_stage_directory(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "upload stage is not inside the reserved private directory",
+            )
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "upload stage has no file name",
+            )
+        })?;
+        if name.to_str().and_then(classify_internal_name) != Some(InternalEntryName::Stage) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "upload stage file name is not canonical",
+            ));
+        }
+        Ok((directory, name.to_os_string()))
+    }
+
     /// Create a new upload-internal file without ever making it accessible to
     /// group or other users. The explicit `fchmod` also neutralizes a
     /// permissive umask or inherited default ACL mode bits.
+    #[cfg(test)]
     pub(super) async fn create_private_new(
         &self,
         path: &Path,
@@ -884,6 +1334,7 @@ impl RootedFs {
             .await
     }
 
+    #[cfg(test)]
     async fn create_new_with_mode(
         &self,
         path: &Path,
@@ -944,6 +1395,7 @@ impl RootedFs {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn ensure_parent(&self, path: &Path) -> std::io::Result<CreatedAncestors> {
         let this = self.clone();
         let path = path.to_path_buf();
@@ -2108,6 +2560,176 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+fn ensure_private_upload_stage_directory_at<F: AsFd>(
+    parent: &F,
+    name: &OsStr,
+) -> std::io::Result<(OwnedFd, Option<FileIdentity>)> {
+    let created = match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) => true,
+        Err(Errno::EXIST) => false,
+        Err(error) => return Err(std::io::Error::from(error)),
+    };
+    let result = open_upload_stage_directory_at(parent, name, true);
+    let directory = match result {
+        Ok(directory) => directory,
+        Err(error) => {
+            if created {
+                let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+                let _ = fsync(parent);
+            }
+            return Err(error);
+        }
+    };
+    let stat = match fstat(&directory) {
+        Ok(stat) => stat,
+        Err(error) => {
+            if created {
+                let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+                let _ = fsync(parent);
+            }
+            return Err(std::io::Error::from(error));
+        }
+    };
+    let identity = FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    };
+    if created {
+        // Make both the directory inode and its parent entry durable before a
+        // checkpoint is allowed to advertise a child stage name in SQLite.
+        if let Err(error) = fsync(&directory).and_then(|()| fsync(parent)) {
+            let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+            let _ = fsync(parent);
+            return Err(std::io::Error::from(error));
+        }
+    }
+    Ok((directory, created.then_some(identity)))
+}
+
+fn open_private_upload_stage_directory_at<F: AsFd>(
+    parent: &F,
+    name: &OsStr,
+) -> std::io::Result<OwnedFd> {
+    open_upload_stage_directory_at(parent, name, false)
+}
+
+fn open_upload_stage_directory_at<F: AsFd>(
+    parent: &F,
+    name: &OsStr,
+    repair_mode: bool,
+) -> std::io::Result<OwnedFd> {
+    let directory = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let parent_stat = fstat(parent).map_err(std::io::Error::from)?;
+    let mut opened = fstat(&directory).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(parent_stat.st_mode) != FileType::Directory
+        || FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+        || opened.st_uid != geteuid().as_raw()
+        || opened.st_dev != parent_stat.st_dev
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload staging directory is not an euid-owned directory on the target parent's filesystem",
+        ));
+    }
+    if repair_mode && opened.st_mode & 0o7777 != 0o700 {
+        fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(std::io::Error::from)?;
+        fsync(&directory).map_err(std::io::Error::from)?;
+        opened = fstat(&directory).map_err(std::io::Error::from)?;
+    }
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+        || opened.st_uid != geteuid().as_raw()
+        || opened.st_dev != parent_stat.st_dev
+        || opened.st_mode & 0o7777 != 0o700
+        || named.st_dev != opened.st_dev
+        || named.st_ino != opened.st_ino
+        || FileType::from_raw_mode(named.st_mode) != FileType::Directory
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload staging directory failed its private identity check",
+        ));
+    }
+    Ok(directory)
+}
+
+enum ExpectedUploadStage {
+    Missing,
+    Match(OwnedFd),
+    Mismatch,
+}
+
+fn open_expected_upload_stage_at<F: AsFd>(
+    parent: &F,
+    name: &OsStr,
+    expected: StoredFileIdentity,
+) -> std::io::Result<ExpectedUploadStage> {
+    let named = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(named) => named,
+        Err(Errno::NOENT) => return Ok(ExpectedUploadStage::Missing),
+        Err(error) => return Err(std::io::Error::from(error)),
+    };
+    if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || named.st_nlink != 1
+        || named.st_dev != expected.device
+        || named.st_ino != expected.inode
+    {
+        return Ok(ExpectedUploadStage::Mismatch);
+    }
+    let file = match openat(
+        parent,
+        name,
+        // A legacy awaiting-confirmation stage may deliberately carry the
+        // destination's mode and ownership already. O_PATH pins its inode for
+        // the rename checks without requiring data-read permission or
+        // changing any of that preserved metadata.
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(Errno::NOENT | Errno::NOTDIR) => return Ok(ExpectedUploadStage::Mismatch),
+        Err(error) => return Err(std::io::Error::from(error)),
+    };
+    match verify_named_upload_stage(parent, name, &file, expected) {
+        Ok(()) => Ok(ExpectedUploadStage::Match(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            Ok(ExpectedUploadStage::Mismatch)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_named_upload_stage<P: AsFd, F: AsFd>(
+    parent: &P,
+    name: &OsStr,
+    file: &F,
+    expected: StoredFileIdentity,
+) -> std::io::Result<()> {
+    let opened = fstat(file).map_err(std::io::Error::from)?;
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || opened.st_nlink != 1
+        || opened.st_dev != expected.device
+        || opened.st_ino != expected.inode
+        || named.st_dev != opened.st_dev
+        || named.st_ino != opened.st_ino
+        || FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || named.st_nlink != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload stage descriptor no longer matches its durable rooted name",
+        ));
+    }
+    Ok(())
 }
 
 #[inline]

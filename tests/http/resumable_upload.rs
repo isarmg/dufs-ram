@@ -279,7 +279,7 @@ fn durable_resumable_upload_keeps_old_file_until_commit(
     assert_eq!(resp.headers().get("x-dufs-upload-offset").unwrap(), "3");
     assert_eq!(resp.headers().get("x-dufs-upload-length").unwrap(), "6");
 
-    let staging_path = std::fs::read_dir(server.path())?
+    let staging_path = std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
@@ -316,11 +316,7 @@ fn durable_resumable_upload_keeps_old_file_until_commit(
         std::fs::read_to_string(server.path().join("index.html"))?,
         "abc123"
     );
-    assert!(
-        !std::fs::read_dir(server.path())?
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
-    );
+    assert!(!server.path().join(UPLOAD_STAGE_DIRECTORY).exists());
 
     let resp = server
         .request(reqwest::Method::HEAD, &url)
@@ -414,7 +410,7 @@ fn durable_upload_rejects_stage_shorter_than_checkpoint(server: TestServer) -> R
         .send()?;
     assert_eq!(resp.status(), 409);
 
-    let staging_path = std::fs::read_dir(server.path())?
+    let staging_path = std::fs::read_dir(server.path().join(UPLOAD_STAGE_DIRECTORY))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
@@ -532,6 +528,12 @@ fn upload_staging_files_are_hidden_and_not_addressable(server: TestServer) -> Re
     for staging_name in &staging_names {
         std::fs::write(server.path().join(staging_name), b"partial")?;
     }
+    let private_stage_directory = server.path().join(UPLOAD_STAGE_DIRECTORY);
+    std::fs::create_dir(&private_stage_directory)?;
+    std::fs::write(
+        private_stage_directory.join(&stage_name),
+        b"private partial",
+    )?;
 
     let resp = server.get(server.url())?;
     let paths = server.paths_from_page(resp)?;
@@ -540,6 +542,17 @@ fn upload_staging_files_are_hidden_and_not_addressable(server: TestServer) -> Re
         let resp = server.get(format!("{}{}", server.url(), staging_name))?;
         assert_eq!(resp.status(), 400);
     }
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.contains(UPLOAD_STAGE_DIRECTORY))
+    );
+    assert_eq!(
+        server
+            .get(format!("{}{}", server.url(), UPLOAD_STAGE_DIRECTORY))?
+            .status(),
+        400
+    );
     let search_paths =
         server.paths_from_page(server.get(format!("{}?q=.dufs-upload", server.url()))?)?;
     for staging_name in &staging_names {

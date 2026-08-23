@@ -1,13 +1,16 @@
 use super::super::{
     identity::OwnerId,
-    rooted_fs::{CreatedAncestors, DeleteIdentity, RootedFs, TrashPurgeProgress},
+    rooted_fs::{
+        CreatedAncestors, DeleteIdentity, LegacyUploadStageMigration, PrivateUploadStageValidation,
+        RootedFs, TrashPurgeProgress,
+    },
     state_store::{
         RejectUploadSession, StateStore, StoreUploadSession, StoredFileIdentity,
         StoredUploadSession, StoredUploadState, UploadSessionKey,
     },
     storage::sync_file_to_storage,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use std::{
     fmt,
     os::unix::fs::MetadataExt,
@@ -44,10 +47,11 @@ pub(super) enum UploadDiscardLookup {
     Rejected(RejectedUploadRecord),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RejectedUploadRecord {
     pub(super) upload_length: u64,
     pub(super) durable_offset: u64,
+    stage_path: PathBuf,
     stage_identity: Option<StoredFileIdentity>,
 }
 
@@ -126,6 +130,8 @@ pub(in crate::server) struct UploadRecordStore {
 }
 
 impl UploadRecordStore {
+    const STARTUP_RECONCILIATION_PAGE_SIZE: usize = 16;
+
     pub(in crate::server) fn new(
         rooted_fs: RootedFs,
         state_store: StateStore,
@@ -142,6 +148,106 @@ impl UploadRecordStore {
         })
     }
 
+    /// Upgrade durable v0.48 stage bindings in bounded keyset pages before the
+    /// server starts any listener or maintenance task. Filesystem movement is
+    /// made durable before the exact SQLite row is changed, so a crash in
+    /// between is recognized by inode on the next startup. A stale terminal
+    /// identity never blocks a later active owner of the same physical name.
+    pub(in crate::server) fn reconcile_stage_layouts(&self) -> Result<()> {
+        let mut after = None;
+        loop {
+            let sessions = self
+                .state_store
+                .upload_sessions_page_blocking(after, Self::STARTUP_RECONCILIATION_PAGE_SIZE)?;
+            if sessions.is_empty() {
+                break;
+            }
+            after = sessions.last().map(|session| session.key);
+            for session in sessions {
+                self.reconcile_stage_layout(session)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_stage_layout(&self, session: StoredUploadSession) -> Result<()> {
+        let upload_id = Uuid::from_bytes(session.key.id);
+        let target_path = self
+            .rooted_fs
+            .resolve_state_path(&session.target_path)
+            .with_context(|| format!("Upload {upload_id} has an invalid target path"))?;
+        let stored_stage = self
+            .rooted_fs
+            .resolve_state_path(&session.stage_path)
+            .with_context(|| format!("Upload {upload_id} has an invalid stage path"))?;
+        ensure!(
+            self.rooted_fs.state_relative_path(&target_path)? == session.target_path
+                && self.rooted_fs.state_relative_path(&stored_stage)? == session.stage_path,
+            "Upload {upload_id} has a non-canonical rooted path"
+        );
+
+        let private_stage = super::upload_temp_path(&target_path, upload_id)?;
+        let legacy_stage = super::legacy_upload_temp_path(&target_path, upload_id)?;
+        ensure!(
+            stored_stage == private_stage || stored_stage == legacy_stage,
+            "Upload {upload_id} has a stage path that does not match its target"
+        );
+
+        let stage_owning = !session.state.is_terminal();
+
+        // A row already bound to the private layout needs no rename, but its
+        // confidentiality boundary and any live inode binding still require
+        // validation. An unrelated stale legacy occupant is deliberately not
+        // consulted here.
+        if stored_stage == private_stage {
+            let validation = self
+                .rooted_fs
+                .validate_private_upload_stage(&private_stage, session.stage_identity)
+                .with_context(|| {
+                    format!("Upload {upload_id} has an invalid private staging directory")
+                })?;
+            if validation == PrivateUploadStageValidation::IdentityMismatch && stage_owning {
+                return Err(if session.stage_identity.is_none() {
+                    anyhow!("Upload {upload_id} has no durable inode identity for its active stage")
+                } else {
+                    anyhow!("Upload {upload_id} staging identity does not match its active record")
+                });
+            }
+            return Ok(());
+        }
+
+        let migration = self
+            .rooted_fs
+            .migrate_legacy_upload_stage(&legacy_stage, &private_stage, session.stage_identity)
+            .with_context(|| {
+                format!("Failed to isolate the staging file for upload {upload_id}")
+            })?;
+
+        if migration == LegacyUploadStageMigration::IdentityMismatch {
+            if stage_owning {
+                return Err(if session.stage_identity.is_none() {
+                    anyhow!("Upload {upload_id} has no durable inode identity for its active stage")
+                } else {
+                    anyhow!("Upload {upload_id} staging identity does not match its active record")
+                });
+            }
+            return Ok(());
+        }
+        if migration == LegacyUploadStageMigration::Missing && !stage_owning {
+            return Ok(());
+        }
+
+        let private_relative = self.rooted_fs.state_relative_path(&private_stage)?;
+        if session.stage_path != private_relative {
+            ensure!(
+                self.state_store
+                    .replace_upload_stage_path_blocking(session, private_relative)?,
+                "Upload {upload_id} changed while its stage path was being migrated"
+            );
+        }
+        Ok(())
+    }
+
     /// Look up the owner-scoped UUID in SQLite.
     pub(super) async fn lookup(
         &self,
@@ -151,11 +257,11 @@ impl UploadRecordStore {
         stage_path: &Path,
     ) -> Result<UploadRecordLookup> {
         let key = upload_session_key(owner_id, upload_id);
-        let (target_relative, stage_relative) =
+        let (target_relative, _stage_relative) =
             self.validated_relative_paths(upload_id, target_path, stage_path)?;
         if let Some(session) = self.state_store.upload_session(key).await? {
             return self
-                .classify_stored_session(&target_relative, &stage_relative, stage_path, session)
+                .classify_stored_session(upload_id, &target_relative, target_path, session)
                 .await;
         }
         Ok(UploadRecordLookup::NotSeen)
@@ -368,11 +474,23 @@ impl UploadRecordStore {
         stage_path: &Path,
     ) -> Result<UploadDiscardLookup> {
         let key = upload_session_key(owner_id, upload_id);
-        let (target_relative, stage_relative) =
+        let (target_relative, _stage_relative) =
             self.validated_relative_paths(upload_id, target_path, stage_path)?;
+        let Some(existing) = self.state_store.upload_session(key).await? else {
+            return Ok(UploadDiscardLookup::NotSeen);
+        };
+        let stored_target = self.rooted_fs.resolve_state_path(&existing.target_path)?;
+        let stored_stage = self.rooted_fs.resolve_state_path(&existing.stage_path)?;
+        if existing.target_path != target_relative
+            || stored_target != target_path
+            || !super::is_upload_temp_path(&stored_target, upload_id, &stored_stage)?
+            || self.rooted_fs.state_relative_path(&stored_stage)? != existing.stage_path
+        {
+            return Ok(UploadDiscardLookup::ForeignOwner);
+        }
         let result = self
             .state_store
-            .reject_upload_session(key, target_relative, stage_relative, self.ttl)
+            .reject_upload_session(key, target_relative, existing.stage_path, self.ttl)
             .await?;
         Ok(match result {
             RejectUploadSession::NotFound => UploadDiscardLookup::NotSeen,
@@ -384,6 +502,7 @@ impl UploadRecordStore {
                 UploadDiscardLookup::Rejected(RejectedUploadRecord {
                     upload_length: session.upload_length,
                     durable_offset: session.durable_offset,
+                    stage_path: stored_stage,
                     stage_identity: session.stage_identity,
                 })
             }
@@ -395,18 +514,19 @@ impl UploadRecordStore {
     /// The rejected row remains the authority for both retries and the inode
     /// identity check. A missing or mismatched row is never permission to
     /// unlink the shared stage pathname.
-    pub(super) async fn cleanup_rejected_stage(
-        &self,
-        stage_path: &Path,
-        record: RejectedUploadRecord,
-    ) -> Result<()> {
+    pub(super) async fn cleanup_rejected_stage(&self, record: &RejectedUploadRecord) -> Result<()> {
         let Some(identity) = record.stage_identity else {
             // Legacy rejected rows may predate durable stage identities. No
             // pathname is safe to unlink without that capability.
             return Ok(());
         };
-        match self.remove_file_if_identity(stage_path, identity).await? {
+        match self
+            .remove_file_if_identity(&record.stage_path, identity)
+            .await?
+        {
             StageCleanupOutcome::RemovedOrAbsent | StageCleanupOutcome::ReplacementPreserved => {
+                self.remove_stage_directory_if_empty(&record.stage_path)
+                    .await?;
                 Ok(())
             }
         }
@@ -448,6 +568,7 @@ impl UploadRecordStore {
         {
             return Err(UploadRecordStoreError::Conflict.into());
         }
+        self.remove_stage_directory_if_empty(stage_path).await?;
         Ok(())
     }
 
@@ -474,11 +595,13 @@ impl UploadRecordStore {
             )
             .await?
         {
-            StageCleanupOutcome::RemovedOrAbsent => Ok(()),
+            StageCleanupOutcome::RemovedOrAbsent => {}
             StageCleanupOutcome::ReplacementPreserved => {
-                Err(UploadRecordStoreError::Conflict.into())
+                return Err(UploadRecordStoreError::Conflict.into());
             }
         }
+        self.remove_stage_directory_if_empty(stage_path).await?;
+        Ok(())
     }
 
     pub(super) async fn reset_and_ancestors(
@@ -555,7 +678,7 @@ impl UploadRecordStore {
         stage_path: &Path,
     ) -> Result<(PathBuf, PathBuf)> {
         ensure!(
-            super::upload_temp_path(target_path, upload_id)? == stage_path,
+            super::is_upload_temp_path(target_path, upload_id, stage_path)?,
             "Upload staging path does not match its target and ID"
         );
         let target_relative = self.rooted_fs.state_relative_path(target_path)?;
@@ -573,9 +696,9 @@ impl UploadRecordStore {
 
     async fn classify_stored_session(
         &self,
+        upload_id: Uuid,
         expected_target: &Path,
-        expected_stage: &Path,
-        stage_path: &Path,
+        target_path: &Path,
         session: StoredUploadSession,
     ) -> Result<UploadRecordLookup> {
         // Treat paths loaded from SQLite as untrusted bytes. Resolution rejects
@@ -583,9 +706,10 @@ impl UploadRecordStore {
         let stored_target = self.rooted_fs.resolve_state_path(&session.target_path)?;
         let stored_stage = self.rooted_fs.resolve_state_path(&session.stage_path)?;
         if session.target_path != expected_target
-            || session.stage_path != expected_stage
             || stored_target != self.rooted_fs.resolve_state_path(expected_target)?
-            || stored_stage != stage_path
+            || stored_target != target_path
+            || !super::is_upload_temp_path(&stored_target, upload_id, &stored_stage)?
+            || self.rooted_fs.state_relative_path(&stored_stage)? != session.stage_path
         {
             return Ok(UploadRecordLookup::ForeignOwner);
         }
@@ -595,7 +719,11 @@ impl UploadRecordStore {
             StoredUploadState::Running | StoredUploadState::AwaitingConfirmation
         ) && session.durable_offset < session.upload_length
             && !self
-                .valid_resumable_stage(stage_path, session.durable_offset, session.stage_identity)
+                .valid_resumable_stage(
+                    &stored_stage,
+                    session.durable_offset,
+                    session.stage_identity,
+                )
                 .await?
         {
             return Ok(UploadRecordLookup::NotSeen);
@@ -712,6 +840,15 @@ impl UploadRecordStore {
             Err(error) => Err(error.into()),
         }
     }
+
+    async fn remove_stage_directory_if_empty(&self, stage_path: &Path) -> Result<()> {
+        if super::upload_stage_directory(stage_path).is_some() {
+            self.rooted_fs
+                .remove_empty_upload_stage_directory(stage_path)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -760,7 +897,7 @@ pub(super) async fn rollback_upload_ancestors(
 mod record_store_tests {
     use super::*;
     use futures_util::poll;
-    use std::task::Poll;
+    use std::{os::unix::fs::PermissionsExt, task::Poll};
 
     const TEST_TTL: Duration = Duration::from_secs(60);
 
@@ -774,8 +911,40 @@ mod record_store_tests {
         (target, stage)
     }
 
+    fn stored_session(
+        rooted_fs: &RootedFs,
+        owner: [u8; 32],
+        upload_id: Uuid,
+        target: &Path,
+        stage: &Path,
+        state: StoredUploadState,
+        stage_identity: Option<StoredFileIdentity>,
+    ) -> StoredUploadSession {
+        let upload_length = 8;
+        StoredUploadSession {
+            key: UploadSessionKey {
+                owner,
+                id: *upload_id.as_bytes(),
+            },
+            target_path: rooted_fs.state_relative_path(target).unwrap(),
+            stage_path: rooted_fs.state_relative_path(stage).unwrap(),
+            upload_length,
+            durable_offset: if state.is_terminal()
+                || state == StoredUploadState::CommitStarted
+                || state == StoredUploadState::AwaitingConfirmation
+            {
+                upload_length
+            } else {
+                4
+            },
+            state,
+            stage_identity,
+            target_revision: None,
+        }
+    }
+
     async fn create_stage(rooted_fs: &RootedFs, stage: &Path, contents: &[u8]) -> fs::File {
-        let (mut file, _) = rooted_fs.create_private_new(stage).await.unwrap();
+        let (mut file, _) = rooted_fs.create_private_upload_stage(stage).await.unwrap();
         file.write_all(contents).await.unwrap();
         file
     }
@@ -838,6 +1007,344 @@ mod record_store_tests {
     }
 
     #[tokio::test]
+    async fn startup_moves_legacy_stage_into_private_directory_without_losing_metadata() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("legacy-stage-owner");
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("legacy.bin");
+        let legacy = super::super::legacy_upload_temp_path(&target, upload_id).unwrap();
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let (mut file, _) = rooted_fs.create_private_new(&legacy).await.unwrap();
+        file.write_all(b"partial").await.unwrap();
+        file.flush().await.unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let metadata = file.metadata().await.unwrap();
+        let session = StoredUploadSession {
+            key: upload_session_key(owner, upload_id),
+            target_path: rooted_fs.state_relative_path(&target).unwrap(),
+            stage_path: rooted_fs.state_relative_path(&legacy).unwrap(),
+            upload_length: 8,
+            durable_offset: 7,
+            state: StoredUploadState::Running,
+            stage_identity: Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+            target_revision: Some([9; 32]),
+        };
+        assert_eq!(
+            state_store
+                .save_upload_session(session.clone(), TEST_TTL)
+                .await
+                .unwrap(),
+            StoreUploadSession::Inserted
+        );
+
+        records.reconcile_stage_layouts().unwrap();
+
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&private).unwrap(), b"partial");
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "migration must preserve metadata already copied from an overwrite target"
+        );
+        assert_eq!(
+            std::fs::metadata(private.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let mut migrated = session;
+        migrated.stage_path = rooted_fs.state_relative_path(&private).unwrap();
+        assert_eq!(
+            state_store.upload_session(migrated.key).await.unwrap(),
+            Some(migrated)
+        );
+        drop(file);
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_an_unidentifiable_legacy_stage() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("legacy-stage-without-identity");
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("unidentified.bin");
+        let legacy = super::super::legacy_upload_temp_path(&target, upload_id).unwrap();
+        std::fs::write(&legacy, b"do not adopt").unwrap();
+        let session = StoredUploadSession {
+            key: upload_session_key(owner, upload_id),
+            target_path: rooted_fs.state_relative_path(&target).unwrap(),
+            stage_path: rooted_fs.state_relative_path(&legacy).unwrap(),
+            upload_length: 12,
+            durable_offset: 0,
+            state: StoredUploadState::Running,
+            stage_identity: None,
+            target_revision: None,
+        };
+        state_store
+            .save_upload_session(session.clone(), TEST_TTL)
+            .await
+            .unwrap();
+
+        let error = records
+            .reconcile_stage_layouts()
+            .expect_err("an occupant without a durable inode identity must block startup");
+        assert!(format!("{error:#}").contains("no durable inode identity"));
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"do not adopt");
+        assert_eq!(
+            state_store.upload_session(session.key).await.unwrap(),
+            Some(session)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_ignores_a_stale_legacy_occupant_for_a_private_record() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let owner = OwnerId::persistent("private-stage-owner");
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("private.bin");
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let legacy = super::super::legacy_upload_temp_path(&target, upload_id).unwrap();
+        let file = create_stage(&rooted_fs, &private, b"private checkpoint").await;
+        let metadata = file.metadata().await.unwrap();
+        std::fs::write(&legacy, b"unrelated stale occupant").unwrap();
+        let session = StoredUploadSession {
+            key: upload_session_key(owner, upload_id),
+            target_path: rooted_fs.state_relative_path(&target).unwrap(),
+            stage_path: rooted_fs.state_relative_path(&private).unwrap(),
+            upload_length: 32,
+            durable_offset: 18,
+            state: StoredUploadState::Running,
+            stage_identity: Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+            target_revision: None,
+        };
+        state_store
+            .save_upload_session(session.clone(), TEST_TTL)
+            .await
+            .unwrap();
+
+        records.reconcile_stage_layouts().unwrap();
+
+        assert_eq!(std::fs::read(&private).unwrap(), b"private checkpoint");
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"unrelated stale occupant");
+        assert_eq!(
+            state_store.upload_session(session.key).await.unwrap(),
+            Some(session)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_a_traversable_directory_for_a_private_record() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("private-mode.bin");
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let file = create_stage(&rooted_fs, &private, b"private checkpoint").await;
+        let metadata = file.metadata().await.unwrap();
+        let session = stored_session(
+            &rooted_fs,
+            [4; 32],
+            upload_id,
+            &target,
+            &private,
+            StoredUploadState::Running,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        state_store
+            .save_upload_session(session, TEST_TTL)
+            .await
+            .unwrap();
+        std::fs::set_permissions(
+            private.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let error = records
+            .reconcile_stage_layouts()
+            .expect_err("a traversable staging directory must block startup");
+        assert!(format!("{error:#}").contains("private identity check"));
+
+        std::fs::set_permissions(
+            private.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        records.reconcile_stage_layouts().unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_a_substituted_private_stage_for_an_active_record() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("private-replacement.bin");
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let file = create_stage(&rooted_fs, &private, b"original checkpoint").await;
+        let metadata = file.metadata().await.unwrap();
+        let session = stored_session(
+            &rooted_fs,
+            [5; 32],
+            upload_id,
+            &target,
+            &private,
+            StoredUploadState::Running,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        state_store
+            .save_upload_session(session, TEST_TTL)
+            .await
+            .unwrap();
+        let _replacement =
+            replace_stage_with_distinct_inode(&rooted_fs, &private, &file, b"substitute").await;
+
+        let error = records
+            .reconcile_stage_layouts()
+            .expect_err("a substituted active stage must block startup");
+        assert!(format!("{error:#}").contains("staging identity does not match"));
+    }
+
+    #[tokio::test]
+    async fn startup_migrates_the_active_owner_past_a_stale_terminal_binding() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("reused-name.bin");
+        let legacy = super::super::legacy_upload_temp_path(&target, upload_id).unwrap();
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let (mut file, _) = rooted_fs.create_private_new(&legacy).await.unwrap();
+        file.write_all(b"live").await.unwrap();
+        file.flush().await.unwrap();
+        let metadata = file.metadata().await.unwrap();
+        let live_identity = StoredFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let stale = stored_session(
+            &rooted_fs,
+            [1; 32],
+            upload_id,
+            &target,
+            &legacy,
+            StoredUploadState::Committed,
+            Some(StoredFileIdentity {
+                device: live_identity.device,
+                inode: live_identity.inode.wrapping_add(1),
+            }),
+        );
+        let live = stored_session(
+            &rooted_fs,
+            [2; 32],
+            upload_id,
+            &target,
+            &legacy,
+            StoredUploadState::Running,
+            Some(live_identity),
+        );
+        state_store
+            .save_upload_session(stale.clone(), TEST_TTL)
+            .await
+            .unwrap();
+        state_store
+            .save_upload_session(live.clone(), TEST_TTL)
+            .await
+            .unwrap();
+
+        records.reconcile_stage_layouts().unwrap();
+
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&private).unwrap(), b"live");
+        assert_eq!(
+            state_store.upload_session(stale.key).await.unwrap(),
+            Some(stale)
+        );
+        let mut migrated_live = live;
+        migrated_live.stage_path = rooted_fs.state_relative_path(&private).unwrap();
+        assert_eq!(
+            state_store.upload_session(migrated_live.key).await.unwrap(),
+            Some(migrated_live)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_isolates_an_exact_rejected_legacy_stage() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let rooted_fs = RootedFs::new(temp.path()).unwrap();
+        let state_store = temporary_store();
+        let records =
+            UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), TEST_TTL).unwrap();
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("rejected.bin");
+        let legacy = super::super::legacy_upload_temp_path(&target, upload_id).unwrap();
+        let private = super::super::upload_temp_path(&target, upload_id).unwrap();
+        let (mut file, _) = rooted_fs.create_private_new(&legacy).await.unwrap();
+        file.write_all(b"rejected staged data").await.unwrap();
+        file.flush().await.unwrap();
+        let metadata = file.metadata().await.unwrap();
+        let session = stored_session(
+            &rooted_fs,
+            [3; 32],
+            upload_id,
+            &target,
+            &legacy,
+            StoredUploadState::Rejected,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        state_store
+            .save_upload_session(session.clone(), TEST_TTL)
+            .await
+            .unwrap();
+
+        records.reconcile_stage_layouts().unwrap();
+
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&private).unwrap(), b"rejected staged data");
+        let mut migrated = session;
+        migrated.stage_path = rooted_fs.state_relative_path(&private).unwrap();
+        assert_eq!(
+            state_store.upload_session(migrated.key).await.unwrap(),
+            Some(migrated)
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_records_are_root_relative_and_bind_the_stage_inode() {
         let temp = assert_fs::TempDir::new().unwrap();
         let rooted_fs = RootedFs::new(temp.path()).unwrap();
@@ -865,7 +1372,10 @@ mod record_store_tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.target_path, Path::new("persistent.bin"));
-        assert_eq!(stored.stage_path, Path::new(stage.file_name().unwrap()));
+        assert_eq!(
+            stored.stage_path,
+            rooted_fs.state_relative_path(&stage).unwrap()
+        );
         assert!(stored.stage_identity.is_some());
         let checkpoint = found(
             records
@@ -1208,10 +1718,7 @@ mod record_store_tests {
             UploadDiscardLookup::Rejected(record) => record,
             _ => panic!("the cancelled rejection was not idempotently replayed"),
         };
-        records
-            .cleanup_rejected_stage(&stage, record)
-            .await
-            .unwrap();
+        records.cleanup_rejected_stage(&record).await.unwrap();
         assert!(!stage.exists());
         state_store.set_query_only(false).await.unwrap();
 
@@ -1223,10 +1730,7 @@ mod record_store_tests {
             UploadDiscardLookup::Rejected(record) => record,
             _ => panic!("the completed discard was not idempotently replayed"),
         };
-        records
-            .cleanup_rejected_stage(&stage, record)
-            .await
-            .unwrap();
+        records.cleanup_rejected_stage(&record).await.unwrap();
         drop(file);
     }
 
@@ -1259,10 +1763,7 @@ mod record_store_tests {
         };
         let replacement =
             replace_stage_with_distinct_inode(&rooted_fs, &stage, &original, b"replacement").await;
-        records
-            .cleanup_rejected_stage(&stage, record)
-            .await
-            .unwrap();
+        records.cleanup_rejected_stage(&record).await.unwrap();
         assert_eq!(std::fs::read(&stage).unwrap(), b"replacement");
         let retry = match records
             .reject_for_discard(owner, upload_id, &target, &stage)
@@ -1272,7 +1773,7 @@ mod record_store_tests {
             UploadDiscardLookup::Rejected(record) => record,
             _ => panic!("the rejected upload was not idempotently replayed"),
         };
-        records.cleanup_rejected_stage(&stage, retry).await.unwrap();
+        records.cleanup_rejected_stage(&retry).await.unwrap();
         assert_eq!(std::fs::read(&stage).unwrap(), b"replacement");
         assert_eq!(
             found(
@@ -1335,10 +1836,7 @@ mod record_store_tests {
             UploadDiscardLookup::Rejected(record) => record,
             _ => panic!("the retry did not reject the awaiting upload"),
         };
-        records
-            .cleanup_rejected_stage(&stage, record)
-            .await
-            .unwrap();
+        records.cleanup_rejected_stage(&record).await.unwrap();
         assert!(!stage.exists());
         drop(file);
     }

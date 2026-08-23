@@ -7,6 +7,13 @@ use uuid::Uuid;
 
 pub(super) const UPLOAD_TEMP_PREFIX: &str = ".dufs-upload-";
 pub(super) const UPLOAD_TEMP_SUFFIX: &str = ".part";
+// Keep the private directory inside a quarantine-name shape understood by
+// v0.48 and earlier. Those releases therefore hide it and never recurse into
+// it even if an operator rolls the binary back; schema v5 independently
+// prevents such a downgrade from opening the state database. Production
+// quarantine names use UUID v4, so the nil UUID cannot collide with one.
+pub(super) const UPLOAD_STAGE_DIRECTORY: &str =
+    ".dufs-quarantine-00000000-0000-0000-0000-000000000000.hold";
 pub(super) const UPLOAD_STATE_SUFFIX: &str = ".state";
 pub(super) const UPLOAD_STATE_TEMP_SUFFIX: &str = ".tmp";
 pub(super) const DELETE_TRASH_PREFIX: &str = ".dufs-upload-delete-";
@@ -41,11 +48,40 @@ pub(in crate::server) fn upload_temp_path(path: &Path, upload_id: Uuid) -> Resul
         .ok_or_else(|| anyhow!("Upload target has no file name"))?;
     let digest = Sha256::digest(file_name.to_string_lossy().as_bytes());
     let target_tag = encode_hex(digest);
+    Ok(parent
+        .join(UPLOAD_STAGE_DIRECTORY)
+        .join(upload_stage_name(&target_tag, upload_id)))
+}
+
+pub(in crate::server) fn legacy_upload_temp_path(path: &Path, upload_id: Uuid) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Upload target has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("Upload target has no file name"))?;
+    let digest = Sha256::digest(file_name.to_string_lossy().as_bytes());
+    let target_tag = encode_hex(digest);
     Ok(parent.join(upload_stage_name(&target_tag, upload_id)))
+}
+
+pub(in crate::server) fn is_upload_temp_path(
+    target: &Path,
+    upload_id: Uuid,
+    stage: &Path,
+) -> Result<bool> {
+    Ok(upload_temp_path(target, upload_id)? == stage
+        || legacy_upload_temp_path(target, upload_id)? == stage)
+}
+
+pub(in crate::server) fn upload_stage_directory(path: &Path) -> Option<&Path> {
+    let directory = path.parent()?;
+    (directory.file_name()?.to_str()? == UPLOAD_STAGE_DIRECTORY).then_some(directory)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InternalEntryName {
+    StageDirectory,
     Stage,
     State,
     StateTemp,
@@ -58,6 +94,9 @@ pub(in crate::server) fn is_internal_name(file_name: &str) -> bool {
 }
 
 pub(super) fn classify_internal_name(file_name: &str) -> Option<InternalEntryName> {
+    if file_name == UPLOAD_STAGE_DIRECTORY {
+        return Some(InternalEntryName::StageDirectory);
+    }
     if is_quarantine_name(file_name) {
         return Some(InternalEntryName::Quarantine);
     }
@@ -164,6 +203,12 @@ mod tests {
     fn generated_stage_readiness_and_trash_names_are_reserved() {
         let upload_id = Uuid::new_v4();
         let stage_path = upload_temp_path(Path::new("file.bin"), upload_id).unwrap();
+        assert_eq!(stage_path.parent(), Some(Path::new(UPLOAD_STAGE_DIRECTORY)));
+        assert!(is_quarantine_name(UPLOAD_STAGE_DIRECTORY));
+        assert_eq!(
+            classify_internal_name(UPLOAD_STAGE_DIRECTORY),
+            Some(InternalEntryName::StageDirectory)
+        );
         let stage = stage_path.file_name().unwrap().to_str().unwrap();
         assert_eq!(
             classify_internal_name(stage),
@@ -187,5 +232,22 @@ mod tests {
             classify_internal_name(&quarantine),
             Some(InternalEntryName::Quarantine)
         );
+    }
+
+    #[test]
+    fn current_and_legacy_stage_paths_are_exactly_bound_to_the_target() {
+        let upload_id = Uuid::new_v4();
+        let target = Path::new("folder/file.bin");
+        let current = upload_temp_path(target, upload_id).unwrap();
+        let legacy = legacy_upload_temp_path(target, upload_id).unwrap();
+
+        assert!(is_upload_temp_path(target, upload_id, &current).unwrap());
+        assert!(is_upload_temp_path(target, upload_id, &legacy).unwrap());
+        assert_eq!(
+            upload_stage_directory(&current),
+            Some(Path::new("folder").join(UPLOAD_STAGE_DIRECTORY).as_path())
+        );
+        assert_eq!(upload_stage_directory(&legacy), None);
+        assert!(!is_upload_temp_path(Path::new("folder/other.bin"), upload_id, &current).unwrap());
     }
 }

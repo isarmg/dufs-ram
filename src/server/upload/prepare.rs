@@ -543,6 +543,7 @@ impl Server {
 
         let mut created_ancestors = None;
         let mut pre_reserved_space = None;
+        let mut fresh_file = None;
         if !resume {
             let reservation_anchor = self
                 .content
@@ -597,14 +598,49 @@ impl Server {
             )? {
                 return Ok(None);
             }
-            let created = self.content.rooted_fs.ensure_parent(&upload_path).await?;
+            let (file, created) = match self
+                .content
+                .rooted_fs
+                .create_private_upload_stage(&upload_path)
+                .await
+            {
+                Ok(created) => created,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    apply_upload_problem(
+                        res,
+                        UploadErrorContext::new(
+                            upload_id,
+                            UploadPublicState::NotSeen,
+                            Some(upload_length),
+                            None,
+                        ),
+                        StatusCode::CONFLICT,
+                        ErrorCode::UPLOAD_STAGE_CONFLICT,
+                        "Upload staging path is already occupied; retry with a new upload ID",
+                        RecoveryAdvice::RetryWithNewId,
+                    )?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
             created_ancestors = Some(created);
+            fresh_file = Some(file);
             active_upload_files = match self.track_active_upload_files(&upload_path, deadline).await
             {
                 Ok(lease) => Some(lease),
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    let file = fresh_file
+                        .take()
+                        .expect("fresh staging file exists before tracking");
+                    let discard = self
+                        .state
+                        .upload_records
+                        .discard_unrecorded_stage(&file, &upload_path)
+                        .await;
+                    drop(file);
                     rollback_upload_ancestors(&self.content.rooted_fs, &mut created_ancestors)
                         .await?;
+                    discard?;
                     upload_deadline_expired(
                         deadline,
                         res,
@@ -614,8 +650,18 @@ impl Server {
                     return Ok(None);
                 }
                 Err(error) => {
+                    let file = fresh_file
+                        .take()
+                        .expect("fresh staging file exists before tracking");
+                    let discard = self
+                        .state
+                        .upload_records
+                        .discard_unrecorded_stage(&file, &upload_path)
+                        .await;
+                    drop(file);
                     rollback_upload_ancestors(&self.content.rooted_fs, &mut created_ancestors)
                         .await?;
+                    discard?;
                     return Err(error.into());
                 }
             };
@@ -625,7 +671,17 @@ impl Server {
                 upload_id,
                 "Upload deadline exceeded during preparation",
             )? {
+                let file = fresh_file
+                    .take()
+                    .expect("fresh staging file exists before deadline check");
+                let discard = self
+                    .state
+                    .upload_records
+                    .discard_unrecorded_stage(&file, &upload_path)
+                    .await;
+                drop(file);
                 rollback_upload_ancestors(&self.content.rooted_fs, &mut created_ancestors).await?;
+                discard?;
                 return Ok(None);
             }
         }
@@ -634,37 +690,9 @@ impl Server {
 
         let (file, status) = match upload_offset {
             None => {
-                let mut file = match create_upload_temp(&self.content.rooted_fs, &upload_path).await
-                {
-                    Ok(file) => file,
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::AlreadyExists
-                        }) =>
-                    {
-                        rollback_upload_ancestors(&self.content.rooted_fs, &mut created_ancestors)
-                            .await?;
-                        apply_upload_problem(
-                            res,
-                            UploadErrorContext::new(
-                                upload_id,
-                                UploadPublicState::NotSeen,
-                                Some(upload_length),
-                                None,
-                            ),
-                            StatusCode::CONFLICT,
-                            ErrorCode::UPLOAD_STAGE_CONFLICT,
-                            "Upload staging path is already occupied; retry with a new upload ID",
-                            RecoveryAdvice::RetryWithNewId,
-                        )?;
-                        return Ok(None);
-                    }
-                    Err(error) => {
-                        rollback_upload_ancestors(&self.content.rooted_fs, &mut created_ancestors)
-                            .await?;
-                        return Err(error);
-                    }
-                };
+                let mut file = fresh_file
+                    .take()
+                    .expect("fresh upload created its staging file");
                 if Instant::now() >= deadline {
                     finish_timed_out_upload(
                         &self.state.upload_records,
@@ -1031,7 +1059,8 @@ fn begin_upload_mutation_or_reject(
     Ok(false)
 }
 
+#[cfg(test)]
 pub(super) async fn create_upload_temp(rooted_fs: &RootedFs, path: &Path) -> Result<fs::File> {
-    let (file, _) = rooted_fs.create_private_new(path).await?;
+    let (file, _) = rooted_fs.create_private_upload_stage(path).await?;
     Ok(file)
 }

@@ -155,7 +155,7 @@ impl StoredUploadState {
         }
     }
 
-    pub(super) fn is_terminal(self) -> bool {
+    pub(in crate::server) fn is_terminal(self) -> bool {
         matches!(self, Self::Committed | Self::Rejected | Self::Unknown)
     }
 }

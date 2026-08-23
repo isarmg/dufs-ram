@@ -2,14 +2,15 @@ use super::{
     Request, Response, Server,
     disk_space::DiskSpaceReservation,
     identity::OwnerId,
-    internal_names::upload_temp_path,
+    internal_names::{
+        is_upload_temp_path, legacy_upload_temp_path, upload_stage_directory, upload_temp_path,
+    },
     maintenance::claim_changes as maintenance_claim_changes,
     path_coordinator::PathLease,
     problem::{ApiError, ErrorCode, RecoveryAdvice, UploadProblemContext, render_problem},
     protocol::UploadPublicState,
     rooted_fs::{
         CreatedAncestors, PreservedFileMetadata, ReplacementTargetIdentity, RootedEntryKey,
-        RootedFs,
     },
     state_store::StateStoreDispatchError,
     status_not_found,
@@ -74,6 +75,8 @@ use super::maintenance::{
     MaintenanceBatchOptions, MaintenanceBudget, MaintenanceScanState, UPLOAD_SESSION_TTL,
     collect_and_remove_stale_internal_files, collect_stale_internal_files_batch,
 };
+#[cfg(test)]
+use super::rooted_fs::RootedFs;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
@@ -415,7 +418,7 @@ impl Server {
         if let Err(error) = self
             .state
             .upload_records
-            .cleanup_rejected_stage(&upload_path, record)
+            .cleanup_rejected_stage(&record)
             .await
         {
             log::error!(

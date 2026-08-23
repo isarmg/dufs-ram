@@ -4,9 +4,9 @@ mod fixtures;
 mod utils;
 
 use fixtures::{
-    BIN_FILE, Error, TestServer, preflight_upload_target, server, with_new_upload_headers,
-    with_new_upload_overwrite_headers, with_resume_upload_headers, with_upload_headers,
-    with_upload_overwrite_headers,
+    BIN_FILE, Error, TestServer, UPLOAD_STAGE_DIRECTORY, preflight_upload_target, server,
+    with_new_upload_headers, with_new_upload_overwrite_headers, with_resume_upload_headers,
+    with_upload_headers, with_upload_overwrite_headers,
 };
 use reqwest::header::HeaderMap;
 use rstest::rstest;

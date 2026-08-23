@@ -4,8 +4,8 @@ mod fixtures;
 mod utils;
 
 use fixtures::{
-    Error, TestServer, preflight_upload_target, server, with_resume_upload_headers,
-    with_upload_headers, with_upload_overwrite_headers,
+    Error, TestServer, UPLOAD_STAGE_DIRECTORY, preflight_upload_target, server,
+    with_resume_upload_headers, with_upload_headers, with_upload_overwrite_headers,
 };
 use reqwest::blocking::{RequestBuilder, Response};
 use reqwest::header::{COOKIE, HeaderValue};
@@ -15,10 +15,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::Cursor;
-use std::os::unix::{
-    ffi::OsStrExt,
-    fs::{MetadataExt, PermissionsExt, symlink},
-};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
