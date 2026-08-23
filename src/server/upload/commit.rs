@@ -92,6 +92,7 @@ impl Server {
                 res,
                 UploadTimeout {
                     message: "Upload timed out before durable commit",
+                    resume_offset: mode.offset(),
                     created_ancestors: created_ancestors.take(),
                 },
             )
@@ -111,6 +112,7 @@ impl Server {
                 res,
                 UploadTimeout {
                     message: "Upload timed out before durable commit",
+                    resume_offset: mode.offset(),
                     created_ancestors: created_ancestors.take(),
                 },
             )
@@ -191,6 +193,7 @@ impl Server {
                 res,
                 UploadTimeout {
                     message: "Upload timed out before durable commit",
+                    resume_offset: mode.offset(),
                     created_ancestors: created_ancestors.take(),
                 },
             )

@@ -371,6 +371,7 @@ async fn timed_out_uploads_apply_the_resume_threshold_before_releasing_leases() 
         &mut small_response,
         UploadTimeout {
             message: "timed out",
+            resume_offset: None,
             created_ancestors: None,
         },
     )
@@ -410,6 +411,61 @@ async fn timed_out_uploads_apply_the_resume_threshold_before_releasing_leases() 
     assert_eq!(small_problem["upload_id"], small_id.to_string());
     assert_eq!(small_problem["upload_state"], "unknown");
 
+    let resumed_temp = assert_fs::TempDir::new().unwrap();
+    let resumed_rooted = RootedFs::new(resumed_temp.path()).unwrap();
+    let resumed_records = test_upload_record_store(&resumed_rooted);
+    let resumed_id = Uuid::new_v4();
+    let resumed_target = resumed_temp.path().join("resumed-small.bin");
+    let resumed_stage = upload_temp_path(&resumed_target, resumed_id).unwrap();
+    let mut resumed_file = create_upload_temp(&resumed_rooted, &resumed_stage)
+        .await
+        .unwrap();
+    resumed_file.write_all(b"small").await.unwrap();
+    resumed_records
+        .persist_initial_checkpoint(
+            &mut resumed_file,
+            UploadRecordContext::new(owner_id, resumed_id, &resumed_target, &resumed_stage, 10),
+            5,
+        )
+        .await
+        .unwrap();
+    resumed_file.write_all(b"more").await.unwrap();
+    let mut resumed_response = Response::default();
+
+    finish_timed_out_upload(
+        &resumed_records,
+        resumed_file,
+        &resumed_target,
+        &resumed_stage,
+        owner_id,
+        10,
+        resumed_id,
+        &mut resumed_response,
+        UploadTimeout {
+            message: "timed out",
+            resume_offset: Some(5),
+            created_ancestors: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resumed_checkpoint = found_record(
+        resumed_records
+            .lookup(owner_id, resumed_id, &resumed_target, &resumed_stage)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resumed_checkpoint.durable_offset, 9);
+    assert!(resumed_stage.exists());
+    assert_eq!(
+        resumed_response
+            .headers()
+            .get(UPLOAD_OFFSET_HEADER)
+            .unwrap(),
+        "9"
+    );
+
     let large_temp = assert_fs::TempDir::new().unwrap();
     let large_rooted = RootedFs::new(large_temp.path()).unwrap();
     let large_records = test_upload_record_store(&large_rooted);
@@ -433,6 +489,7 @@ async fn timed_out_uploads_apply_the_resume_threshold_before_releasing_leases() 
         &mut large_response,
         UploadTimeout {
             message: "timed out",
+            resume_offset: None,
             created_ancestors: None,
         },
     )

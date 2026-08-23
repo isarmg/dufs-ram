@@ -37,6 +37,17 @@ impl std::error::Error for UploadTransferError {
     }
 }
 
+fn partial_upload_is_checkpointable(
+    partial_size: u64,
+    initial_offset: u64,
+    upload_length: u64,
+    resume: bool,
+) -> bool {
+    partial_size >= initial_offset
+        && partial_size <= upload_length
+        && (resume || partial_size >= RESUMABLE_UPLOAD_MIN_SIZE)
+}
+
 impl Server {
     /// Consumes the request body while the transaction retains all rollback
     /// state. A successful transfer advances to the pre-commit stage.
@@ -97,17 +108,18 @@ impl Server {
                     res,
                     UploadTimeout {
                         message: "Upload deadline exceeded; the final result is unknown",
+                        resume_offset: mode.offset(),
                         created_ancestors: created_ancestors.take(),
                     },
                 )
                 .await?;
                 return Ok(());
             }
-            let partial_size = file
-                .metadata()
-                .await
-                .map(|metadata| metadata.len())
-                .unwrap_or_default();
+            let partial_size = match file.metadata().await {
+                Ok(metadata) => metadata.len(),
+                Err(error) if resume => return Err(error.into()),
+                Err(_) => 0,
+            };
 
             match err {
                 UploadTransferError::ExcessBody => {
@@ -192,8 +204,12 @@ impl Server {
                     return Ok(());
                 }
                 UploadTransferError::IdleTimeout => {
-                    let keep_for_resume =
-                        partial_size >= RESUMABLE_UPLOAD_MIN_SIZE && partial_size <= upload_length;
+                    let keep_for_resume = partial_upload_is_checkpointable(
+                        partial_size,
+                        initial_offset,
+                        upload_length,
+                        resume,
+                    );
                     if keep_for_resume {
                         self.state
                             .upload_records
@@ -214,7 +230,7 @@ impl Server {
                             UPLOAD_OFFSET_HEADER,
                             HeaderValue::from_str(&partial_size.to_string())?,
                         );
-                    } else {
+                    } else if !resume {
                         drop(file);
                         self.state
                             .upload_records
@@ -226,6 +242,12 @@ impl Server {
                                 created_ancestors.take(),
                             )
                             .await?;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "resumed upload stage length no longer contains its durable checkpoint",
+                        )
+                        .into());
                     }
                     let state = if keep_for_resume {
                         UploadPublicState::Running
@@ -252,8 +274,12 @@ impl Server {
                     return Ok(());
                 }
                 UploadTransferError::Io(err) => {
-                    let keep_for_resume =
-                        partial_size >= RESUMABLE_UPLOAD_MIN_SIZE && partial_size <= upload_length;
+                    let keep_for_resume = partial_upload_is_checkpointable(
+                        partial_size,
+                        initial_offset,
+                        upload_length,
+                        resume,
+                    );
                     if keep_for_resume {
                         self.state
                             .upload_records
@@ -270,7 +296,7 @@ impl Server {
                                 partial_size,
                             )
                             .await?;
-                    } else {
+                    } else if !resume {
                         drop(file);
                         self.state
                             .upload_records
@@ -282,6 +308,12 @@ impl Server {
                                 created_ancestors.take(),
                             )
                             .await?;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "resumed upload stage length no longer contains its durable checkpoint",
+                        )
+                        .into());
                     }
                     return Err(err.into());
                 }
