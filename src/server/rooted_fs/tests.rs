@@ -190,7 +190,6 @@ fn legacy_upload_stage_migration_is_identity_safe_and_crash_resumable() {
     let legacy = legacy_upload_temp_path(&target, upload_id).unwrap();
     let private = upload_temp_path(&target, upload_id).unwrap();
     std::fs::write(&legacy, b"legacy staged content").unwrap();
-    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o440)).unwrap();
     let opened = std::fs::File::open(&legacy).unwrap();
     fsetxattr(
         &opened,
@@ -199,6 +198,7 @@ fn legacy_upload_stage_migration_is_identity_safe_and_crash_resumable() {
         XattrFlags::empty(),
     )
     .unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o440)).unwrap();
     let metadata = opened.metadata().unwrap();
     let identity = StoredFileIdentity {
         device: metadata.dev(),
