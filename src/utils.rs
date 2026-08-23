@@ -73,7 +73,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
 
 pub fn parse_range(range: &str, size: u64) -> Option<(u64, u64)> {
     let (unit, range) = range.split_once('=')?;
-    if unit != "bytes" {
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
     if range.contains(',') {
@@ -109,6 +109,8 @@ mod tests {
     #[test]
     fn test_parse_range() {
         assert_eq!(parse_range("bytes=0-499", 500), Some((0, 499)));
+        assert_eq!(parse_range("Bytes=0-499", 500), Some((0, 499)));
+        assert_eq!(parse_range("BYTES=0-499", 500), Some((0, 499)));
         assert_eq!(parse_range("bytes=0-", 500), Some((0, 499)));
         assert_eq!(parse_range("bytes=299-", 500), Some((299, 499)));
         assert_eq!(parse_range("bytes=-500", 500), Some((0, 499)));
