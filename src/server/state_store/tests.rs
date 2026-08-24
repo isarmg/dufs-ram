@@ -1691,8 +1691,7 @@ fn detects_a_sidecar_replacement_before_sqlite_can_open_it() -> Result<()> {
         },
     );
     let error = result
-        .err()
-        .expect("a sidecar replacement must be rejected before SQLite opens the database");
+        .expect_err("a sidecar replacement must be rejected before SQLite opens the database");
     let error = format!("{error:#}");
     assert!(
         error.contains("SQLite sidecar")
