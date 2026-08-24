@@ -591,6 +591,17 @@ export function createUploadManager(options) {
         );
         return;
       }
+      if (
+        classification.kind === "awaiting-confirmation" &&
+        !classification.outcomeUnknown &&
+        classification.protocol?.length === this.file.size &&
+        classification.protocol.offset === this.file.size &&
+        detail.status === request.status &&
+        detail.recovery === "query_upload"
+      ) {
+        void this.queryCheckpoint();
+        return;
+      }
       if (classification.kind === "unknown") {
         this.unknown(
           detail.message

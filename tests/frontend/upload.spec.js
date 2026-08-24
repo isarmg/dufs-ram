@@ -617,6 +617,197 @@ test("提交时的重名确认用空 PATCH 发布已上传的暂存内容", asyn
   });
 });
 
+test("确认 PATCH 返回可查询待确认状态时自动核对 checkpoint", async ({
+  appPage: page,
+}) => {
+  const initialRevision = "1".repeat(64);
+  const checkpointRevision = "2".repeat(64);
+  const contents = Buffer.from("checkpoint before republishing the stage");
+  const requests = [];
+  let patchCount = 0;
+  await page.route("**/query-awaiting-confirmation.txt", async route => {
+    const request = route.request();
+    const method = request.method();
+    requests.push({
+      method,
+      uploadId: request.headers()["x-dufs-upload-id"],
+      overwrite: request.headers()["x-dufs-upload-overwrite"] || null,
+      revision: request.headers()["x-dufs-target-revision"] || null,
+      offset: request.headers()["x-dufs-upload-offset"] || null,
+      bodyLength: request.postDataBuffer()?.length || 0,
+    });
+    if (method === "PUT") {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/problem+json",
+        headers: {
+          ...protocolHeaders(request, "awaiting-confirmation", "length"),
+          "X-Dufs-Target-Revision": initialRevision,
+          "X-Dufs-Target-Replaceable": "true",
+        },
+        body: problemDetails(
+          409,
+          "destination_exists",
+          "Destination appeared while uploading",
+          "refresh_target",
+        ),
+      });
+      return;
+    }
+    if (method === "HEAD") {
+      await route.fulfill({
+        status: 409,
+        headers: {
+          ...protocolHeaders(
+            request,
+            "awaiting-confirmation",
+            "length",
+            String(contents.length),
+          ),
+          "X-Dufs-Target-Revision": checkpointRevision,
+          "X-Dufs-Target-Replaceable": "true",
+        },
+        body: "",
+      });
+      return;
+    }
+    patchCount++;
+    if (patchCount === 1) {
+      await route.fulfill({
+        status: 413,
+        contentType: "application/problem+json",
+        headers: protocolHeaders(request, "awaiting-confirmation", "length"),
+        body: problemDetails(
+          413,
+          "upload_body_exceeds_remaining_length",
+          "The upload remains staged and requires a status check",
+          "query_upload",
+        ),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 204,
+      headers: protocolHeaders(request, "committed", "length"),
+      body: "",
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "query-awaiting-confirmation.txt",
+    buffer: contents,
+  }]);
+  const dialog = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await expect(dialog).toContainText("uploaded data is staged");
+  await dialog.getByRole("button", { name: "Overwrite", exact: true }).click();
+
+  await expect.poll(() => requests.map(request => request.method)).toEqual([
+    "PUT",
+    "PATCH",
+    "HEAD",
+  ]);
+  await expect(dialog).toContainText("uploaded data is staged");
+  await expect(page.locator(".upload-unknown")).toHaveCount(0);
+  await expect(page.locator(".upload-queue-message")).toBeHidden();
+  await dialog.getByRole("button", { name: "Overwrite", exact: true }).click();
+
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "query-awaiting-confirmation.txt: upload complete",
+  );
+  expect(requests.map(request => request.method)).toEqual([
+    "PUT",
+    "PATCH",
+    "HEAD",
+    "PATCH",
+  ]);
+  expect(new Set(requests.map(request => request.uploadId)).size).toBe(1);
+  expect(requests[1]).toMatchObject({
+    overwrite: "true",
+    revision: initialRevision,
+    offset: String(contents.length),
+    bodyLength: 0,
+  });
+  expect(requests[2]).toMatchObject({
+    overwrite: null,
+    revision: null,
+    offset: null,
+    bodyLength: 0,
+  });
+  expect(requests[3]).toMatchObject({
+    overwrite: "true",
+    revision: checkpointRevision,
+    offset: String(contents.length),
+    bodyLength: 0,
+  });
+});
+
+test("可查询待确认响应的 offset 未到文件尾时仍失败关闭", async ({
+  appPage: page,
+}) => {
+  const revision = "3".repeat(64);
+  const contents = Buffer.from("never trust an incomplete staged upload");
+  const methods = [];
+  await page.route("**/incomplete-awaiting-confirmation.txt", async route => {
+    const request = route.request();
+    methods.push(request.method());
+    if (request.method() === "PUT") {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/problem+json",
+        headers: {
+          ...protocolHeaders(request, "awaiting-confirmation", "length"),
+          "X-Dufs-Target-Revision": revision,
+          "X-Dufs-Target-Replaceable": "true",
+        },
+        body: problemDetails(
+          409,
+          "destination_exists",
+          "Destination appeared while uploading",
+          "refresh_target",
+        ),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 413,
+      contentType: "application/problem+json",
+      headers: protocolHeaders(
+        request,
+        "awaiting-confirmation",
+        contents.length - 1,
+      ),
+      body: problemDetails(
+        413,
+        "upload_body_exceeds_remaining_length",
+        "The staged offset is inconsistent",
+        "query_upload",
+      ),
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "incomplete-awaiting-confirmation.txt",
+    buffer: contents,
+  }]);
+  const dialog = page.getByRole("dialog", {
+    name: "Upload destination changed",
+    exact: true,
+  });
+  await dialog.getByRole("button", { name: "Overwrite", exact: true }).click();
+
+  await expect(page.locator(".upload-unknown")).toContainText(
+    /inconsistent upload response/i,
+  );
+  await expect(page.locator(".upload-queue-message")).toContainText(
+    "remaining upload queue is paused",
+  );
+  expect(methods).toEqual(["PUT", "PATCH"]);
+});
+
 test("可信暂存冲突丢弃后 Skip 时使列表失效且不覆盖", async ({
   appPage: page,
 }) => {
