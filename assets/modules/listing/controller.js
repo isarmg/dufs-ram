@@ -1,4 +1,5 @@
 import {
+  RequestError,
   assertResponse,
   isAuthenticationError,
   requestJson,
@@ -16,6 +17,15 @@ const LIST_PAGE_LIMIT = 200;
 const MAX_CURSOR_LENGTH = 1024;
 const MAX_RENDERED_ITEMS = LIST_PAGE_LIMIT;
 const PATH_TYPES = new Set(["Dir", "SymlinkDir", "File", "SymlinkFile"]);
+
+/** @param {unknown} error */
+function isRefreshableDirectoryChange(error) {
+  return error instanceof RequestError &&
+    error.status === 409 &&
+    error.problemStatus === 409 &&
+    error.code === "directory_changed" &&
+    error.recovery === "refresh_target";
+}
 
 /** @typedef {(typeof MUTATION_EFFECT)[keyof typeof MUTATION_EFFECT]} MutationEffect */
 
@@ -347,13 +357,29 @@ export function createDirectoryListing(options) {
       if (nextCursor !== null) url.searchParams.set("cursor", nextCursor);
 
       const requestedCursor = nextCursor;
-      const { response, payload: rawPayload } = await requestJson(url);
-      if (requestRevision !== revision) return;
-      if (response.status === 409 && loaded) {
-        resetListing();
-        throw new Error("Folder contents changed. Reload the list and try again.");
+      let rawPayload;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { response, payload } = await requestJson(url);
+        if (requestRevision !== revision) return;
+        if (response.status === 409 && loaded) {
+          resetListing();
+          throw new Error("Folder contents changed. Reload the list and try again.");
+        }
+        try {
+          await assertResponse(response, onUnauthorized);
+        } catch (error) {
+          if (
+            attempt === 0 &&
+            requestedCursor === null &&
+            isRefreshableDirectoryChange(error)
+          ) {
+            continue;
+          }
+          throw error;
+        }
+        rawPayload = payload;
+        break;
       }
-      await assertResponse(response, onUnauthorized);
       const payload = validateListingPage(rawPayload);
       if (
         payload.nextCursor !== null &&

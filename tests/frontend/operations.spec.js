@@ -61,6 +61,21 @@ function fulfillTrackedFailure(route, status, code, detail, headers = {}) {
   });
 }
 
+function fulfillDirectoryChanged(route) {
+  return route.fulfill({
+    status: 409,
+    contentType: "application/problem+json",
+    body: JSON.stringify({
+      type: "urn:dufs:problem:directory_changed",
+      title: "Directory changed",
+      status: 409,
+      detail: "Directory changed; restart listing",
+      code: "directory_changed",
+      recovery: "refresh_target",
+    }),
+  });
+}
+
 function inlineNameInput(page) {
   return page.locator(".inline-name-input");
 }
@@ -2224,6 +2239,13 @@ test("作业查询拒绝矛盾头和非法成功状态码", async ({ appPage: pa
 });
 
 test("删除成功后更新已加载数量并移动焦点", async ({ appPage: page }) => {
+  let listingRequests = 0;
+  await page.route("**/__dufs__/api/list?**", route => {
+    listingRequests++;
+    return listingRequests === 1
+      ? fulfillDirectoryChanged(route)
+      : route.continue();
+  });
   const status = page.locator(".list-status");
   const beforeText = await status.textContent();
   const beforeCount = Number(beforeText.match(/\d+/)?.[0]);
@@ -2247,9 +2269,25 @@ test("删除成功后更新已加载数量并移动焦点", async ({ appPage: pa
   );
   await expect(rowByName(page, "delete-me.txt")).toHaveCount(0);
   await expect(status).toHaveText(`All ${beforeCount - 1} items loaded`);
+  expect(listingRequests).toBe(2);
   expect(
     await page.evaluate(() => document.activeElement !== document.body),
   ).toBe(true);
+});
+
+test("连续目录变化冲突只自动重试一次", async ({ appPage: page }) => {
+  let listingRequests = 0;
+  await page.route("**/__dufs__/api/list?**", route => {
+    listingRequests++;
+    return fulfillDirectoryChanged(route);
+  });
+
+  await page.reload();
+  await expect(page.locator(".list-status")).toHaveText(
+    "Unable to load the file list: Directory changed; restart listing",
+  );
+  await expect(page.getByRole("button", { name: "Retry" })).toBeEnabled();
+  expect(listingRequests).toBe(2);
 });
 
 test("写入挂起期间新建置顶不会让旧 index 删除错误行", async ({
