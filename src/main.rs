@@ -16,7 +16,7 @@ use std::sync::{
 use std::time::Duration;
 use std::{
     future::Future,
-    io::{self, IoSlice},
+    io::{self, IoSlice, Write},
     net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     pin::Pin,
     task::{Context as TaskContext, Poll},
@@ -65,7 +65,9 @@ async fn run_server(args: Args) -> Result<()> {
     let mut signals = ShutdownSignals::new()?;
     let serving = serve(args)?;
     let listening = print_listening(&print_addrs, serving.port);
-    println!("{listening}");
+    if let Err(error) = write_listening(std::io::stdout().lock(), &listening) {
+        warn!("Failed to write listening address to stdout: {error}");
+    }
 
     let reason = tokio::select! {
         biased;
@@ -744,6 +746,10 @@ fn print_listening(print_addrs: &[IpAddr], port: u16) -> String {
     }
 
     output
+}
+
+fn write_listening(mut output: impl Write, listening: &str) -> io::Result<()> {
+    writeln!(output, "{listening}")
 }
 
 struct ShutdownSignals {
