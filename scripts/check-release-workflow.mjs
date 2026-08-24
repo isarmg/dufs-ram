@@ -9,6 +9,13 @@ const workflowPath = resolve(
   "workflows",
   "release-binary.yml",
 );
+const dependencyAuditWorkflowPath = resolve(
+  projectRoot,
+  ".github",
+  "workflows",
+  "dependency-audit.yml",
+);
+const qualityGatePath = resolve(projectRoot, "scripts", "check.sh");
 
 function requireMatch(source, pattern, message) {
   if (!pattern.test(source)) {
@@ -25,6 +32,14 @@ function jobBlock(source, name) {
   const rest = source.slice(start + marker.length);
   const nextJob = /^  [0-9A-Za-z_]+:\n/mu.exec(rest);
   return source.slice(start, nextJob ? start + marker.length + nextJob.index : undefined);
+}
+
+function checkYankedAuditPreparation(source, label) {
+  const fetch = source.indexOf("cargo fetch --locked");
+  const audit = source.indexOf("cargo audit --deny yanked");
+  if (fetch === -1 || audit === -1 || fetch > audit) {
+    throw new Error(`${label} must fetch the locked graph before auditing yanked crates`);
+  }
 }
 
 function checkWorkflow(source) {
@@ -133,11 +148,42 @@ function checkWorkflow(source) {
 }
 
 const workflow = readFileSync(workflowPath, "utf8");
+const dependencyAuditWorkflow = readFileSync(
+  dependencyAuditWorkflowPath,
+  "utf8",
+);
+const qualityGate = readFileSync(qualityGatePath, "utf8");
 try {
   checkWorkflow(workflow);
+  checkYankedAuditPreparation(
+    dependencyAuditWorkflow,
+    "dependency audit workflow",
+  );
+  checkYankedAuditPreparation(qualityGate, "local quality gate");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`check-release-workflow: ${message}\n`);
+  process.exit(1);
+}
+
+for (const [source, label] of [
+  [
+    dependencyAuditWorkflow.replace("cargo fetch --locked", "cargo fetch"),
+    "dependency audit workflow",
+  ],
+  [
+    qualityGate.replace("run cargo fetch --locked", "run cargo fetch"),
+    "local quality gate",
+  ],
+]) {
+  try {
+    checkYankedAuditPreparation(source, label);
+  } catch {
+    continue;
+  }
+  process.stderr.write(
+    "check-release-workflow: a yanked-audit preparation regression was accepted\n",
+  );
   process.exit(1);
 }
 
