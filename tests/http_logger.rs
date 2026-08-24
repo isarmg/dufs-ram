@@ -521,6 +521,7 @@ fn spawn_logged_server(tmpdir: &TempDir, args: &[&str]) -> Result<(Child, u16, T
         .arg("--state-dir")
         .arg(state_dir.path())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
     let port = read_bound_url(&mut child)?
         .port()
@@ -593,12 +594,23 @@ fn stop_and_read(child: &mut Child) -> Result<String, Error> {
     if !status.success() {
         return Err("Failed to send SIGTERM to logged test server".into());
     }
-    child.wait()?;
     let mut output = String::new();
+    child
+        .stderr
+        .take()
+        .ok_or("Missing child stderr")?
+        .read_to_string(&mut output)?;
+    child.wait()?;
+
+    let mut unexpected_stdout = String::new();
     child
         .stdout
         .take()
         .ok_or("Missing child stdout")?
-        .read_to_string(&mut output)?;
+        .read_to_string(&mut unexpected_stdout)?;
+    assert!(
+        unexpected_stdout.is_empty(),
+        "console log leaked into the startup-address stream: {unexpected_stdout:?}"
+    );
     Ok(output)
 }

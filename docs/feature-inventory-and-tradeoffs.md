@@ -83,7 +83,7 @@
 | C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
 | C-08 | `-a, --auth` / `auth` | 至少一个账号；可重复 | 配置完整权限账号；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
-| C-10 | `--log-file` / `log-file` | 不指定时输出到 stdout/stderr；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
+| C-10 | `--log-file` / `log-file` | 不指定时全部日志输出到 stderr，stdout 只输出监听地址；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
 | C-12 | `--max-upload-size` | 100 GiB；允许设为 `0` | 单文件声明长度上限；`0` 表示只允许零字节上传，不是关闭限制 | 保障 |
 | C-13 | `--upload-idle-timeout` | 60 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 上传正文无进展时限 | 保障 |
 | C-14 | `--upload-total-timeout` | 24 小时；不得为 `0`、小于空闲时限或超过 365 天，且必须能由平台单调时钟表示 | 每次 PUT/PATCH 在等待路径租约前建立绝对 deadline，覆盖租约等待、上传准备、正文、写入、flush、metadata 重放以及等待最终提交确认。受跟踪 task 的首次文件系统/上传状态 mutation 与 deadline 原子竞争：deadline 先赢则关闭边界、abort 并返回 `408 not-started + retry`；task 先越界后才以 `unknown + query_upload` 处理外层超时，进入不可取消的 rename/fsync 段后由后台安全收尾 | 保障 |
@@ -316,7 +316,7 @@
 | O-03 | 敏感头脱敏 | Authorization、Proxy-Authorization、Cookie、CSRF 统一记录为 `[REDACTED]` | 删除可能把凭据写入日志 | 保障 | 低 |
 | O-04 | 单行转义和长度上限 | 控制字符转义；格式最多 4096 字节/128 元素；单条最多 16 KiB | 防止日志注入和巨型分配 | 保障 | 中 |
 | O-05 | 有界异步日志 | 容量 4096；请求线程不阻塞；满时丢最新并聚合告警；250 ms flush；刷新失败保留 dirty 状态供后续重试 | 改同步写会让慢磁盘阻塞请求 | 保障 | 中 |
-| O-06 | 安全文件或控制台输出 | `--log-file` 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开，要求当前服务用户拥有、单硬链接的普通文件；新文件固定 `0600`，已有文件必须预先精确为 `0600`，不安全权限不会被就地修改；未配置文件时使用 stdout/stderr | 防止高权限服务跟随符号链接、在特殊对象打开阶段阻塞或把 fd 泄漏给子进程，也避免 chmod 伪装修复已泄露或被预开 fd 持有的日志；只用 journald 时文件输出可删除 | 可选 | 低 |
+| O-06 | 安全文件或控制台输出 | `--log-file` 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开，要求当前服务用户拥有、单硬链接的普通文件；新文件固定 `0600`，已有文件必须预先精确为 `0600`，不安全权限不会被就地修改；未配置文件时全部日志使用 stderr，stdout 仅输出监听地址 | 防止高权限服务跟随符号链接、在特殊对象打开阶段阻塞或把 fd 泄漏给子进程，也避免 chmod 伪装修复已泄露或被预开 fd 持有的日志；单一控制台 sink 还避免 stdout 阻塞或刷新失败拖住 WARN/ERROR；只用 journald 时文件输出可删除 | 可选 | 低 |
 | O-07 | 连接错误分类 | 记录 peer、协议、超时、断开、I/O 类型和系统错误码 | 对定位网关 `502`、超时和协议错误有价值 | 开发/运维 | 低 |
 | O-08 | accept 错误退避 | 从 50 ms 指数退避到 1 秒，下一次成功后重置 | 删除可能在 fd/内存耗尽时形成错误忙循环 | 保障 | 低 |
 | O-09 | 公开 liveness | `GET/HEAD /__dufs__/health` 不要求会话并返回 `{"status":"OK"}`；它不访问文件内容、账号或共享根，只证明进程仍能处理 HTTP | 可供网关无凭据探活；删除收益很小 | 建议保留 | 低 |

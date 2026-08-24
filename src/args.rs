@@ -147,7 +147,7 @@ pub fn build_cli() -> Command {
                 .long("log-file")
                 .value_name("file")
                 .value_parser(value_parser!(PathBuf))
-                .help("Specify the file to save logs to, other than stdout/stderr"),
+                .help("Specify the file to save logs to instead of stderr"),
         )
         .arg(
             Arg::new("max-upload-size")

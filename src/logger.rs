@@ -7,7 +7,7 @@ use rustix::{
     process::geteuid,
 };
 use std::fs::File;
-use std::io::{BufWriter, Stderr, Stdout, Write};
+use std::io::{BufWriter, Stderr, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -90,38 +90,25 @@ enum WriterCommand {
 
 struct LogEntry {
     text: String,
-    stderr: bool,
 }
 
 enum LogOutput {
     File(BufWriter<File>),
-    Console {
-        stdout: BufWriter<Stdout>,
-        stderr: BufWriter<Stderr>,
-    },
+    Console(BufWriter<Stderr>),
 }
 
 impl LogOutput {
     fn write_line(&mut self, entry: &LogEntry) -> std::io::Result<()> {
         match self {
             Self::File(file) => writeln!(file, "{}", entry.text),
-            Self::Console { stdout, stderr } => {
-                if entry.stderr {
-                    writeln!(stderr, "{}", entry.text)
-                } else {
-                    writeln!(stdout, "{}", entry.text)
-                }
-            }
+            Self::Console(stderr) => writeln!(stderr, "{}", entry.text),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::File(file) => file.flush(),
-            Self::Console { stdout, stderr } => {
-                stdout.flush()?;
-                stderr.flush()
-            }
+            Self::Console(stderr) => stderr.flush(),
         }
     }
 }
@@ -144,7 +131,6 @@ impl log::Log for AsyncLogger {
         };
         let entry = LogEntry {
             text: truncate_log_entry(text),
-            stderr: record.level() < Level::Info,
         };
         match self.sender.try_send(WriterCommand::Entry(entry)) {
             Ok(()) => {}
@@ -177,10 +163,7 @@ impl log::Log for AsyncLogger {
 
 pub fn init(log_file: Option<PathBuf>) -> Result<()> {
     let output = match log_file {
-        None => LogOutput::Console {
-            stdout: BufWriter::new(std::io::stdout()),
-            stderr: BufWriter::new(std::io::stderr()),
-        },
+        None => LogOutput::Console(BufWriter::new(std::io::stderr())),
         Some(log_file) => LogOutput::File(BufWriter::new(open_log_file(&log_file)?)),
     };
 
@@ -396,7 +379,6 @@ fn report_dropped(output: &mut LogOutput, dropped: &AtomicU64) -> bool {
             "{} WARN log_queue_overloaded dropped_newest={count} capacity={LOG_QUEUE_CAPACITY}",
             timestamp()
         ),
-        stderr: true,
     };
     match output.write_line(&warning) {
         Ok(()) => true,
