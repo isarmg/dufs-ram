@@ -1,9 +1,46 @@
 use super::*;
 
 fn test_access_control() -> AccessControl {
+    test_access_control_with_clock(SessionClock::boottime())
+}
+
+fn test_access_control_with_clock(clock: SessionClock) -> AccessControl {
     let hash = hash_password("pass").unwrap();
     let account = format!("user:{hash}");
-    AccessControl::from_config(AuthConfig::new(&[&account]).unwrap())
+    AccessControl::with_clock(AuthConfig::new(&[&account]).unwrap(), clock)
+}
+
+fn session_test_time() -> SessionInstant {
+    SessionInstant(Duration::from_secs(24 * 60 * 60))
+}
+
+#[derive(Clone)]
+struct ManualSessionClock {
+    current: Arc<Mutex<SessionInstant>>,
+}
+
+impl ManualSessionClock {
+    fn new(current: SessionInstant) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(current)),
+        }
+    }
+
+    fn session_clock(&self) -> SessionClock {
+        let current = Arc::clone(&self.current);
+        SessionClock::injected(move || {
+            *current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+    }
+
+    fn set(&self, current: SessionInstant) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+    }
 }
 
 #[test]
@@ -230,7 +267,9 @@ fn login_creates_an_opaque_digest_stored_session_and_rotates() {
 
 #[test]
 fn rotating_a_full_session_store_does_not_evict_an_unrelated_session() {
-    let auth = test_access_control();
+    let now = session_test_time();
+    let clock = ManualSessionClock::new(now);
+    let auth = test_access_control_with_clock(clock.session_clock());
     let first = auth
         .create_session(
             VerifiedUser {
@@ -242,7 +281,6 @@ fn rotating_a_full_session_store_does_not_evict_an_unrelated_session() {
 
     {
         let mut sessions = auth.lock_sessions();
-        let now = Instant::now();
         let mut index = 0u64;
         while sessions.entries.len() < SESSION_CAPACITY {
             let digest: [u8; SECRET_BYTES] = Sha256::digest(index.to_be_bytes()).into();
@@ -331,55 +369,80 @@ fn csrf_is_random_session_bound_and_compared_by_value() {
 }
 
 #[test]
-fn authentication_refreshes_idle_time_and_enforces_both_expirations() {
-    let auth = test_access_control();
+fn injected_clock_enforces_idle_csrf_and_absolute_expiration_boundaries() {
+    let start = session_test_time();
+    let clock = ManualSessionClock::new(start);
+    let auth = test_access_control_with_clock(clock.session_clock());
     let idle = auth.login("user", "pass", None).unwrap().unwrap();
+    let csrf = auth.login("user", "pass", None).unwrap().unwrap();
     let absolute = auth.login("user", "pass", None).unwrap().unwrap();
-    let now = Instant::now();
 
-    {
-        let mut sessions = auth.lock_sessions();
-        let idle_record = sessions
+    // Advancing the injected clock without executing application code models
+    // elapsed CLOCK_BOOTTIME while the machine is suspended.
+    clock.set(start + (SESSION_IDLE_TIMEOUT - Duration::from_nanos(1)));
+    assert!(auth.verify_csrf(
+        &csrf.token,
+        &csrf.session.csrf_token,
+        &csrf.session.csrf_token
+    ));
+    assert!(auth.authenticate(&absolute.token).is_some());
+    assert_eq!(
+        auth.lock_sessions()
             .entries
-            .get_mut(&session_digest(&idle.token))
-            .unwrap();
-        idle_record.last_seen = now - SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+            .get(&session_digest(&absolute.token))
+            .unwrap()
+            .last_seen,
+        start + (SESSION_IDLE_TIMEOUT - Duration::from_nanos(1))
+    );
 
-        let absolute_record = sessions
-            .entries
-            .get_mut(&session_digest(&absolute.token))
-            .unwrap();
-        absolute_record.created_at = now - SESSION_ABSOLUTE_TIMEOUT - Duration::from_secs(1);
-        absolute_record.last_seen = now;
+    clock.set(start + SESSION_IDLE_TIMEOUT);
+    assert!(auth.authenticate(&idle.token).is_none());
+    assert!(!auth.verify_csrf(
+        &csrf.token,
+        &csrf.session.csrf_token,
+        &csrf.session.csrf_token
+    ));
+    assert!(auth.authenticate(&absolute.token).is_some());
+
+    let refresh_step = Duration::from_secs(15 * 60);
+    let mut elapsed = SESSION_IDLE_TIMEOUT + refresh_step;
+    while elapsed < SESSION_ABSOLUTE_TIMEOUT {
+        clock.set(start + elapsed);
+        assert!(auth.authenticate(&absolute.token).is_some());
+        elapsed += refresh_step;
     }
 
-    assert!(auth.authenticate_at(&idle.token, now).is_none());
-    assert!(auth.authenticate_at(&absolute.token, now).is_none());
-
-    let active = auth.login("user", "pass", None).unwrap().unwrap();
-    let before = {
-        let mut sessions = auth.lock_sessions();
-        let record = sessions
+    clock.set(start + (SESSION_ABSOLUTE_TIMEOUT - Duration::from_nanos(1)));
+    assert!(auth.authenticate(&absolute.token).is_some());
+    clock.set(start + SESSION_ABSOLUTE_TIMEOUT);
+    assert!(auth.authenticate(&absolute.token).is_none());
+    assert!(
+        auth.lock_sessions()
             .entries
-            .get_mut(&session_digest(&active.token))
-            .unwrap();
-        record.last_seen = now - Duration::from_secs(60);
-        record.last_seen
-    };
-    assert!(auth.authenticate_at(&active.token, now).is_some());
-    let after = auth
-        .lock_sessions()
-        .entries
-        .get(&session_digest(&active.token))
-        .unwrap()
-        .last_seen;
-    assert!(after > before);
+            .get(&session_digest(&absolute.token))
+            .is_none()
+    );
+}
+
+#[test]
+fn injected_clock_regression_does_not_underflow_or_move_idle_time_backwards() {
+    let start = session_test_time();
+    let clock = ManualSessionClock::new(start);
+    let auth = test_access_control_with_clock(clock.session_clock());
+    let session = auth.login("user", "pass", None).unwrap().unwrap();
+
+    clock.set(SessionInstant(start.0 - Duration::from_secs(1)));
+    assert!(auth.authenticate(&session.token).is_some());
+    let stored = auth.lock_sessions();
+    let record = stored.entries.get(&session_digest(&session.token)).unwrap();
+    assert_eq!(record.created_at, start);
+    assert_eq!(record.last_seen, start);
 }
 
 #[test]
 fn session_store_is_bounded_and_evicts_the_least_recent_session() {
     let mut store = SessionStore::default();
-    let now = Instant::now();
+    let now = session_test_time();
     let oldest_digest = session_digest("oldest");
 
     store
@@ -416,7 +479,7 @@ fn session_store_is_bounded_and_evicts_the_least_recent_session() {
 #[test]
 fn session_store_enforces_the_per_user_capacity_before_global_capacity() {
     let mut store = SessionStore::default();
-    let now = Instant::now();
+    let now = session_test_time();
     let oldest = session_digest("same-user-0");
     for index in 0..=SESSION_PER_USER_CAPACITY {
         store
@@ -439,7 +502,7 @@ fn session_store_enforces_the_per_user_capacity_before_global_capacity() {
 #[test]
 fn repeated_logins_evict_the_same_users_oldest_session_first() {
     let mut store = SessionStore::default();
-    let now = Instant::now();
+    let now = session_test_time();
     let protected_digest = session_digest("protected-oldest");
     store
         .insert(

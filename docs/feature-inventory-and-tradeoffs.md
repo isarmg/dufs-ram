@@ -118,7 +118,7 @@
 | A-06 | 一次性登录错误 | 失败后使用 POST/Redirect/GET；随机错误 token 最多存活 60 秒、最多 1024 条，刷新不会重复显示 | 可改成同页 `4xx`，但会改变刷新和表单体验 | 建议保留 | 中 |
 | A-07 | 登录计算与速率限制 | 正文读取前每个请求同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket；正文读取还受全局 32/每 IP 4 个并发许可约束。解析用户名后再执行“来源 IP + 用户名 SHA-256 摘要”组合键失败退避；最多两个 Argon2 blocking 校验任务。相同组合连续失败 5 次后指数退避 1–60 秒，记录 15 分钟过期；成功只清除对应组合状态，其他来源不会被一个攻击者按账号全局锁定。`Retry-After` 把剩余时间向上取整到完整秒，并只由 PRG 后的最终 `429` 登录错误页返回，POST 的 `303` 不携带该字段 | 同时限制慢正文、昂贵计算、轮换标识突发和单 IP/账号猜测，并避免跨来源定向锁号；网关仍应对登录路径族提供独立的真实 IP 限速、并发和正文时限 | 保障 | 中 |
 | A-08 | 随机服务端会话 | 256 位随机 token；服务端只存 token 摘要；重启即失效 | 改成无状态 token 会改变撤销和密钥管理模型 | 保障 | 高 |
-| A-09 | 会话寿命与公平容量 | 空闲 30 分钟、绝对 12 小时；每账号最多 32 个、全局最多 1024 个；达到账号上限或全局已满时优先淘汰同账号最久未活动会话，否则淘汰全局最久未活动会话 | 删除过期、公平性和容量边界会造成长期会话、单账号驱逐其他账号或内存无界增长 | 保障 | 中 |
+| A-09 | 会话寿命与公平容量 | 空闲 30 分钟、绝对 12 小时，两者均按 Linux `CLOCK_BOOTTIME` 计时并包含系统休眠；每账号最多 32 个、全局最多 1024 个；达到账号上限或全局已满时优先淘汰同账号最久未活动会话，否则淘汰全局最久未活动会话 | 删除过期、公平性和容量边界会造成长期会话、单账号驱逐其他账号或内存无界增长 | 保障 | 中 |
 | A-10 | 安全 Cookie | `__Host-dufs-session`，`Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/`、无 `Domain` 和 `Max-Age`，因此是浏览器会话 Cookie | 依赖浏览器 HTTPS 入口；弱化属性会扩大攻击面 | 保障 | 低 |
 | A-11 | 主动注销 | `POST /__dufs__/logout` 立即撤销服务端会话并清 Cookie | 删除后只能等待过期或手工清 Cookie | 建议保留 | 低 |
 | A-12 | CSRF 令牌 | 每个会话独立 256 位令牌；除公开登录 POST 外，所有受保护的 `POST/PUT/PATCH/DELETE` 必须携带并常量时间比较 | 删除后，同一浏览器中的恶意站点可能借会话执行写操作 | 保障 | 高 |
@@ -443,7 +443,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 
 1. `hash-password`、登录页面和服务端登录解析已经统一为非空且最多 1024 个 UTF-8 字节，但仍没有最低长度或复杂度要求；配置时应自行使用高熵密码。
 2. Dufs 已有正文读取全局/每 IP 并发限制、全局/每 IP token bucket、Argon2 并发上限和按“客户端 IP + 账号摘要”组合键的失败退避，但状态只在当前进程内、成功会清除对应组合记录，也不是分布式防护；公网网关仍应独立按可信真实 IP 限速。
-3. 会话空闲 30 分钟和绝对 12 小时目前是固定常量，不能通过命令行或 YAML 调整。
+3. 会话空闲 30 分钟和绝对 12 小时目前是固定常量，不能通过命令行或 YAML 调整；两者按 Linux `CLOCK_BOOTTIME` 计时，系统休眠时间同样消耗期限。
 4. 公开 `/__dufs__/health` 只证明进程和路由能响应；认证 `/__dufs__/ready` 会真实创建隐藏文件、写入、同步文件、删除并同步根目录，还会在当前 SQLite actor 连接中执行回滚写事务。它仍不执行 rename 或介质读回，也不预测目标冲突、上传/purge 容量等全部业务准入，因此不能替代完整 CRUD 冒烟和备份恢复演练。
 5. `$remote_addr` 始终是与 Dufs 建立 TCP 连接的 peer；登录限流仅在该 peer 匹配显式 `trusted-proxies` IP/CIDR 时接受恰好一个、无逗号且能解析为 IP 的 `X-Forwarded-For`。默认列表为空；未匹配、重复、多值或非法头会退回 TCP peer。受信列表只是来源地址声明，不能区分 nginx 与能直连同一回环端口的其他本机进程，仍需 OS/网络隔离。
 6. CLI/YAML 的最终 bind 列表必须非空；`bind: []` 在创建 listener 或其他运行时资源前就以明确配置错误失败。多个 listener 各自先等待可读，再取得共享连接许可后 `try_accept`，因此空闲地址不会预占许可，用户态已接受 socket 不会越过上限；达到上限时内核 backlog 仍可能暂存已经完成握手的连接。
@@ -526,7 +526,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 | 统一控制状态 | `src/server/operation_registry.rs`、`src/server/state_store.rs`、`src/server/upload/record.rs`、`src/server/purge.rs` | `rusqlite`（bundled SQLite） | schema v5 文件数据库同时持久化管理 operations/upload_sessions/purge_jobs；SQLite 是唯一状态权威，`state-dir` 必填，不存在内存模式，支持从 v2/v3/v4 事务迁移 |
 | HTTP 服务 | `src/main.rs`、`src/server.rs`、`src/server/router.rs`、`src/server/assets.rs` | `tokio`、`tokio-util`、`hyper`、`hyper-util`、`http-body-util`、`headers`、`bytes`、`futures-util` | 核心运行栈；Range 改用 `ReaderStream` 后不再直接依赖 `pin-project-lite`；`hyper-util` 只提供 Tokio I/O 和计时适配，生产依赖图不包含 `h2` |
 | TCP 监听 | `src/main.rs` | `socket2` | 用于 Linux listener 配置和 backlog |
-| 根目录与持久化 | `src/server/rooted_fs.rs`、`src/server/rooted_fs/purge.rs`、`storage.rs`、`disk_space.rs` | `rustix` | `openat2`、`*at`、`fsync`、fd-relative 递归删除、`fstatvfs` 等核心 Linux 边界 |
+| Linux 系统边界与会话计时 | `src/auth.rs`、`src/server/rooted_fs.rs`、`src/server/rooted_fs/purge.rs`、`storage.rs`、`disk_space.rs` | `rustix` | `CLOCK_BOOTTIME` 让会话期限包含系统休眠；`openat2`、`*at`、`fsync`、fd-relative 递归删除、`fstatvfs` 等构成文件系统边界 |
 | 路由和表单编码 | `src/server.rs`、`src/server/router.rs`、`session.rs`、前端 URL | `percent-encoding`、`form_urlencoded` | 登录、查询和路径编码共同使用 |
 | 浏览器 JSON 协议 | `browser_api.rs`、`listing.rs`、`listing/snapshot.rs`、`operation_registry.rs`、`upload.rs`、`upload/record.rs` | `serde`、`serde_json` | mkdir/move/rename、分页结果、operation 状态和上传状态都使用 |
 | 文件类型判断 | `src/server/download.rs` | `mime_guess` | 附件只按扩展名给出 MIME，未知名称使用 octet-stream；不再抽样或猜测 charset |
