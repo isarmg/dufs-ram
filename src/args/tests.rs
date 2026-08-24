@@ -535,6 +535,191 @@ fn read_config_rejects_a_real_hard_link_and_insecure_mode() {
 }
 
 #[test]
+fn path_identity_matches_canonical_entries_and_existing_objects() {
+    let tmpdir = assert_fs::TempDir::new().unwrap();
+    let real_parent = tmpdir.child("real");
+    std::fs::create_dir(real_parent.path()).unwrap();
+    let alias_parent = tmpdir.child("alias");
+    std::os::unix::fs::symlink(real_parent.path(), alias_parent.path()).unwrap();
+
+    let direct_entry =
+        PathIdentity::inspect(&real_parent.path().join("future"), "test path").unwrap();
+    let aliased_entry =
+        PathIdentity::inspect(&alias_parent.path().join("future"), "test path").unwrap();
+    assert!(direct_entry.shares_entry_or_object_with(&aliased_entry));
+    assert!(direct_entry.object.is_none());
+
+    let object = real_parent.child("object");
+    object.write_str("contents").unwrap();
+    let hard_link = tmpdir.child("object-link");
+    std::fs::hard_link(object.path(), hard_link.path()).unwrap();
+    let direct_object = PathIdentity::inspect(object.path(), "test path").unwrap();
+    let aliased_object = PathIdentity::inspect(hard_link.path(), "test path").unwrap();
+    assert_ne!(direct_object.entry, aliased_object.entry);
+    assert!(direct_object.shares_entry_or_object_with(&aliased_object));
+}
+
+#[test]
+fn configuration_and_log_paths_cannot_resolve_into_the_shared_root() {
+    let shared = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let alias_dir = assert_fs::TempDir::new().unwrap();
+    let shared_alias = alias_dir.child("shared-alias");
+    std::os::unix::fs::symlink(shared.path(), shared_alias.path()).unwrap();
+
+    let config = shared.child("config.yaml");
+    config
+        .write_str(&format!(
+            "auth:\n  - {TEST_ACCOUNT}\nstate-dir: '{}'\n",
+            state_dir.path().display()
+        ))
+        .unwrap();
+    make_config_private(config.path());
+    for config_path in [
+        config.path().to_path_buf(),
+        shared_alias.path().join("config.yaml"),
+    ] {
+        let matches = build_cli()
+            .try_get_matches_from([
+                OsString::from("dufs"),
+                shared.path().as_os_str().to_owned(),
+                OsString::from("--config"),
+                config_path.into_os_string(),
+            ])
+            .unwrap();
+        let error = Args::parse(matches)
+            .expect_err("a configuration path inside the shared root was accepted");
+        assert!(
+            error.to_string().contains("resolve into shared path"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    let inside_log = shared.child("inside.log");
+    inside_log.write_str("existing log").unwrap();
+    let outside_log_link = alias_dir.child("outside-log-link");
+    std::os::unix::fs::symlink(inside_log.path(), outside_log_link.path()).unwrap();
+    for log_path in [
+        shared.path().join("new.log"),
+        shared_alias.path().join("new.log"),
+        outside_log_link.path().to_path_buf(),
+    ] {
+        let error = Args {
+            serve_path: shared.path().to_path_buf(),
+            state_dir: Some(state_dir.path().to_path_buf()),
+            auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+            log_file: Some(log_path),
+            ..Args::default()
+        }
+        .validate()
+        .expect_err("a log path resolving inside the shared root was accepted");
+        assert!(
+            error.to_string().contains("resolve into shared path"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    let hard_link = alias_dir.child("hard-linked-log");
+    std::fs::hard_link(inside_log.path(), hard_link.path()).unwrap();
+    let error = Args {
+        serve_path: shared.path().to_path_buf(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+        log_file: Some(hard_link.path().to_path_buf()),
+        ..Args::default()
+    }
+    .validate()
+    .expect_err("a hard-linked log alias of a shared object was accepted");
+    assert!(error.to_string().contains("exactly one hard link"));
+}
+
+#[test]
+fn configuration_and_log_paths_must_have_distinct_identities() {
+    let shared = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let config_dir = assert_fs::TempDir::new().unwrap();
+    let config = config_dir.child("config.yaml");
+
+    for log_path in [
+        config.path().to_path_buf(),
+        config_dir.path().join("config-log-alias"),
+    ] {
+        if log_path.as_path() != config.path() {
+            std::os::unix::fs::symlink(config.path(), &log_path).unwrap();
+        }
+        config
+            .write_str(&format!(
+                "auth:\n  - {TEST_ACCOUNT}\nstate-dir: '{}'\nlog-file: '{}'\n",
+                state_dir.path().display(),
+                log_path.display()
+            ))
+            .unwrap();
+        make_config_private(config.path());
+        let matches = build_cli()
+            .try_get_matches_from([
+                OsString::from("dufs"),
+                shared.path().as_os_str().to_owned(),
+                OsString::from("--config"),
+                config.path().as_os_str().to_owned(),
+            ])
+            .unwrap();
+        let error = Args::parse(matches)
+            .expect_err("configuration and log identity collision was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts by entry or object identity with log file"),
+            "unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn state_database_sidecar_conflicts_include_entry_and_object_aliases() {
+    let shared = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let alias_dir = assert_fs::TempDir::new().unwrap();
+    let state_alias = alias_dir.child("state-alias");
+    std::os::unix::fs::symlink(state_dir.path(), state_alias.path()).unwrap();
+
+    let aliased_entry = state_alias.path().join("state.sqlite3-wal");
+    let error = Args {
+        serve_path: shared.path().to_path_buf(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+        log_file: Some(aliased_entry),
+        ..Args::default()
+    }
+    .validate()
+    .expect_err("an aliased SQLite sidecar entry was accepted as the log path");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with SQLite state database")
+    );
+
+    let sidecar = state_dir.path().join("state.sqlite3-shm");
+    std::fs::write(&sidecar, "existing sidecar").unwrap();
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let object_alias = alias_dir.child("sidecar-object-alias");
+    std::os::unix::fs::symlink(&sidecar, object_alias.path()).unwrap();
+    let error = Args {
+        serve_path: shared.path().to_path_buf(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+        log_file: Some(object_alias.path().to_path_buf()),
+        ..Args::default()
+    }
+    .validate()
+    .expect_err("an aliased SQLite sidecar object was accepted as the log path");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with SQLite state database")
+    );
+}
+
+#[test]
 fn direct_validation_enforces_runtime_invariants() {
     let tmpdir = assert_fs::TempDir::new().unwrap();
     let args = Args {
@@ -584,8 +769,9 @@ fn config_without_bind_uses_the_loopback_default() {
 #[test]
 fn test_args_from_config_file1() {
     let tmpdir = assert_fs::TempDir::new().unwrap();
+    let config_dir = assert_fs::TempDir::new().unwrap();
     let state_dir = private_state_dir();
-    let config_file = tmpdir.child("config.yaml");
+    let config_file = config_dir.child("config.yaml");
     let contents = format!(
         r#"
 serve-path: {}

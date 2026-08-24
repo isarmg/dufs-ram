@@ -260,14 +260,14 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 | 参数 | 说明 |
 | --- | --- |
 | `[serve-path]` | 要管理的现有目录，默认当前目录；非目录会拒绝启动 |
-| `-c, --config <file>` | YAML 配置文件 |
+| `-c, --config <file>` | YAML 配置文件；路径及可解析别名必须位于共享根之外 |
 | `--state-dir <dir>` | 必填的 SQLite 状态目录；固定使用 `<dir>/state.sqlite3`，目录须为服务账号所有的 `0700` 非符号链接目录并与共享根分离 |
 | `-b, --bind <ips>` | 监听一个或多个 IPv4/IPv6 地址，默认 `127.0.0.1`；配置结果不能为空 |
 | `--trusted-proxy <networks>` | 信任一个或多个直连代理的 `X-Forwarded-For` / `X-Forwarded-Proto`；接受 IP 或 CIDR，默认不信任任何代理 |
 | `-p, --port <port>` | 监听端口，默认 `5000` |
 | `-a, --auth <account>` | 添加一个拥有完整共享目录权限的账号 |
 | `--log-format <format>` | 自定义 HTTP 访问日志格式 |
-| `--log-file <file>` | 将日志写入文件 |
+| `--log-file <file>` | 将日志写入文件；路径及可解析别名必须位于共享根之外且不得与配置/状态文件冲突 |
 | `--max-upload-size <bytes>` | 单文件最大声明长度，默认 100 GiB |
 | `--upload-idle-timeout <seconds>` | 上传正文最大空闲时间，默认 60 秒，最大 365 天 |
 | `--upload-total-timeout <seconds>` | 单次上传总时限，默认 24 小时，最大 365 天 |
@@ -326,7 +326,7 @@ chmod 0600 ./dufs.yaml
 
 YAML 会拒绝未知字段和空的 `bind` 列表。`trusted-proxies` 可写成单个 IP/CIDR 字符串或列表，默认空；命令行显式提供 `--trusted-proxy` 时会整体覆盖 YAML 列表。`state-dir` 必须由 YAML 或命令行提供，目录必须满足上述私有目录约束，固定数据库目标不能是符号链接或目录；命令行显式指定时会覆盖 YAML 中的值。`max-search-entries` 必须位于支持的正数范围内，硬上限与直接列表的 100000 项保护一致。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
 
-Linux 上的 YAML 文件必须由 root 或服务进程的有效用户拥有，只能使用精确的 `0400`、`0440`、`0600` 或 `0640`；使用组读位时，文件 gid 必须等于进程的有效 gid。文件还必须是无扩展 POSIX access ACL 的单硬链接普通文件。Dufs 以 `O_NOFOLLOW|O_NONBLOCK` 打开一次，在同一 fd 上探测 ACL、读取最多 1 MiB，并在探测和读取前后用 `fstat` 复核 dev/inode、mode、nlink、uid/gid、大小及纳秒级 mtime/ctime 均未变化。
+Linux 上的 YAML 文件必须由 root 或服务进程的有效用户拥有，只能使用精确的 `0400`、`0440`、`0600` 或 `0640`；使用组读位时，文件 gid 必须等于进程的有效 gid。文件还必须是无扩展 POSIX access ACL 的单硬链接普通文件。Dufs 以 `O_NOFOLLOW|O_NONBLOCK` 打开一次，在同一 fd 上探测 ACL、读取最多 1 MiB，并在探测和读取前后用 `fstat` 复核 dev/inode、mode、nlink、uid/gid、大小及纳秒级 mtime/ctime 均未变化。配置文件与日志文件都必须位于共享根之外；规范化父目录、最终目标及目录实体检查会拒绝经父目录符号链接等可解析别名落入共享根的路径，单硬链接要求则拒绝硬链接别名。两者不能指向同一规范目录项或同一已存在 dev/inode，也不能以目录项或对象别名碰撞 `state.sqlite3`、`state.sqlite3-journal`、`state.sqlite3-wal` 或 `state.sqlite3-shm`。
 
 仓库根目录的示例产物 `./dufs.yaml` 和 `./dufs.log` 分别含口令验证器及账号/请求路径等敏感信息，已由根 `.gitignore` 排除；不要强制加入版本控制，也不要把同类本地文件换名后提交。`deploy/dufs.yaml.example` 只保留占位符，继续作为可跟踪模板。
 
@@ -418,7 +418,7 @@ Authorization、Proxy-Authorization、Cookie 和 CSRF 请求头会在自定义�
 
 设置 `--log-format=''` 可以关闭 HTTP 访问日志。
 
-未配置 `--log-file` 时，INFO/WARN/ERROR 和访问日志都写入 stderr；stdout 只用于启动后输出一行监听地址，避免被阻塞或损坏的普通日志流延迟错误诊断。该地址是便捷提示而不是服务发布事务：stdout 已关闭等写入失败只记录告警，已构建的服务继续监听。日志初始化成功后的绑定、共享根、状态恢复或其他启动失败会记录完整错误链并在进程返回失败前有界刷新。`--log-file` 使用不跟随符号链接的追加方式打开，只接受由当前服务用户拥有、且仅有一个硬链接的普通文件。新文件原子创建为 `0600`；已有文件必须事先就是精确的 `0600`，服务不会在打开后用 chmod 掩盖既往泄露或仍由其他进程持有的宽松权限。异步 writer 的刷新失败会保留待刷新状态并在下个周期或显式刷新时重试；回退诊断写入失败也不会使日志线程 panic。进程不会在轮转重命名后自动重新打开路径，长期运行时应使用 journald、`copytruncate`，或在安全创建新日志后重启服务。
+未配置 `--log-file` 时，INFO/WARN/ERROR 和访问日志都写入 stderr；stdout 只用于启动后输出一行监听地址，避免被阻塞或损坏的普通日志流延迟错误诊断。该地址是便捷提示而不是服务发布事务：stdout 已关闭等写入失败只记录告警，已构建的服务继续监听。日志初始化成功后的绑定、共享根、状态恢复或其他启动失败会记录完整错误链并在进程返回失败前有界刷新。`--log-file` 必须位于共享根之外，且不能与配置、状态库或其热 sidecar 共享规范目录项或已存在对象身份；它使用不跟随符号链接的追加方式打开，只接受由当前服务用户拥有、且仅有一个硬链接的普通文件。新文件原子创建为 `0600`；已有文件必须事先就是精确的 `0600`，服务不会在打开后用 chmod 掩盖既往泄露或仍由其他进程持有的宽松权限。异步 writer 的刷新失败会保留待刷新状态并在下个周期或显式刷新时重试；回退诊断写入失败也不会使日志线程 panic。进程不会在轮转重命名后自动重新打开路径，长期运行时应使用 journald、`copytruncate`，或在安全创建新日志后重启服务。
 
 ## 停止服务与 systemd
 
