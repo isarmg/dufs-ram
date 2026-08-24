@@ -77,7 +77,7 @@ cargo install cargo-llvm-cov --version 0.8.6 --locked
 
 日常修改并不要求每次都运行覆盖率或依赖审计。先安装它们，是为了准备最终工程级检查。
 
-首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；`cargo audit` 还要取得 RustSec 数据，`npm audit` 要访问 npm registry。正式发布只允许 cargo-audit 0.22.2。宿主 RustSec DB 只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 FETCH_HEAD 不得比当前时间早超过 7 天或晚超过 300 秒，并通过物理/Git/内容完整性检查后才能复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径和 tracked 内容/mode 漂移都会拒绝。合格数据库以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在运行任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新，断网即失败关闭。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed pre-audit，随后要求 `DUFS_QUALITY_AUDIT_DB` 把同一封存交给 `scripts/check.sh`。封存时校验 seal 与新鲜度，pre-audit 后只重验 seal；完整门后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。离线执行前必须预热或提供相应缓存/镜像，且预先安装与仓库版本相容的 Chromium、Firefox；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
+首次安装 Rust/npm 依赖和 Playwright 浏览器通常需要网络；Cargo 审计还需要 RustSec，并须先取得锁图所需的 crates.io 索引项，`npm audit` 要访问 npm registry。正式发布只允许 cargo-audit 0.22.2。宿主 RustSec DB 只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 FETCH_HEAD 不得比当前时间早超过 7 天或晚超过 300 秒，并通过物理/Git/内容完整性检查后才能复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径和 tracked 内容/mode 漂移都会拒绝。合格数据库以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在运行任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新，断网即失败关闭。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed advisory pre-audit，再用私有 Cargo home 执行 `cargo fetch --locked` 取得完整锁图所需的 crates.io 索引项，并以 `--deny yanked` 拒绝已撤回依赖；空索引不能作为成功审计。随后 `DUFS_QUALITY_AUDIT_DB` 把同一封存交给 `scripts/check.sh`。封存时校验 seal 与新鲜度，pre-audit 和 yanked 检查后重验 seal；完整门后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。普通本地检查若要离线执行，必须预热或提供相应缓存/镜像并预先安装相容的 Chromium、Firefox；正式 yanked 检查使用每次全新创建的私有 Cargo home，当前仍要求 registry 网络可达，宿主缓存不能替代这一步；不能把“命令已经安装”误解为所有审计和浏览器门禁一定能离线运行。
 
 所有 npm 脚本及锁定版本都可以在 [package.json](../../package.json) 和 [package-lock.json](../../package-lock.json) 中找到。生产前端没有 Node 打包步骤；这里安装的是检查和测试工具，不是服务器运行依赖。
 
@@ -485,7 +485,7 @@ Network 重点看：
 - npm audit；
 - Git 空白和工作树状态检查。
 
-完整门禁默认不是纯离线流程：缓存缺失时 `npm ci` 会下载包，`cargo audit` 会更新/读取 RustSec advisory 数据，`npm audit` 会查询 registry；Playwright 浏览器也必须已经安装。受限网络或 air-gapped CI 应显式准备锁定依赖、advisory/registry 策略和浏览器制品，并记录哪些审计因策略被替代，不能静默跳过后仍宣称与默认门禁等价。
+完整门禁默认不是纯离线流程：缓存缺失时 `npm ci` 会下载包，`cargo audit` 会更新/读取 RustSec advisory 与 crates.io yanked 数据，`npm audit` 会查询 registry；Playwright 浏览器也必须已经安装。正式包 E2E 还会在隔离 clone 中重跑整套门禁、真实构建/SBOM/签名/原子发布和外部验收。受限网络或 air-gapped CI 应显式准备锁定依赖、advisory/registry 策略和浏览器制品，并记录哪些审计因策略被替代，不能静默跳过后仍宣称与默认门禁等价。
 
 它的工具链不止 `cargo`、Git、Node、npm、nginx、`systemd-analyze`、`cargo-audit`、固定的 `cargo-llvm-cov 0.8.6` 和 Playwright 浏览器；间接执行的部署与 release 自测还要求 curl、OpenSSL、tar/gzip、flock、sha256sum、支持 `--update=none --no-copy` 的 GNU `mv`，以及支持 Linux `RENAME_NOREPLACE` 的发布文件系统。发布脚本不会把 `--update=none` 的静默跳过当成成功，只有 source 消失且 destination 的设备号/inode 与原 source 相同时才确认发布。权威清单以 [scripts/check.sh](../../scripts/check.sh) 及其调用脚本的启动检查为准，更具体的部署工具准备见[第 9 章](09-deployment-security-and-operations.md)。
 
