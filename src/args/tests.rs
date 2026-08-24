@@ -159,6 +159,46 @@ fn invalid_or_unbounded_trusted_proxy_networks_are_rejected() {
 }
 
 #[test]
+fn trusted_proxy_union_cannot_cover_an_entire_address_family() {
+    for networks in [["0.0.0.0/1", "128.0.0.0/1"], ["::/1", "8000::/1"]] {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let state_dir = private_state_dir();
+        let args = Args {
+            serve_path: tmpdir.path().to_path_buf(),
+            state_dir: Some(state_dir.path().to_path_buf()),
+            auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+            trusted_proxies: networks
+                .into_iter()
+                .map(|network| network.parse().unwrap())
+                .collect(),
+            ..Args::default()
+        };
+        let error = args
+            .validate()
+            .expect_err("collectively unbounded trusted proxies were accepted");
+        assert!(error.to_string().contains("entire IPv4 or IPv6"));
+    }
+}
+
+#[test]
+fn trusted_proxy_union_may_leave_part_of_an_address_family_untrusted() {
+    let tmpdir = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let args = Args {
+        serve_path: tmpdir.path().to_path_buf(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+        trusted_proxies: ["0.0.0.0/1", "128.0.0.0/2"]
+            .into_iter()
+            .map(|network| network.parse().unwrap())
+            .collect(),
+        ..Args::default()
+    };
+    args.validate()
+        .expect("a bounded trusted proxy union was rejected");
+}
+
+#[test]
 fn excessive_trusted_proxy_networks_are_rejected_for_library_callers() {
     let tmpdir = assert_fs::TempDir::new().unwrap();
     let state_dir = private_state_dir();

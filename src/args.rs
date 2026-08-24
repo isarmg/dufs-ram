@@ -49,10 +49,6 @@ impl TrustedProxy {
     pub fn contains(&self, address: &IpAddr) -> bool {
         self.0.contains(address)
     }
-
-    fn prefix_len(&self) -> u8 {
-        self.0.prefix_len()
-    }
 }
 
 impl FromStr for TrustedProxy {
@@ -478,10 +474,8 @@ impl Args {
         if self.trusted_proxies.len() > MAX_TRUSTED_PROXIES {
             bail!("trusted-proxies must not contain more than {MAX_TRUSTED_PROXIES} networks");
         }
-        if self
-            .trusted_proxies
-            .iter()
-            .any(|network| network.prefix_len() == 0)
+        if trusted_proxy_union_covers_entire_family(&self.trusted_proxies, true)
+            || trusted_proxy_union_covers_entire_family(&self.trusted_proxies, false)
         {
             bail!("trusted-proxies must not trust the entire IPv4 or IPv6 address space");
         }
@@ -785,6 +779,39 @@ fn parse_trusted_proxies(values: &[&str]) -> Result<Vec<TrustedProxy>> {
         .iter()
         .map(|value| parse_trusted_proxy(value))
         .collect()
+}
+
+fn trusted_proxy_union_covers_entire_family(networks: &[TrustedProxy], ipv4: bool) -> bool {
+    let mut ranges = networks
+        .iter()
+        .filter_map(
+            |network| match (network.0.network(), network.0.broadcast()) {
+                (IpAddr::V4(start), IpAddr::V4(end)) if ipv4 => {
+                    Some((u32::from(start) as u128, u32::from(end) as u128))
+                }
+                (IpAddr::V6(start), IpAddr::V6(end)) if !ipv4 => {
+                    Some((u128::from(start), u128::from(end)))
+                }
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+
+    let maximum = if ipv4 { u32::MAX as u128 } else { u128::MAX };
+    let Some(&(first_start, mut covered_to)) = ranges.first() else {
+        return false;
+    };
+    if first_start != 0 {
+        return false;
+    }
+    for &(start, end) in &ranges[1..] {
+        if start > covered_to.saturating_add(1) {
+            return false;
+        }
+        covered_to = covered_to.max(end);
+    }
+    covered_to == maximum
 }
 
 fn deserialize_bind_addrs<'de, D>(deserializer: D) -> Result<Vec<IpAddr>, D::Error>

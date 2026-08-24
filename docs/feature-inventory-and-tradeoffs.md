@@ -80,7 +80,7 @@
 | C-03 | `-c, --config` | 不指定则只用命令行 | 加载严格 YAML；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
-| C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝 `/0` | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
+| C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
 | C-08 | `-a, --auth` / `auth` | 至少一个账号；可重复 | 配置完整权限账号；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
 | C-10 | `--log-file` / `log-file` | 不指定时输出到 stdout/stderr；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
