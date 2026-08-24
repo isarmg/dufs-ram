@@ -1,26 +1,39 @@
-use super::{BUF_SIZE, Response, Server, set_content_disposition, status_not_found};
+use super::{
+    BUF_SIZE, Response, Server,
+    blocking_io::{BlockingIoGate, blocking_io_gate},
+    set_content_disposition, status_not_found,
+};
 use crate::utils::{ParsedRange, parse_range, try_get_file_name};
 
 use crate::utils::encode_hex;
-use anyhow::{Result, anyhow};
-use futures_util::TryStreamExt;
+use anyhow::Result;
+use bytes::Bytes;
+use futures_util::{TryStreamExt, stream};
 use headers::{
     AcceptRanges, CacheControl, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
     IfNoneMatch, IfUnmodifiedSince, LastModified,
 };
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
 use hyper::{
     StatusCode,
     body::Frame,
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, IF_RANGE, RANGE},
 };
 use sha2::{Digest, Sha256};
-use std::{fs::Metadata, io::SeekFrom, os::unix::fs::MetadataExt, path::Path};
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+use std::{
+    fs::{File, Metadata},
+    io,
+    os::unix::fs::{FileExt, MetadataExt},
+    path::Path,
 };
-use tokio_util::io::ReaderStream;
+use tokio::fs;
+
+struct DownloadReadState {
+    file: File,
+    gate: BlockingIoGate,
+    offset: u64,
+    remaining: u64,
+}
 
 impl Server {
     pub(super) async fn handle_send_file(
@@ -49,12 +62,37 @@ impl Server {
 
 async fn send_open_file(
     path: &Path,
-    mut file: fs::File,
+    file: fs::File,
     headers: &HeaderMap<HeaderValue>,
     head_only: bool,
     res: &mut Response,
 ) -> Result<()> {
-    let meta = file.metadata().await?;
+    let file = file.into_std().await;
+    send_open_file_with_gate(
+        path,
+        file,
+        headers,
+        head_only,
+        res,
+        blocking_io_gate().clone(),
+    )
+    .await
+}
+
+async fn send_open_file_with_gate(
+    path: &Path,
+    file: File,
+    headers: &HeaderMap<HeaderValue>,
+    head_only: bool,
+    res: &mut Response,
+    gate: BlockingIoGate,
+) -> Result<()> {
+    let (file, meta) = gate
+        .run_io(move || {
+            let meta = file.metadata()?;
+            Ok((file, meta))
+        })
+        .await?;
     if !meta.is_file() {
         status_not_found(res);
         return Ok(());
@@ -124,7 +162,6 @@ async fn send_open_file(
 
     match range {
         Some(ParsedRange::Satisfiable(start, end)) => {
-            file.seek(SeekFrom::Start(start)).await?;
             let range_size = end - start + 1;
             *res.status_mut() = StatusCode::PARTIAL_CONTENT;
             let content_range = format!("bytes {start}-{end}/{size}");
@@ -136,13 +173,7 @@ async fn send_open_file(
                 return Ok(());
             }
 
-            let reader_stream = ReaderStream::with_capacity(file.take(range_size), BUF_SIZE);
-            let stream_body = StreamBody::new(
-                reader_stream
-                    .map_ok(Frame::data)
-                    .map_err(|err| anyhow!("{err}")),
-            );
-            *res.body_mut() = stream_body.boxed();
+            *res.body_mut() = gated_file_body(file, gate, start, range_size);
         }
         Some(ParsedRange::Unsatisfiable) => {
             *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -158,16 +189,60 @@ async fn send_open_file(
 
             // Keep the body framed to the representation whose metadata produced
             // Content-Length, even if another writer appends to the same inode.
-            let reader_stream = ReaderStream::with_capacity(file.take(size), BUF_SIZE);
-            let stream_body = StreamBody::new(
-                reader_stream
-                    .map_ok(Frame::data)
-                    .map_err(|err| anyhow!("{err}")),
-            );
-            *res.body_mut() = stream_body.boxed();
+            *res.body_mut() = gated_file_body(file, gate, 0, size);
         }
     }
     Ok(())
+}
+
+fn gated_file_body(
+    file: File,
+    gate: BlockingIoGate,
+    offset: u64,
+    remaining: u64,
+) -> BoxBody<Bytes, anyhow::Error> {
+    let stream = stream::try_unfold(
+        DownloadReadState {
+            file,
+            gate,
+            offset,
+            remaining,
+        },
+        |state| async move {
+            if state.remaining == 0 {
+                return Ok(None);
+            }
+
+            let chunk_size = state.remaining.min(BUF_SIZE as u64) as usize;
+            let gate = state.gate.clone();
+            gate.run_io(move || {
+                let mut buffer = vec![0_u8; chunk_size];
+                let read = state.file.read_at(&mut buffer, state.offset)?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "download file ended before its advertised length",
+                    ));
+                }
+                buffer.truncate(read);
+                let read = read as u64;
+                let next = DownloadReadState {
+                    file: state.file,
+                    gate: state.gate,
+                    offset: state.offset + read,
+                    remaining: state.remaining - read,
+                };
+                Ok(Some((Bytes::from(buffer), next)))
+            })
+            .await
+        },
+    );
+    StreamBody::new(
+        stream
+            .map_ok(Frame::data)
+            .map_err(anyhow::Error::from),
+    )
+    .boxed()
 }
 
 fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
@@ -203,7 +278,14 @@ fn get_content_type(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::server::rooted_fs::RootedFs;
-    use std::io::Write as _;
+    use std::{
+        future::{Future, poll_fn},
+        io::Write as _,
+        pin::Pin,
+        sync::mpsc,
+        task::Poll,
+        time::Duration,
+    };
 
     async fn render_open_file(
         path: &Path,
@@ -232,6 +314,117 @@ mod tests {
             headers.typed_get::<LastModified>().as_ref(),
             Some(&expected.1)
         );
+    }
+
+    async fn assert_future_pending<F>(mut future: Pin<&mut F>, message: &str)
+    where
+        F: Future,
+    {
+        let first_poll = poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending(), "{message}");
+    }
+
+    async fn occupy_gate(
+        gate: &BlockingIoGate,
+    ) -> (
+        mpsc::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_gate = gate.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .run_io(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocking gate holder did not start")
+        })
+        .await
+        .unwrap();
+        (release_tx, blocker)
+    }
+
+    #[tokio::test]
+    async fn open_file_metadata_waits_for_blocking_io_admission() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let target = temp.path().join("download.txt");
+        std::fs::write(&target, "gated metadata").unwrap();
+        let file = std::fs::File::open(&target).unwrap();
+        let gate = BlockingIoGate::with_capacity_for_test(1);
+        let (release, blocker) = occupy_gate(&gate).await;
+        let headers = HeaderMap::new();
+        let mut response = Response::default();
+        let mut send = Box::pin(send_open_file_with_gate(
+            &target,
+            file,
+            &headers,
+            false,
+            &mut response,
+            gate,
+        ));
+
+        assert_future_pending(
+            send.as_mut(),
+            "file metadata bypassed blocking I/O admission",
+        )
+        .await;
+        release.send(()).unwrap();
+        blocker
+            .await
+            .expect("gate holder task failed")
+            .expect("gate holder I/O failed");
+        send.as_mut().await.unwrap();
+        drop(send);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_LENGTH], "14");
+    }
+
+    #[tokio::test]
+    async fn range_body_reads_wait_for_blocking_io_admission() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let target = temp.path().join("download.bin");
+        std::fs::write(&target, b"0123456789").unwrap();
+        let file = std::fs::File::open(&target).unwrap();
+        let gate = BlockingIoGate::with_capacity_for_test(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=2-7"));
+        let mut response = Response::default();
+        send_open_file_with_gate(
+            &target,
+            file,
+            &headers,
+            false,
+            &mut response,
+            gate.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+
+        let (release, blocker) = occupy_gate(&gate).await;
+        let mut collect = Box::pin(response.into_body().collect());
+        assert_future_pending(
+            collect.as_mut(),
+            "range body read bypassed blocking I/O admission",
+        )
+        .await;
+        release.send(()).unwrap();
+        blocker
+            .await
+            .expect("gate holder task failed")
+            .expect("gate holder I/O failed");
+        let body = collect.await.unwrap().to_bytes();
+
+        assert_eq!(body.as_ref(), b"234567");
     }
 
     #[tokio::test]
