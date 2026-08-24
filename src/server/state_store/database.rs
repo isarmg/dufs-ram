@@ -1,13 +1,15 @@
 use super::*;
 use rusqlite::{OpenFlags, config::DbConfig};
 use std::{
-    fs::{self, OpenOptions, Permissions},
+    fs::{self, File, OpenOptions, Permissions},
+    io::{self, ErrorKind, Seek, SeekFrom},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-const SCHEMA_V5: &str = r#"
+pub(super) const SCHEMA_V5: &str = r#"
 CREATE TABLE store_meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -229,11 +231,300 @@ struct IndexColumnSchemaSnapshot {
     collation: Option<String>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SidecarMetadataSnapshot {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl SidecarMetadataSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+struct MainDatabaseGuard {
+    path: PathBuf,
+    file: File,
+    snapshot: SidecarMetadataSnapshot,
+}
+
+impl MainDatabaseGuard {
+    fn inspect(path: &Path) -> Result<Self> {
+        let path_metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("Failed to inspect state database `{}`", path.display()))?;
+        validate_main_database_metadata(path, &path_metadata)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
+            .open(path)
+            .with_context(|| {
+                format!("Failed to safely open state database `{}`", path.display())
+            })?;
+        let opened_metadata = file.metadata().with_context(|| {
+            format!(
+                "Failed to inspect opened state database `{}`",
+                path.display()
+            )
+        })?;
+        validate_main_database_metadata(path, &opened_metadata)?;
+        let snapshot = SidecarMetadataSnapshot::from_metadata(&opened_metadata);
+        ensure!(
+            SidecarMetadataSnapshot::from_metadata(&path_metadata) == snapshot,
+            "State database `{}` was replaced while it was being inspected",
+            path.display()
+        );
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            snapshot,
+        })
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        let opened_metadata = self.file.metadata().with_context(|| {
+            format!(
+                "Failed to re-inspect opened state database `{}`",
+                self.path.display()
+            )
+        })?;
+        validate_main_database_metadata(&self.path, &opened_metadata)?;
+        ensure!(
+            SidecarMetadataSnapshot::from_metadata(&opened_metadata) == self.snapshot,
+            "Opened state database `{}` changed identity or metadata",
+            self.path.display()
+        );
+        let path_metadata = fs::symlink_metadata(&self.path).with_context(|| {
+            format!(
+                "State database `{}` disappeared or was replaced after validation",
+                self.path.display()
+            )
+        })?;
+        validate_main_database_metadata(&self.path, &path_metadata)?;
+        ensure!(
+            SidecarMetadataSnapshot::from_metadata(&path_metadata) == self.snapshot,
+            "State database `{}` was replaced after validation",
+            self.path.display()
+        );
+        Ok(())
+    }
+}
+
+struct SqliteSidecarGuard {
+    entries: Vec<SqliteSidecarEntry>,
+}
+
+struct SqliteSidecarEntry {
+    path: PathBuf,
+    state: SqliteSidecarState,
+}
+
+enum SqliteSidecarState {
+    Absent,
+    Present {
+        file: File,
+        snapshot: SidecarMetadataSnapshot,
+    },
+}
+
+impl SqliteSidecarGuard {
+    fn inspect(database_path: &Path) -> Result<Self> {
+        let mut entries = Vec::with_capacity(SQLITE_SIDECAR_SUFFIXES.len());
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let path = sqlite_sidecar_path(database_path, suffix);
+            let state = match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    validate_sidecar_metadata(&path, &metadata)?;
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(
+                            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits()
+                                as i32,
+                        )
+                        .open(&path)
+                        .with_context(|| {
+                            format!("Failed to safely open SQLite sidecar `{}`", path.display())
+                        })?;
+                    let opened_metadata = file.metadata().with_context(|| {
+                        format!(
+                            "Failed to inspect opened SQLite sidecar `{}`",
+                            path.display()
+                        )
+                    })?;
+                    validate_sidecar_metadata(&path, &opened_metadata)?;
+                    let expected = SidecarMetadataSnapshot::from_metadata(&metadata);
+                    let opened = SidecarMetadataSnapshot::from_metadata(&opened_metadata);
+                    ensure!(
+                        opened == expected,
+                        "SQLite sidecar `{}` was replaced while it was being inspected",
+                        path.display()
+                    );
+                    SqliteSidecarState::Present {
+                        file,
+                        snapshot: opened,
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => SqliteSidecarState::Absent,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to inspect SQLite sidecar `{}`", path.display())
+                    });
+                }
+            };
+            entries.push(SqliteSidecarEntry { path, state });
+        }
+        let guard = Self { entries };
+        guard.revalidate()?;
+        Ok(guard)
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        for entry in &self.entries {
+            match &entry.state {
+                SqliteSidecarState::Absent => match fs::symlink_metadata(&entry.path) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Ok(_) => bail!(
+                        "SQLite sidecar `{}` appeared or was replaced after validation",
+                        entry.path.display()
+                    ),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "Failed to re-inspect absent SQLite sidecar `{}`",
+                                entry.path.display()
+                            )
+                        });
+                    }
+                },
+                SqliteSidecarState::Present { file, snapshot } => {
+                    let opened_metadata = file.metadata().with_context(|| {
+                        format!(
+                            "Failed to re-inspect opened SQLite sidecar `{}`",
+                            entry.path.display()
+                        )
+                    })?;
+                    validate_sidecar_metadata(&entry.path, &opened_metadata)?;
+                    ensure!(
+                        SidecarMetadataSnapshot::from_metadata(&opened_metadata) == *snapshot,
+                        "Opened SQLite sidecar `{}` changed identity or security metadata",
+                        entry.path.display()
+                    );
+
+                    let path_metadata = fs::symlink_metadata(&entry.path).with_context(|| {
+                        format!(
+                            "SQLite sidecar `{}` disappeared or was replaced after validation",
+                            entry.path.display()
+                        )
+                    })?;
+                    validate_sidecar_metadata(&entry.path, &path_metadata)?;
+                    ensure!(
+                        SidecarMetadataSnapshot::from_metadata(&path_metadata) == *snapshot,
+                        "SQLite sidecar `{}` was replaced after validation",
+                        entry.path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_present_sidecar(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(&entry.state, SqliteSidecarState::Present { .. }))
+    }
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn validate_sidecar_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "SQLite sidecar `{}` cannot be a symbolic link",
+        path.display()
+    );
+    ensure!(
+        metadata.file_type().is_file(),
+        "SQLite sidecar `{}` must be a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.nlink() == 1,
+        "SQLite sidecar `{}` cannot have multiple hard links",
+        path.display()
+    );
+    Ok(())
+}
+
+fn validate_main_database_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "State database `{}` cannot be a symbolic link",
+        path.display()
+    );
+    ensure!(
+        metadata.file_type().is_file(),
+        "State database `{}` must be a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.nlink() == 1,
+        "State database `{}` cannot have multiple hard links",
+        path.display()
+    );
+    Ok(())
+}
+
 pub(super) fn prepare_database_file(path: &Path, root: &RootIdentity) -> Result<()> {
     ensure!(
         path.file_name().is_some(),
         "State database path must name a file"
     );
+    // Reject an unsafe pre-existing SQLite sidecar before creating, chmodding,
+    // or opening the main database. Holding the safe fds also keeps their
+    // inspected identities anchored until this filesystem preparation ends.
+    let sidecars = SqliteSidecarGuard::inspect(path)?;
+    if sidecars.has_present_sidecar() {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => bail!(
+                "Refusing to create state database `{}` while a SQLite sidecar already exists",
+                path.display()
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect state database `{}`", path.display())
+                });
+            }
+        }
+    }
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -325,7 +616,7 @@ pub(super) fn open_initialized_connection(
     upload_ttl_ms: i64,
     recovery_now_ms: i64,
 ) -> Result<Connection> {
-    let mut connection = open_connection(path)?;
+    let mut connection = open_connection(path, root)?;
     initialize_database(
         &mut connection,
         root,
@@ -336,32 +627,120 @@ pub(super) fn open_initialized_connection(
     Ok(connection)
 }
 
-fn open_connection(path: &Path) -> Result<Connection> {
+fn open_connection(path: &Path, root: RootIdentity) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    let connection = Connection::open_with_flags(path, flags)
-        .with_context(|| format!("Failed to open state database `{}`", path.display()))?;
-    harden_connection(&connection)?;
-    Ok(connection)
+    open_connection_with_sidecar_guard(path, root, flags, "open", || Ok(()))
 }
 
-fn open_existing_database_read_only(path: &Path) -> Result<Connection> {
+fn open_existing_database_read_only(path: &Path, root: RootIdentity) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    let connection = Connection::open_with_flags(path, flags).with_context(|| {
-        format!(
-            "Failed to inspect existing state database `{}`",
-            path.display()
-        )
-    })?;
+    open_connection_with_sidecar_guard(path, root, flags, "inspect existing", || Ok(()))
+}
+
+fn open_connection_with_sidecar_guard<F>(
+    path: &Path,
+    root: RootIdentity,
+    flags: OpenFlags,
+    action: &str,
+    after_snapshot: F,
+) -> Result<Connection>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let sidecars = SqliteSidecarGuard::inspect(path)?;
+    let main_database = MainDatabaseGuard::inspect(path)?;
+    after_snapshot()?;
+    // The injected test boundary models a rename between the first path/fd
+    // snapshot and sqlite3_open_v2. Reject it before SQLite receives a path.
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    validate_raw_main_database(&main_database, &sidecars, root)?;
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    let connection = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("Failed to {action} state database `{}`", path.display()))?;
+    // sqlite3_open_v2 has only opened the main handle at this point. Recheck
+    // before any pragma or prepared statement can make SQLite adopt a sidecar.
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    drop(main_database);
+    drop(sidecars);
     harden_connection(&connection)?;
     Ok(connection)
+}
+
+fn validate_raw_main_database(
+    main_database: &MainDatabaseGuard,
+    sidecars: &SqliteSidecarGuard,
+    root: RootIdentity,
+) -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("dufs-state-baseline-")
+        .tempdir()
+        .context("Failed to create a private state database validation directory")?;
+    let snapshot_path = directory.path().join("state.sqlite3");
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&snapshot_path)
+        .context("Failed to create a private state database validation snapshot")?;
+    let mut source = main_database
+        .file
+        .try_clone()
+        .context("Failed to duplicate the state database validation handle")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .context("Failed to rewind the state database validation handle")?;
+    io::copy(&mut source, &mut destination)
+        .context("Failed to copy the raw state database validation snapshot")?;
+    drop(destination);
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let connection = Connection::open_with_flags(&snapshot_path, flags)
+        .context("Failed to open the raw state database validation snapshot")?;
+    harden_connection(&connection)?;
+    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    ensure!(
+        version != 0 || !sidecars.has_present_sidecar(),
+        "Refusing to initialize an empty main state database from SQLite sidecar contents"
+    );
+    validate_database_before_mutation(&connection, root)
+        .context("The raw main state database does not have a trusted DUFS baseline")?;
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn open_existing_database_after_sidecar_snapshot_for_test<F>(
+    path: &Path,
+    root: RootIdentity,
+    after_snapshot: F,
+) -> Result<Connection>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    open_connection_with_sidecar_guard(path, root, flags, "inspect existing", after_snapshot)
 }
 
 fn harden_connection(connection: &Connection) -> Result<()> {
@@ -422,7 +801,7 @@ fn initialize_database(
 }
 
 fn preflight_existing_database(path: &Path, root: RootIdentity) -> Result<()> {
-    let connection = open_existing_database_read_only(path)?;
+    let connection = open_existing_database_read_only(path, root)?;
     validate_database_before_mutation(&connection, root).with_context(|| {
         format!(
             "Refusing to modify unrecognized state database `{}`",
