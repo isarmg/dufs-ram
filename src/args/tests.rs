@@ -24,6 +24,10 @@ fn make_config_private(path: &Path) {
     }
 }
 
+fn yaml_path_scalar(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).unwrap()
+}
+
 fn config_snapshot(mode: u32, uid: u32, gid: u32) -> ConfigFileSnapshot {
     ConfigFileSnapshot {
         device: 1,
@@ -858,7 +862,7 @@ port: 3000
 auth:
   - {TEST_ACCOUNT}
 "#,
-        tmpdir.display()
+        yaml_path_scalar(tmpdir.path())
     );
     config_file.write_str(&contents).unwrap();
     make_config_private(config_file.path());
@@ -882,7 +886,7 @@ serve-path: {}
 auth:
   - {TEST_ACCOUNT}
 "#,
-        shared_file.display()
+        yaml_path_scalar(shared_file.path())
     );
     config_file.write_str(&contents).unwrap();
     make_config_private(config_file.path());
