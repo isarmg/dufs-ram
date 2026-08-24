@@ -97,6 +97,32 @@ fn unknown_config_field_is_rejected(tmpdir: TempDir, #[case] field: &str) -> Res
 }
 
 #[rstest]
+fn unknown_yaml_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let config_path = tmpdir.path().join("unknown-log-variable.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\nlog-format: '$stauts'\n",
+            state_dir.path().display()
+        ),
+    )?;
+    let matches = build_cli().try_get_matches_from([
+        "dufs",
+        tmpdir.path().to_str().expect("UTF-8 test path"),
+        "--config",
+        config_path.to_str().expect("UTF-8 config path"),
+    ])?;
+
+    let error = Args::parse(matches).expect_err("unknown YAML log variable was accepted");
+    assert!(
+        format!("{error:#}").contains("Unknown HTTP log variable `$stauts`"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     const PLACEHOLDER: &str = "admin:$argon2id$REPLACE_WITH_A_REAL_HASH";
     const STATE_DIR: &str = "/var/lib/dufs";

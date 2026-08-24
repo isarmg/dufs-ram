@@ -385,16 +385,21 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 
 | 变量 | 含义 |
 | --- | --- |
+| `$time_local` | 请求记录时的本地 RFC 3339 时间 |
 | `$time_iso8601` | 请求完成时的 ISO 8601 时间 |
+| `$msec` | 请求记录时的 Unix epoch 秒数，保留三位小数 |
 | `$log_level` | 本条访问日志的级别 |
 | `$remote_addr` | 与 Dufs 建立 TCP 连接的客户端地址；经网关时通常是网关地址 |
 | `$remote_user` | 已成功认证的用户名；未认证或认证失败时为 `-` |
 | `$request` | 完整请求行：方法、保留百分号编码的原始 request-target 和 HTTP 版本；控制字符会转义 |
+| `$request_method` | HTTP 请求方法 |
 | `$request_uri` | 百分号解码后的 URI；仅用于便于阅读，精确协议审计应使用 `$request` |
 | `$status` | HTTP 状态码 |
 | `$operation_id` | 写操作的规范 UUID；没有时为 `-` |
 | `$operation_state` | 普通 operation 或上传响应的状态，可为 `running/succeeded/failed/rejected/unknown/committed/not-seen/not-started`；没有时为 `-` |
 | `$http_...` | 请求头，例如 `$http_user_agent` |
+
+除合法的 `$http_...` 请求头变量外，固定变量只接受上表名称；拼写错误会在启动时明确失败，不会静默输出 `-`。
 
 Authorization、Proxy-Authorization、Cookie 和 CSRF 请求头会在自定义日志变量中脱敏。连接处理错误会记录 TCP peer、错误类别和系统错误码，便于定位网关 `502`、超时和协议问题。
 
