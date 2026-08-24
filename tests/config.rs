@@ -123,6 +123,34 @@ fn unknown_yaml_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
 }
 
 #[rstest]
+fn duplicate_yaml_bind_address_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let config_path = tmpdir.path().join("duplicate-bind.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\nbind:\n  - 127.0.0.1\n  - 127.0.0.1\n",
+            state_dir.path().display()
+        ),
+    )?;
+    let matches = build_cli().try_get_matches_from([
+        "dufs",
+        tmpdir.path().to_str().expect("UTF-8 test path"),
+        "--config",
+        config_path.to_str().expect("UTF-8 config path"),
+    ])?;
+
+    let error = Args::parse(matches).expect_err("duplicate YAML bind address was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("bind must not contain duplicate IP addresses"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     const PLACEHOLDER: &str = "admin:$argon2id$REPLACE_WITH_A_REAL_HASH";
     const STATE_DIR: &str = "/var/lib/dufs";
