@@ -35,6 +35,7 @@ for command_name in \
   node \
   rm \
   sed \
+  sleep \
   systemd-analyze
 do
   command -v "$command_name" >/dev/null 2>&1 || {
@@ -43,20 +44,70 @@ do
   }
 done
 
+shutdown_term_timeout_seconds=5
+shutdown_kill_timeout_seconds=2
+
+wait_for_child_exit() {
+  local child_pid="$1"
+  local timeout_seconds="$2"
+  local deadline=$((SECONDS + timeout_seconds))
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  wait "$child_pid" 2>/dev/null || true
+  return 0
+}
+
+terminate_child() {
+  local child_pid="$1"
+  local child_name="$2"
+  local term_timeout="${3:-$shutdown_term_timeout_seconds}"
+  local kill_timeout="${4:-$shutdown_kill_timeout_seconds}"
+
+  if ! kill -0 "$child_pid" 2>/dev/null; then
+    wait "$child_pid" 2>/dev/null || true
+    return 0
+  fi
+
+  kill -TERM "$child_pid" 2>/dev/null || true
+  if wait_for_child_exit "$child_pid" "$term_timeout"; then
+    return 0
+  fi
+
+  printf '%s did not exit within %ss after TERM; sending KILL.\n' \
+    "$child_name" "$term_timeout" >&2
+  kill -KILL "$child_pid" 2>/dev/null || true
+  if ! wait_for_child_exit "$child_pid" "$kill_timeout"; then
+    printf '%s remained alive %ss after KILL; continuing cleanup.\n' \
+      "$child_name" "$kill_timeout" >&2
+  fi
+  return 1
+}
+
 run_early_cleanup_self_test() {
   (
     local self_test_tmp_root self_test_dir child_status
+    local stubborn_pid ready_file shutdown_log started_at elapsed_seconds
     local -a leftovers
 
     self_test_tmp_root="${TMPDIR:-/tmp}"
     self_test_tmp_root="$(cd -P -- "$self_test_tmp_root" && pwd -P)"
     self_test_dir=""
+    stubborn_pid=""
 
     cleanup_self_test() {
       local status=$?
 
       trap - EXIT HUP INT TERM
       set +e
+      if [[ -n "$stubborn_pid" ]]; then
+        kill -KILL "$stubborn_pid" 2>/dev/null || true
+        wait_for_child_exit "$stubborn_pid" 1 || true
+      fi
       if [[ -n "$self_test_dir" && \
         "${self_test_dir%/*}" == "$self_test_tmp_root" && \
         "${self_test_dir##*/}" == dufs-deployment-trap-test.* ]]
@@ -100,7 +151,50 @@ run_early_cleanup_self_test() {
       exit 1
     fi
 
-    printf 'Early cleanup trap self-test passed.\n'
+    ready_file="$self_test_dir/stubborn-child.ready"
+    shutdown_log="$self_test_dir/bounded-shutdown.log"
+    "$BASH" -c '
+      trap "" TERM
+      : > "$1"
+      exec sleep 60
+    ' deployment-cleanup-self-test "$ready_file" &
+    stubborn_pid=$!
+    for _ in {1..50}; do
+      [[ -e "$ready_file" ]] && break
+      sleep 0.02
+    done
+    if [[ ! -e "$ready_file" ]]; then
+      printf 'Bounded-shutdown self-test child did not become ready.\n' >&2
+      exit 1
+    fi
+
+    started_at=$SECONDS
+    set +e
+    terminate_child "$stubborn_pid" "Bounded-shutdown self-test child" \
+      1 1 2>"$shutdown_log"
+    child_status=$?
+    set -e
+    elapsed_seconds=$((SECONDS - started_at))
+    if kill -0 "$stubborn_pid" 2>/dev/null; then
+      printf 'Bounded-shutdown self-test left its child alive.\n' >&2
+      exit 1
+    fi
+    stubborn_pid=""
+    if [[ "$child_status" -ne 1 ]]; then
+      printf 'Bounded-shutdown self-test did not report forced termination.\n' >&2
+      exit 1
+    fi
+    if [[ "$elapsed_seconds" -gt 5 ]]; then
+      printf 'Bounded-shutdown self-test exceeded its deadline: %ss.\n' \
+        "$elapsed_seconds" >&2
+      exit 1
+    fi
+    if ! grep -Fq -- 'sending KILL.' "$shutdown_log"; then
+      printf 'Bounded-shutdown self-test did not exercise KILL escalation.\n' >&2
+      exit 1
+    fi
+
+    printf 'Deployment cleanup self-tests passed.\n'
   )
 }
 
@@ -120,9 +214,9 @@ nginx_pid=""
 
 stop_nginx() {
   if [[ -n "$nginx_pid" ]]; then
-    kill -TERM "$nginx_pid" 2>/dev/null || true
-    wait "$nginx_pid" 2>/dev/null || true
+    local child_pid="$nginx_pid"
     nginx_pid=""
+    terminate_child "$child_pid" "Nginx"
   fi
 }
 
@@ -131,10 +225,17 @@ cleanup() {
 
   trap - EXIT HUP INT TERM
   set +e
-  stop_nginx
+  if ! stop_nginx && [[ "$status" -eq 0 ]]; then
+    status=1
+  fi
   if [[ -n "$upstream_pid" ]]; then
-    kill -TERM "$upstream_pid" 2>/dev/null
-    wait "$upstream_pid" 2>/dev/null
+    local child_pid="$upstream_pid"
+    upstream_pid=""
+    if ! terminate_child "$child_pid" "Deployment mock upstream" && \
+      [[ "$status" -eq 0 ]]
+    then
+      status=1
+    fi
   fi
   if [[ -n "$validation_dir" ]]; then
     if [[ "${validation_dir%/*}" == "$tmp_root" && \
