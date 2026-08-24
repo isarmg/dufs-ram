@@ -99,11 +99,12 @@ flowchart TD
     AUTH_OK -- 是 --> ADDRS{"bind 列表非空？"}
     ADDRS -- 否 --> STOP
     ADDRS -- 是 --> LOGGER["初始化日志"]
-    LOGGER --> ROOT["打开共享根目录 fd<br/>取得非阻塞独占 flock 并试用 openat2"]
+    LOGGER --> BIND["创建并暂存全部 TCP listener<br/>默认仅 127.0.0.1"]
+    BIND -- 任一失败 --> STOP
+    BIND -- 全部成功 --> ROOT["打开共享根目录 fd、初始化持久状态<br/>取得非阻塞独占 flock 并试用 openat2"]
     ROOT -- 失败 --> STOP
-    ROOT -- 成功 --> BIND["逐个绑定 TCP/IP 地址<br/>默认仅 127.0.0.1"]
-    BIND --> IP["创建 TCP listener"]
-    IP --> READY["等待 listener 可读<br/>不预占连接许可"]
+    ROOT -- 成功 --> PUBLISH["统一启动全部 listener task"]
+    PUBLISH --> READY["等待 listener 可读<br/>不预占连接许可"]
     READY -- 失败 --> ACCEPT_LOG["记录 listener、错误分类<br/>io_kind、系统错误码和 retry_ms"]
     ACCEPT_LOG --> BACKOFF["50 ms 起指数退避<br/>封顶 1 s"]
     BACKOFF --> READY
@@ -130,6 +131,8 @@ flowchart TD
 生产配置只来自可选 YAML 和命令行，且命令行覆盖 YAML；Dufs 二进制不读取 `DUFS_*` 环境变量。`--bind` 只接受 IPv4 或 IPv6 地址，CLI 和 YAML 均会拒绝非 IP 值，覆盖完成后的地址列表也必须至少包含一项；`bind: []` 会在初始化日志、根 fd 或 listener 前产生明确配置错误并以非零状态退出。YAML 反序列化启用 `deny_unknown_fields`，字段拼写错误或不属于当前配置结构的字段都会指出配置文件和未知字段并阻止启动。递归搜索项数必须大于零且不超过 100000，避免管理员把有界协议配置成任意大结果。
 
 TCP `accept` 返回的对端 `SocketAddr` 会作为必填参数依次传入 `handle_stream` 和 `Server::call`，访问日志始终记录 `remote_addr`。
+
+启动先创建并暂存全部 TCP listener；只有每个地址都成功绑定，才打开共享根、创建或迁移状态库并执行恢复。运行时完整构建后才统一启动 listener task，因此任一后项绑定失败时，前面已经绑定的 socket 不会接受连接，持久状态也保持未初始化。
 
 所有监听器共享一个连接信号量，默认最多保留 256 个活跃 TCP 连接。每个 listener 先独立等待可读，确认已有连接进入 backlog 后才可取消地竞争许可，取得许可后立即用 `try_accept` 接收；`WouldBlock` 会释放许可并重新等待，不做错误退避。这样空闲 listener 不占槽，多 bind 和低连接上限不会让某个已公布地址确定性饥饿，而且所有进入用户态的 socket 从接受之初就计入全局上限；超额握手只留在有界内核 backlog。停机可以同时打断可读等待、许可等待和错误退避。后端使用 Hyper HTTP/1 连接处理器，接受 HTTP/1.0 和 HTTP/1.1；HTTP/2 prior knowledge 和 HTTP/1.1 `Upgrade: h2c` 均不受支持。浏览器侧 HTTP/2 或 HTTP/3 必须终止在外部 HTTPS 网关，网关固定用 HTTP/1.1 回源。全部后端连接统一使用 10 秒请求头读取时限和 64 KiB 接收缓冲上限；HTTP/1.0/1.1 单连接请求串行处理，因此一个连接不能再通过并发 HTTP/2 stream 绕过连接预算。
 

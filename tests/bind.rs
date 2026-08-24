@@ -41,6 +41,27 @@ fn bind_fails(tmpdir: TempDir, #[case] args: &[&str]) -> Result<(), Error> {
 }
 
 #[rstest]
+fn later_bind_failure_does_not_initialize_persistent_state(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .args(["-p", "0"])
+        .args(["--auth", TEST_ACCOUNT])
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .args(["--bind", "127.0.0.1", "--bind", "20.205.243.166"])
+        .assert()
+        .stderr(predicates::str::contains("Failed to bind"))
+        .failure();
+
+    assert!(
+        !state_dir.path().join("state.sqlite3").exists(),
+        "a later bind failure must not initialize persistent state"
+    );
+    Ok(())
+}
+
+#[rstest]
 #[case("not-an-ip-address")]
 #[case("localhost")]
 fn non_ip_bind_is_rejected(tmpdir: TempDir, #[case] bind: &str) -> Result<(), Error> {
