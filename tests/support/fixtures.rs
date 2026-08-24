@@ -13,7 +13,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, sleep};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[allow(dead_code)]
@@ -761,7 +762,25 @@ fn extract_index_data(content: &str) -> Option<Value> {
 impl Drop for TestServer {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            let pid = i32::try_from(self.child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
+            let term_sent = pid.is_some_and(|pid| {
+                rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+            });
+            if term_sent {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => sleep(Duration::from_millis(10)),
+                        Err(_) => break,
+                    }
+                }
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
         }
         let _ = self.child.wait();
         if let Some(stdout_drain) = self.stdout_drain.take() {
