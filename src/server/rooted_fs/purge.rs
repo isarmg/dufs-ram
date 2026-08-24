@@ -31,6 +31,10 @@ use uuid::Uuid;
 #[cfg(test)]
 use rustix::fs::mkdirat;
 
+// Linux bounds each retained component name, so limiting the number of frames
+// also places a fixed upper bound on the DFS stack's retained heap memory.
+const MAX_PURGE_STACK_DEPTH: usize = 2048;
+
 pub(in crate::server) struct TrashEntry {
     parent: File,
     pub(in crate::server) name: OsString,
@@ -47,6 +51,10 @@ pub(in crate::server) struct TrashEntry {
     inject_entry_before_directory_unlink: bool,
     #[cfg(test)]
     replace_entry_before_final_isolation: bool,
+    #[cfg(test)]
+    purge_stack_depth_limit: usize,
+    #[cfg(test)]
+    fail_purge_stack_reserve_at_depth: Option<usize>,
 }
 
 pub(super) struct PurgeDirectory {
@@ -123,6 +131,10 @@ impl TrashEntry {
             inject_entry_before_directory_unlink: false,
             #[cfg(test)]
             replace_entry_before_final_isolation: false,
+            #[cfg(test)]
+            purge_stack_depth_limit: MAX_PURGE_STACK_DEPTH,
+            #[cfg(test)]
+            fail_purge_stack_reserve_at_depth: None,
         }
     }
 
@@ -311,6 +323,8 @@ impl TrashEntry {
                     "trash directory identity changed before purge",
                 ));
             }
+            let directory = Dir::new(directory).map_err(std::io::Error::from)?;
+            self.reserve_purge_directory_slot()?;
             self.purge_stack.push(PurgeDirectory {
                 name: self.name.clone(),
                 cursor: DirectoryCursor::default(),
@@ -318,7 +332,7 @@ impl TrashEntry {
                 revision_identity: opened_revision_identity,
                 pending_anchor: None,
             });
-            Some(Dir::new(directory).map_err(std::io::Error::from)?)
+            Some(directory)
         } else {
             self.open_current_purge_directory(&mut examined, max_entries, deadline, cancellation)?
         };
@@ -583,6 +597,10 @@ impl TrashEntry {
                 }
             };
             if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+                // Reserve before opening the child or advancing the parent cursor. If
+                // allocation fails, the retained frame still points at this entry and a
+                // later slice can retry it without skipping any subtree.
+                self.reserve_purge_directory_slot()?;
                 let child_identity = identity_from_stat(&metadata);
                 let child_revision_identity = replacement_target_identity(&metadata);
                 let child = match openat2(
@@ -736,6 +754,43 @@ impl TrashEntry {
                     .expect("directory purge stack is non-empty")
                     .cursor = next_cursor;
             }
+        }
+    }
+
+    fn reserve_purge_directory_slot(&mut self) -> std::io::Result<()> {
+        let maximum_depth = self.purge_stack_depth_limit();
+        if self.purge_stack.len() >= maximum_depth {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trash directory depth exceeds the purge stack limit",
+            ));
+        }
+
+        #[cfg(test)]
+        let additional = if self.fail_purge_stack_reserve_at_depth == Some(self.purge_stack.len()) {
+            self.fail_purge_stack_reserve_at_depth = None;
+            // This deterministically exercises `TryReserveError::CapacityOverflow`
+            // without relying on an allocator or exhausting process memory.
+            usize::MAX
+        } else {
+            1
+        };
+        #[cfg(not(test))]
+        let additional = 1;
+
+        self.purge_stack
+            .try_reserve(additional)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))
+    }
+
+    fn purge_stack_depth_limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.purge_stack_depth_limit
+        }
+        #[cfg(not(test))]
+        {
+            MAX_PURGE_STACK_DEPTH
         }
     }
 
@@ -996,6 +1051,7 @@ impl TrashEntry {
         let revision_identity = replacement_target_identity(
             &fstat(directory.fd().map_err(std::io::Error::from)?).map_err(std::io::Error::from)?,
         );
+        self.reserve_purge_directory_slot()?;
         self.purge_stack.push(PurgeDirectory {
             name: self.name.clone(),
             cursor: DirectoryCursor::default(),
@@ -1019,6 +1075,16 @@ impl TrashEntry {
     #[cfg(test)]
     pub(in crate::server) fn replace_entry_before_final_isolation_once_for_test(&mut self) {
         self.replace_entry_before_final_isolation = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_purge_stack_depth_limit_for_test(&mut self, maximum_depth: usize) {
+        self.purge_stack_depth_limit = maximum_depth;
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_purge_stack_reserve_at_depth_once_for_test(&mut self, depth: usize) {
+        self.fail_purge_stack_reserve_at_depth = Some(depth);
     }
 }
 
