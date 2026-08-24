@@ -196,13 +196,7 @@ impl Serving {
 fn serve(args: Args) -> Result<Serving> {
     let addrs = args.addrs.clone();
     let mut port = args.port;
-    let connection_slots = Arc::new(Semaphore::new(args.max_connections));
-    let listener_tasks = TaskTracker::new();
-    let connection_tasks = TaskTracker::new();
-    let runtime = Server::builder(args).build()?;
-    let server_handle = runtime.server().clone();
-    let shutdown = runtime.shutdown_token();
-    let force_shutdown = runtime.force_shutdown_token();
+    let mut listeners = Vec::with_capacity(addrs.len());
 
     for ip in addrs {
         let listener = create_listener(SocketAddr::new(ip, port))
@@ -214,7 +208,18 @@ fn serve(args: Args) -> Result<Serving> {
                 .context("Failed to inspect the dynamically assigned listen port")?
                 .port();
         }
+        listeners.push(listener);
+    }
 
+    let connection_slots = Arc::new(Semaphore::new(args.max_connections));
+    let listener_tasks = TaskTracker::new();
+    let connection_tasks = TaskTracker::new();
+    let runtime = Server::builder(args).build()?;
+    let server_handle = runtime.server().clone();
+    let shutdown = runtime.shutdown_token();
+    let force_shutdown = runtime.force_shutdown_token();
+
+    for listener in listeners {
         let runtime = ListenerRuntime {
             server: server_handle.clone(),
             shutdown: shutdown.clone(),
