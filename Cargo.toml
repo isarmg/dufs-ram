@@ -15,7 +15,7 @@ build = "build.rs"
 clap = { version = "4.5", features = ["wrap_help"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "net", "time"]}
-tokio-util = { version = "0.7", default-features = false, features = ["io-util", "rt"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 hyper = { version = "1", features = ["http1", "server"] }
 percent-encoding = "2.3"
 serde = { version = "1", features = ["derive"] }
