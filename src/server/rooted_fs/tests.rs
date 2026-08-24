@@ -1506,6 +1506,100 @@ async fn trash_purge_handles_depth_beyond_common_file_descriptor_limits() {
 }
 
 #[tokio::test]
+async fn purge_stack_depth_limit_allows_the_exact_boundary() {
+    const STACK_DEPTH_LIMIT: usize = 4;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let mut current = directory.clone();
+    for _ in 1..STACK_DEPTH_LIMIT {
+        current = current.join("d");
+        std::fs::create_dir(&current).unwrap();
+    }
+    std::fs::write(current.join("leaf"), "content").unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.set_purge_stack_depth_limit_for_test(STACK_DEPTH_LIMIT);
+    trash.purge_all_blocking().unwrap();
+
+    assert!(!trash_path.exists());
+    assert!(quarantine_entries(temp.path()).is_empty());
+}
+
+#[tokio::test]
+async fn purge_stack_depth_limit_quarantines_the_unvisited_subtree() {
+    const STACK_DEPTH_LIMIT: usize = 4;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let mut current = directory.clone();
+    let mut deepest_relative = PathBuf::new();
+    for _ in 0..STACK_DEPTH_LIMIT {
+        current = current.join("d");
+        deepest_relative.push("d");
+        std::fs::create_dir(&current).unwrap();
+    }
+    std::fs::write(current.join("leaf"), "content").unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.set_purge_stack_depth_limit_for_test(STACK_DEPTH_LIMIT);
+    let error = match trash
+        .purge_slice(usize::MAX, Duration::from_secs(1), CancellationToken::new())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a tree beyond the purge stack limit must be rejected"),
+    };
+    let (trash, source) = error.into_parts();
+
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(trash.purge_stack.len(), STACK_DEPTH_LIMIT);
+    assert!(!trash_path.exists());
+    assert_eq!(
+        classify_internal_name(trash.name.to_str().unwrap()),
+        Some(InternalEntryName::Quarantine)
+    );
+    let quarantined = temp.path().join(&trash.name);
+    assert_eq!(
+        std::fs::read_to_string(quarantined.join(deepest_relative).join("leaf")).unwrap(),
+        "content"
+    );
+}
+
+#[tokio::test]
+async fn purge_stack_reservation_failure_leaves_the_child_retryable() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let directory = temp.path().join("directory");
+    let child = directory.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("leaf"), "content").unwrap();
+
+    let mut trash = rooted.move_to_trash(&directory).await.unwrap();
+    let trash_path = temp.path().join(&trash.name);
+    trash.fail_purge_stack_reserve_at_depth_once_for_test(1);
+    let error = trash
+        .purge_slice_blocking(usize::MAX, Instant::now() + Duration::from_secs(1), None)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+    assert_eq!(trash.purge_stack.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(trash_path.join("child/leaf")).unwrap(),
+        "content"
+    );
+
+    trash.purge_all_blocking().unwrap();
+    assert!(!trash_path.exists());
+}
+
+#[tokio::test]
 async fn deep_purge_reopen_progress_is_resumable_and_slice_bounded() {
     const DEPTH: usize = 32;
 
