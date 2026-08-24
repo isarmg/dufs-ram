@@ -3710,6 +3710,23 @@ printf 'Running the sealed RustSec pre-audit for commit %s.\n' "$source_sha"
     --no-fetch \
     --no-yanked
 )
+printf 'Fetching the locked release graph into the private Cargo index.\n'
+(
+  cd "$release_stage"
+  "${audit_environment[@]}" \
+    "$cargo_command" fetch \
+    --locked \
+    --manifest-path "$quality_source/Cargo.toml"
+)
+printf 'Checking the locked release graph for yanked crates.\n'
+(
+  cd "$quality_source"
+  "${audit_environment[@]}" \
+    "$cargo_command" audit \
+    --db "$quality_audit_db" \
+    --no-fetch \
+    --deny yanked
+)
 validate_advisory_database_state \
   "$quality_audit_db" \
   "$rustsec_advisory_db_revision" \
