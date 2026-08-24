@@ -2,7 +2,8 @@
 mod fixtures;
 
 use fixtures::{
-    Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, TestServer, read_bound_url, server, tmpdir,
+    Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, TestServer, dufs_command, read_bound_url,
+    server, tmpdir,
 };
 
 use assert_cmd::prelude::*;
@@ -26,10 +27,10 @@ fn private_state_dir() -> Result<TempDir, Error> {
 #[case(&["-b", "20.205.243.166"])]
 fn bind_fails(tmpdir: TempDir, #[case] args: &[&str]) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
-    Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    command
         .arg(tmpdir.path())
         .args(["-p", "0"])
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .args(args)
@@ -43,10 +44,10 @@ fn bind_fails(tmpdir: TempDir, #[case] args: &[&str]) -> Result<(), Error> {
 #[rstest]
 fn later_bind_failure_does_not_initialize_persistent_state(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
-    Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    command
         .arg(tmpdir.path())
         .args(["-p", "0"])
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .args(["--bind", "127.0.0.1", "--bind", "20.205.243.166"])
@@ -65,9 +66,9 @@ fn later_bind_failure_does_not_initialize_persistent_state(tmpdir: TempDir) -> R
 #[case("not-an-ip-address")]
 #[case("localhost")]
 fn non_ip_bind_is_rejected(tmpdir: TempDir, #[case] bind: &str) -> Result<(), Error> {
-    Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    command
         .arg(tmpdir.path())
-        .args(["--auth", TEST_ACCOUNT])
         .args(["--bind", bind])
         .assert()
         .stderr(predicates::str::contains("invalid value"))
@@ -77,10 +78,10 @@ fn non_ip_bind_is_rejected(tmpdir: TempDir, #[case] bind: &str) -> Result<(), Er
 }
 
 #[rstest]
-#[case(server(&[] as &[&str]), true, false)]
-#[case(server(&["-b", "0.0.0.0"]), true, false)]
-#[case(server(&["-b", "127.0.0.1", "-b", "::"]), true, true)]
-#[case(server(&["-b", "127.0.0.1", "-b", "::1"]), true, true)]
+#[case(server(&[] as &[&str], &[TEST_ACCOUNT]), true, false)]
+#[case(server(&["-b", "0.0.0.0"], &[TEST_ACCOUNT]), true, false)]
+#[case(server(&["-b", "127.0.0.1", "-b", "::"], &[TEST_ACCOUNT]), true, true)]
+#[case(server(&["-b", "127.0.0.1", "-b", "::1"], &[TEST_ACCOUNT]), true, true)]
 fn bind_ipv4_ipv6(
     #[case] server: TestServer,
     #[case] bind_ipv4: bool,
@@ -107,8 +108,6 @@ fn idle_listener_does_not_starve_another_bind_when_connection_limit_is_one(
         "127.0.0.2",
         "--max-connections",
         "1",
-        "--auth",
-        TEST_ACCOUNT,
     ])]
     server: TestServer,
 ) -> Result<(), Error> {
@@ -138,8 +137,6 @@ fn connection_limit_bounds_userspace_sockets_across_multiple_binds(
         "127.0.0.2",
         "--max-connections",
         "1",
-        "--auth",
-        TEST_ACCOUNT,
     ])]
     server: TestServer,
 ) -> Result<(), Error> {
@@ -215,11 +212,11 @@ fn wait_for_socket_fd_count(pid: u32, expected: usize) -> Result<(), Error> {
 #[rstest]
 fn validate_printed_url(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    let mut child = command
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .stdout(Stdio::piped())
@@ -244,11 +241,11 @@ fn closed_stdout_does_not_abort_the_server(tmpdir: TempDir) -> Result<(), Error>
     drop(port_probe);
 
     let state_dir = private_state_dir()?;
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    let mut child = command
         .arg(tmpdir.path())
         .arg("--port")
         .arg(port.to_string())
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .stdout(Stdio::piped())

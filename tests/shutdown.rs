@@ -1,7 +1,6 @@
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
-use assert_cmd::cargo::cargo_bin;
 use assert_fs::TempDir;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
@@ -25,7 +24,9 @@ use std::{
 };
 use uuid::Uuid;
 
-use fixtures::{TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, UPLOAD_STAGE_DIRECTORY, read_bound_url};
+use fixtures::{
+    TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, UPLOAD_STAGE_DIRECTORY, dufs_command, read_bound_url,
+};
 
 const FILE_SIZE: usize = 8 * 1024 * 1024;
 static SHUTDOWN_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -75,11 +76,11 @@ fn signal_drains_an_active_download_and_stops_accepting(
     let state_dir = TempDir::new()?;
     std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
     std::fs::File::create(temp.path().join("large.bin"))?.set_len(FILE_SIZE as u64)?;
-    let mut child = Command::new(cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    let mut child = command
         .arg(temp.path())
         .args(["--bind", "127.0.0.1"])
         .args(["--port", "0"])
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .stdout(Stdio::piped())
@@ -145,11 +146,11 @@ fn shutdown_deadline_checkpoints_a_stalled_upload_before_exit() -> Result<(), Bo
     let state_dir = TempDir::new()?;
     std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
     let state_db = state_dir.path().join("state.sqlite3");
-    let mut child = Command::new(cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    let mut child = command
         .arg(temp.path())
         .args(["--bind", "127.0.0.1"])
         .args(["--port", "0"])
-        .args(["--auth", TEST_ACCOUNT])
         .args(["--min-free-space", "0"])
         .args(["--upload-idle-timeout", "120"])
         .args(["--upload-total-timeout", "3600"])

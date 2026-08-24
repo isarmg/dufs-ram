@@ -140,7 +140,7 @@ fn cursor_is_bound_to_the_page_size(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn cursor_is_bound_to_the_authenticated_account(
-    #[with(&["--auth", USER_ACCOUNT, "--auth", ADMIN_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT, ADMIN_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let user = server.login("user", TEST_PASSWORD)?;
     let admin = server.login("admin", TEST_PASSWORD)?;

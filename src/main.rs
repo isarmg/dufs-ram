@@ -1,4 +1,4 @@
-use dufs::args::{Args, build_cli};
+use dufs::args::{Args, build_cli, reject_cli_auth_args};
 use dufs::auth::{MAX_PASSWORD_BYTES, hash_password};
 use dufs::logger;
 use dufs::server::{Server, ServerRuntime};
@@ -36,10 +36,16 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const FORCED_SHUTDOWN_PERIOD: Duration = Duration::from_secs(10);
 const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn main() -> Result<()> {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    reject_cli_auth_args(&raw_args)?;
+    run(raw_args)
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run(raw_args: Vec<std::ffi::OsString>) -> Result<()> {
     let cmd = build_cli();
-    let matches = cmd.get_matches();
+    let matches = cmd.get_matches_from(raw_args);
     if matches.subcommand_matches("hash-password").is_some() {
         let password = rpassword::prompt_password("Password: ")?;
         validate_cli_password(&password)?;

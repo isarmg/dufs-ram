@@ -81,7 +81,7 @@
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
 | C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
-| C-08 | `-a, --auth` / `auth` | 至少一个账号；可重复 | 配置完整权限账号；认证本身必须保留，多账号能力可单独评估 | 核心 |
+| C-08 | YAML `auth` | 至少一个账号；列表可含多个账号；配置文件须满足严格属主、权限和文件身份校验 | 配置完整权限账号；`--auth`/`-a` 固定脱敏拒绝，避免 PHC 暴露于 argv；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
 | C-10 | `--log-file` / `log-file` | 不指定时全部日志输出到 stderr，stdout 只输出监听地址；路径及可解析别名必须在共享根外；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 与配置、`state.sqlite3` 及 `-journal/-wal/-shm` 比较规范目录项和已存在 dev/inode 身份；以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
 | C-12 | `--max-upload-size` | 100 GiB；允许设为 `0` | 单文件声明长度上限；`0` 表示只允许零字节上传，不是关闭限制 | 保障 |
@@ -101,7 +101,7 @@
 其他配置语义：
 
 - YAML 的 `bind` 与 `trusted-proxies` 接受单个字符串或字符串列表，`bind` 列表非空，`auth` 使用列表；
-- 命令行显式提供 `bind`、`trusted-proxy` 或 `auth` 时会整体替换 YAML 中的对应值，不是追加；
+- 命令行显式提供 `bind` 或 `trusted-proxy` 时会整体替换 YAML 中的对应值，不是追加；账号只接受受保护 YAML 的 `auth`；
 - 大小和时限使用裸字节、裸秒数，不接受 `10GiB`、`5m` 等单位文本；
 - 服务固定挂载在独立主机名的根路径 `/`，不支持 URL 子路径部署；
 - 配置账号、路径、监听地址或其他启动项发生变化后必须重启，没有运行时配置管理 API。

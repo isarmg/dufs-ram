@@ -2,7 +2,9 @@ use super::*;
 
 use assert_fs::prelude::*;
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt as _;
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 
@@ -47,15 +49,56 @@ where
         .into_iter()
         .map(|value| value.as_ref().to_os_string())
         .collect::<Vec<_>>();
+    let has_config = values.iter().any(|value| {
+        value.to_str().is_some_and(|value| {
+            value == "--config" || value == "-c" || value.starts_with("--config=")
+        })
+    });
+    if !has_config {
+        let config_path = state_dir.join("test-auth.yaml");
+        if !config_path.exists() {
+            let mut config = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config_path)
+                .unwrap();
+            writeln!(config, "auth:\n  - '{TEST_ACCOUNT}'").unwrap();
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        values.push("--config".into());
+        values.push(config_path.into_os_string());
+    }
     values.push("--state-dir".into());
     values.push(state_dir.as_os_str().to_os_string());
     build_cli().try_get_matches_from(values).unwrap()
 }
 
 #[test]
+fn legacy_auth_argv_scanner_handles_non_utf8_without_panicking() {
+    let unrelated = OsString::from_vec(vec![0xff, b'x']);
+    reject_cli_auth_args([OsString::from("dufs"), unrelated]).unwrap();
+
+    let attached_auth = OsString::from_vec(vec![b'-', b'a', 0xff]);
+    let error = reject_cli_auth_args([OsString::from("dufs"), attached_auth])
+        .expect_err("non-UTF-8 -a value was accepted");
+    assert_eq!(error.to_string(), CLI_AUTH_REJECTION_MESSAGE);
+}
+
+#[test]
+fn legacy_auth_argv_scanner_respects_option_boundaries() {
+    reject_cli_auth_args(["dufs", "--", "--auth"]).unwrap();
+    reject_cli_auth_args(["dufs", "--authfoo"]).unwrap();
+
+    let error = reject_cli_auth_args(["dufs", "-afoo"])
+        .expect_err("short -a with an attached value was accepted");
+    assert_eq!(error.to_string(), CLI_AUTH_REJECTION_MESSAGE);
+}
+
+#[test]
 fn test_default() {
     let state_dir = private_state_dir();
-    let matches = matches_with_state(["", "--auth", TEST_ACCOUNT], state_dir.path());
+    let matches = matches_with_state([""], state_dir.path());
     let args = Args::parse(matches).unwrap();
     let cwd = Args::sanitize_path(std::env::current_dir().unwrap()).unwrap();
     assert_eq!(args.serve_path, cwd);
@@ -82,8 +125,6 @@ fn trusted_proxies_accept_cli_ips_and_cidrs_and_normalize_them() {
     let matches = matches_with_state(
         [
             "",
-            "--auth",
-            TEST_ACCOUNT,
             "--trusted-proxy",
             "198.51.100.42/24,127.0.0.1",
             "--trusted-proxy",
@@ -178,10 +219,7 @@ fn invalid_or_unbounded_trusted_proxy_networks_are_rejected() {
 
     for unbounded in ["0.0.0.0/0", "::/0"] {
         let state_dir = private_state_dir();
-        let matches = matches_with_state(
-            ["", "--auth", TEST_ACCOUNT, "--trusted-proxy", unbounded],
-            state_dir.path(),
-        );
+        let matches = matches_with_state(["", "--trusted-proxy", unbounded], state_dir.path());
         let error = Args::parse(matches).expect_err("unbounded trusted proxy was accepted");
         assert!(error.to_string().contains("entire IPv4 or IPv6"));
     }
@@ -894,8 +932,6 @@ fn upload_limits_from_cli_override_defaults() {
     let matches = matches_with_state(
         [
             "",
-            "--auth",
-            TEST_ACCOUNT,
             "--max-upload-size",
             "0",
             "--upload-idle-timeout",
@@ -937,12 +973,13 @@ fn invalid_upload_time_and_concurrency_limits_are_rejected() {
         ["--max-concurrent-uploads", "0"],
         ["--upload-idle-timeout", "60"],
     ] {
-        let mut values = vec!["", "--auth", TEST_ACCOUNT];
+        let state_dir = private_state_dir();
+        let mut values = vec![""];
         values.extend(invalid_args);
         if invalid_args[0] == "--upload-idle-timeout" && invalid_args[1] == "60" {
             values.extend(["--upload-total-timeout", "59"]);
         }
-        let matches = build_cli().try_get_matches_from(values).unwrap();
+        let matches = matches_with_state(values, state_dir.path());
         assert!(Args::parse(matches).is_err(), "accepted {invalid_args:?}");
     }
 }
@@ -955,20 +992,15 @@ fn extreme_timeout_values_are_rejected_during_startup_validation() {
         "--request-timeout",
     ] {
         for value in [(MAX_TIMEOUT_SECONDS + 1).to_string(), u64::MAX.to_string()] {
-            let mut values = vec![
-                "".to_string(),
-                "--auth".to_string(),
-                TEST_ACCOUNT.to_string(),
-                name.to_string(),
-                value,
-            ];
+            let state_dir = private_state_dir();
+            let mut values = vec!["".to_string(), name.to_string(), value];
             if name == "--upload-idle-timeout" {
                 values.extend([
                     "--upload-total-timeout".to_string(),
                     MAX_TIMEOUT_SECONDS.to_string(),
                 ]);
             }
-            let matches = build_cli().try_get_matches_from(values).unwrap();
+            let matches = matches_with_state(values, state_dir.path());
             let error = Args::parse(matches).expect_err("extreme timeout value was accepted");
             assert!(
                 error.to_string().contains("must not exceed"),
@@ -985,8 +1017,6 @@ fn maximum_timeout_value_is_accepted() {
     let matches = matches_with_state(
         [
             "",
-            "--auth",
-            TEST_ACCOUNT,
             "--upload-idle-timeout",
             maximum.as_str(),
             "--upload-total-timeout",
@@ -1010,9 +1040,8 @@ fn zero_ordinary_request_budgets_are_rejected() {
         "--max-concurrent-searches",
         "--request-timeout",
     ] {
-        let matches = build_cli()
-            .try_get_matches_from(["", "--auth", TEST_ACCOUNT, name, "0"])
-            .unwrap();
+        let state_dir = private_state_dir();
+        let matches = matches_with_state(["", name, "0"], state_dir.path());
         assert!(Args::parse(matches).is_err(), "accepted {name}=0");
     }
 }
@@ -1023,13 +1052,7 @@ fn search_entry_limit_has_a_hard_upper_bound() {
     for value in [MAX_SEARCH_ENTRIES, MAX_SEARCH_ENTRIES + 1] {
         let value_string = value.to_string();
         let matches = matches_with_state(
-            [
-                "",
-                "--auth",
-                TEST_ACCOUNT,
-                "--max-search-entries",
-                value_string.as_str(),
-            ],
+            ["", "--max-search-entries", value_string.as_str()],
             state_dir.path(),
         );
         let result = Args::parse(matches);
@@ -1054,9 +1077,8 @@ fn semaphore_limits_above_tokios_maximum_are_rejected() {
         "--max-concurrent-uploads",
         "--max-concurrent-searches",
     ] {
-        let matches = build_cli()
-            .try_get_matches_from(["", "--auth", TEST_ACCOUNT, name, too_many.as_str()])
-            .unwrap();
+        let state_dir = private_state_dir();
+        let matches = matches_with_state(["", name, too_many.as_str()], state_dir.path());
         let error = Args::parse(matches).expect_err("oversized semaphore count was accepted");
         assert!(
             error.to_string().contains("must not exceed"),
