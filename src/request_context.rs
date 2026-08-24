@@ -1,5 +1,5 @@
 use crate::http_logger::HttpLogger;
-use hyper::{Request, body::Incoming};
+use hyper::Request;
 use std::{collections::HashMap, net::SocketAddr};
 
 /// Data parsed once at the HTTP boundary and shared by request handlers.
@@ -13,7 +13,7 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    pub fn new(request: &Request<Incoming>, peer: SocketAddr, logger: &HttpLogger) -> Self {
+    pub fn new<B>(request: &Request<B>, peer: SocketAddr, logger: &HttpLogger) -> Self {
         let mut access_log = logger.data(request);
         logger.set_runtime_value(&mut access_log, "remote_addr", || peer.ip().to_string());
         Self { peer, access_log }
