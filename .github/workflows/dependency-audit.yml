@@ -54,7 +54,11 @@ jobs:
           test "$(cargo audit --version)" = \
             "cargo-audit-audit $CARGO_AUDIT_VERSION"
       - name: Audit the locked Rust dependency graph
-        run: cargo audit --deny yanked
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo audit --deny yanked
       - name: Use the fixed Node.js release
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
