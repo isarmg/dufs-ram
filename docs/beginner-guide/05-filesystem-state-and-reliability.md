@@ -297,10 +297,10 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 - busy timeout；
 - rollback journal `DELETE`；
 - `synchronous=EXTRA`；
-- application ID、schema version、quick check；
+- application ID、schema version、精确的表/列/约束/索引对象身份与 quick check；
 - 数据库绑定的共享根 device/inode。
 
-空白数据库直接建立 schema v5。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内依次完成 v3 上传字段、v4 purge revision 并提升到 v5；v3 完成 purge revision 后提升到 v5；v4 在事务中只提升版本。v5 改变的是上传 stage 路径的持久语义：数据库先提升，随后启动恢复按记录的 dev/inode 把旧版同目录 stage rename 到私有 `0700` 子目录，同步两个父目录后再用全行 CAS 改写路径。这样迁移中断可以重入，旧二进制也不能在部分移动后降级打开。其他 schema 版本在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
+空白数据库直接建立 schema v5。版本号不是迁移凭据：v2/v3/v4/v5 都要逐项匹配表、列类型、空值/默认值/主键/检查约束、严格表属性、索引定义，并拒绝任何额外的项目表、索引、触发器或视图。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内重验后依次完成 v3 上传字段、v4 purge revision 并提升到 v5；v3 重验后完成 purge revision，v4 重验后只提升版本；每条迁移都在提交前确认目标已经是精确 v5。v5 改变的是上传 stage 路径的持久语义：数据库先提升，随后启动恢复按记录的 dev/inode 把旧版同目录 stage rename 到私有 `0700` 子目录，同步两个父目录后再用全行 CAS 改写路径。这样迁移中断可以重入，旧二进制也不能在部分移动后降级打开。其他 schema 版本或结构漂移在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
 
 数据库不能随意复制给另一个共享根继续使用，因为里面的路径、对象身份和未完成动作都绑定旧根。
 
