@@ -83,10 +83,11 @@ test_root="$(mktemp -d --tmpdir="$temporary_parent" \
 chmod 0700 "$test_root"
 
 # Exercise path serialization as part of the real release invocation. The
-# production script must work from and publish below paths containing shell
-# and replacement-language metacharacters without interpreting them.
+# source checkout retains a backslash, while the supported output path covers
+# shell and replacement-language metacharacters without interpreting them.
+# package-release.sh self-tests the unsupported output-backslash rejection.
 repository="$test_root/checkout with spaces & # \\ source"
-output_dir="$test_root/output with spaces & # \\ release"
+output_dir="$test_root/output with spaces & # release"
 signing_key="$test_root/ephemeral Ed25519 signing key.pem"
 unpack_dir="$test_root/verified unpack"
 expected_public_key="$test_root/expected public key.pem"

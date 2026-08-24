@@ -613,6 +613,13 @@ validate_output_directory() {
   local mode
   local numeric_mode
 
+  case "$directory" in
+    *\\*)
+      printf 'Release output path contains an unsupported backslash: %s\n' \
+        "$directory" >&2
+      return 1
+      ;;
+  esac
   [[ -d "$directory" && ! -L "$directory" ]] || {
     printf 'Release output is not a physical directory: %s\n' "$directory" >&2
     return 1
@@ -1873,6 +1880,7 @@ trap 'exit 143' TERM
 run_publication_self_test() {
   local test_root
   local test_output
+  local unsupported_output
   local test_alias
   local physical_output
   local staged_parent
@@ -2342,6 +2350,16 @@ EOF
     "$node_command"
   verify_release_package_checksum_coverage \
     "$documentation_unpack_root/$documentation_package_name"
+
+  unsupported_output="$test_root/output\\unsupported"
+  install -d -m 0700 "$unsupported_output"
+  if validate_output_directory \
+    "$unsupported_output" \
+    "$current_uid" 2>/dev/null
+  then
+    printf 'release self-test accepted an output path containing a backslash\n' >&2
+    return 1
+  fi
 
   test_output="$test_root/output"
   test_alias="$test_root/output-alias"
