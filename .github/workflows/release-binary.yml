@@ -22,7 +22,7 @@ jobs:
   verify_build:
     name: Verify and build without write permission
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 240
     permissions:
       actions: read
       contents: read
@@ -153,6 +153,7 @@ jobs:
 
           require_successful_run read-only-ci.yml 'read-only CI'
           require_successful_run dependency-audit.yml 'dependency audit'
+          require_successful_run formal-release-e2e.yml 'formal release package E2E'
 
       - name: Install the fixed Rust toolchain
         shell: bash
