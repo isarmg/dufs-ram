@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, value_parser};
 use ipnet::IpNet;
 use rustix::{
@@ -851,6 +851,7 @@ impl Args {
                 state_dir.display()
             );
         }
+        Self::validate_state_dir_ancestor_chain(&state_dir)?;
         if state_dir.starts_with(serve_path) || serve_path.starts_with(&state_dir) {
             bail!(
                 "State directory `{}` must not overlap shared path `{}`",
@@ -863,6 +864,50 @@ impl Args {
         // or other unsupported file type fails before the server starts.
         Self::sanitize_state_db_path(&state_dir.join(STATE_DATABASE_FILE_NAME), serve_path)?;
         Ok(state_dir)
+    }
+
+    fn validate_state_dir_ancestor_chain(state_dir: &Path) -> Result<()> {
+        let service_uid = rustix::process::geteuid().as_raw();
+        let trusted_owner = |uid: u32| uid == 0 || uid == service_uid;
+        let mut child = state_dir.to_path_buf();
+        let mut child_metadata = child.metadata().with_context(|| {
+            format!(
+                "Failed to inspect state directory `{}` while validating its ancestor chain",
+                child.display()
+            )
+        })?;
+
+        while let Some(parent) = child.parent() {
+            let parent_metadata = parent.metadata().with_context(|| {
+                format!(
+                    "Failed to inspect state directory ancestor `{}`",
+                    parent.display()
+                )
+            })?;
+            ensure!(
+                parent_metadata.is_dir(),
+                "State directory ancestor `{}` must be a directory",
+                parent.display()
+            );
+            ensure!(
+                trusted_owner(parent_metadata.uid()),
+                "State directory ancestor `{}` must be owned by root or the effective service user",
+                parent.display()
+            );
+
+            let parent_mode = parent_metadata.permissions().mode() & 0o7777;
+            if parent_mode & 0o022 != 0 {
+                ensure!(
+                    parent_mode & 0o1000 != 0 && trusted_owner(child_metadata.uid()),
+                    "State directory ancestor `{}` can be renamed by untrusted local users; group/other-writable ancestors require sticky-bit protection for a root- or service-owned child",
+                    parent.display()
+                );
+            }
+
+            child = parent.to_path_buf();
+            child_metadata = parent_metadata;
+        }
+        Ok(())
     }
 
     pub(crate) fn state_database_path(&self) -> Option<PathBuf> {
