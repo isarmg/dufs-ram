@@ -83,6 +83,31 @@ fn unknown_cli_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
 }
 
 #[rstest]
+fn duplicate_cli_bind_address_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let matches = build_cli().try_get_matches_from([
+        "dufs",
+        tmpdir.path().to_str().expect("UTF-8 test path"),
+        "--auth",
+        TEST_ACCOUNT,
+        "--state-dir",
+        state_dir.path().to_str().expect("UTF-8 state path"),
+        "--bind",
+        "127.0.0.1",
+        "--bind",
+        "127.0.0.1",
+    ])?;
+    let error = Args::parse(matches).expect_err("duplicate CLI bind address was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("bind must not contain duplicate IP addresses"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn state_dir_is_required(tmpdir: TempDir) -> Result<(), Error> {
     let matches = build_cli().try_get_matches_from([
         "dufs",

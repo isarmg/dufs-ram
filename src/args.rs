@@ -470,6 +470,11 @@ impl Args {
         if self.addrs.len() > MAX_BIND_ADDRESSES {
             bail!("bind must not contain more than {MAX_BIND_ADDRESSES} IP addresses");
         }
+        let mut sorted_addrs = self.addrs.clone();
+        sorted_addrs.sort_unstable();
+        if sorted_addrs.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("bind must not contain duplicate IP addresses");
+        }
         if self.trusted_proxies.len() > MAX_TRUSTED_PROXIES {
             bail!("trusted-proxies must not contain more than {MAX_TRUSTED_PROXIES} networks");
         }
