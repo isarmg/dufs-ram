@@ -77,7 +77,7 @@
 | --- | --- | --- | --- | --- |
 | C-01 | `[serve-path]` / `serve-path` | 当前目录；相对路径按进程 cwd 而不是 YAML 所在目录解析，随后 canonicalize；启动时必须已存在且为目录 | 决定唯一共享根，不能删除 | 核心 |
 | C-02 | `dufs hash-password` | 交互输入和确认密码 | 生成符合固定策略的 Argon2id PHC；外部工具必须精确复现当前参数，删除收益有限 | 建议保留 |
-| C-03 | `-c, --config` | 不指定则只用命令行 | 加载严格 YAML；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
+| C-03 | `-c, --config` | 不指定则只用命令行；文件最多 1 MiB | 以 `O_NOFOLLOW|O_NONBLOCK` 单次打开严格 YAML；只接受 root/euid 所有、精确 `0400/0440/0600/0640`、单硬链接且无扩展 POSIX access ACL 的普通文件，组读要求 gid 等于 egid。同一 fd 在 ACL 探测和读取前后复核完整身份、安全元数据、大小及 mtime/ctime；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
 | C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
@@ -526,7 +526,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 | 统一控制状态 | `src/server/operation_registry.rs`、`src/server/state_store.rs`、`src/server/upload/record.rs`、`src/server/purge.rs` | `rusqlite`（bundled SQLite） | schema v5 文件数据库同时持久化管理 operations/upload_sessions/purge_jobs；SQLite 是唯一状态权威，`state-dir` 必填，不存在内存模式，支持从 v2/v3/v4 事务迁移 |
 | HTTP 服务 | `src/main.rs`、`src/server.rs`、`src/server/router.rs`、`src/server/assets.rs` | `tokio`、`tokio-util`、`hyper`、`hyper-util`、`http-body-util`、`headers`、`bytes`、`futures-util` | 核心运行栈；Range 改用 `ReaderStream` 后不再直接依赖 `pin-project-lite`；`hyper-util` 只提供 Tokio I/O 和计时适配，生产依赖图不包含 `h2` |
 | TCP 监听 | `src/main.rs` | `socket2` | 用于 Linux listener 配置和 backlog |
-| Linux 系统边界与会话计时 | `src/auth.rs`、`src/server/rooted_fs.rs`、`src/server/rooted_fs/purge.rs`、`storage.rs`、`disk_space.rs` | `rustix` | `CLOCK_BOOTTIME` 让会话期限包含系统休眠；`openat2`、`*at`、`fsync`、fd-relative 递归删除、`fstatvfs` 等构成文件系统边界 |
+| Linux 系统边界与会话计时 | `src/args.rs`、`src/auth.rs`、`src/server/rooted_fs.rs`、`src/server/rooted_fs/purge.rs`、`storage.rs`、`disk_space.rs` | `rustix` | 配置 ACL 探测使用 fd-relative xattr；`CLOCK_BOOTTIME` 让会话期限包含系统休眠；`openat2`、`*at`、`fsync`、fd-relative 递归删除、`fstatvfs` 等构成文件系统边界 |
 | 路由和表单编码 | `src/server.rs`、`src/server/router.rs`、`session.rs`、前端 URL | `percent-encoding`、`form_urlencoded` | 登录、查询和路径编码共同使用 |
 | 浏览器 JSON 协议 | `browser_api.rs`、`listing.rs`、`listing/snapshot.rs`、`operation_registry.rs`、`upload.rs`、`upload/record.rs` | `serde`、`serde_json` | mkdir/move/rename、分页结果、operation 状态和上传状态都使用 |
 | 文件类型判断 | `src/server/download.rs` | `mime_guess` | 附件只按扩展名给出 MIME，未知名称使用 octet-stream；不再抽样或猜测 charset |

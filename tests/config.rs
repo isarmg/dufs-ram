@@ -14,12 +14,15 @@ use predicates::str::contains;
 use reqwest::Method;
 use rstest::rstest;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[rstest]
 fn use_config_file(tmpdir: TempDir) -> Result<(), Error> {
-    let config_path = get_config_path().display().to_string();
+    let config_dir = TempDir::new()?;
+    let config_path = config_dir.path().join("config.yaml");
+    write_private_config(&config_path, std::fs::read(get_config_path())?)?;
+    let config_path = config_path.display().to_string();
     let state_dir = private_state_dir()?;
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
         .arg(tmpdir.path())
@@ -81,7 +84,7 @@ fn use_config_file(tmpdir: TempDir) -> Result<(), Error> {
 #[case("max-concurrent-zips")]
 fn unknown_config_field_is_rejected(tmpdir: TempDir, #[case] field: &str) -> Result<(), Error> {
     let config_path = tmpdir.path().join("unknown-field.yaml");
-    std::fs::write(
+    write_private_config(
         &config_path,
         format!("auth:\n  - '{USER_ACCOUNT}'\n{field}: true\n"),
     )?;
@@ -100,7 +103,7 @@ fn unknown_config_field_is_rejected(tmpdir: TempDir, #[case] field: &str) -> Res
 fn unknown_yaml_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
     let config_path = tmpdir.path().join("unknown-log-variable.yaml");
-    std::fs::write(
+    write_private_config(
         &config_path,
         format!(
             "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\nlog-format: '$stauts'\n",
@@ -126,7 +129,7 @@ fn unknown_yaml_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
 fn duplicate_yaml_bind_address_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
     let config_path = tmpdir.path().join("duplicate-bind.yaml");
-    std::fs::write(
+    write_private_config(
         &config_path,
         format!(
             "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\nbind:\n  - 127.0.0.1\n  - 127.0.0.1\n",
@@ -175,7 +178,7 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
         1,
     );
     let config = tmpdir.path().join("dufs.yaml");
-    std::fs::write(&config, rendered)?;
+    write_private_config(&config, rendered)?;
     let matches = build_cli().try_get_matches_from([
         "dufs",
         tmpdir.path().to_str().expect("UTF-8 test path"),
@@ -204,7 +207,7 @@ fn cli_state_dir_overrides_yaml_state_dir(tmpdir: TempDir) -> Result<(), Error> 
     let yaml_state_dir = private_state_dir()?;
     let cli_state_dir = private_state_dir()?;
     let config = tmpdir.path().join("state-dir.yaml");
-    std::fs::write(
+    write_private_config(
         &config,
         format!(
             "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\n",
@@ -259,7 +262,7 @@ fn state_dir_rejects_configuration_file_collisions(
     let mut config_path = state_db.as_os_str().to_os_string();
     config_path.push(suffix);
     let config_path = PathBuf::from(config_path);
-    std::fs::write(
+    write_private_config(
         &config_path,
         format!(
             "auth:\n  - '{USER_ACCOUNT}'\nstate-dir: '{}'\n",
@@ -295,4 +298,16 @@ fn private_state_dir() -> Result<TempDir, Error> {
     let state_dir = TempDir::new()?;
     std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
     Ok(state_dir)
+}
+
+fn write_private_config(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), Error> {
+    std::fs::write(path, contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = rustix::fs::removexattr(path, "system.posix_acl_access")
+        && error != rustix::io::Errno::NODATA
+        && error != rustix::io::Errno::NOTSUP
+    {
+        return Err(std::io::Error::from(error).into());
+    }
+    Ok(())
 }

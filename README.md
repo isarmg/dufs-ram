@@ -320,10 +320,13 @@ request-timeout: 300
 启动：
 
 ```sh
+chmod 0600 ./dufs.yaml
 ./target/release/dufs --config ./dufs.yaml
 ```
 
 YAML 会拒绝未知字段和空的 `bind` 列表。`trusted-proxies` 可写成单个 IP/CIDR 字符串或列表，默认空；命令行显式提供 `--trusted-proxy` 时会整体覆盖 YAML 列表。`state-dir` 必须由 YAML 或命令行提供，目录必须满足上述私有目录约束，固定数据库目标不能是符号链接或目录；命令行显式指定时会覆盖 YAML 中的值。`max-search-entries` 必须位于支持的正数范围内，硬上限与直接列表的 100000 项保护一致。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
+
+Linux 上的 YAML 文件必须由 root 或服务进程的有效用户拥有，只能使用精确的 `0400`、`0440`、`0600` 或 `0640`；使用组读位时，文件 gid 必须等于进程的有效 gid。文件还必须是无扩展 POSIX access ACL 的单硬链接普通文件。Dufs 以 `O_NOFOLLOW|O_NONBLOCK` 打开一次，在同一 fd 上探测 ACL、读取最多 1 MiB，并在探测和读取前后用 `fstat` 复核 dev/inode、mode、nlink、uid/gid、大小及纳秒级 mtime/ctime 均未变化。
 
 仓库根目录的示例产物 `./dufs.yaml` 和 `./dufs.log` 分别含口令验证器及账号/请求路径等敏感信息，已由根 `.gitignore` 排除；不要强制加入版本控制，也不要把同类本地文件换名后提交。`deploy/dufs.yaml.example` 只保留占位符，继续作为可跟踪模板。
 

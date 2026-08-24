@@ -37,7 +37,7 @@
    install -o root -g root -m 0644 deploy/dufs-proxy.conf /etc/nginx/snippets/dufs-proxy.conf
    ```
 
-3. 使用 `/opt/dufs/bin/dufs hash-password` 生成 Argon2id PHC，替换 YAML 中的占位值。配置含登录验证材料，应保持 `0640` 或更严格权限。部署样例必须提供 `state-dir: /var/lib/dufs`；对应 systemd unit 用 `StateDirectory=dufs` 和 `StateDirectoryMode=0700` 在启动命令前准备目录。若不使用该 unit，必须先创建由服务账号所有、权限为 `0700` 且不是符号链接的专用目录。状态目录不能与 `/srv/dufs` 互为祖先/后代，也不能用 bind mount 或其他挂载别名让固定的 `state.sqlite3` 从共享根内可见；启动检查普通路径关系，但不会解析管理员在运行时建立的所有挂载别名。
+3. 使用 `/opt/dufs/bin/dufs hash-password` 生成 Argon2id PHC，替换 YAML 中的占位值。配置含登录验证材料，只允许 root 或服务进程的有效用户拥有，并精确使用 `0400`、`0440`、`0600` 或 `0640`；`0440/0640` 还要求文件 gid 等于服务进程的有效 gid，因此样例的 `root:dufs 0640` 是合法基线。配置必须是无扩展 POSIX access ACL 的单硬链接普通文件，Dufs 会在同一打开 fd 上围绕 ACL 探测和正文读取复核身份、安全属性、大小及 mtime/ctime 稳定。部署样例必须提供 `state-dir: /var/lib/dufs`；对应 systemd unit 用 `StateDirectory=dufs` 和 `StateDirectoryMode=0700` 在启动命令前准备目录。若不使用该 unit，必须先创建由服务账号所有、权限为 `0700` 且不是符号链接的专用目录。状态目录不能与 `/srv/dufs` 互为祖先/后代，也不能用 bind mount 或其他挂载别名让固定的 `state.sqlite3` 从共享根内可见；启动检查普通路径关系，但不会解析管理员在运行时建立的所有挂载别名。
 4. 安装真实 TLS 证书，替换 nginx 示例域名，然后检查配置：
 
    ```sh

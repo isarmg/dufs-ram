@@ -67,7 +67,7 @@ flowchart LR
 - `/srv/dufs` 只授予业务需要的读写权限；
 - `/var/lib/dufs` owner 是服务用户、mode 精确 `0700`；
 - `state.sqlite3` 最终为 `0600`；
-- YAML 和 TLS 私钥不让无关用户读取；
+- YAML 由 root 或服务 euid 拥有，精确使用 `0400/0440/0600/0640`、单硬链接且无扩展 POSIX access ACL；组读时 gid 必须匹配服务 egid；TLS 私钥同样不让无关用户读取；
 - state-dir 与 serve-path 互不包含，也不通过别名落在一起。
 
 systemd 样例通过 `StateDirectory=dufs` 与 `StateDirectoryMode=0700` 创建 `/var/lib/dufs`。
