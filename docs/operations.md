@@ -9,7 +9,7 @@
 - 唯一共享根为 `/srv/dufs`；
 - nginx 与 Dufs 位于同一主机，Dufs 只监听 `127.0.0.1:5000`。
 
-网关样例要求 nginx 1.24.0 或更高版本、HTTP SSL/HTTP2 模块，以及仍由上游或操作系统发行商提供安全更新的 OpenSSL；新部署优先使用 OpenSSL 3.5 LTS，不能把已经结束公开安全支持的上游 OpenSSL 1.1.1 作为生产基线。源码质量门不只加载语法：部署检查会从包含空格、`&`、`#` 和反斜杠的真实 checkout fixture 读取文件，复制到安全运行名后启动隔离的真实 nginx 与 mock upstream，分别验证规范重定向、Host/SNI 拒绝、固定回源头与真实客户端 IP 覆盖、登录别名 4 KiB 限制，以及连接/请求速率限制的拒绝和恢复。systemd 校验会把 `ExecStart` 换为占位可执行文件；门禁不会真实启动 systemd unit 与 Dufs/nginx 组合，因此生产数据副本上的启动、readiness 和 CRUD 冒烟不能省略。
+网关样例要求 nginx 1.24.0 或更高版本、HTTP SSL/HTTP2 模块，以及仍由上游或操作系统发行商提供安全更新的 OpenSSL；新部署优先使用 OpenSSL 3.5 LTS，不能把已经结束公开安全支持的上游 OpenSSL 1.1.1 作为生产基线。源码质量门不只加载语法：部署检查会从包含空格、`&`、`#` 和反斜杠的真实 checkout fixture 读取文件，复制到安全运行名后启动隔离的真实 nginx 与 mock upstream，分别验证规范重定向、Host/SNI 拒绝、固定回源头与真实客户端 IP 覆盖、登录别名 4 KiB 限制，以及连接/请求速率限制的拒绝和恢复。脚本在创建第一个临时目录前安装清理 trap，并以首个目录创建后立即失败的内置自测验证部分初始化也会清除资源。systemd 校验会把 `ExecStart` 换为占位可执行文件；门禁不会真实启动 systemd unit 与 Dufs/nginx 组合，因此生产数据副本上的启动、readiness 和 CRUD 冒烟不能省略。
 
 自动 CI、部署样例和发布验收的架构基线是 `x86_64-unknown-linux-gnu`。`build.rs` 允许其他 64 位 Linux 源码构建，但 aarch64 等目标在加入等价工具链、浏览器和部署矩阵前只属于未验证的 best effort；制品必须匹配 CPU、libc、动态加载器和 `openat2` 内核能力。
 
