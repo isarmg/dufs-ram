@@ -16,6 +16,12 @@ elif [[ "$#" -eq 1 ]]; then
     --self-test-fail-after-validation-dir)
       deployment_mode="fail-after-validation-dir"
       ;;
+    --self-test-cleanup-success)
+      deployment_mode="cleanup-success"
+      ;;
+    --self-test-cleanup-term)
+      deployment_mode="cleanup-term"
+      ;;
     *)
       printf 'Usage: %s [--self-test]\n' "${0##*/}" >&2
       exit 2
@@ -126,7 +132,8 @@ run_early_cleanup_self_test() {
     local self_test_tmp_root self_test_dir child_status
     local stubborn_pid ready_file shutdown_log started_at elapsed_seconds
     local unsafe_tmp_dir unsafe_tmp_log
-    local -a leftovers
+    local rm_shim_dir rm_shim cleanup_log expected_status index
+    local -a leftovers cleanup_modes cleanup_statuses
 
     self_test_tmp_root="${TMPDIR:-/tmp}"
     self_test_tmp_root="$(cd -P -- "$self_test_tmp_root" && pwd -P)"
@@ -147,7 +154,13 @@ run_early_cleanup_self_test() {
         "${self_test_dir%/*}" == "$self_test_tmp_root" && \
         "${self_test_dir##*/}" == dufs-deployment-trap-test.* ]]
       then
-        rm -rf --one-file-system -- "$self_test_dir"
+        if ! rm -rf --one-file-system -- "$self_test_dir"; then
+          printf 'Failed to remove deployment self-test path: %s\n' \
+            "$self_test_dir" >&2
+          if [[ "$status" -eq 0 ]]; then
+            status=1
+          fi
+        fi
       fi
       exit "$status"
     }
@@ -193,6 +206,68 @@ run_early_cleanup_self_test() {
     if [[ "${#leftovers[@]}" -ne 0 ]]; then
       printf 'Unsafe-TMPDIR self-test created temporary resources:\n' >&2
       printf '  %s\n' "${leftovers[@]}" >&2
+      exit 1
+    fi
+
+    rm_shim_dir="$self_test_dir/rm-shim"
+    rm_shim="$rm_shim_dir/rm"
+    install -d -m 0700 -- "$rm_shim_dir"
+    printf '#!/bin/sh\nexit 73\n' > "$rm_shim"
+    chmod 0700 "$rm_shim"
+    cleanup_modes=(
+      --self-test-cleanup-success
+      --self-test-fail-after-validation-dir
+      --self-test-cleanup-term
+    )
+    cleanup_statuses=(1 97 143)
+    for index in "${!cleanup_modes[@]}"; do
+      cleanup_log="$self_test_dir/rm-failure-${index}.log"
+      expected_status="${cleanup_statuses[$index]}"
+      set +e
+      PATH="$rm_shim_dir:$PATH" \
+        TMPDIR="$self_test_dir" \
+        "$BASH" "$project_dir/scripts/check-deployment.sh" \
+        "${cleanup_modes[$index]}" \
+        >/dev/null 2>"$cleanup_log"
+      child_status=$?
+      set -e
+      if [[ "$child_status" -ne "$expected_status" ]]; then
+        printf \
+          'Cleanup-rm self-test %s returned %s instead of %s.\n' \
+          "${cleanup_modes[$index]}" "$child_status" "$expected_status" \
+          >&2
+        exit 1
+      fi
+      if ! grep -Fq -- 'Failed to remove deployment path:' "$cleanup_log"; then
+        printf 'Cleanup-rm self-test did not report the validation path.\n' >&2
+        exit 1
+      fi
+      if [[ "${cleanup_modes[$index]}" != \
+        "--self-test-fail-after-validation-dir" ]] && \
+        ! grep -Fq -- \
+          'Failed to remove deployment socket path:' "$cleanup_log"
+      then
+        printf 'Cleanup-rm self-test did not report the socket path.\n' >&2
+        exit 1
+      fi
+    done
+
+    leftovers=(
+      "$self_test_dir"/dufs-deployment.*
+      "$self_test_dir"/dufs-deployment-sockets.*
+    )
+    if [[ "${#leftovers[@]}" -ne 5 ]]; then
+      printf 'Cleanup-rm self-test expected 5 residual paths, found %s.\n' \
+        "${#leftovers[@]}" >&2
+      exit 1
+    fi
+    rm -rf --one-file-system -- "${leftovers[@]}"
+    leftovers=(
+      "$self_test_dir"/dufs-deployment.*
+      "$self_test_dir"/dufs-deployment-sockets.*
+    )
+    if [[ "${#leftovers[@]}" -ne 0 ]]; then
+      printf 'Cleanup-rm self-test could not remove injected residuals.\n' >&2
       exit 1
     fi
 
@@ -309,22 +384,38 @@ cleanup() {
     if [[ "${validation_dir%/*}" == "$tmp_root" && \
       "${validation_dir##*/}" == dufs-deployment.* ]]
     then
-      rm -rf --one-file-system -- "$validation_dir"
+      if ! rm -rf --one-file-system -- "$validation_dir"; then
+        printf 'Failed to remove deployment path: %s\n' \
+          "$validation_dir" >&2
+        if [[ "$status" -eq 0 ]]; then
+          status=1
+        fi
+      fi
     else
       printf 'Refusing to remove unexpected deployment path: %s\n' \
         "$validation_dir" >&2
-      status=1
+      if [[ "$status" -eq 0 ]]; then
+        status=1
+      fi
     fi
   fi
   if [[ -n "$socket_dir" ]]; then
     if [[ "${socket_dir%/*}" == "$tmp_root" && \
       "${socket_dir##*/}" == dufs-deployment-sockets.* ]]
     then
-      rm -rf --one-file-system -- "$socket_dir"
+      if ! rm -rf --one-file-system -- "$socket_dir"; then
+        printf 'Failed to remove deployment socket path: %s\n' \
+          "$socket_dir" >&2
+        if [[ "$status" -eq 0 ]]; then
+          status=1
+        fi
+      fi
     else
       printf 'Refusing to remove unexpected deployment socket path: %s\n' \
         "$socket_dir" >&2
-      status=1
+      if [[ "$status" -eq 0 ]]; then
+        status=1
+      fi
     fi
   fi
   exit "$status"
@@ -355,6 +446,13 @@ chmod 0755 "$socket_dir"
   printf 'Deployment validator created an unexpected socket path.\n' >&2
   exit 1
 }
+if [[ "$deployment_mode" == "cleanup-success" ]]; then
+  exit 0
+elif [[ "$deployment_mode" == "cleanup-term" ]]; then
+  kill -TERM "$$"
+  printf 'Injected TERM did not terminate the deployment validator.\n' >&2
+  exit 1
+fi
 special_checkout="$validation_dir/checkout with spaces & # \\ path"
 runtime_dir="$validation_dir/runtime"
 install -d -m 0755 \
