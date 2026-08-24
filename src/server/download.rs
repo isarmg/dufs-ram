@@ -148,12 +148,21 @@ async fn send_open_file_with_gate(
     let range = if use_range {
         let mut ranges = headers.get_all(RANGE).iter();
         ranges.next().map(|range| {
+            let parsed = range
+                .to_str()
+                .map_or(ParsedRange::Unsatisfiable, |range| parse_range(range, size));
+            // RFC 9110 requires an origin server to ignore a Range field whose
+            // unit it does not understand. Preserve that decision before
+            // applying this server's stricter policy for repeated byte-range
+            // fields; otherwise two unknown-unit fields are incorrectly
+            // converted into a 416 response.
+            if parsed == ParsedRange::Ignore {
+                return ParsedRange::Ignore;
+            }
             if ranges.next().is_some() {
                 return ParsedRange::Unsatisfiable;
             }
-            range
-                .to_str()
-                .map_or(ParsedRange::Unsatisfiable, |range| parse_range(range, size))
+            parsed
         })
     } else {
         None
