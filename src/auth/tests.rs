@@ -417,10 +417,10 @@ fn injected_clock_enforces_idle_csrf_and_absolute_expiration_boundaries() {
     clock.set(start + SESSION_ABSOLUTE_TIMEOUT);
     assert!(auth.authenticate(&absolute.token).is_none());
     assert!(
-        auth.lock_sessions()
+        !auth
+            .lock_sessions()
             .entries
-            .get(&session_digest(&absolute.token))
-            .is_none()
+            .contains_key(&session_digest(&absolute.token))
     );
 }
 
