@@ -5,13 +5,14 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use headers::HeaderValue;
+use rustix::time::{ClockId, clock_gettime};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use subtle::ConstantTimeEq;
 
@@ -54,16 +55,67 @@ pub(crate) struct VerifiedUser {
     user: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SessionInstant(Duration);
+
+impl SessionInstant {
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Add<Duration> for SessionInstant {
+    type Output = Self;
+
+    fn add(self, duration: Duration) -> Self::Output {
+        Self(
+            self.0
+                .checked_add(duration)
+                .expect("test session time is representable"),
+        )
+    }
+}
+
+#[derive(Clone)]
+enum SessionClock {
+    Boottime,
+    #[cfg(test)]
+    Injected(Arc<dyn Fn() -> SessionInstant + Send + Sync>),
+}
+
+impl SessionClock {
+    fn boottime() -> Self {
+        Self::Boottime
+    }
+
+    #[cfg(test)]
+    fn injected(now: impl Fn() -> SessionInstant + Send + Sync + 'static) -> Self {
+        Self::Injected(Arc::new(now))
+    }
+
+    fn now(&self) -> SessionInstant {
+        match self {
+            Self::Boottime => SessionInstant(
+                Duration::try_from(clock_gettime(ClockId::Boottime))
+                    .expect("CLOCK_BOOTTIME is a non-negative duration"),
+            ),
+            #[cfg(test)]
+            Self::Injected(now) => now(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SessionRecord {
     user: String,
     csrf_token: [u8; SECRET_BYTES],
-    created_at: Instant,
-    last_seen: Instant,
+    created_at: SessionInstant,
+    last_seen: SessionInstant,
 }
 
 impl SessionRecord {
-    fn is_expired(&self, now: Instant) -> bool {
+    fn is_expired(&self, now: SessionInstant) -> bool {
         now.saturating_duration_since(self.created_at) >= SESSION_ABSOLUTE_TIMEOUT
             || now.saturating_duration_since(self.last_seen) >= SESSION_IDLE_TIMEOUT
     }
@@ -82,7 +134,7 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn purge_expired(&mut self, now: Instant) {
+    fn purge_expired(&mut self, now: SessionInstant) {
         self.entries.retain(|_, session| !session.is_expired(now));
     }
 
@@ -198,6 +250,7 @@ impl<'de> Deserialize<'de> for AuthConfig {
 pub struct AccessControl {
     config: AuthConfig,
     sessions: Arc<Mutex<SessionStore>>,
+    clock: SessionClock,
 }
 
 impl Default for AccessControl {
@@ -228,9 +281,14 @@ impl AccessControl {
     /// configuration. The new service never shares sessions with another
     /// service created from the same configuration.
     pub fn from_config(config: AuthConfig) -> Self {
+        Self::with_clock(config, SessionClock::boottime())
+    }
+
+    fn with_clock(config: AuthConfig, clock: SessionClock) -> Self {
         Self {
             config,
             sessions: Arc::new(Mutex::new(SessionStore::default())),
+            clock,
         }
     }
 
@@ -259,7 +317,7 @@ impl AccessControl {
         let token = random_secret()?;
         let token_digest = session_digest(&token);
         let csrf_token = random_bytes()?;
-        let now = Instant::now();
+        let now = self.clock.now();
 
         let mut sessions = self.lock_sessions();
         sessions.purge_expired(now);
@@ -312,7 +370,7 @@ impl AccessControl {
 
     /// Authenticate a session and refresh its idle timeout.
     pub fn authenticate(&self, token: &str) -> Option<SessionInfo> {
-        self.authenticate_at(token, Instant::now())
+        self.authenticate_at(token, self.clock.now())
     }
 
     /// Remove a session. Returns whether an active or expired record existed.
@@ -335,7 +393,7 @@ impl AccessControl {
             return false;
         }
 
-        let now = Instant::now();
+        let now = self.clock.now();
         let digest = session_digest(token);
         let mut sessions = self.lock_sessions();
         let Some(session) = sessions.entries.get(&digest) else {
@@ -372,7 +430,7 @@ impl AccessControl {
         known_user && verified
     }
 
-    fn authenticate_at(&self, token: &str, now: Instant) -> Option<SessionInfo> {
+    fn authenticate_at(&self, token: &str, now: SessionInstant) -> Option<SessionInfo> {
         if !is_encoded_secret(token) {
             return None;
         }
@@ -389,7 +447,7 @@ impl AccessControl {
         }
 
         let session = sessions.entries.get_mut(&digest)?;
-        session.last_seen = now;
+        session.last_seen = session.last_seen.max(now);
         Some(session.info())
     }
 
