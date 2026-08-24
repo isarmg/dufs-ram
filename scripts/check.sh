@@ -87,6 +87,7 @@ elif [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]]; then
   printf 'DUFS_QUALITY_AUDIT_DB is reserved for the isolated release gate\n' >&2
   exit 1
 else
+  run cargo fetch --locked
   run cargo audit --deny yanked
 fi
 
