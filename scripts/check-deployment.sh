@@ -44,6 +44,22 @@ do
   }
 done
 
+require_safe_tmp_root() {
+  local tmp_path="$1"
+  local LC_ALL=C
+
+  if [[ ! "$tmp_path" =~ ^/[-A-Za-z0-9._/]+$ ]]; then
+    printf \
+      'TMPDIR resolves to a path unsafe for generated sed/Nginx config: %q\n' \
+      "$tmp_path" >&2
+    printf \
+      'Use an absolute path containing only ASCII letters, digits, /, ., _, or -.\n' \
+      >&2
+    return 1
+  fi
+  return 0
+}
+
 # All probes use local Unix sockets. The hold route intentionally waits one
 # second, so it receives a separate deadline with ample scheduling margin.
 curl_connect_timeout_seconds=2
@@ -109,10 +125,12 @@ run_early_cleanup_self_test() {
   (
     local self_test_tmp_root self_test_dir child_status
     local stubborn_pid ready_file shutdown_log started_at elapsed_seconds
+    local unsafe_tmp_dir unsafe_tmp_log
     local -a leftovers
 
     self_test_tmp_root="${TMPDIR:-/tmp}"
     self_test_tmp_root="$(cd -P -- "$self_test_tmp_root" && pwd -P)"
+    require_safe_tmp_root "$self_test_tmp_root"
     self_test_dir=""
     stubborn_pid=""
 
@@ -145,6 +163,39 @@ run_early_cleanup_self_test() {
     )"
     chmod 0700 "$self_test_dir"
 
+    unsafe_tmp_dir="$self_test_dir/tmp with spaces & # \\ \" \$"
+    unsafe_tmp_log="$self_test_dir/unsafe-tmp.log"
+    install -d -m 0700 -- "$unsafe_tmp_dir"
+    set +e
+    TMPDIR="$unsafe_tmp_dir" \
+      "$BASH" "$project_dir/scripts/check-deployment.sh" \
+      --self-test-fail-after-validation-dir \
+      >/dev/null 2>"$unsafe_tmp_log"
+    child_status=$?
+    set -e
+    if [[ "$child_status" -ne 1 ]]; then
+      printf 'Unsafe-TMPDIR self-test returned %s instead of 1.\n' \
+        "$child_status" >&2
+      exit 1
+    fi
+    if ! grep -Fq -- \
+      'TMPDIR resolves to a path unsafe for generated sed/Nginx config' \
+      "$unsafe_tmp_log"
+    then
+      printf 'Unsafe-TMPDIR self-test did not report the rejected path.\n' >&2
+      exit 1
+    fi
+    shopt -s nullglob
+    leftovers=(
+      "$unsafe_tmp_dir"/dufs-deployment.*
+      "$unsafe_tmp_dir"/dufs-deployment-sockets.*
+    )
+    if [[ "${#leftovers[@]}" -ne 0 ]]; then
+      printf 'Unsafe-TMPDIR self-test created temporary resources:\n' >&2
+      printf '  %s\n' "${leftovers[@]}" >&2
+      exit 1
+    fi
+
     set +e
     TMPDIR="$self_test_dir" \
       "$BASH" "$project_dir/scripts/check-deployment.sh" \
@@ -157,7 +208,6 @@ run_early_cleanup_self_test() {
       exit 1
     fi
 
-    shopt -s nullglob
     leftovers=(
       "$self_test_dir"/dufs-deployment.*
       "$self_test_dir"/dufs-deployment-sockets.*
@@ -211,7 +261,7 @@ run_early_cleanup_self_test() {
       exit 1
     fi
 
-    printf 'Deployment cleanup self-tests passed.\n'
+    printf 'Deployment script self-tests passed.\n'
   )
 }
 
@@ -224,6 +274,7 @@ fi
 
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="$(cd -P -- "$tmp_root" && pwd -P)"
+require_safe_tmp_root "$tmp_root"
 validation_dir=""
 socket_dir=""
 upstream_pid=""
