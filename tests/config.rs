@@ -172,12 +172,13 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     );
 
     let state_dir = private_state_dir()?;
+    let config_dir = TempDir::new()?;
     let rendered = template.replacen(PLACEHOLDER, ADMIN_ACCOUNT, 1).replacen(
         STATE_DIR,
         &state_dir.path().to_string_lossy(),
         1,
     );
-    let config = tmpdir.path().join("dufs.yaml");
+    let config = config_dir.path().join("dufs.yaml");
     write_private_config(&config, rendered)?;
     let matches = build_cli().try_get_matches_from([
         "dufs",
@@ -206,7 +207,8 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
 fn cli_state_dir_overrides_yaml_state_dir(tmpdir: TempDir) -> Result<(), Error> {
     let yaml_state_dir = private_state_dir()?;
     let cli_state_dir = private_state_dir()?;
-    let config = tmpdir.path().join("state-dir.yaml");
+    let config_dir = TempDir::new()?;
+    let config = config_dir.path().join("state-dir.yaml");
     write_private_config(
         &config,
         format!(

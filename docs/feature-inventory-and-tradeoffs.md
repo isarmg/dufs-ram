@@ -77,13 +77,13 @@
 | --- | --- | --- | --- | --- |
 | C-01 | `[serve-path]` / `serve-path` | 当前目录；相对路径按进程 cwd 而不是 YAML 所在目录解析，随后 canonicalize；启动时必须已存在且为目录 | 决定唯一共享根，不能删除 | 核心 |
 | C-02 | `dufs hash-password` | 交互输入和确认密码 | 生成符合固定策略的 Argon2id PHC；外部工具必须精确复现当前参数，删除收益有限 | 建议保留 |
-| C-03 | `-c, --config` | 不指定则只用命令行；文件最多 1 MiB | 以 `O_NOFOLLOW|O_NONBLOCK` 单次打开严格 YAML；只接受 root/euid 所有、精确 `0400/0440/0600/0640`、单硬链接且无扩展 POSIX access ACL 的普通文件，组读要求 gid 等于 egid。同一 fd 在 ACL 探测和读取前后复核完整身份、安全元数据、大小及 mtime/ctime；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
+| C-03 | `-c, --config` | 不指定则只用命令行；文件最多 1 MiB；路径及可解析别名必须在共享根外 | 以 `O_NOFOLLOW|O_NONBLOCK` 单次打开严格 YAML；只接受 root/euid 所有、精确 `0400/0440/0600/0640`、单硬链接且无扩展 POSIX access ACL 的普通文件，组读要求 gid 等于 egid。同一 fd 在 ACL 探测和读取前后复核完整身份、安全元数据、大小及 mtime/ctime；与日志、固定状态库及热 sidecar 同时比较规范目录项和已存在 dev/inode 身份；若始终使用固定 systemd 命令行，可考虑删除 YAML | 可选 |
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
 | C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
 | C-08 | `-a, --auth` / `auth` | 至少一个账号；可重复 | 配置完整权限账号；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
-| C-10 | `--log-file` / `log-file` | 不指定时全部日志输出到 stderr，stdout 只输出监听地址；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
+| C-10 | `--log-file` / `log-file` | 不指定时全部日志输出到 stderr，stdout 只输出监听地址；路径及可解析别名必须在共享根外；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 与配置、`state.sqlite3` 及 `-journal/-wal/-shm` 比较规范目录项和已存在 dev/inode 身份；以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
 | C-12 | `--max-upload-size` | 100 GiB；允许设为 `0` | 单文件声明长度上限；`0` 表示只允许零字节上传，不是关闭限制 | 保障 |
 | C-13 | `--upload-idle-timeout` | 60 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 上传正文无进展时限 | 保障 |
 | C-14 | `--upload-total-timeout` | 24 小时；不得为 `0`、小于空闲时限或超过 365 天，且必须能由平台单调时钟表示 | 每次 PUT/PATCH 在等待路径租约前建立绝对 deadline，覆盖租约等待、上传准备、正文、写入、flush、metadata 重放以及等待最终提交确认。受跟踪 task 的首次文件系统/上传状态 mutation 与 deadline 原子竞争：deadline 先赢则关闭边界、abort 并返回 `408 not-started + retry`；task 先越界后才以 `unknown + query_upload` 处理外层超时，进入不可取消的 rename/fsync 段后由后台安全收尾 | 保障 |
@@ -94,7 +94,7 @@
 | C-22 | `--max-concurrent-searches` | 2；必须大于 0 | 普通目录或递归搜索的首个快照扫描共用并发槽；后续 cursor 页只读取缓存快照，不再占扫描槽 | 保障 |
 | C-24 | `--request-timeout` | 300 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 普通请求处理和响应头生成时限；不限制已开始的文件或 Range 正文总时长，但每个源分块读取及套接字写入分别有 30 秒 idle deadline | 保障 |
 | C-25 | `-h/--help`、`-V/--version` | Clap 内置；版本同时显示构建源码 Git SHA，无法取得时显示 `unknown` | 基础命令行自描述和制品来源追踪，删除收益极低 | 开发/运维 |
-| C-26 | `--state-dir` / `state-dir` | 必填；固定使用私有 `0700` 目录内的 `state.sqlite3`，目录须由服务账号所有、非符号链接、与共享根分离，文件绑定共享根 dev/inode；接受空白新库、当前 schema v5，或在一个 `BEGIN IMMEDIATE` 事务内从 schema v2/v3/v4 迁移，不存在进程内数据库模式 | 文件型 store 在同一 schema 中持久化 operation 幂等结果、upload session 与 purge outbox；v2 依次执行上传 v3、purge v4 与版本 v5 迁移，v3 执行 purge v4 后提升到 v5，v4 先提升到 v5 再做 identity-safe stage 路径恢复，其他版本零修改拒绝。升级和备份必须同时考虑状态库与共享根 | 保障 |
+| C-26 | `--state-dir` / `state-dir` | 必填；固定使用私有 `0700` 目录内的 `state.sqlite3`，目录须由服务账号所有、非符号链接、与共享根分离，文件绑定共享根 dev/inode；数据库及 `-journal/-wal/-shm` 不得与配置/日志共享目录项或对象身份；接受空白新库、当前 schema v5，或在一个 `BEGIN IMMEDIATE` 事务内从 schema v2/v3/v4 迁移，不存在进程内数据库模式 | 文件型 store 在同一 schema 中持久化 operation 幂等结果、upload session 与 purge outbox；v2 依次执行上传 v3、purge v4 与版本 v5 迁移，v3 执行 purge v4 后提升到 v5，v4 先提升到 v5 再做 identity-safe stage 路径恢复，其他版本零修改拒绝。升级和备份必须同时考虑状态库与共享根 | 保障 |
 
 所有信号量型配置还会拒绝超过 Tokio 最大 permit 数的值。上传时限互相矛盾、超过一年或平台单调时钟可表示范围的极端时限、零并发和零遍历上限都会阻止启动。已经退役的 `compress`、`max-zip-entries`、`max-zip-uncompressed-size`、`max-zip-output-size` 和 `max-concurrent-zips` 不再接受；严格 YAML 会把这些字段视为未知配置。
 

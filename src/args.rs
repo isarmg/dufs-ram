@@ -8,6 +8,7 @@ use rustix::{
 };
 use serde::{Deserialize, Deserializer};
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
@@ -46,6 +47,215 @@ const LONG_VERSION: &str = concat!(
     env!("DUFS_BUILD_GIT_SHA"),
     ")"
 );
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ObjectIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EntryIdentity {
+    parent: ObjectIdentity,
+    name: OsString,
+}
+
+#[derive(Clone, Debug)]
+struct PathIdentity {
+    entry_path: PathBuf,
+    resolved_path: Option<PathBuf>,
+    entry: EntryIdentity,
+    object: Option<ObjectIdentity>,
+    links: Option<u64>,
+}
+
+impl PathIdentity {
+    fn inspect(path: &Path, path_name: &str) -> Result<Self> {
+        Self::inspect_with_expected_object(path, path_name, None)
+    }
+
+    fn inspect_with_expected_object(
+        path: &Path,
+        path_name: &str,
+        expected_object: Option<ObjectIdentity>,
+    ) -> Result<Self> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .with_context(|| "Failed to determine the current directory")?
+                .join(path)
+        };
+        let file_name = absolute.file_name().ok_or_else(|| {
+            anyhow::anyhow!("{path_name} path `{}` must name a file", path.display())
+        })?;
+        let parent = absolute.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{path_name} path `{}` must have a parent directory",
+                path.display()
+            )
+        })?;
+        let parent = std::fs::canonicalize(parent).with_context(|| {
+            format!(
+                "Failed to access {path_name} parent directory `{}`",
+                parent.display()
+            )
+        })?;
+        let parent_metadata = parent.metadata().with_context(|| {
+            format!(
+                "Failed to inspect {path_name} parent directory `{}`",
+                parent.display()
+            )
+        })?;
+        if !parent_metadata.is_dir() {
+            bail!(
+                "{path_name} parent `{}` must be a directory",
+                parent.display()
+            );
+        }
+
+        let entry_path = parent.join(file_name);
+        let (object, links, resolved_path) = match std::fs::metadata(&entry_path) {
+            Ok(metadata) => {
+                let object = ObjectIdentity::from_metadata(&metadata);
+                let resolved_path = std::fs::canonicalize(&entry_path).with_context(|| {
+                    format!(
+                        "Failed to resolve {path_name} path `{}`",
+                        entry_path.display()
+                    )
+                })?;
+                let resolved_metadata = resolved_path.metadata().with_context(|| {
+                    format!(
+                        "Failed to verify resolved {path_name} path `{}`",
+                        resolved_path.display()
+                    )
+                })?;
+                if ObjectIdentity::from_metadata(&resolved_metadata) != object {
+                    bail!(
+                        "{path_name} path `{}` changed while its identity was being inspected",
+                        entry_path.display()
+                    );
+                }
+                (
+                    Some(object),
+                    Some(resolved_metadata.nlink()),
+                    Some(resolved_path),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None, None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect {path_name} path `{}`",
+                        entry_path.display()
+                    )
+                });
+            }
+        };
+        if expected_object.is_some() && expected_object != object {
+            bail!(
+                "{path_name} path `{}` changed after it was securely read",
+                entry_path.display()
+            );
+        }
+
+        Ok(Self {
+            entry_path,
+            resolved_path,
+            entry: EntryIdentity {
+                parent: ObjectIdentity::from_metadata(&parent_metadata),
+                name: file_name.to_os_string(),
+            },
+            object,
+            links,
+        })
+    }
+
+    fn shares_entry_or_object_with(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            || matches!((self.object, other.object), (Some(left), Some(right)) if left == right)
+    }
+
+    fn resolves_within_shared_root(
+        &self,
+        shared_root: &Path,
+        shared_root_object: ObjectIdentity,
+    ) -> Result<bool> {
+        if self.entry_path.starts_with(shared_root)
+            || self
+                .resolved_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with(shared_root))
+            || self.object == Some(shared_root_object)
+        {
+            return Ok(true);
+        }
+
+        let mut ancestor = self.entry_path.parent();
+        while let Some(path) = ancestor {
+            let metadata = path.metadata().with_context(|| {
+                format!(
+                    "Failed to inspect ancestor `{}` while checking the shared-path boundary",
+                    path.display()
+                )
+            })?;
+            if ObjectIdentity::from_metadata(&metadata) == shared_root_object {
+                return Ok(true);
+            }
+            ancestor = path.parent();
+        }
+        Ok(false)
+    }
+}
+
+fn ensure_outside_shared_root(
+    identity: &PathIdentity,
+    path_name: &str,
+    shared_root: &Path,
+) -> Result<()> {
+    let shared_root_metadata = shared_root.metadata().with_context(|| {
+        format!(
+            "Failed to inspect shared path `{}` while validating {path_name}",
+            shared_root.display()
+        )
+    })?;
+    if identity.resolves_within_shared_root(
+        shared_root,
+        ObjectIdentity::from_metadata(&shared_root_metadata),
+    )? {
+        bail!(
+            "{path_name} `{}` must not be inside or resolve into shared path `{}`",
+            identity.entry_path.display(),
+            shared_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_distinct_path_identities(
+    left: &PathIdentity,
+    left_name: &str,
+    right: &PathIdentity,
+    right_name: &str,
+) -> Result<()> {
+    if left.shares_entry_or_object_with(right) {
+        bail!(
+            "{left_name} `{}` conflicts by entry or object identity with {right_name} `{}`",
+            left.entry_path.display(),
+            right.entry_path.display()
+        );
+    }
+    Ok(())
+}
 
 /// An immediate proxy whose forwarded client and scheme headers may be trusted.
 ///
@@ -332,10 +542,16 @@ impl Args {
     pub fn parse(matches: ArgMatches) -> Result<Args> {
         let mut args = Self::default();
         let config_path = matches.get_one::<PathBuf>("config").cloned();
+        let mut config_identity = None;
 
         if let Some(config_path) = config_path.as_deref() {
-            let contents = read_config(config_path)?;
-            args = serde_yaml::from_str(&contents)
+            let config = read_config(config_path)?;
+            config_identity = Some(PathIdentity::inspect_with_expected_object(
+                config_path,
+                "Configuration file",
+                Some(config.object),
+            )?);
+            args = serde_yaml::from_str(&config.contents)
                 .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
         }
 
@@ -401,10 +617,24 @@ impl Args {
         }
 
         let args = args.validate()?;
-        if let (Some(state_db), Some(config_path)) =
-            (args.state_database_path(), config_path.as_deref())
-        {
-            Self::ensure_no_state_db_path_conflict(&state_db, config_path, "Configuration file")?;
+        if let Some(config_identity) = config_identity.as_ref() {
+            ensure_outside_shared_root(config_identity, "Configuration file", &args.serve_path)?;
+            if let Some(log_file) = args.log_file.as_deref() {
+                let log_identity = PathIdentity::inspect(log_file, "Log file")?;
+                ensure_distinct_path_identities(
+                    config_identity,
+                    "Configuration file",
+                    &log_identity,
+                    "log file",
+                )?;
+            }
+            if let Some(state_db) = args.state_database_path() {
+                Self::ensure_no_state_db_identity_conflict(
+                    &state_db,
+                    config_identity,
+                    "Configuration file",
+                )?;
+            }
         }
         Ok(args)
     }
@@ -434,13 +664,28 @@ impl Args {
             );
         }
 
+        let log_identity = if let Some(log_file) = self.log_file.as_deref() {
+            let identity = PathIdentity::inspect(log_file, "Log file")?;
+            ensure_outside_shared_root(&identity, "Log file", &self.serve_path)?;
+            if identity.links.is_some_and(|links| links != 1) {
+                bail!(
+                    "Existing log file `{}` must have exactly one hard link",
+                    identity.entry_path.display()
+                );
+            }
+            self.log_file = Some(identity.entry_path.clone());
+            Some(identity)
+        } else {
+            None
+        };
+
         if let Some(state_dir) = self.state_dir.as_deref() {
             self.state_dir = Some(Self::sanitize_state_dir_path(state_dir, &self.serve_path)?);
         }
-        if let (Some(state_db), Some(log_file)) =
-            (self.state_database_path(), self.log_file.as_deref())
+        if let (Some(state_db), Some(log_identity)) =
+            (self.state_database_path(), log_identity.as_ref())
         {
-            Self::ensure_no_state_db_path_conflict(&state_db, log_file, "Log file")?;
+            Self::ensure_no_state_db_identity_conflict(&state_db, log_identity, "Log file")?;
         }
 
         let timeout_origin = Instant::now();
@@ -674,34 +919,11 @@ impl Args {
         Ok(state_db)
     }
 
-    fn ensure_no_state_db_path_conflict(
+    fn ensure_no_state_db_identity_conflict(
         state_db: &Path,
-        other: &Path,
+        other: &PathIdentity,
         other_name: &str,
     ) -> Result<()> {
-        let absolute = if other.is_absolute() {
-            other.to_path_buf()
-        } else {
-            env::current_dir()
-                .with_context(|| "Failed to determine the current directory")?
-                .join(other)
-        };
-        let file_name = absolute.file_name().ok_or_else(|| {
-            anyhow::anyhow!("{other_name} path `{}` must name a file", other.display())
-        })?;
-        let parent = absolute.parent().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{other_name} path `{}` must have a parent directory",
-                other.display()
-            )
-        })?;
-        let parent = std::fs::canonicalize(parent).with_context(|| {
-            format!(
-                "Failed to access {other_name} parent directory `{}`",
-                parent.display()
-            )
-        })?;
-        let normalized = parent.join(file_name);
         let conflicts = std::iter::once(state_db.to_path_buf()).chain(
             ["-journal", "-wal", "-shm"].into_iter().map(|suffix| {
                 let mut sidecar = state_db.as_os_str().to_os_string();
@@ -709,12 +931,16 @@ impl Args {
                 PathBuf::from(sidecar)
             }),
         );
-        if conflicts.into_iter().any(|path| path == normalized) {
-            bail!(
-                "{other_name} `{}` conflicts with SQLite state database `{}` or one of its sidecar files",
-                normalized.display(),
-                state_db.display()
-            );
+        for conflict in conflicts {
+            let identity =
+                PathIdentity::inspect(&conflict, "SQLite state database or sidecar file")?;
+            if other.shares_entry_or_object_with(&identity) {
+                bail!(
+                    "{other_name} `{}` conflicts with SQLite state database `{}` or one of its sidecar files by entry or object identity",
+                    other.entry_path.display(),
+                    state_db.display()
+                );
+            }
         }
         Ok(())
     }
@@ -753,7 +979,22 @@ impl ConfigFileSnapshot {
     }
 }
 
-fn read_config(path: &Path) -> Result<String> {
+struct ReadConfig {
+    contents: String,
+    object: ObjectIdentity,
+}
+
+impl fmt::Debug for ReadConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadConfig")
+            .field("contents", &"<redacted>")
+            .field("object", &self.object)
+            .finish()
+    }
+}
+
+fn read_config(path: &Path) -> Result<ReadConfig> {
     let mut file = OpenOptions::new()
         .read(true)
         // Opening a FIFO or device supplied in place of the config must not
@@ -772,7 +1013,7 @@ fn read_open_config(
     file: &mut File,
     path: &Path,
     mut inspect: impl FnMut(&File) -> Result<ConfigFileSnapshot>,
-) -> Result<String> {
+) -> Result<ReadConfig> {
     let before = inspect(file)?;
 
     let mut bytes = Vec::with_capacity(before.size.min(MAX_CONFIG_BYTES) as usize);
@@ -789,8 +1030,15 @@ fn read_open_config(
     let after = inspect(file)?;
     ensure_config_snapshot_stable(before, after, path, "while it was being read")?;
 
-    String::from_utf8(bytes)
-        .with_context(|| format!("Config at {} is not valid UTF-8", path.display()))
+    let contents = String::from_utf8(bytes)
+        .with_context(|| format!("Config at {} is not valid UTF-8", path.display()))?;
+    Ok(ReadConfig {
+        contents,
+        object: ObjectIdentity {
+            device: after.device,
+            inode: after.inode,
+        },
+    })
 }
 
 fn inspect_open_config(
