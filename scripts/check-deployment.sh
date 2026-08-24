@@ -4,6 +4,25 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
+deployment_mode="normal"
+if [[ "$#" -gt 1 ]]; then
+  printf 'Usage: %s [--self-test]\n' "${0##*/}" >&2
+  exit 2
+elif [[ "$#" -eq 1 ]]; then
+  case "$1" in
+    --self-test)
+      deployment_mode="self-test"
+      ;;
+    --self-test-fail-after-validation-dir)
+      deployment_mode="fail-after-validation-dir"
+      ;;
+    *)
+      printf 'Usage: %s [--self-test]\n' "${0##*/}" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 for command_name in \
   cargo \
   chmod \
@@ -24,8 +43,128 @@ do
   }
 done
 
+run_early_cleanup_self_test() {
+  (
+    local self_test_tmp_root self_test_dir child_status
+    local -a leftovers
+
+    self_test_tmp_root="${TMPDIR:-/tmp}"
+    self_test_tmp_root="$(cd -P -- "$self_test_tmp_root" && pwd -P)"
+    self_test_dir=""
+
+    cleanup_self_test() {
+      local status=$?
+
+      trap - EXIT HUP INT TERM
+      set +e
+      if [[ -n "$self_test_dir" && \
+        "${self_test_dir%/*}" == "$self_test_tmp_root" && \
+        "${self_test_dir##*/}" == dufs-deployment-trap-test.* ]]
+      then
+        rm -rf --one-file-system -- "$self_test_dir"
+      fi
+      exit "$status"
+    }
+
+    trap cleanup_self_test EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    self_test_dir="$(
+      mktemp -d -p "$self_test_tmp_root" \
+        dufs-deployment-trap-test.XXXXXXXX
+    )"
+    chmod 0700 "$self_test_dir"
+
+    set +e
+    TMPDIR="$self_test_dir" \
+      "$BASH" "$project_dir/scripts/check-deployment.sh" \
+      --self-test-fail-after-validation-dir >/dev/null 2>&1
+    child_status=$?
+    set -e
+    if [[ "$child_status" -ne 97 ]]; then
+      printf 'Early-cleanup self-test returned %s instead of 97.\n' \
+        "$child_status" >&2
+      exit 1
+    fi
+
+    shopt -s nullglob
+    leftovers=(
+      "$self_test_dir"/dufs-deployment.*
+      "$self_test_dir"/dufs-deployment-sockets.*
+    )
+    if [[ "${#leftovers[@]}" -ne 0 ]]; then
+      printf 'Early-cleanup self-test left temporary resources behind:\n' >&2
+      printf '  %s\n' "${leftovers[@]}" >&2
+      exit 1
+    fi
+
+    printf 'Early cleanup trap self-test passed.\n'
+  )
+}
+
+if [[ "$deployment_mode" == "self-test" ]]; then
+  run_early_cleanup_self_test
+  exit 0
+elif [[ "$deployment_mode" == "normal" ]]; then
+  run_early_cleanup_self_test
+fi
+
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="$(cd -P -- "$tmp_root" && pwd -P)"
+validation_dir=""
+socket_dir=""
+upstream_pid=""
+nginx_pid=""
+
+stop_nginx() {
+  if [[ -n "$nginx_pid" ]]; then
+    kill -TERM "$nginx_pid" 2>/dev/null || true
+    wait "$nginx_pid" 2>/dev/null || true
+    nginx_pid=""
+  fi
+}
+
+cleanup() {
+  local status=$?
+
+  trap - EXIT HUP INT TERM
+  set +e
+  stop_nginx
+  if [[ -n "$upstream_pid" ]]; then
+    kill -TERM "$upstream_pid" 2>/dev/null
+    wait "$upstream_pid" 2>/dev/null
+  fi
+  if [[ -n "$validation_dir" ]]; then
+    if [[ "${validation_dir%/*}" == "$tmp_root" && \
+      "${validation_dir##*/}" == dufs-deployment.* ]]
+    then
+      rm -rf --one-file-system -- "$validation_dir"
+    else
+      printf 'Refusing to remove unexpected deployment path: %s\n' \
+        "$validation_dir" >&2
+      status=1
+    fi
+  fi
+  if [[ -n "$socket_dir" ]]; then
+    if [[ "${socket_dir%/*}" == "$tmp_root" && \
+      "${socket_dir##*/}" == dufs-deployment-sockets.* ]]
+    then
+      rm -rf --one-file-system -- "$socket_dir"
+    else
+      printf 'Refusing to remove unexpected deployment socket path: %s\n' \
+        "$socket_dir" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 validation_dir="$(mktemp -d -p "$tmp_root" dufs-deployment.XXXXXXXX)"
 chmod 0700 "$validation_dir"
 [[ "${validation_dir%/*}" == "$tmp_root" && \
@@ -33,6 +172,10 @@ chmod 0700 "$validation_dir"
   printf 'Deployment validator created an unexpected temporary path.\n' >&2
   exit 1
 }
+if [[ "$deployment_mode" == "fail-after-validation-dir" ]]; then
+  printf 'Injected failure after validation directory creation.\n' >&2
+  exit 97
+fi
 # Nginx may drop privileges for worker processes. Keep configs, keys and logs
 # in the private validation directory while exposing only transient Unix
 # sockets through a separate searchable directory.
@@ -74,51 +217,6 @@ install -m 0644 \
 install -m 0644 \
   "$special_checkout/tests/deployment/mock-upstream.mjs" \
   "$runtime_dir/mock-upstream.mjs"
-upstream_pid=""
-nginx_pid=""
-
-stop_nginx() {
-  if [[ -n "$nginx_pid" ]]; then
-    kill -TERM "$nginx_pid" 2>/dev/null || true
-    wait "$nginx_pid" 2>/dev/null || true
-    nginx_pid=""
-  fi
-}
-
-cleanup() {
-  local status=$?
-
-  trap - EXIT HUP INT TERM
-  set +e
-  stop_nginx
-  if [[ -n "$upstream_pid" ]]; then
-    kill -TERM "$upstream_pid" 2>/dev/null
-    wait "$upstream_pid" 2>/dev/null
-  fi
-  if [[ "${validation_dir%/*}" == "$tmp_root" && \
-    "${validation_dir##*/}" == dufs-deployment.* ]]
-  then
-    rm -rf --one-file-system -- "$validation_dir"
-  else
-    printf 'Refusing to remove unexpected deployment path: %s\n' \
-      "$validation_dir" >&2
-    status=1
-  fi
-  if [[ "${socket_dir%/*}" == "$tmp_root" && \
-    "${socket_dir##*/}" == dufs-deployment-sockets.* ]]
-  then
-    rm -rf --one-file-system -- "$socket_dir"
-  else
-    printf 'Refusing to remove unexpected deployment socket path: %s\n' \
-      "$socket_dir" >&2
-    status=1
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 sed \
   's#/opt/dufs/bin/dufs#/bin/true#' \
