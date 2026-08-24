@@ -52,6 +52,15 @@ async fn main() -> Result<()> {
     }
     let args = Args::parse(matches)?;
     logger::init(args.log_file.clone()).map_err(|e| anyhow!("Failed to init logger, {e}"))?;
+    let result = run_server(args).await;
+    if let Err(error) = &result {
+        error!("Server failed: {error:#}");
+        log::logger().flush();
+    }
+    result
+}
+
+async fn run_server(args: Args) -> Result<()> {
     let print_addrs = args.addrs.clone();
     let mut signals = ShutdownSignals::new()?;
     let serving = serve(args)?;

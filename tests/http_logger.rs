@@ -7,6 +7,7 @@ use fixtures::{
     Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, USER_ACCOUNT, read_bound_url, tmpdir,
 };
 
+use assert_cmd::prelude::*;
 use assert_fs::fixture::TempDir;
 use reqwest::blocking::Client;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE};
@@ -502,6 +503,33 @@ fn malformed_http_connection_logs_peer_and_category(tmpdir: TempDir) -> Result<(
     assert!(output.contains("request_seen=false"));
     assert!(output.contains("io_kind=-"));
     assert_eq!(output.matches("HTTP connection error").count(), 1);
+    Ok(())
+}
+
+#[rstest]
+fn startup_failure_is_written_and_flushed_to_the_configured_log(
+    tmpdir: TempDir,
+) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let log_dir = TempDir::new()?;
+    let log_file = log_dir.path().join("startup.log");
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .args(["--auth", TEST_ACCOUNT])
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .args(["--bind", "20.205.243.166", "--port", "0"])
+        .arg("--log-file")
+        .arg(&log_file)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Failed to bind"));
+
+    let output = std::fs::read_to_string(&log_file)?;
+    assert!(
+        output.contains("ERROR Server failed: Failed to bind `20.205.243.166:0`"),
+        "startup failure was not flushed to the configured log: {output:?}"
+    );
     Ok(())
 }
 
