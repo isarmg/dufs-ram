@@ -63,7 +63,25 @@ async fn main() -> Result<()> {
 async fn run_server(args: Args) -> Result<()> {
     let print_addrs = args.addrs.clone();
     let mut signals = ShutdownSignals::new()?;
-    let serving = serve(args)?;
+    let runtime_handle = tokio::runtime::Handle::current();
+    let mut startup = tokio::task::spawn_blocking(move || {
+        // Server construction performs synchronous filesystem and SQLite work,
+        // while starting maintenance requires an entered Tokio runtime.
+        let _runtime_guard = runtime_handle.enter();
+        serve(args)
+    });
+    let serving = tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            let reason = signal?;
+            info!("Shutdown requested during startup reason={reason}");
+            // The process has not advertised a listening address or accepted
+            // traffic.  Flush the diagnostic and exit explicitly so a stuck
+            // synchronous filesystem/database call cannot delay SIGTERM.
+            return graceful_exit(&mut signals).await;
+        }
+        result = &mut startup => result.context("Server startup task failed")??,
+    };
     let listening = print_listening(&print_addrs, serving.port);
     if let Err(error) = write_listening(std::io::stdout().lock(), &listening) {
         warn!("Failed to write listening address to stdout: {error}");
@@ -838,6 +856,25 @@ fn hard_deadline_exit(active_work: usize, active_mutations: usize) -> ! {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_startup_work_does_not_block_the_signal_runtime() {
+        let runtime_handle = tokio::runtime::Handle::current();
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let startup = tokio::task::spawn_blocking(move || {
+            let _runtime_guard = runtime_handle.enter();
+            let _ = entered_sender.send(());
+            release_receiver.recv().expect("startup release was dropped")
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered_receiver)
+            .await
+            .expect("blocking startup starved the runtime")
+            .expect("blocking startup ended before signalling entry");
+        release_sender.send(7_u8).unwrap();
+        assert_eq!(startup.await.unwrap(), 7);
+    }
 
     #[test]
     fn accept_backoff_is_bounded_and_resets_after_success() {
