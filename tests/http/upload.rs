@@ -1140,12 +1140,18 @@ fn put_overwrite_rejects_a_fifo_without_waiting_for_a_peer(
 #[rstest]
 fn put_overwrite_rejects_a_unix_socket_without_opening_it(server: TestServer) -> Result<(), Error> {
     use std::{
-        os::unix::{fs::FileTypeExt, net::UnixListener},
+        fs::File,
+        os::{
+            fd::AsRawFd,
+            unix::{fs::FileTypeExt, net::UnixListener},
+        },
         time::Duration,
     };
 
+    let root = File::open(server.path())?;
     let socket_path = server.path().join("service.sock");
-    let _listener = UnixListener::bind(&socket_path)?;
+    let socket_bind_path = format!("/proc/self/fd/{}/service.sock", root.as_raw_fd());
+    let _listener = UnixListener::bind(socket_bind_path)?;
     let upload_id = uuid::Uuid::new_v4();
     let preflight = preflight_upload_target(&server, "/service.sock")?;
     assert!(preflight.exists);
