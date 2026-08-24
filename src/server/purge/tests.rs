@@ -3,7 +3,8 @@ use super::*;
 use crate::{Args, auth::AuthConfig};
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
-    sync::Arc,
+    sync::{Arc, mpsc},
+    time::Duration as StdDuration,
 };
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
@@ -613,6 +614,98 @@ async fn periodic_reconciliation_quarantines_a_post_rename_prepared_intent() {
         })
         .expect("periodic reconciliation must retain renamed Prepared trash");
     assert_eq!(std::fs::read(quarantined.path()).unwrap(), b"removed");
+}
+
+#[tokio::test]
+async fn shutdown_keeps_an_inflight_prepared_quarantine_tracked_and_leased() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = server(temp.path());
+    let target = temp.path().join("shutdown-quarantine.txt");
+    std::fs::write(&target, "preserve through shutdown").unwrap();
+    let (prepared, _) = prepared(&server, &target).await;
+    let trash = server
+        .content
+        .rooted_fs
+        .trash_path_for_id(&target, prepared.trash_id)
+        .unwrap();
+    drop(
+        server
+            .content
+            .rooted_fs
+            .move_to_trash_with_expected_identity(
+                &target,
+                prepared.trash_id,
+                prepared.source_identity,
+            )
+            .await
+            .unwrap(),
+    );
+
+    let (entered_sender, entered_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    server
+        .content
+        .rooted_fs
+        .inject_before_quarantine_sync_once(move || {
+            entered_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+    let reconciler_server = server.clone();
+    let mut reconciler = tokio::spawn(async move {
+        reconciler_server.run_prepared_purge_reconciler().await;
+    });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("prepared quarantine did not reach its pre-fsync hook")
+    })
+    .await
+    .unwrap();
+
+    server.lifecycle.shutdown.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut reconciler)
+            .await
+            .is_err(),
+        "shutdown dropped an in-flight prepared quarantine task"
+    );
+    let mut competing_lease = Box::pin(server.content.path_coordinator.acquire([&target, &trash]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), competing_lease.as_mut())
+            .await
+            .is_err(),
+        "shutdown released the prepared quarantine path lease before fsync"
+    );
+
+    release_sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), &mut reconciler)
+        .await
+        .expect("prepared reconciler did not finish after quarantine fsync")
+        .unwrap();
+    drop(competing_lease.await);
+    assert!(
+        server
+            .state
+            .state_store
+            .purge_job(prepared.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!trash.exists());
+    let quarantined = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
+            })
+        })
+        .expect("shutdown quarantine must retain the ambiguous trash entry");
+    assert_eq!(
+        std::fs::read(quarantined.path()).unwrap(),
+        b"preserve through shutdown"
+    );
 }
 
 #[tokio::test]

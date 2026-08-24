@@ -304,15 +304,16 @@ impl Server {
     /// a process restart.
     pub(in crate::server) async fn run_prepared_purge_reconciler(self: Arc<Self>) {
         loop {
-            let reconciliation = self.reconcile_prepared_purge_jobs();
-            tokio::select! {
-                biased;
-                _ = self.lifecycle.shutdown.cancelled() => return,
-                result = reconciliation => {
-                    if let Err(error) = result {
-                        warn!("Failed to reconcile prepared purge jobs error={error:#}");
-                    }
-                }
+            if self.lifecycle.shutdown.is_cancelled() {
+                return;
+            }
+            // Once a job has acquired its semantic path lease, do not drop its
+            // future on shutdown: fd-relative quarantine may already be inside
+            // a non-cancellable rename/fsync blocking closure. The reconciler
+            // itself is tracked, so shutdown now observes that work and the
+            // lease remains held until its filesystem and SQLite steps finish.
+            if let Err(error) = self.reconcile_prepared_purge_jobs().await {
+                warn!("Failed to reconcile prepared purge jobs error={error:#}");
             }
             tokio::select! {
                 biased;
@@ -495,6 +496,9 @@ impl Server {
             .prepared_purge_jobs(DELETE_PURGE_RECONCILE_LIMIT)
             .await?;
         for job in jobs {
+            if self.lifecycle.shutdown.is_cancelled() {
+                break;
+            }
             if let Err(error) = self.reconcile_prepared_purge_job(&job).await {
                 warn!(
                     "Failed to reconcile prepared purge job job_id={} error={error:#}",
