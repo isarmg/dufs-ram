@@ -900,9 +900,12 @@ flowchart TD
     MAP --> ESTATUS["400/403/404/409/504/507<br/>未知错误才返回 500"]
     STATUS --> ASSET{"GET + 精确内置资源路径 + 200？"}
     ASSET -- 是 --> SKIP["仅跳过该成功资源访问日志"]
-    ASSET -- 否 --> LOG["记录方法、路径和状态"]
-    ESTATUS --> ERRORLOG["记录完整内部错误链"]
-    UNKNOWN --> ERRORLOG
+    ASSET -- 否 --> BODY["等待响应正文流完成"]
+    ESTATUS --> BODYERROR["保留完整内部错误链并等待错误正文"]
+    UNKNOWN --> BODYERROR
+    BODY -- 正常结束 --> LOG["记录方法、路径和状态"]
+    BODY -- 读取失败或提前丢弃 --> STREAMERROR["以 ERROR 记录流错误和已发送状态"]
+    BODYERROR --> ERRORLOG["以 ERROR 记录完整内部错误链"]
     SKIP --> RETURN
     LOG --> RETURN
     ERRORLOG --> RETURN
@@ -922,7 +925,7 @@ Problem Details 只是 API 失败协议，不改变成功资源的表示。登�
 
 携带有效 Operation ID 的 mkdir、move、rename 或 DELETE 只有在已调用 `mark_commit_started` 后让未分类错误传播，才保守返回相同 ID 和 `unknown`；此时 guard 也终结为 `unknown/outcome_uncertain`。仍为 `Reserved` 时的异常丢弃会移除记录，使 pre-commit 取消可以安全重试；handler 内已经明确判定的参数、权限、目标不存在或冲突则完成为稳定的 `4xx` 与 `failed`。这一区分避免把尚未触碰文件系统的取消错误地永久记成“可能已提交”。
 
-访问日志只跳过同时满足三个条件的请求：方法是 `GET`、规范化后的路径精确匹配已知内置 JavaScript/CSS/图标、响应状态是 `200`。内置资源的 `HEAD`、未知资源、资源错误，以及页面、健康检查、登录、下载和 API 请求仍照常记录；处理器返回的内部错误也始终记录。连接级错误与 HTTP 访问日志分开处理，诊断记录会按错误类型分类并带上时间、级别和 TCP peer 地址。
+访问日志只跳过同时满足三个条件的请求：方法是 `GET`、规范化后的路径精确匹配已知内置 JavaScript/CSS/图标、响应状态是 `200`。内置资源的 `HEAD`、未知资源、资源错误，以及页面、健康检查、登录、下载和 API 请求仍照常记录；处理器返回的内部错误也始终记录。访问日志在响应正文流正常结束、返回读取错误或被提前丢弃时才写出；后两种情况使用 ERROR 级别并保留已经发送的实际 HTTP 状态。socket 写入可能发生在正文生产端已经正常结束之后，无法由访问日志正文包装器证明已送达，仍由独立连接错误记录按错误类型和 TCP peer 地址补充诊断。
 
 HTTP 访问日志从动态字段拼接阶段就使用 16 KiB 有界构造器，重复变量不会先形成巨型临时字符串；请求线程只把已经转义为单个物理行、再次经过 16 KiB 入队硬上限的日志放入容量 4096 的有界 channel，不直接写终端或文件。超长 UTF-8 文本会在字符边界截断并只带一个固定标记；自定义日志格式最多 4096 字节和 128 个解析元素，超限配置会阻止启动。未配置日志文件时，INFO/WARN/ERROR 和访问日志共用 stderr 这一条控制台 sink，stdout 仅在启动后输出监听地址；这样单 writer 不会因为先写或刷新 stdout 而阻止错误日志到达 stderr。`--log-file` 使用 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开，只接受当前服务用户拥有、仅有一个硬链接的普通文件；新文件原子创建并固定为 `0600`，已有文件必须预先就是精确 `0600`，不安全权限保持不变并阻止启动，避免 chmod 无法撤销的既往泄露或预开 fd 写权限。符号链接、异常文件类型、属主不匹配和多硬链接对象同样都会阻止启动。独立写线程批量写入并每 250 ms 刷新；刷新失败保留 dirty 状态，由下个周期或显式 flush 重试，回退诊断 sink 失败也不会 panic writer。队列满时丢弃最新记录，运行中至多每秒输出一次聚合 `dropped_newest` 告警，显式 flush 和退出仍提交累计数。正常停止由专用命名 OS thread 提交 flush 命令并最多等待 5 秒，不依赖可能被故障文件系统占满的 Tokio blocking pool；主 async 任务同时继续监听第二停止信号。请求 URI、请求头、用户名、连接错误和 handler 错误都经过控制字符转义，认证、Cookie 与 CSRF 头继续脱敏。
 
