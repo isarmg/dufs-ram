@@ -1,0 +1,168 @@
+name: Formal signed release package E2E
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "37 8 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-release-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24.8.0"
+  RUST_TOOLCHAIN: "1.97.1"
+  SHELLCHECK_VERSION: "0.11.0"
+  SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+  CARGO_LLVM_COV_VERSION: "0.8.6"
+  CARGO_LLVM_COV_SHA256: "eff7a72a3432ef18956a7f7424f87f7d08b30f465c79e1f03baeee17f7ccb960"
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_CYCLONEDX_VERSION: "0.5.9"
+  CARGO_TERM_COLOR: always
+  CI: "1"
+
+jobs:
+  formal_release:
+    name: Build, sign, and independently verify the formal package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the harness and repository version contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/ms-playwright\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          test -x scripts/check-formal-release-e2e.sh
+          bash -n scripts/check-formal-release-e2e.sh
+          test "$(
+            sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml
+          )" = "$RUST_TOOLCHAIN"
+          grep -Fxq \
+            "required_version=\"cargo-llvm-cov $CARGO_LLVM_COV_VERSION\"" \
+            scripts/check-coverage.sh
+          grep -Fxq \
+            "required_cargo_audit_version=\"$CARGO_AUDIT_VERSION\"" \
+            scripts/check.sh
+          grep -Fxq \
+            "required_cargo_audit_version=\"$CARGO_AUDIT_VERSION\"" \
+            scripts/package-release.sh
+          grep -Fxq \
+            "required_cargo_cyclonedx_version=\"$CARGO_CYCLONEDX_VERSION\"" \
+            scripts/package-release.sh
+          grep -Fq "NODE_VERSION: \"$NODE_VERSION\"" \
+            .github/workflows/read-only-ci.yml
+          grep -Fq "SHELLCHECK_VERSION: \"$SHELLCHECK_VERSION\"" \
+            .github/workflows/read-only-ci.yml
+          grep -Fq "SHELLCHECK_SHA256: \"$SHELLCHECK_SHA256\"" \
+            .github/workflows/read-only-ci.yml
+          grep -Fq \
+            "CARGO_LLVM_COV_VERSION: \"$CARGO_LLVM_COV_VERSION\"" \
+            .github/workflows/read-only-ci.yml
+          grep -Fq \
+            "CARGO_LLVM_COV_SHA256: \"$CARGO_LLVM_COV_SHA256\"" \
+            .github/workflows/read-only-ci.yml
+
+      - name: Use the fixed Node.js release
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install the fixed Rust and Cargo tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt \
+            --component llvm-tools-preview
+          cargo +"$RUST_TOOLCHAIN" install cargo-audit \
+            --version "$CARGO_AUDIT_VERSION" \
+            --locked
+          cargo +"$RUST_TOOLCHAIN" install cargo-cyclonedx \
+            --version "$CARGO_CYCLONEDX_VERSION" \
+            --locked
+
+          archive="${RUNNER_TEMP}/cargo-llvm-cov.tar.gz"
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          curl --proto '=https' --tlsv1.2 \
+            --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${CARGO_LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$CARGO_LLVM_COV_SHA256" "$archive" | \
+            sha256sum --check
+          install -d -m 0755 "$cargo_bin"
+          tar --no-same-owner -xzf "$archive" \
+            -C "$cargo_bin" cargo-llvm-cov
+          chmod 0755 "$cargo_bin/cargo-llvm-cov"
+
+          rustc +"$RUST_TOOLCHAIN" --version --verbose
+          cargo +"$RUST_TOOLCHAIN" --version --verbose
+          test "$(cargo audit --version)" = \
+            "cargo-audit-audit $CARGO_AUDIT_VERSION"
+          test "$(cargo cyclonedx --version)" = \
+            "cargo-cyclonedx-cyclonedx $CARGO_CYCLONEDX_VERSION"
+          test "$(cargo llvm-cov --version)" = \
+            "cargo-llvm-cov $CARGO_LLVM_COV_VERSION"
+
+      - name: Install the checksum-pinned ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/shellcheck.tar.xz"
+          install_dir="${RUNNER_TEMP}/shellcheck"
+          curl --proto '=https' --tlsv1.2 \
+            --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          printf '%s  %s\n' "$SHELLCHECK_SHA256" "$archive" | \
+            sha256sum --check
+          install -d -m 0755 "$install_dir"
+          tar --no-same-owner -xJf "$archive" -C "$install_dir"
+          shellcheck_bin="$install_dir/shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          test -x "$shellcheck_bin"
+          test "$(
+            "$shellcheck_bin" --version | sed -n 's/^version: //p'
+          )" = "$SHELLCHECK_VERSION"
+          "$shellcheck_bin" --severity=warning \
+            scripts/check-formal-release-e2e.sh
+          printf '%s\n' "${shellcheck_bin%/*}" >> "$GITHUB_PATH"
+
+      - name: Install deployment and browser prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v nginx >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes nginx
+          fi
+          npm ci --ignore-scripts --no-audit --no-fund
+          ./node_modules/.bin/playwright install --with-deps chromium firefox
+          nginx -v
+          systemd-analyze --version | sed -n '1p'
+          node --version
+          npm --version
+          mv --version | sed -n '1p'
+          df -h "${RUNNER_TEMP}"
+
+      - name: Run the real formal signed-package path
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/check-formal-release-e2e.sh
