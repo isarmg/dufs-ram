@@ -25,14 +25,21 @@ use std::{
     io,
     os::unix::fs::{FileExt, MetadataExt},
     path::Path,
+    time::Duration,
 };
 use tokio::fs;
+
+/// Maximum time to obtain the next file-backed response chunk, including both
+/// blocking-I/O admission and the underlying filesystem read. Socket write
+/// progress has a separate idle deadline at the connection boundary.
+const DOWNLOAD_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct DownloadReadState {
     file: File,
     gate: BlockingIoGate,
     offset: u64,
     remaining: u64,
+    idle_timeout: Duration,
 }
 
 impl Server {
@@ -75,6 +82,7 @@ async fn send_open_file(
         head_only,
         res,
         blocking_io_gate().clone(),
+        DOWNLOAD_READ_IDLE_TIMEOUT,
     )
     .await
 }
@@ -86,6 +94,7 @@ async fn send_open_file_with_gate(
     head_only: bool,
     res: &mut Response,
     gate: BlockingIoGate,
+    read_idle_timeout: Duration,
 ) -> Result<()> {
     let (file, meta) = gate
         .run_io(move || {
@@ -173,7 +182,7 @@ async fn send_open_file_with_gate(
                 return Ok(());
             }
 
-            *res.body_mut() = gated_file_body(file, gate, start, range_size);
+            *res.body_mut() = gated_file_body(file, gate, start, range_size, read_idle_timeout);
         }
         Some(ParsedRange::Unsatisfiable) => {
             *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -189,7 +198,7 @@ async fn send_open_file_with_gate(
 
             // Keep the body framed to the representation whose metadata produced
             // Content-Length, even if another writer appends to the same inode.
-            *res.body_mut() = gated_file_body(file, gate, 0, size);
+            *res.body_mut() = gated_file_body(file, gate, 0, size, read_idle_timeout);
         }
     }
     Ok(())
@@ -200,6 +209,7 @@ fn gated_file_body(
     gate: BlockingIoGate,
     offset: u64,
     remaining: u64,
+    idle_timeout: Duration,
 ) -> BoxBody<Bytes, anyhow::Error> {
     let stream = stream::try_unfold(
         DownloadReadState {
@@ -207,6 +217,7 @@ fn gated_file_body(
             gate,
             offset,
             remaining,
+            idle_timeout,
         },
         |state| async move {
             if state.remaining == 0 {
@@ -214,8 +225,9 @@ fn gated_file_body(
             }
 
             let chunk_size = state.remaining.min(BUF_SIZE as u64) as usize;
+            let idle_timeout = state.idle_timeout;
             let gate = state.gate.clone();
-            gate.run_io(move || {
+            let read = gate.run_io(move || {
                 let mut buffer = vec![0_u8; chunk_size];
                 let read = state.file.read_at(&mut buffer, state.offset)?;
                 if read == 0 {
@@ -231,10 +243,17 @@ fn gated_file_body(
                     gate: state.gate,
                     offset: state.offset + read,
                     remaining: state.remaining - read,
+                    idle_timeout: state.idle_timeout,
                 };
                 Ok(Some((Bytes::from(buffer), next)))
-            })
-            .await
+            });
+            match tokio::time::timeout(idle_timeout, read).await {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "download response body produced no file data before the read idle deadline",
+                )),
+            }
         },
     );
     StreamBody::new(stream.map_ok(Frame::data).map_err(anyhow::Error::from)).boxed()
@@ -364,6 +383,7 @@ mod tests {
             false,
             &mut response,
             gate,
+            DOWNLOAD_READ_IDLE_TIMEOUT,
         ));
 
         assert_future_pending(
@@ -393,9 +413,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=2-7"));
         let mut response = Response::default();
-        send_open_file_with_gate(&target, file, &headers, false, &mut response, gate.clone())
-            .await
-            .unwrap();
+        send_open_file_with_gate(
+            &target,
+            file,
+            &headers,
+            false,
+            &mut response,
+            gate.clone(),
+            DOWNLOAD_READ_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
 
         let (release, blocker) = occupy_gate(&gate).await;
@@ -413,6 +441,48 @@ mod tests {
         let body = collect.await.unwrap().to_bytes();
 
         assert_eq!(body.as_ref(), b"234567");
+    }
+
+    #[tokio::test]
+    async fn queued_download_read_expires_with_a_diagnostic_idle_timeout() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let target = temp.path().join("download.bin");
+        std::fs::write(&target, b"content").unwrap();
+        let file = std::fs::File::open(&target).unwrap();
+        let gate = BlockingIoGate::with_capacity_for_test(1);
+        let mut response = Response::default();
+        send_open_file_with_gate(
+            &target,
+            file,
+            &HeaderMap::new(),
+            false,
+            &mut response,
+            gate.clone(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        let (release, blocker) = occupy_gate(&gate).await;
+        let error = match response.into_body().collect().await {
+            Err(error) => error,
+            Ok(_) => panic!("a queued download read must exceed its idle deadline"),
+        };
+        let source = error
+            .downcast_ref::<io::Error>()
+            .expect("download idle timeout must retain its I/O error type");
+        assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            source.to_string(),
+            "download response body produced no file data before the read idle deadline"
+        );
+
+        release.send(()).unwrap();
+        blocker
+            .await
+            .expect("gate holder task failed")
+            .expect("gate holder I/O failed");
+        assert_eq!(gate.run_io(|| Ok(7_u8)).await.unwrap(), 7);
     }
 
     #[tokio::test]
