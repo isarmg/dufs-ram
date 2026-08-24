@@ -951,6 +951,7 @@ mod record_store_tests {
     async fn create_stage(rooted_fs: &RootedFs, stage: &Path, contents: &[u8]) -> fs::File {
         let (mut file, _) = rooted_fs.create_private_upload_stage(stage).await.unwrap();
         file.write_all(contents).await.unwrap();
+        file.flush().await.unwrap();
         file
     }
 
