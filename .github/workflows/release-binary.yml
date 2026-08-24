@@ -86,6 +86,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          gh --version
+          jq --version
 
           require_successful_run() {
             local workflow="$1"
@@ -270,6 +272,8 @@ jobs:
           EXPECTED_RELEASE_INPUT_DIGEST: ${{ needs.verify_build.outputs.release_input_digest }}
         run: |
           set -euo pipefail
+          gh --version
+          jq --version
 
           tag="$GITHUB_REF_NAME"
           version="${tag#v}"
@@ -277,6 +281,10 @@ jobs:
           input_dir="${RUNNER_TEMP}/github-release-input"
           work_dir="$(mktemp -d "${RUNNER_TEMP}/dufs-release.XXXXXX")"
           trap 'rm -rf -- "$work_dir"' EXIT
+          release_state="$work_dir/release.json"
+          release_rest_state="$work_dir/release-rest.json"
+          release_asset_pages="$work_dir/release-asset-pages.json"
+          release_assets_state="$work_dir/release-assets.json"
 
           if [[ "$GITHUB_REF_TYPE" != "tag" || \
             ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ || \
@@ -300,6 +308,8 @@ jobs:
           asset_path="$input_dir/$asset_name"
           checksum_path="$input_dir/$checksum_name"
           notes_path="$input_dir/$notes_name"
+          repository_owner="${GH_REPO%%/*}"
+          repository_name="${GH_REPO#*/}"
           prerelease=false
           if [[ "$version" == *-* ]]; then
             prerelease=true
@@ -325,6 +335,7 @@ jobs:
             fi
           done
           asset_size="$(stat -c %s "$asset_path")"
+          checksum_size="$(stat -c %s "$checksum_path")"
           notes_size="$(stat -c %s "$notes_path")"
           if ((asset_size == 0 || asset_size > 268435456)); then
             printf 'Release binary size is outside the accepted range.\n' >&2
@@ -336,6 +347,7 @@ jobs:
           fi
 
           local_digest="$(sha256sum "$asset_path" | awk '{print $1}')"
+          checksum_digest="$(sha256sum "$checksum_path" | awk '{print $1}')"
           printf '%s  %s\n' "$local_digest" "$asset_name" \
             > "$work_dir/expected.sha256"
           if ! cmp -s "$work_dir/expected.sha256" "$checksum_path"; then
@@ -359,11 +371,17 @@ jobs:
             exit 1
           fi
 
+          release_query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){tagName name description isDraft isPrerelease}}}'
+
           verify_tag_target() {
             local remote_sha=""
-            remote_sha="$(
+            if ! remote_sha="$(
               gh api "repos/${GH_REPO}/commits/${tag}" --jq .sha
             )"
+            then
+              printf 'Unable to resolve remote tag %s.\n' "$tag" >&2
+              return 2
+            fi
             if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
               printf 'Remote tag %s resolves to %s, expected %s.\n' \
                 "$tag" "$remote_sha" "$GITHUB_SHA" >&2
@@ -371,51 +389,468 @@ jobs:
             fi
           }
 
+          read_release() {
+            local release_id=""
+            local release_missing=""
+
+            if ! gh api graphql \
+              -f query="$release_query" \
+              -F owner="$repository_owner" \
+              -F name="$repository_name" \
+              -F tag="$tag" \
+              > "$release_state"
+            then
+              return 2
+            fi
+            release_missing="$(
+              jq -r '.data.repository.release == null' "$release_state"
+            )" || return 2
+            if [[ "$release_missing" == "true" ]]
+            then
+              printf '{}\n' > "$release_rest_state"
+              printf '[]\n' > "$release_assets_state"
+              return 0
+            fi
+            if [[ "$release_missing" != "false" ]]; then
+              printf 'GraphQL release lookup returned an invalid state.\n' >&2
+              return 2
+            fi
+            if ! gh api "repos/${GH_REPO}/releases/tags/${tag}" \
+              > "$release_rest_state"
+            then
+              return 2
+            fi
+            release_id="$(jq -r .id "$release_rest_state")" || return 2
+            if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+              printf 'Release ID is invalid.\n' >&2
+              return 2
+            fi
+            if ! gh api --paginate --slurp \
+              "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" \
+              > "$release_asset_pages"
+            then
+              return 2
+            fi
+            if ! jq -e \
+              'type == "array" and all(.[]; type == "array")' \
+              "$release_asset_pages" >/dev/null
+            then
+              printf 'Release asset pages have an invalid shape.\n' >&2
+              return 2
+            fi
+            jq 'add // []' "$release_asset_pages" \
+              > "$release_assets_state" || return 2
+          }
+
+          validate_release_metadata() {
+            local graphql_draft=""
+
+            if ! jq -e \
+              --arg tag "$tag" \
+              --arg title "$title" \
+              --argjson prerelease "$prerelease" \
+              '.data.repository.release != null and
+               .data.repository.release.tagName == $tag and
+               .data.repository.release.name == $title and
+               .data.repository.release.isPrerelease == $prerelease' \
+              "$release_state" >/dev/null
+            then
+              printf 'Existing release metadata does not match this run.\n' >&2
+              return 1
+            fi
+            graphql_draft="$(
+              jq -r '.data.repository.release.isDraft' "$release_state"
+            )" || return 2
+            if [[ "$graphql_draft" != "true" && "$graphql_draft" != "false" ]]; then
+              printf 'GraphQL release draft state is invalid.\n' >&2
+              return 2
+            fi
+            if ! jq -e \
+              --arg tag "$tag" \
+              --arg title "$title" \
+              --argjson prerelease "$prerelease" \
+              --argjson draft "$graphql_draft" \
+              '.tag_name == $tag and
+               .name == $title and
+               .prerelease == $prerelease and
+               .draft == $draft' \
+              "$release_rest_state" >/dev/null
+            then
+              printf 'REST release metadata does not match this run.\n' >&2
+              return 1
+            fi
+            if ! jq -j '.data.repository.release.description // ""' \
+              "$release_state" > "$work_dir/remote-notes.md"
+            then
+              return 2
+            fi
+            if ! cmp -s "$work_dir/remote-notes.md" "$notes_path"; then
+              printf 'Existing release notes do not match tagged CHANGELOG notes.\n' >&2
+              return 1
+            fi
+            if ! jq -j '.body // ""' "$release_rest_state" \
+              > "$work_dir/remote-rest-notes.md"
+            then
+              return 2
+            fi
+            if ! cmp -s "$work_dir/remote-rest-notes.md" "$notes_path"; then
+              printf 'REST release notes do not match tagged CHANGELOG notes.\n' >&2
+              return 1
+            fi
+          }
+
+          validate_draft_asset_subset() {
+            if ! jq -e \
+              --arg asset "$asset_name" \
+              --arg checksum "$checksum_name" \
+              '. as $assets |
+               ($assets | length) <= 2 and
+               ([ $assets[].name ] | unique | length) == ($assets | length) and
+               ([ $assets[].name ] |
+                 all(. == $asset or . == $checksum))' \
+              "$release_assets_state" >/dev/null
+            then
+              printf 'Draft contains duplicate or unexpected release assets.\n' >&2
+              return 1
+            fi
+          }
+
+          validate_complete_asset_set() {
+            if ! jq -e \
+              --arg asset "$asset_name" \
+              --arg checksum "$checksum_name" \
+              --arg asset_digest "sha256:$local_digest" \
+              --arg checksum_digest "sha256:$checksum_digest" \
+              --argjson asset_size "$asset_size" \
+              --argjson checksum_size "$checksum_size" \
+              '. as $assets |
+               ($assets | length) == 2 and
+               ([ $assets[].name ] | sort) == ([$asset, $checksum] | sort) and
+               all($assets[]; .state == "uploaded") and
+               ([ $assets[] | select(.name == $asset) | .size ] == [$asset_size]) and
+               ([ $assets[] | select(.name == $checksum) | .size ] == [$checksum_size]) and
+               ([ $assets[] | select(.name == $asset) | .digest ] == [$asset_digest]) and
+               ([ $assets[] | select(.name == $checksum) | .digest ] == [$checksum_digest])' \
+              "$release_assets_state" >/dev/null
+            then
+              printf 'Release does not contain exactly the two fixed assets.\n' >&2
+              return 1
+            fi
+          }
+
+          asset_exists() {
+            local name="$1"
+            jq -e \
+              --arg name "$name" \
+              '.[] | select(.name == $name)' \
+              "$release_assets_state" >/dev/null
+          }
+
+          require_matching_draft() {
+            if ! read_release; then
+              printf 'Unable to refresh the release draft.\n' >&2
+              return 2
+            fi
+            validate_release_metadata || return 1
+            if [[ "$(jq -r .draft "$release_rest_state")" != \
+              "true" ]]
+            then
+              printf 'Release is no longer the matching mutable draft.\n' >&2
+              return 1
+            fi
+            validate_draft_asset_subset || return 1
+            verify_tag_target || return 1
+          }
+
+          require_complete_matching_draft() {
+            require_matching_draft || return $?
+            validate_complete_asset_set || return 1
+          }
+
+          compare_remote_asset() {
+            local name="$1"
+            local local_path="$2"
+            local download_dir=""
+            local remote_path=""
+            local remote_digest=""
+            local expected_digest=""
+            local count=""
+
+            download_dir="$(mktemp -d "$work_dir/download.XXXXXX")" || return 2
+            if ! gh release download "$tag" \
+              --pattern "$name" \
+              --dir "$download_dir"
+            then
+              printf 'Unable to download remote asset %s.\n' "$name" >&2
+              return 2
+            fi
+            remote_path="$download_dir/$name"
+            count="$(
+              find -P "$download_dir" -mindepth 1 -printf x | wc -c
+            )" || return 2
+            if [[ "$count" != "1" || ! -f "$remote_path" || \
+              -L "$remote_path" || "$(stat -c %h "$remote_path")" != "1" ]]
+            then
+              printf 'Downloaded remote asset %s has an unsafe shape.\n' \
+                "$name" >&2
+              return 2
+            fi
+            remote_digest="$(
+              sha256sum "$remote_path" | awk '{print $1}'
+            )" || return 2
+            expected_digest="$(
+              sha256sum "$local_path" | awk '{print $1}'
+            )" || return 2
+            printf 'Remote %s SHA-256: %s\n' "$name" "$remote_digest"
+            if [[ "$remote_digest" != "$expected_digest" ]] || \
+              ! cmp -s "$remote_path" "$local_path"
+            then
+              printf 'Expected %s SHA-256: %s\n' \
+                "$name" "$expected_digest" >&2
+              return 1
+            fi
+            rm -rf -- "$download_dir"
+            return 0
+          }
+
+          remove_stable_starter_asset() {
+            local name="$1"
+            local first="$work_dir/starter-first.json"
+            local second="$work_dir/starter-second.json"
+            local current="$work_dir/starter-current.json"
+            local first_signature=""
+            local second_signature=""
+            local current_list_signature=""
+            local asset_id=""
+            local delete_response=""
+            local status_line=""
+
+            require_matching_draft || return $?
+            if ! jq -e \
+              --arg name "$name" \
+              '[.[] | select(.name == $name)] |
+               if length == 1 then .[0] else empty end' \
+              "$release_assets_state" > "$first"
+            then
+              printf 'Unable to inspect interrupted asset %s.\n' "$name" >&2
+              return 1
+            fi
+            if ! jq -e \
+              --arg name "$name" \
+              '.name == $name and
+               .state == "starter" and
+               .size == 0 and
+               (.id | type == "number")' \
+              "$first" >/dev/null
+            then
+              printf 'Mismatched asset %s is not a removable empty starter.\n' \
+                "$name" >&2
+              return 1
+            fi
+            first_signature="$(jq -c '{id,name,state,size}' "$first")" || return 2
+
+            sleep 5
+            require_matching_draft || return $?
+            if ! jq -e \
+              --arg name "$name" \
+              '[.[] | select(.name == $name)] |
+               if length == 1 then .[0] else empty end' \
+              "$release_assets_state" > "$second"
+            then
+              printf 'Unable to re-inspect interrupted asset %s.\n' "$name" >&2
+              return 1
+            fi
+            if ! jq -e \
+              --arg name "$name" \
+              '.name == $name and
+               .state == "starter" and
+               .size == 0 and
+               (.id | type == "number")' \
+              "$second" >/dev/null
+            then
+              printf 'Interrupted asset %s changed during validation.\n' \
+                "$name" >&2
+              return 1
+            fi
+            second_signature="$(jq -c '{id,name,state,size}' "$second")" || return 2
+            if [[ "$first_signature" != "$second_signature" ]]; then
+              printf 'Interrupted asset %s changed identity or state.\n' \
+                "$name" >&2
+              return 1
+            fi
+
+            asset_id="$(jq -r .id "$second")" || return 2
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]]; then
+              printf 'Interrupted asset ID is invalid.\n' >&2
+              return 1
+            fi
+            require_matching_draft || return $?
+            current_list_signature="$(
+              jq -c \
+                --arg name "$name" \
+                '[.[] | select(.name == $name)] |
+                 if length == 1 then .[0] | {id,name,state,size} else empty end' \
+                "$release_assets_state"
+            )" || return 1
+            if [[ "$current_list_signature" != "$second_signature" ]]; then
+              printf 'Interrupted asset %s changed before final inspection.\n' \
+                "$name" >&2
+              return 1
+            fi
+            if ! gh api "repos/${GH_REPO}/releases/assets/${asset_id}" \
+              > "$current"
+            then
+              printf 'Interrupted asset %s disappeared before deletion.\n' \
+                "$name" >&2
+              return 2
+            fi
+            if ! jq -e \
+              --arg name "$name" \
+              --arg id "$asset_id" \
+              '(.id | tostring) == $id and
+               .name == $name and
+               .state == "starter" and
+               .size == 0' \
+              "$current" >/dev/null
+            then
+              printf 'Interrupted asset %s changed before deletion.\n' \
+                "$name" >&2
+              return 1
+            fi
+
+            verify_tag_target || return 1
+            if ! delete_response="$(
+              gh api --include --method DELETE \
+                "repos/${GH_REPO}/releases/assets/${asset_id}"
+            )"
+            then
+              printf 'Unable to delete interrupted asset ID %s.\n' \
+                "$asset_id" >&2
+              return 2
+            fi
+            status_line="${delete_response%%$'\n'*}"
+            if [[ ! "$status_line" =~ ^HTTP/[0-9.]+[[:space:]]+204([[:space:]]|$) ]]; then
+              printf 'Deleting interrupted asset ID %s did not return 204.\n' \
+                "$asset_id" >&2
+              return 2
+            fi
+
+            require_matching_draft || return $?
+            if asset_exists "$name"; then
+              printf 'Deleted interrupted asset %s is still present.\n' \
+                "$name" >&2
+              return 2
+            fi
+            printf 'Removed stable empty starter asset %s by ID %s.\n' \
+              "$name" "$asset_id"
+          }
+
+          recover_interrupted_asset() {
+            local name="$1"
+            local local_path="$2"
+            local comparison_status="$3"
+            local cleanup_status=0
+
+            printf 'Draft asset %s could not be verified; checking starter state.\n' \
+              "$name" >&2
+            if remove_stable_starter_asset "$name"; then
+              require_matching_draft || return $?
+              gh release upload "$tag" "$local_path" || return 2
+              return 0
+            else
+              cleanup_status=$?
+            fi
+            if ((cleanup_status == 2)); then
+              return 2
+            fi
+            return "$comparison_status"
+          }
+
+          sync_draft_asset() {
+            local name="$1"
+            local local_path="$2"
+            local comparison_status=0
+
+            require_matching_draft
+            if asset_exists "$name"; then
+              if compare_remote_asset "$name" "$local_path"; then
+                printf 'Keeping verified draft asset %s.\n' "$name"
+                return 0
+              else
+                comparison_status=$?
+              fi
+              recover_interrupted_asset \
+                "$name" "$local_path" "$comparison_status"
+              return
+            fi
+
+            require_matching_draft
+            if asset_exists "$name"; then
+              if compare_remote_asset "$name" "$local_path"; then
+                printf 'Keeping concurrently uploaded draft asset %s.\n' "$name"
+                return 0
+              else
+                comparison_status=$?
+              fi
+              recover_interrupted_asset \
+                "$name" "$local_path" "$comparison_status"
+              return
+            fi
+            gh release upload "$tag" "$local_path"
+          }
+
+          verify_complete_release() {
+            read_release
+            validate_release_metadata
+            validate_complete_asset_set
+            compare_remote_asset "$asset_name" "$asset_path"
+            compare_remote_asset "$checksum_name" "$checksum_path"
+          }
+
           verify_tag_target
-          if gh release view "$tag" >/dev/null 2>&1; then
-            printf 'Release %s already exists; refusing to replace it.\n' \
-              "$tag" >&2
+          read_release
+          if [[ "$(jq -r '.data.repository.release == null' "$release_state")" == "true" ]]; then
+            create_flags=(
+              --verify-tag
+              --draft
+              --title "$title"
+              --notes-file "$notes_path"
+            )
+            if [[ "$prerelease" == "true" ]]; then
+              create_flags+=(--prerelease)
+            fi
+            verify_tag_target
+            gh release create "$tag" "${create_flags[@]}"
+            read_release
+          fi
+
+          validate_release_metadata
+          if [[ "$(jq -r .draft "$release_rest_state")" == "false" ]]; then
+            verify_tag_target
+            verify_complete_release
+            verify_tag_target
+            printf 'Published release %s already matches this exact run.\n' "$tag"
+            exit 0
+          fi
+          if [[ "$(jq -r .draft "$release_rest_state")" != "true" ]]; then
+            printf 'Release draft state is invalid.\n' >&2
             exit 1
           fi
 
-          create_flags=(
-            --verify-tag
-            --draft
-            --title "$title"
-            --notes-file "$notes_path"
-          )
-          if [[ "$prerelease" == "true" ]]; then
-            create_flags+=(--prerelease)
-          fi
-          gh release create "$tag" "${create_flags[@]}"
-          verify_tag_target
-          gh release upload "$tag" "$asset_path" "$checksum_path"
+          validate_draft_asset_subset
+          sync_draft_asset "$asset_name" "$asset_path"
+          sync_draft_asset "$checksum_name" "$checksum_path"
 
-          expected_assets="$(
-            printf '%s\n' "$asset_name" "$checksum_name" | sort
-          )"
-          actual_assets="$(
-            gh release view "$tag" --json assets --jq '.assets[].name' | sort
-          )"
-          is_draft="$(
-            gh release view "$tag" --json isDraft --jq .isDraft
-          )"
-          if [[ "$is_draft" != "true" || \
-            "$actual_assets" != "$expected_assets" ]]
-          then
-            printf 'Draft release verification failed.\n' >&2
-            exit 1
-          fi
-
-          verify_tag_target
+          verify_complete_release
+          require_complete_matching_draft
           latest_flags=(--latest)
           if [[ "$prerelease" == "true" ]]; then
             latest_flags=(--latest=false)
           fi
           gh release edit "$tag" --draft=false "${latest_flags[@]}"
-          if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != \
-            "false" ]]
-          then
+
+          verify_complete_release
+          if [[ "$(jq -r .draft "$release_rest_state")" != "false" ]]; then
             printf 'Release %s remained a draft.\n' "$tag" >&2
             exit 1
           fi

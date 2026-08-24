@@ -103,6 +103,7 @@ run ./scripts/check-coverage.sh
 run npm ci --ignore-scripts --no-audit --no-fund
 run ./node_modules/.bin/tsc --version
 run node scripts/extract-release-notes.mjs --self-test
+run node scripts/check-release-workflow.mjs
 run npm run check:js
 run npm run check:types
 run npm run check:docs
