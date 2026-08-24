@@ -460,7 +460,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 17. Dufs 后端使用明文 Hyper HTTP/1 handler，接受 HTTP/1.0 和 HTTP/1.1；标准 HTTP/2 prior-knowledge connection preface 会被拒绝，也不实现 HTTP/1.1 `Upgrade: h2c`。浏览器到网关仍可使用 HTTP/2 或 HTTP/3，但生产网关固定用 HTTP/1.1 回源。
 18. `upload/manager.js` 返回对象中的 `isBusy()` 当前没有生产或测试调用，可作为不改变功能的微型代码清理。
 19. 固定 localhost Playwright 私钥和证书只供自动化测试，不能用于生产网关。
-20. 本地发布脚本提供强制完整门禁、反复 exact-source 检查、来源隔离、源码 SHA、实际构建环境清单、固定工具生成的规范化 SBOM、第三方许可证 notice、校验和和签名制品，并拒绝 symlink、submodule 与特殊源/归档条目；环境清单记录本次工具事实但不钉扎宿主链，SBOM 规范化也不代表完整 schema 验证。项目仍没有远程托管发布、自动升级、包管理器或密钥托管；晚打开私钥不能隔离同 UID 恶意进程，管理员仍须使用独立账号、主机或 HSM。
+20. 本地发布脚本提供强制完整门禁、反复 exact-source 检查、来源隔离、源码 SHA、实际构建环境清单、固定工具生成的规范化 SBOM、第三方许可证 notice、校验和和签名制品，并拒绝 symlink、submodule 与特殊源/归档条目；环境清单记录本次工具事实但不钉扎宿主链，SBOM 规范化也不代表完整 schema 验证。项目已经提供由版本 tag 触发的远程 GitHub 便捷二进制发布，但该制品没有独立发布者签名，项目仍没有自动升级、包管理器或密钥托管；晚打开私钥不能隔离同 UID 恶意进程，管理员仍须使用独立账号、主机或 HSM。
 21. 同源检查明确拒绝 `Sec-Fetch-Site: cross-site`；`Origin: null` 只在 Fetch Metadata 明确为 same-origin 时接受；普通 Origin 同时比较 scheme 与 authority。生产网关必须列入显式受信代理、只接受固定规范主机名，以固定值覆盖上游 `Host`，并写入唯一、无逗号的 `X-Forwarded-Proto: https`；未配置受信代理时经 HTTPS 网关的带 Origin 写请求失败关闭。Origin 缺失时不会单独拒绝，整体安全仍依赖每会话 CSRF token。
 22. 会话 Cookie 固定为 `__Host-dufs-session; Path=/`，Cookie 不按端口隔离：同一主机名下的应用共享 host/path 作用域；若还共用 scheme 和端口，则浏览器也会把它们视为同源。同主机再部署另一份 Dufs 还会发生 Cookie 名冲突。因此 Dufs 必须独占一个主机名，并固定部署在该域名的根路径 `/`。
 23. 同一共享根上的第二个 Dufs 实例会因根 fd 的非阻塞独占 `flock` 启动失败；该 advisory lock 没有 PID 文件，也不能阻止 shell、宿主机、网络文件系统另一节点或忽略 flock 的程序修改目录。多个根目录仍由多个进程分别管理。
