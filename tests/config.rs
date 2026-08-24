@@ -171,13 +171,16 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
         "deployment state directory path must occur exactly once"
     );
 
-    let state_dir = private_state_dir()?;
+    let state_root = private_state_dir()?;
+    let state_dir = state_root.path().join("state dir & # \"quoted\"");
+    std::fs::create_dir(&state_dir)?;
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
     let config_dir = TempDir::new()?;
-    let rendered = template.replacen(PLACEHOLDER, ADMIN_ACCOUNT, 1).replacen(
-        STATE_DIR,
-        &state_dir.path().to_string_lossy(),
-        1,
-    );
+    let state_dir_scalar = serde_json::to_string(&state_dir.to_string_lossy())?;
+    let rendered =
+        template
+            .replacen(PLACEHOLDER, ADMIN_ACCOUNT, 1)
+            .replacen(STATE_DIR, &state_dir_scalar, 1);
     let config = config_dir.path().join("dufs.yaml");
     write_private_config(&config, rendered)?;
     let matches = build_cli().try_get_matches_from([
@@ -189,7 +192,7 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     let args = Args::parse(matches)?;
 
     assert_eq!(args.serve_path, std::fs::canonicalize(tmpdir.path())?);
-    assert_eq!(args.state_dir.as_deref(), Some(state_dir.path()));
+    assert_eq!(args.state_dir.as_deref(), Some(state_dir.as_path()));
     assert_eq!(args.addrs, [std::net::IpAddr::from([127, 0, 0, 1])]);
     assert_eq!(
         args.trusted_proxies
