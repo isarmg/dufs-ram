@@ -9,6 +9,11 @@ if [[ "$script_parent" == "$script_source" ]]; then
 fi
 project_dir="$(cd -P -- "$script_parent/.." && pwd -P)"
 cd "$project_dir"
+packager_pid="$BASHPID"
+[[ "$packager_pid" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'Unable to determine the release packager process ID.\n' >&2
+  exit 1
+}
 
 usage() {
   printf 'Usage: %s --signing-key <PEM private key> [--output-dir <directory>]\n' "$0"
@@ -27,9 +32,10 @@ run_node_entrypoint() {
   local entrypoint="$2"
   shift 2
 
-  # Staged release paths are anchored below /proc/self/fd. Node's default
-  # main-module realpath would expose the physical output name again and, on
-  # POSIX, rejects a valid backslash in that name as an encoded URL separator.
+  # Staged release paths are anchored below the packager process directory fd.
+  # Node's default main-module realpath would expose the physical output name
+  # again and, on POSIX, rejects a valid backslash in that name as an encoded
+  # URL separator.
   "$node_command" --preserve-symlinks-main "$entrypoint" "$@"
 }
 
@@ -2425,9 +2431,18 @@ EOF
 
   exec {test_lock_fd}<"$physical_output"
   flock --exclusive "$test_lock_fd"
-  locked_output="/proc/self/fd/$test_lock_fd"
+  locked_output="/proc/$packager_pid/fd/$test_lock_fd"
   original_output_identity="$(stat -Lc '%d:%i' -- "$locked_output")"
   original_output_metadata="$(stat -Lc '%u:%a:%d:%i' -- "$locked_output")"
+  if ! (
+    exec {test_lock_fd}>&-
+    [[ "$(stat -Lc '%d:%i' -- "$locked_output")" == \
+      "$original_output_identity" ]]
+  ); then
+    printf '%s\n' \
+      'release self-test lost its fixed-process output anchor after closing the inherited fd' >&2
+    return 1
+  fi
   validate_private_directory_binding \
     "$locked_output" \
     "$physical_output" \
@@ -3426,7 +3441,7 @@ validate_output_directory "$output_dir" "$current_uid"
 output_identity="$(stat -Lc '%d:%i' -- "$output_dir")"
 exec {release_lock_fd}<"$output_dir"
 flock --exclusive "$release_lock_fd"
-locked_output_directory="/proc/self/fd/$release_lock_fd"
+locked_output_directory="/proc/$packager_pid/fd/$release_lock_fd"
 validate_output_directory "$output_dir" "$current_uid"
 [[ "$(stat -Lc '%d:%i' -- "$output_dir")" == "$output_identity" ]] || {
   printf 'Release output directory changed while acquiring its lock.\n' >&2
