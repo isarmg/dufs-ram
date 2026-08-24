@@ -87,7 +87,7 @@ elif [[ -n "${DUFS_QUALITY_AUDIT_DB:-}" ]]; then
   printf 'DUFS_QUALITY_AUDIT_DB is reserved for the isolated release gate\n' >&2
   exit 1
 else
-  run cargo audit
+  run cargo audit --deny yanked
 fi
 
 # 发布自测统一聚合 normalize-sbom、third-party notices 与 npm cache seed，
