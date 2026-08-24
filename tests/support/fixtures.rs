@@ -8,8 +8,10 @@ use reqwest::{IntoUrl, Method, Url};
 use rstest::fixture;
 use serde_json::Value;
 use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 use uuid::Uuid;
@@ -31,6 +33,57 @@ pub const USER_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+y
 pub const ADMIN_ACCOUNT: &str = "admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
 const CSRF_HEADER: &str = "x-dufs-csrf-token";
+
+#[allow(dead_code)]
+pub struct TestAuthConfig {
+    _directory: TempDir,
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl TestAuthConfig {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[allow(dead_code)]
+pub fn test_auth_config(accounts: &[&str]) -> TestAuthConfig {
+    let directory = TempDir::new().expect("Couldn't create an auth config dir for tests");
+    let path = directory.path().join("dufs.yaml");
+    let contents = serde_yaml::to_string(&serde_json::json!({ "auth": accounts }))
+        .expect("Couldn't serialize test accounts");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("Couldn't create a private auth config for tests");
+    file.write_all(contents.as_bytes())
+        .expect("Couldn't write the private auth config for tests");
+    file.flush()
+        .expect("Couldn't flush the private auth config for tests");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("Couldn't enforce private auth config permissions for tests");
+    if let Err(error) = rustix::fs::removexattr(&path, "system.posix_acl_access") {
+        assert!(
+            error == rustix::io::Errno::NODATA || error == rustix::io::Errno::NOTSUP,
+            "Couldn't remove an inherited auth config ACL: {error}"
+        );
+    }
+    TestAuthConfig {
+        _directory: directory,
+        path,
+    }
+}
+
+#[allow(dead_code)]
+pub fn dufs_command(accounts: &[&str]) -> (Command, TestAuthConfig) {
+    let auth_config = test_auth_config(accounts);
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
+    command.arg("--config").arg(auth_config.path());
+    (command, auth_config)
+}
 
 #[allow(dead_code)]
 pub fn with_new_upload_headers(request: RequestBuilder, upload_length: u64) -> RequestBuilder {
@@ -252,29 +305,51 @@ pub fn tmpdir() -> TempDir {
 /// optional arguments, then wait until it reports its bound URL.
 #[fixture]
 #[allow(dead_code)]
-pub fn server<I>(#[default(&[] as &[&str])] args: I) -> TestServer
+pub fn server<I, A>(
+    #[default(&[] as &[&str])] args: I,
+    #[default(&[TEST_ACCOUNT] as &[&str])] accounts: A,
+) -> TestServer
 where
-    I: IntoIterator + Clone,
+    I: IntoIterator,
     I::Item: AsRef<std::ffi::OsStr>,
+    A: IntoIterator,
+    A::Item: AsRef<str>,
 {
     let tmpdir = tmpdir();
-    let has_auth = args.clone().into_iter().any(|value| {
-        matches!(
-            value.as_ref().to_str(),
-            Some("--auth") | Some("-a") | Some("--config") | Some("-c")
-        )
+    let args = args
+        .into_iter()
+        .map(|value| value.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    let accounts = accounts
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let has_config = args.iter().any(|value| {
+        value.to_str().is_some_and(|value| {
+            value == "--config" || value == "-c" || value.starts_with("--config=")
+        })
     });
-    let has_min_free_space = args.clone().into_iter().any(|value| {
-        value.as_ref().to_str().is_some_and(|value| {
+    let has_min_free_space = args.iter().any(|value| {
+        value.to_str().is_some_and(|value| {
             value == "--min-free-space" || value.starts_with("--min-free-space=")
         })
     });
-    let has_state_dir = args.clone().into_iter().any(|value| {
+    let has_state_dir = args.iter().any(|value| {
         value
-            .as_ref()
             .to_str()
             .is_some_and(|value| value == "--state-dir" || value.starts_with("--state-dir="))
     });
+    let auth_config = if has_config {
+        None
+    } else {
+        let account_refs = accounts.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(test_auth_config(&account_refs))
+    };
+    let use_default_auth = auth_config.is_some()
+        && accounts.len() == 1
+        && accounts
+            .first()
+            .is_some_and(|account| account == TEST_ACCOUNT);
     let automatic_state_dir = if has_state_dir {
         None
     } else {
@@ -284,13 +359,9 @@ where
         Some(state_dir)
     };
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
-    command
-        .arg(tmpdir.path())
-        .arg("-p")
-        .arg("0")
-        .args(args.clone());
-    if !has_auth {
-        command.args(["--auth", TEST_ACCOUNT]);
+    command.arg(tmpdir.path()).arg("-p").arg("0").args(&args);
+    if let Some(auth_config) = auth_config.as_ref() {
+        command.arg("--config").arg(auth_config.path());
     }
     if !has_min_free_space {
         command.args(["--min-free-space", "0"]);
@@ -310,10 +381,11 @@ where
         port,
         tmpdir,
         child,
-        !has_auth,
+        use_default_auth,
         automatic_state_dir,
+        auth_config,
     );
-    if !has_auth {
+    if use_default_auth {
         server
             .refresh_default_session()
             .expect("Couldn't create default authenticated test session");
@@ -331,6 +403,7 @@ pub struct TestServer {
     default_session: Option<TestSession>,
     stdout_drain: Option<JoinHandle<()>>,
     automatic_state_dir: Option<TempDir>,
+    auth_config: Option<TestAuthConfig>,
 }
 
 #[allow(dead_code)]
@@ -354,7 +427,7 @@ impl TestSession {
 #[allow(dead_code)]
 impl TestServer {
     pub fn new(port: u16, tmpdir: TempDir, child: Child, use_default_auth: bool) -> Self {
-        Self::new_with_automatic_state_dir(port, tmpdir, child, use_default_auth, None)
+        Self::new_with_automatic_state_dir(port, tmpdir, child, use_default_auth, None, None)
     }
 
     fn new_with_automatic_state_dir(
@@ -363,6 +436,7 @@ impl TestServer {
         mut child: Child,
         use_default_auth: bool,
         automatic_state_dir: Option<TempDir>,
+        auth_config: Option<TestAuthConfig>,
     ) -> Self {
         let client = Client::builder()
             .build()
@@ -381,6 +455,7 @@ impl TestServer {
             default_session: None,
             stdout_drain,
             automatic_state_dir,
+            auth_config,
         }
     }
 
@@ -572,6 +647,7 @@ impl TestServer {
             .client
             .get(page_url)
             .header(COOKIE, &cookie)
+            .header("connection", "close")
             .send()?
             .error_for_status()?;
         let csrf_token = extract_csrf_token(&page.text()?)
@@ -623,7 +699,13 @@ impl TestServer {
             .arg(self.tmpdir.path())
             .arg("-p")
             .arg("0")
-            .args(["--auth", TEST_ACCOUNT])
+            .arg("--config")
+            .arg(
+                self.auth_config
+                    .as_ref()
+                    .expect("default-auth restart requires the fixture-owned auth config")
+                    .path(),
+            )
             .args(args);
         if !has_min_free_space {
             command.args(["--min-free-space", "0"]);

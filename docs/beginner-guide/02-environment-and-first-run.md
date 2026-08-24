@@ -115,7 +115,7 @@ $argon2id$v=19$m=...$...$...
 
 这是 PHC 格式的 Argon2id 密码哈希，不是原始密码。原始密码必须非空，并且最多 1024 个 UTF-8 字节。
 
-Shell 会把 `$` 解释为变量开头，所以把完整账号参数放在单引号中：
+把完整账号值写入 YAML 时建议使用单引号：
 
 ```text
 'admin:$argon2id$v=19$...'
@@ -125,16 +125,13 @@ Shell 会把 `$` 解释为变量开头，所以把完整账号参数放在单引
 
 ## 2.6 启动最小实例
 
-把下面的哈希替换为刚才生成的完整结果：
+先复制受保护配置模板，把其中的共享根、状态目录和账号 PHC 替换为本章生成的真实值，再启动：
 
 ```sh
-target/debug/dufs \
-  --bind 127.0.0.1 \
-  --port 5000 \
-  --auth 'admin:$argon2id$v=19$...' \
-  --state-dir "$tutorial_root/state" \
-  --min-free-space 0 \
-  "$tutorial_root/shared"
+cp deploy/dufs.yaml.example "$tutorial_root/dufs.yaml"
+chmod 0600 "$tutorial_root/dufs.yaml"
+# 用编辑器替换路径、PHC，并为本章的小型临时卷设置 min-free-space: 0
+target/debug/dufs --config "$tutorial_root/dufs.yaml"
 ```
 
 `--min-free-space 0` 只为了避免很小的临时测试卷达不到默认 1 GiB 余量；不要把它不加思考地复制到生产配置。
@@ -246,7 +243,7 @@ password: test-password
 
 ## 2.9 用 YAML 保存配置
 
-命令行适合快速实验，长期运行适合 YAML。复制示例后修改：
+第 2.6 节已经复制了配置模板；若需要重新开始，可再次复制并立即收紧权限：
 
 ```sh
 cp deploy/dufs.yaml.example "$tutorial_root/dufs.yaml"
@@ -270,7 +267,7 @@ min-free-space: 0
 
 上面的 `ABCDEFGH` 和 PHC 都是占位符。编辑复制出的 YAML 时必须完成三项替换：把两个路径改成第 2.4 节打印的**同一个真实 `$tutorial_root` 值**，把 `auth` 改成第 2.5 节生成的完整 Argon2id PHC，并为这个临时小卷确认 `min-free-space: 0`。Dufs 不会在 YAML 内展开 shell 变量；保留示例中的 `REPLACE_WITH_A_REAL_HASH` 会因无效认证配置启动失败。
 
-先在第 2.6 节启动服务的原终端按 `Ctrl+C` 正常停止实例，再回到保有 `$tutorial_root` 的**同一个 shell**启动 YAML 版本；否则另一个 shell 没有这个变量，旧实例也仍占用共享根锁和端口。
+若第 2.6 节的服务仍在运行，先在原终端按 `Ctrl+C` 正常停止，再回到保有 `$tutorial_root` 的**同一个 shell**启动；否则另一个 shell 没有这个变量，旧实例也仍占用共享根锁和端口。
 
 启动：
 
@@ -280,7 +277,7 @@ target/debug/dufs --config "$tutorial_root/dufs.yaml"
 
 YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项会直接失败，不会静默忽略。这样升级时更吵，但能防止操作者误以为某个安全限制仍然生效。
 
-配置优先级是“内置默认值 → YAML → 命令行中明确给出的参数”。因此命令行值会覆盖 YAML；重复的 `--bind`、`--trusted-proxy` 和 `--auth` 会分别整体替换 YAML 中的对应列表，而不是追加合并。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
+配置优先级是“内置默认值 → YAML → 命令行中明确给出的非认证参数”。因此命令行中的 `--bind` 和 `--trusted-proxy` 会分别整体替换 YAML 中的对应列表，而不是追加合并。账号只能来自受保护 YAML 的 `auth`；`--auth`/`-a` 会因 argv 可能泄露口令哈希而在读取配置前固定拒绝。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
 
 配置文件本身必须是不超过 1 MiB 的普通 UTF-8 文件，不能是符号链接、FIFO 或设备。Linux 上只允许 root 或服务 euid 拥有，mode 必须精确为 `0400/0440/0600/0640`；组读模式要求 gid 匹配服务 egid，还要求单硬链接且没有扩展 POSIX access ACL。文件只打开一次，ACL 探测与正文读取使用同一 fd，并在读取前后复核身份、安全属性、大小和修改时间没有变化。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量；测试脚本中名字相似的环境变量只控制测试工具，不会成为服务配置。
 

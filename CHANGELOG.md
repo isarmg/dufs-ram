@@ -6,6 +6,7 @@
 
 ### 变更
 
+- **破坏性安全变更：** 不再接受或展示 `--auth`/`-a`，以免 Argon2id PHC 通过 argv、`/proc`、服务管理器或 CI 日志泄露；所有账号必须迁移到权限受严格校验的 YAML `auth`，并通过 `--config` 启动。旧参数会在读取配置及创建运行时资源前以固定脱敏错误拒绝，不会静默覆盖 YAML。曾传递真实 PHC 的部署应清理 shell、服务和 CI 历史并轮换凭据；官方 systemd 样例已只使用配置路径，无需修改启动参数。
 - 不再因直连 TCP peer 是回环地址而隐式信任 `X-Forwarded-For` / `X-Forwarded-Proto`；新增可重复的 `--trusted-proxy <IP[/CIDR]>` 与 YAML `trusted-proxies`，默认空并失败关闭。现有 HTTPS 反向代理部署必须显式声明直连网关地址；官方同机样例已配置 `127.0.0.1/32`。
 - 同步 `v0.48.0` GitHub Release、受保护 tag 和自动便捷二进制已经公开的文档状态。
 

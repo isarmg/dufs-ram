@@ -9,7 +9,7 @@ fn sqlite_state_dir_resumes_upload_after_restart() -> Result<(), Error> {
         OsString::from("--state-dir"),
         state_dir.path().as_os_str().to_owned(),
     ];
-    let mut server = server(state_args.clone());
+    let mut server = server(state_args.clone(), &[TEST_ACCOUNT]);
     let upload_id = Uuid::new_v4();
     let target_name = "sqlite-resumable.bin";
     let upload_length = 6_u64;
@@ -114,7 +114,7 @@ fn sqlite_delete_outbox_purges_trash_and_replays_after_restart() -> Result<(), E
         OsString::from("--state-dir"),
         state_dir.path().as_os_str().to_owned(),
     ];
-    let mut server = server(state_args.clone());
+    let mut server = server(state_args.clone(), &[TEST_ACCOUNT]);
     let target = server.path().join("durable-delete");
     std::fs::create_dir(&target)?;
     for index in 0..1024 {
@@ -209,7 +209,7 @@ fn sqlite_claimed_delete_job_is_recovered_and_purged_after_forced_restart() -> R
         OsString::from("--state-dir"),
         state_dir.path().as_os_str().to_owned(),
     ];
-    let mut server = server(state_args.clone());
+    let mut server = server(state_args.clone(), &[TEST_ACCOUNT]);
     let job_id = Uuid::new_v4();
     let trash_name = format!(".dufs-upload-delete-{job_id}.trash");
     let trash = server.path().join(&trash_name);

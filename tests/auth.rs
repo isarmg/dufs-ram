@@ -2,8 +2,8 @@
 mod fixtures;
 
 use fixtures::{
-    ADMIN_ACCOUNT, Error, TEST_PASSWORD, TestServer, TestSession, USER_ACCOUNT,
-    preflight_upload_target_with, server, tmpdir, with_new_upload_headers,
+    ADMIN_ACCOUNT, Error, TEST_ACCOUNT, TEST_PASSWORD, TestServer, TestSession, USER_ACCOUNT,
+    dufs_command, preflight_upload_target_with, server, tmpdir, with_new_upload_headers,
     with_new_upload_overwrite_headers, with_resume_upload_headers, with_upload_headers,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -13,7 +13,6 @@ use reqwest::header::{
 use reqwest::{Method, StatusCode, Url};
 use rstest::rstest;
 use serde_json::json;
-use std::process::Command;
 use uuid::Uuid;
 
 const CSRF_HEADER: &str = "x-dufs-csrf-token";
@@ -81,7 +80,7 @@ fn request_with_csrf(
 
 #[rstest]
 fn unauthenticated_html_navigation_redirects_to_login(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let client = client_without_redirects()?;
     let response = client
@@ -155,7 +154,7 @@ fn unauthenticated_html_navigation_redirects_to_login(
 
 #[rstest]
 fn noncanonical_login_paths_are_rejected(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let client = client_without_redirects()?;
     for raw_path in [
@@ -182,7 +181,7 @@ fn noncanonical_login_paths_are_rejected(
 
 #[rstest]
 fn unauthenticated_writes_return_401_before_touching_disk(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let put_path = server.path().join("unauthenticated-put.txt");
     let patch_path = server.path().join("unauthenticated-patch.txt");
@@ -235,7 +234,7 @@ fn unauthenticated_writes_return_401_before_touching_disk(
 
 #[rstest]
 fn login_form_uses_one_time_prg_errors_and_sets_cookie_only_on_success(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let client = client_without_redirects()?;
     let mut locations = Vec::new();
@@ -298,11 +297,9 @@ fn login_form_uses_one_time_prg_errors_and_sets_cookie_only_on_success(
 #[rstest]
 fn login_backoff_is_scoped_to_the_source_and_account_pair(
     #[with(&[
-        "--auth",
-        USER_ACCOUNT,
         "--trusted-proxy",
         "127.0.0.1/32"
-    ])]
+    ], &[USER_ACCOUNT])]
     server: TestServer,
 ) -> Result<(), Error> {
     let client = client_without_redirects()?;
@@ -374,11 +371,9 @@ fn login_backoff_is_scoped_to_the_source_and_account_pair(
 #[rstest]
 fn successful_login_clears_the_pair_failure_history(
     #[with(&[
-        "--auth",
-        USER_ACCOUNT,
         "--trusted-proxy",
         "127.0.0.1/32"
-    ])]
+    ], &[USER_ACCOUNT])]
     server: TestServer,
 ) -> Result<(), Error> {
     let client_ip = "192.0.2.20";
@@ -405,7 +400,7 @@ fn successful_login_clears_the_pair_failure_history(
 
 #[rstest]
 fn untrusted_forwarded_addresses_do_not_split_login_backoff(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     for _ in 0..5 {
         let rejected = login_form_response_from(&server, "user", "wrong", Some("192.0.2.30"))?;
@@ -425,7 +420,7 @@ fn untrusted_forwarded_addresses_do_not_split_login_backoff(
 
 #[rstest]
 fn cross_site_login_and_write_requests_are_rejected(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let form = form_urlencoded::Serializer::new(String::new())
         .append_pair("username", "user")
@@ -458,7 +453,7 @@ fn cross_site_login_and_write_requests_are_rejected(
 
 #[test]
 fn configured_argon2id_account_can_log_in() -> Result<(), Error> {
-    let server = server(&["--auth", USER_ACCOUNT]);
+    let server = server(&[] as &[&str], &[USER_ACCOUNT]);
 
     let session = server.login("user", TEST_PASSWORD)?;
     assert_eq!(
@@ -469,13 +464,40 @@ fn configured_argon2id_account_can_log_in() -> Result<(), Error> {
 }
 
 #[rstest]
+fn running_server_argv_contains_only_the_protected_config_path(
+    server: TestServer,
+) -> Result<(), Error> {
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", server.process_id()))?;
+    assert!(
+        !cmdline
+            .windows(b"$argon2id$".len())
+            .any(|window| window == b"$argon2id$"),
+        "running server argv exposed an Argon2id PHC"
+    );
+    assert!(
+        !cmdline
+            .windows(TEST_ACCOUNT.len())
+            .any(|window| window == TEST_ACCOUNT.as_bytes()),
+        "running server argv exposed the complete test account"
+    );
+    let argv = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == b"--config" && !pair[1].is_empty()),
+        "running server argv did not contain the protected config path"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn invalid_password_hash_is_rejected_at_startup(
     tmpdir: assert_fs::fixture::TempDir,
 ) -> Result<(), Error> {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!())
-        .arg(tmpdir.path())
-        .args(["--auth", "user:not-an-argon2id-phc"])
-        .output()?;
+    let (mut command, _auth_config) = dufs_command(&["user:not-an-argon2id-phc"]);
+    let output = command.arg(tmpdir.path()).output()?;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -487,7 +509,7 @@ fn invalid_password_hash_is_rejected_at_startup(
 
 #[rstest]
 fn accounts_have_independent_sessions_and_full_filesystem_access(
-    #[with(&["--auth", ADMIN_ACCOUNT, "--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[ADMIN_ACCOUNT, USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let admin = server.login("admin", TEST_PASSWORD)?;
     let user = server.login("user", TEST_PASSWORD)?;
@@ -537,7 +559,7 @@ fn accounts_have_independent_sessions_and_full_filesystem_access(
 
 #[rstest]
 fn every_write_method_rejects_missing_forged_and_cross_session_csrf(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let session = server.login("user", TEST_PASSWORD)?;
     let other_session = server.login("user", TEST_PASSWORD)?;
@@ -621,7 +643,7 @@ fn every_write_method_rejects_missing_forged_and_cross_session_csrf(
 
 #[rstest]
 fn valid_csrf_allows_put_patch_delete_and_browser_post(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let session = server.login("user", TEST_PASSWORD)?;
 
@@ -679,7 +701,7 @@ fn valid_csrf_allows_put_patch_delete_and_browser_post(
 
 #[rstest]
 fn logout_clears_cookie_and_immediately_revokes_the_session(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let session = server.login("user", TEST_PASSWORD)?;
     let logout = server
@@ -721,7 +743,7 @@ fn logout_clears_cookie_and_immediately_revokes_the_session(
 
 #[rstest]
 fn authorization_header_does_not_replace_browser_session_authentication(
-    #[with(&["--auth", USER_ACCOUNT])] server: TestServer,
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let response = server
         .raw_request(Method::GET, server.url())

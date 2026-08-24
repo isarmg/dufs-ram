@@ -4,7 +4,8 @@ mod fixtures;
 mod utils;
 
 use fixtures::{
-    Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, USER_ACCOUNT, read_bound_url, tmpdir,
+    Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, USER_ACCOUNT, dufs_command, read_bound_url,
+    tmpdir,
 };
 
 use assert_cmd::prelude::*;
@@ -32,14 +33,10 @@ struct Session {
 #[rstest]
 fn verified_session_user_is_written_to_access_log(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
+    let (mut child, port, _state_dir) = spawn_logged_server_with_accounts(
         &tmpdir,
-        &[
-            "--auth",
-            USER_ACCOUNT,
-            "--log-format",
-            "ACCESS $status $remote_user",
-        ],
+        &["--log-format", "ACCESS $status $remote_user"],
+        &[USER_ACCOUNT],
     )?;
     let session = login(port, "user", TEST_PASSWORD)?;
 
@@ -58,8 +55,7 @@ fn verified_session_user_is_written_to_access_log(tmpdir: TempDir) -> Result<(),
 #[rstest]
 fn empty_log_format_disables_access_log(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) =
-        spawn_logged_server(&tmpdir, &["--auth", TEST_ACCOUNT, "--log-format", ""])?;
+    let (mut child, port, _state_dir) = spawn_logged_server(&tmpdir, &["--log-format", ""])?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
     let response = Client::new()
         .get(format!("http://localhost:{port}"))
@@ -76,15 +72,8 @@ fn empty_log_format_disables_access_log(tmpdir: TempDir) -> Result<(), Error> {
 #[rstest]
 fn invalid_session_is_not_written_to_access_log(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
-        &tmpdir,
-        &[
-            "--auth",
-            TEST_ACCOUNT,
-            "--log-format",
-            "ACCESS $status $remote_user",
-        ],
-    )?;
+    let (mut child, port, _state_dir) =
+        spawn_logged_server(&tmpdir, &["--log-format", "ACCESS $status $remote_user"])?;
     let response = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
@@ -102,15 +91,8 @@ fn invalid_session_is_not_written_to_access_log(tmpdir: TempDir) -> Result<(), E
 #[rstest]
 fn authenticated_logout_keeps_verified_user_in_access_log(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
-        &tmpdir,
-        &[
-            "--auth",
-            TEST_ACCOUNT,
-            "--log-format",
-            "ACCESS $status $remote_user",
-        ],
-    )?;
+    let (mut child, port, _state_dir) =
+        spawn_logged_server(&tmpdir, &["--log-format", "ACCESS $status $remote_user"])?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
     let response = Client::new()
         .post(format!("http://localhost:{port}/__dufs__/logout"))
@@ -127,15 +109,14 @@ fn authenticated_logout_keeps_verified_user_in_access_log(tmpdir: TempDir) -> Re
 #[rstest]
 fn sensitive_request_headers_are_redacted(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
+    let (mut child, port, _state_dir) = spawn_logged_server_with_accounts(
         &tmpdir,
         &[
-            "--auth",
-            USER_ACCOUNT,
             "--log-format",
             "SECRETS $http_cookie $http_x_dufs_csrf_token $http_authorization \
              $http_proxy_authorization",
         ],
+        &[USER_ACCOUNT],
     )?;
     let session = login(port, "user", TEST_PASSWORD)?;
     let response = Client::new()
@@ -165,17 +146,16 @@ fn sensitive_request_header_variable_suffixes_are_case_insensitive(
     tmpdir: TempDir,
 ) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
+    let (mut child, port, _state_dir) = spawn_logged_server_with_accounts(
         &tmpdir,
         &[
-            "--auth",
-            USER_ACCOUNT,
             "--log-format",
             "CASE_SECRETS $http_AUTHORIZATION $http_AuThOrIzAtIoN \
              $http_PROXY_AUTHORIZATION $http_PrOxY_AuThOrIzAtIoN \
              $http_COOKIE $http_CoOkIe \
              $http_X_DUFS_CSRF_TOKEN $http_X_DuFs_CsRf_ToKeN",
         ],
+        &[USER_ACCOUNT],
     )?;
     let session = login(port, "user", TEST_PASSWORD)?;
     let authorization_secret = "case-authorization-secret";
@@ -214,14 +194,10 @@ fn mixed_case_non_sensitive_request_header_variable_is_logged(
     tmpdir: TempDir,
 ) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
+    let (mut child, port, _state_dir) = spawn_logged_server_with_accounts(
         &tmpdir,
-        &[
-            "--auth",
-            USER_ACCOUNT,
-            "--log-format",
-            "REQUEST_ID $http_X_ReQuEsT_Id",
-        ],
+        &["--log-format", "REQUEST_ID $http_X_ReQuEsT_Id"],
+        &[USER_ACCOUNT],
     )?;
     let session = login(port, "user", TEST_PASSWORD)?;
     let response = Client::new()
@@ -243,10 +219,8 @@ fn mixed_case_non_sensitive_request_header_variable_is_logged(
 #[rstest]
 fn complete_request_line_keeps_raw_target_and_http_version(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let (mut child, port, _state_dir) = spawn_logged_server(
-        &tmpdir,
-        &["--auth", TEST_ACCOUNT, "--log-format", "REQUEST $request"],
-    )?;
+    let (mut child, port, _state_dir) =
+        spawn_logged_server(&tmpdir, &["--log-format", "REQUEST $request"])?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
@@ -282,12 +256,7 @@ fn truncated_download_is_logged_as_a_stream_failure(tmpdir: TempDir) -> Result<(
 
     let (mut child, port, _state_dir) = spawn_logged_server(
         &tmpdir,
-        &[
-            "--auth",
-            TEST_ACCOUNT,
-            "--log-format",
-            "STREAM $request $log_level $status",
-        ],
+        &["--log-format", "STREAM $request $log_level $status"],
     )?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
@@ -341,8 +310,6 @@ fn authenticated_operation_id_is_available_to_access_logs(tmpdir: TempDir) -> Re
     let (mut child, port, _state_dir) = spawn_logged_server(
         &tmpdir,
         &[
-            "--auth",
-            TEST_ACCOUNT,
             "--log-format",
             "OPERATION $operation_id $operation_state $status",
         ],
@@ -380,12 +347,7 @@ fn only_successful_embedded_asset_gets_are_omitted_from_access_log(
     tmpdir: TempDir,
 ) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let args = [
-        "--auth",
-        TEST_ACCOUNT,
-        "--log-format",
-        "P006 $request_method $request_uri $status",
-    ];
+    let args = ["--log-format", "P006 $request_method $request_uri $status"];
     let (mut child, port, _state_dir) = spawn_logged_server(&tmpdir, &args)?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
     let client = Client::new();
@@ -520,14 +482,15 @@ fn only_successful_embedded_asset_gets_are_omitted_from_access_log(
 #[rstest]
 fn malformed_http_connection_logs_peer_and_category(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
-    let log_file = tmpdir.path().join("connection.log");
+    let log_dir = TempDir::new()?;
+    let log_file = log_dir.path().join("connection.log");
     let state_dir = private_state_dir()?;
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    let mut child = command
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")
         .args(["--bind", "127.0.0.1"])
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .arg("--log-file")
@@ -576,9 +539,9 @@ fn startup_failure_is_written_and_flushed_to_the_configured_log(
     let state_dir = private_state_dir()?;
     let log_dir = TempDir::new()?;
     let log_file = log_dir.path().join("startup.log");
-    Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
+    command
         .arg(tmpdir.path())
-        .args(["--auth", TEST_ACCOUNT])
         .arg("--state-dir")
         .arg(state_dir.path())
         .args(["--bind", "20.205.243.166", "--port", "0"])
@@ -603,8 +566,17 @@ fn serialize_http_logger_test() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_logged_server(tmpdir: &TempDir, args: &[&str]) -> Result<(Child, u16, TempDir), Error> {
+    spawn_logged_server_with_accounts(tmpdir, args, &[TEST_ACCOUNT])
+}
+
+fn spawn_logged_server_with_accounts(
+    tmpdir: &TempDir,
+    args: &[&str],
+    accounts: &[&str],
+) -> Result<(Child, u16, TempDir), Error> {
     let state_dir = private_state_dir()?;
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+    let (mut command, _auth_config) = dufs_command(accounts);
+    let mut child = command
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")

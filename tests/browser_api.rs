@@ -4,7 +4,7 @@ mod fixtures;
 mod utils;
 
 use fixtures::{
-    Error, TestServer, UPLOAD_STAGE_DIRECTORY, preflight_upload_target, server,
+    Error, TEST_ACCOUNT, TestServer, UPLOAD_STAGE_DIRECTORY, preflight_upload_target, server,
     with_resume_upload_headers, with_upload_headers, with_upload_overwrite_headers,
 };
 use reqwest::blocking::{RequestBuilder, Response};

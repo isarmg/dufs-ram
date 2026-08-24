@@ -33,7 +33,7 @@ fn normal_health(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn auth_health(#[with(&["--auth", USER_ACCOUNT])] server: TestServer) -> Result<(), Error> {
+fn auth_health(#[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer) -> Result<(), Error> {
     let url = format!("{}{HEALTH_CHECK_PATH}", server.url());
     let resp = server.raw_request(reqwest::Method::GET, &url).send()?;
     assert_eq!(resp.status(), 200);

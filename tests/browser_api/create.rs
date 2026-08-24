@@ -200,7 +200,7 @@ fn sqlite_state_dir_replays_completed_mkdir_after_restart() -> Result<(), Error>
         OsString::from("--state-dir"),
         state_dir.path().as_os_str().to_owned(),
     ];
-    let mut server = server(state_args.clone());
+    let mut server = server(state_args.clone(), &[TEST_ACCOUNT]);
     let operation_id = Uuid::new_v4();
     let request = json!({"path": "/persistent-idempotent-directory"});
 

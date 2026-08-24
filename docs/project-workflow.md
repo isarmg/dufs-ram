@@ -172,7 +172,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    RAW["每个 --auth / YAML auth 值"] --> SPLIT["按第一个冒号拆分<br/>用户名和 Argon2id PHC"]
+    RAW["受保护 YAML 中的每个 auth 值"] --> SPLIT["按第一个冒号拆分<br/>用户名和 Argon2id PHC"]
     SPLIT --> VALID{"用户名非空且不超过 128 个 UTF-8 字节？<br/>PHC 非空？"}
     VALID -- 否 --> ERROR1["启动失败<br/>只报告账号序号和错误类型"]
     VALID -- 是 --> DUP{"用户名重复？"}
@@ -183,7 +183,7 @@ flowchart TD
     STORE --> FULL["账号拥有整个共享根目录的完整文件管理能力"]
 ```
 
-账号格式固定为 `用户名:$argon2id$...`。应先运行交互式 `dufs hash-password`，再把输出的完整 PHC 字符串写入命令行或 YAML；`hash-password` 和公开哈希入口都拒绝空密码或超过 1024 个 UTF-8 字节的密码，任何其他账号格式也会使启动失败。每个账号拥有整个共享根目录的完整文件管理能力，但仍不能通过符号链接访问根外对象。
+账号格式固定为 `用户名:$argon2id$...`。应先运行交互式 `dufs hash-password`，再把输出的完整 PHC 字符串写入受保护 YAML 的 `auth`；`--auth`/`-a` 会在配置读取前以固定脱敏错误拒绝，避免服务长期把口令验证器留在 argv。`hash-password` 和公开哈希入口都拒绝空密码或超过 1024 个 UTF-8 字节的密码，任何其他账号格式也会使启动失败。每个账号拥有整个共享根目录的完整文件管理能力，但仍不能通过符号链接访问根外对象。
 
 ### 3.2 登录与单次请求认证
 

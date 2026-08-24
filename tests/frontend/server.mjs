@@ -22,7 +22,9 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(currentDir, "..", "..");
 const shareRoot = mkdtempSync(join(tmpdir(), "dufs-frontend-test-"));
 const stateRoot = mkdtempSync(join(tmpdir(), "dufs-frontend-state-"));
+const authRoot = mkdtempSync(join(tmpdir(), "dufs-frontend-auth-"));
 chmodSync(stateRoot, 0o700);
+chmodSync(authRoot, 0o700);
 const externalPort = Number(process.env.DUFS_FRONTEND_TEST_PORT);
 if (
   !Number.isSafeInteger(externalPort) ||
@@ -48,6 +50,12 @@ const binary = join(cargoTargetDir, "debug", "dufs");
 const testPasswordHash =
   "$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 const testAccounts = [`frontend-test-0:${testPasswordHash}`];
+const authConfig = join(authRoot, "dufs.yaml");
+const authYaml = `auth:\n${testAccounts
+  .map(account => `  - '${account.replaceAll("'", "''")}'`)
+  .join("\n")}\n`;
+writeFileSync(authConfig, authYaml, { flag: "wx", mode: 0o600 });
+chmodSync(authConfig, 0o600);
 
 mkdirSync(join(shareRoot, "existing-folder"));
 writeFileSync(join(shareRoot, "existing-folder", "nested.txt"), "nested");
@@ -76,7 +84,8 @@ const child = spawn(
     "0",
     "--state-dir",
     stateRoot,
-    ...testAccounts.flatMap(account => ["--auth", account]),
+    "--config",
+    authConfig,
   ],
   {
     cwd: projectRoot,
@@ -163,6 +172,7 @@ function startProxy(backendPort) {
 function cleanup() {
   rmSync(shareRoot, { recursive: true, force: true });
   rmSync(stateRoot, { recursive: true, force: true });
+  rmSync(authRoot, { recursive: true, force: true });
 }
 
 function stop(exitCode = 0) {

@@ -72,15 +72,19 @@ cargo install --locked --path .
 ./target/release/dufs hash-password
 ```
 
-再把下面的 `$argon2id$…` 替换为命令输出的完整 PHC 字符串：
+再把 `$argon2id$…` 替换为命令输出的完整 PHC，并保存为共享根之外、权限为 `0600` 的 YAML：
+
+```yaml
+serve-path: /需要管理的目录
+state-dir: /专用状态目录
+port: 5000
+auth:
+  - 'admin:$argon2id$…'
+```
 
 ```sh
-install -d -m 0700 /专用状态目录
-./target/release/dufs \
-  -p 5000 \
-  -a 'admin:$argon2id$…' \
-  --state-dir /专用状态目录 \
-  /需要管理的目录
+chmod 0600 /受保护配置目录/dufs.yaml
+./target/release/dufs --config /受保护配置目录/dufs.yaml
 ```
 
 未指定 `--bind` 时，Dufs 默认只监听 `127.0.0.1:5000`。需要从其他主机上的网关回源时，必须显式指定内网 IP，并通过防火墙或 ACL 限制来源；需要 IPv6 时可显式使用 `--bind ::1` 或其他 IPv6 地址。CLI/YAML 至少要提供一个监听地址且不能重复，空的 `bind: []` 或完全重复的 IP 会在创建任何运行时资源前报错退出。全部地址都成功绑定后才初始化共享根和持久状态，运行时构建成功后再统一启动 accept；因此后项绑定失败不会创建或迁移状态库，也不会短暂发布前面的地址。多个 listener 先各自等待可读，只有取得共享连接许可后才从内核 backlog 接受 socket；因此空闲地址不预占许可，用户态已接受连接的总数也不会超过全局上限。
@@ -91,7 +95,7 @@ install -d -m 0700 /专用状态目录
 https://files.example.com/
 ```
 
-服务至少需要一个账号；没有通过命令行或 YAML 配置账号时会拒绝启动。登录后无需开启其他能力开关，即可使用全部文件管理功能。
+服务至少需要一个通过受保护 YAML 配置的账号；缺少账号时会拒绝启动。登录后无需开启其他能力开关，即可使用全部文件管理功能。
 
 ## 账号与登录
 
@@ -101,21 +105,18 @@ https://files.example.com/
 用户名:$argon2id$...
 ```
 
-配置多个账号时重复使用 `--auth`：
+配置多个账号时在受保护 YAML 的 `auth` 列表中逐项添加：
 
-```sh
-./target/release/dufs \
-  -b 127.0.0.1 \
-  -a 'admin:$argon2id$…' \
-  -a 'user:$argon2id$…' \
-  --state-dir /专用状态目录 \
-  /需要管理的目录
+```yaml
+auth:
+  - 'admin:$argon2id$…'
+  - 'user:$argon2id$…'
 ```
 
 使用要求：
 
 - 原始密码必须非空且最多 1024 个 UTF-8 字节；`dufs hash-password`、登录表单解析和 Argon2id 哈希入口共用这一字节上限，配置中保存的是该命令生成的完整 PHC 字符串；
-- 哈希包含 `$`，在 Shell 中应使用单引号；
+- 哈希包含 `$`，在 YAML 中建议使用单引号包围完整账号值；
 - 重复用户名和非 Argon2id 格式会阻止启动；
 - 每个账号均可浏览、上传、覆盖、移动、删除及搜索整个共享根；
 - 登录成功后使用服务端内存会话；空闲 30 分钟或创建满 12 小时后失效，时限按 Linux `CLOCK_BOOTTIME` 计算，系统休眠时间也计入；
@@ -265,7 +266,6 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 | `-b, --bind <ips>` | 监听一个或多个 IPv4/IPv6 地址，默认 `127.0.0.1`；配置结果不能为空 |
 | `--trusted-proxy <networks>` | 信任一个或多个直连代理的 `X-Forwarded-For` / `X-Forwarded-Proto`；接受 IP 或 CIDR，默认不信任任何代理 |
 | `-p, --port <port>` | 监听端口，默认 `5000` |
-| `-a, --auth <account>` | 添加一个拥有完整共享目录权限的账号 |
 | `--log-format <format>` | 自定义 HTTP 访问日志格式 |
 | `--log-file <file>` | 将日志写入文件；路径及可解析别名必须位于共享根之外且不得与配置/状态文件冲突 |
 | `--max-upload-size <bytes>` | 单文件最大声明长度，默认 100 GiB |
@@ -281,6 +281,8 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 | `-V, --version` | 显示版本和构建来源 Git SHA |
 
 当前命令为 `hash-password`，用于交互生成配置所需的 Argon2id PHC；`help` 显示顶层或子命令帮助。
+
+账号只能写入受保护 YAML 的 `auth`。`--auth`/`-a` 不再显示于帮助，并会在读取配置或创建运行时资源前以固定、不会回显账号值的错误拒绝，因为命令行参数可能通过进程列表、服务管理器或 CI 日志暴露 PHC。曾在真实部署中传递 PHC 的操作者应清理相关历史记录并轮换凭据。
 
 `--bind` 只接受 IP 地址，可以重复使用参数或用逗号分隔；主机名、文件路径、Unix socket 路径和完全重复的 IP 会被拒绝。`--trusted-proxy` 同样可重复或用逗号分隔，裸 IP 会规范化为单地址 CIDR；最多配置 128 个网段，单个 `/0` 或多个网段组合覆盖整个 IPv4/IPv6 地址空间都会被拒绝。命令行参数会整体覆盖 YAML 中对应的列表。
 
@@ -350,11 +352,7 @@ Dufs
 默认回环监听适合网关与 Dufs 位于同一主机的部署，无需额外传入 `--bind`：
 
 ```sh
-./target/release/dufs \
-  -p 5000 \
-  --trusted-proxy 127.0.0.1/32 \
-  -a 'admin:$argon2id$…' \
-  /需要管理的目录
+./target/release/dufs --config /etc/dufs/dufs.yaml
 ```
 
 网关位于其他主机时，可显式绑定服务器内网 IP，并用 `--trusted-proxy <网关IP或窄CIDR>` 声明直连网关；只有确有多网卡监听需求时才使用 `0.0.0.0`，并应使用主机防火墙只允许网关访问该端口。
@@ -410,10 +408,9 @@ Authorization、Proxy-Authorization、Cookie 和 CSRF 请求头会在自定义�
 
 ```sh
 ./target/release/dufs \
-  -a 'admin:$argon2id$…' \
+  --config /受保护配置目录/dufs.yaml \
   --log-format '$time_iso8601 $log_level $remote_addr $remote_user "$request" $status operation_id=$operation_id operation_state=$operation_state' \
-  --log-file ./dufs.log \
-  /需要管理的目录
+  --log-file ./dufs.log
 ```
 
 设置 `--log-format=''` 可以关闭 HTTP 访问日志。
