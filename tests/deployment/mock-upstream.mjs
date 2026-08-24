@@ -9,6 +9,9 @@ const server = createServer((request, response) => {
   const chunks = [];
   request.on("data", chunk => chunks.push(chunk));
   request.on("end", () => {
+    if (request.url?.includes("/never-reply")) {
+      return;
+    }
     const finish = () => {
       response.writeHead(200, {
         "content-type": "application/json",
