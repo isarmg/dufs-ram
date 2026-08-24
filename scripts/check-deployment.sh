@@ -44,6 +44,23 @@ do
   }
 done
 
+# All probes use local Unix sockets. The hold route intentionally waits one
+# second, so it receives a separate deadline with ample scheduling margin.
+curl_connect_timeout_seconds=2
+curl_default_max_time_seconds=10
+curl_rejection_max_time_seconds=3
+curl_hold_max_time_seconds=5
+curl_timeout_probe_max_time_seconds=2
+
+bounded_curl() {
+  local max_time_seconds="$1"
+  shift
+  curl \
+    --connect-timeout "$curl_connect_timeout_seconds" \
+    --max-time "$max_time_seconds" \
+    "$@"
+}
+
 shutdown_term_timeout_seconds=5
 shutdown_kill_timeout_seconds=2
 
@@ -453,7 +470,7 @@ start_nginx() {
 }
 
 start_nginx
-curl \
+bounded_curl "$curl_default_max_time_seconds" \
   --noproxy '*' \
   --silent \
   --show-error \
@@ -465,8 +482,7 @@ grep -Eq '^HTTP/[0-9.]+ 308' "$validation_dir/redirect.headers"
 grep -Eiq \
   '^location: https://files\.example\.com/folder\?value=1[[:space:]]*$' \
   "$validation_dir/redirect.headers"
-if curl \
-  --max-time 3 \
+if bounded_curl "$curl_rejection_max_time_seconds" \
   --noproxy '*' \
   --silent \
   --show-error \
@@ -477,9 +493,8 @@ then
   printf 'Unknown HTTP Host was not rejected by the default server.\n' >&2
   exit 1
 fi
-if curl \
+if bounded_curl "$curl_rejection_max_time_seconds" \
   --insecure \
-  --max-time 3 \
   --noproxy '*' \
   --silent \
   --show-error \
@@ -490,10 +505,9 @@ then
   printf 'Unknown HTTPS SNI was not rejected by the default server.\n' >&2
   exit 1
 fi
-if curl \
+if bounded_curl "$curl_rejection_max_time_seconds" \
   --header 'Host: unknown.example.invalid' \
   --insecure \
-  --max-time 3 \
   --noproxy '*' \
   --silent \
   --show-error \
@@ -504,7 +518,7 @@ then
   printf 'Unknown HTTPS Host was accepted with valid SNI.\n' >&2
   exit 1
 fi
-curl \
+bounded_curl "$curl_default_max_time_seconds" \
   --fail \
   --header 'X-Forwarded-For: 203.0.113.99' \
   --http1.1 \
@@ -534,6 +548,35 @@ node -e '
   }
 ' "$validation_dir/upstream.json"
 
+# Exercise the total request deadline against an upstream that accepts the
+# request but deliberately never sends a response.
+timeout_probe_started=$SECONDS
+timeout_probe_status=0
+bounded_curl "$curl_timeout_probe_max_time_seconds" \
+  --http1.1 \
+  --insecure \
+  --noproxy '*' \
+  --silent \
+  --show-error \
+  --unix-socket "$socket_dir/https.sock" \
+  --output /dev/null \
+  'https://files.example.com/never-reply' \
+  2>"$validation_dir/timeout-probe.log" || timeout_probe_status=$?
+timeout_probe_elapsed=$((SECONDS - timeout_probe_started))
+if [[ "$timeout_probe_status" -ne 28 ]]; then
+  printf 'Curl timeout probe returned %s instead of 28.\n' \
+    "$timeout_probe_status" >&2
+  sed -n '1,80p' "$validation_dir/timeout-probe.log" >&2
+  exit 1
+fi
+if [[ "$timeout_probe_elapsed" -gt \
+  $((curl_timeout_probe_max_time_seconds + 3)) ]]
+then
+  printf 'Curl timeout probe exceeded its deadline: %ss.\n' \
+    "$timeout_probe_elapsed" >&2
+  exit 1
+fi
+
 head -c 5000 /dev/zero > "$validation_dir/large-login-body"
 for login_path in \
   '/__dufs__/login' \
@@ -542,7 +585,7 @@ for login_path in \
   '/__dufs__//login'
 do
   login_status="$(
-    curl \
+    bounded_curl "$curl_default_max_time_seconds" \
       --http1.1 \
       --insecure \
       --noproxy '*' \
@@ -564,7 +607,7 @@ do
   }
 done
 ordinary_status="$(
-  curl \
+  bounded_curl "$curl_default_max_time_seconds" \
     --http1.1 \
     --insecure \
     --noproxy '*' \
@@ -583,7 +626,7 @@ stop_nginx
 start_nginx
 connection_pids=()
 for index in {1..5}; do
-  curl \
+  bounded_curl "$curl_hold_max_time_seconds" \
     --http1.1 \
     --insecure \
     --noproxy '*' \
@@ -610,7 +653,7 @@ grep -qx '200' "$validation_dir"/connection-*.status || {
 }
 sleep 13
 connection_recovery_status="$(
-  curl \
+  bounded_curl "$curl_default_max_time_seconds" \
     --http1.1 \
     --insecure \
     --noproxy '*' \
@@ -631,7 +674,7 @@ stop_nginx
 
 start_nginx
 for index in {1..7}; do
-  curl \
+  bounded_curl "$curl_default_max_time_seconds" \
     --http1.1 \
     --insecure \
     --noproxy '*' \
@@ -654,7 +697,7 @@ grep -qx '200' "$validation_dir"/rate-*.status || {
 }
 sleep 13
 rate_recovery_status="$(
-  curl \
+  bounded_curl "$curl_default_max_time_seconds" \
     --http1.1 \
     --insecure \
     --noproxy '*' \
