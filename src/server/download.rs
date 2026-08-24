@@ -237,12 +237,7 @@ fn gated_file_body(
             .await
         },
     );
-    StreamBody::new(
-        stream
-            .map_ok(Frame::data)
-            .map_err(anyhow::Error::from),
-    )
-    .boxed()
+    StreamBody::new(stream.map_ok(Frame::data).map_err(anyhow::Error::from)).boxed()
 }
 
 fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
@@ -398,16 +393,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=2-7"));
         let mut response = Response::default();
-        send_open_file_with_gate(
-            &target,
-            file,
-            &headers,
-            false,
-            &mut response,
-            gate.clone(),
-        )
-        .await
-        .unwrap();
+        send_open_file_with_gate(&target, file, &headers, false, &mut response, gate.clone())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
 
         let (release, blocker) = occupy_gate(&gate).await;

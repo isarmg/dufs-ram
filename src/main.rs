@@ -865,7 +865,9 @@ mod tests {
         let startup = tokio::task::spawn_blocking(move || {
             let _runtime_guard = runtime_handle.enter();
             let _ = entered_sender.send(());
-            release_receiver.recv().expect("startup release was dropped")
+            release_receiver
+                .recv()
+                .expect("startup release was dropped")
         });
 
         tokio::time::timeout(Duration::from_secs(1), entered_receiver)
