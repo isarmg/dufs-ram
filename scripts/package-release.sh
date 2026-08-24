@@ -22,6 +22,17 @@ require_command() {
   }
 }
 
+run_node_entrypoint() {
+  local node_command="$1"
+  local entrypoint="$2"
+  shift 2
+
+  # Staged release paths are anchored below /proc/self/fd. Node's default
+  # main-module realpath would expose the physical output name again and, on
+  # POSIX, rejects a valid backslash in that name as an encoded URL separator.
+  "$node_command" --preserve-symlinks-main "$entrypoint" "$@"
+}
+
 require_shellcheck_version() {
   local output
   local line
@@ -1177,7 +1188,7 @@ verify_release_documentation_layout() {
     return 1
   }
 
-  "$node_command" \
+  run_node_entrypoint "$node_command" \
     "$package_root/scripts/check-docs.mjs" \
     --root "$package_root"
 }
@@ -3080,9 +3091,15 @@ EOF
     return 1
   fi
 
-  "$node_command" "$project_dir/scripts/normalize-sbom.mjs" --self-test
-  "$node_command" "$project_dir/scripts/generate-third-party-notices.mjs" --self-test
-  "$node_command" "$project_dir/scripts/seed-npm-cache.mjs" \
+  run_node_entrypoint \
+    "$node_command" \
+    "$project_dir/scripts/normalize-sbom.mjs" \
+    --self-test
+  run_node_entrypoint \
+    "$node_command" \
+    "$project_dir/scripts/generate-third-party-notices.mjs" \
+    --self-test
+  run_node_entrypoint "$node_command" "$project_dir/scripts/seed-npm-cache.mjs" \
     --self-test \
     "$npm_command"
 
@@ -3752,7 +3769,7 @@ install -m 0600 \
   "$quality_vendor_config" \
   "$quality_isolated_cargo_home/config.toml"
 
-"$node_command" \
+run_node_entrypoint "$node_command" \
   "$quality_source/scripts/seed-npm-cache.mjs" \
   "$quality_source/package-lock.json" \
   "$host_npm_cache" \
@@ -3943,7 +3960,9 @@ release_third_party_notices="$release_stage/THIRD_PARTY_LICENSES.txt"
     --all-features \
     --filter-platform "$host_target" > "$release_metadata"
 )
-"$node_command" "$release_build_source/scripts/generate-third-party-notices.mjs" \
+run_node_entrypoint \
+  "$node_command" \
+  "$release_build_source/scripts/generate-third-party-notices.mjs" \
   "$release_metadata" \
   "$release_build_source/vendor" \
   "$release_build_source" \
@@ -4007,7 +4026,9 @@ second_source_archive_checksum="${second_source_archive_checksum%% *}"
   printf 'Source archive changed between the two isolated extractions.\n' >&2
   exit 1
 }
-"$node_command" "$release_package_source/scripts/normalize-sbom.mjs" \
+run_node_entrypoint \
+  "$node_command" \
+  "$release_package_source/scripts/normalize-sbom.mjs" \
   "$release_sbom" \
   "$release_build_source" \
   "$version" \
