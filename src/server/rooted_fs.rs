@@ -57,6 +57,8 @@ struct RootedFsInner {
     ancestor_creation: Mutex<()>,
     #[cfg(test)]
     before_missing_rename: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_quarantine_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct OpenedParent {
@@ -328,6 +330,8 @@ impl RootedFs {
                 ancestor_creation: Mutex::new(()),
                 #[cfg(test)]
                 before_missing_rename: Mutex::new(None),
+                #[cfg(test)]
+                before_quarantine_sync: Mutex::new(None),
             }),
         })
     }
@@ -351,6 +355,34 @@ impl RootedFs {
         let hook = self
             .inner
             .before_missing_rename
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_before_quarantine_sync_once(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self
+            .inner
+            .before_quarantine_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "a quarantine-sync hook is already installed"
+        );
+    }
+
+    fn run_before_quarantine_sync_hook(&self) {
+        #[cfg(test)]
+        let hook = self
+            .inner
+            .before_quarantine_sync
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -2195,6 +2227,7 @@ impl RootedFs {
                         RenameFlags::NOREPLACE,
                     ) {
                         Ok(()) => {
+                            this.run_before_quarantine_sync_hook();
                             fsync(&parent.fd).map_err(std::io::Error::from)?;
                             return Ok(Some(parent_path.join(name)));
                         }
