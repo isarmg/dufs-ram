@@ -92,7 +92,7 @@
 | C-17 | `--max-connections` | 256；必须大于 0 | 所有监听器共享的活跃 TCP 连接上限 | 保障 |
 | C-18 | `--max-search-entries` | 10000；必须为 1–100000 | 单次递归搜索最多检查的目录项；硬上限同时约束配置和运行时物化 | 保障 |
 | C-22 | `--max-concurrent-searches` | 2；必须大于 0 | 普通目录或递归搜索的首个快照扫描共用并发槽；后续 cursor 页只读取缓存快照，不再占扫描槽 | 保障 |
-| C-24 | `--request-timeout` | 300 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 普通请求处理和响应头生成时限；不限制已开始的文件或 Range 正文总时长，但套接字连续 30 秒无写入进展会断开 | 保障 |
+| C-24 | `--request-timeout` | 300 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 普通请求处理和响应头生成时限；不限制已开始的文件或 Range 正文总时长，但每个源分块读取及套接字写入分别有 30 秒 idle deadline | 保障 |
 | C-25 | `-h/--help`、`-V/--version` | Clap 内置；版本同时显示构建源码 Git SHA，无法取得时显示 `unknown` | 基础命令行自描述和制品来源追踪，删除收益极低 | 开发/运维 |
 | C-26 | `--state-dir` / `state-dir` | 必填；固定使用私有 `0700` 目录内的 `state.sqlite3`，目录须由服务账号所有、非符号链接、与共享根分离，文件绑定共享根 dev/inode；接受空白新库、当前 schema v5，或在一个 `BEGIN IMMEDIATE` 事务内从 schema v2/v3/v4 迁移，不存在进程内数据库模式 | 文件型 store 在同一 schema 中持久化 operation 幂等结果、upload session 与 purge outbox；v2 依次执行上传 v3、purge v4 与版本 v5 迁移，v3 执行 purge v4 后提升到 v5，v4 先提升到 v5 再做 identity-safe stage 路径恢复，其他版本零修改拒绝。升级和备份必须同时考虑状态库与共享根 | 保障 |
 
@@ -181,7 +181,7 @@
 | D-08 | 弱 ETag 与 Last-Modified | ETag 包含 dev、inode、长度、纳秒 mtime/ctime；`If-Range` 存在时返回完整文件 | 防止快速原子替换后拼接错误版本 | 保障 | 中 |
 | D-09 | 扩展名 MIME | 使用 `mime_guess` 的扩展名映射；未知名称固定为 `application/octet-stream`，不读取文件内容或猜测字符集 | 统一 octet-stream 还能再简化少量逻辑，但会丢失下载管理器可用的类型提示 | 可选 | 低 |
 | D-10 | 同一文件句柄、类型与长度一致性 | 数据句柄经根 fd 以 `O_NONBLOCK` 打开，并在同一 fd 上确认普通文件；metadata 和正文都来自该句柄。完整 GET 与 Range 只发送打开时的 metadata 长度，随后原地追加同一 inode 也不会越过已声明正文 | 防止路由分类后被外部写者换成 FIFO 而阻塞，或使头与正文来自不同对象，也防止响应体超过 `Content-Length` | 保障 | 中 |
-| D-11 | 无正文总时限、有写空闲时限 | 响应头发出后的普通文件和 Range 传输不受 `request-timeout` 或最低速率限制，但服务端套接字连续 30 秒没有写入进展会超时关闭；公网总时长/速率策略仍由网关补充 | 避免永久卡死的写端，同时不对持续有进展的慢速大文件设硬总时限 | 建议保留 | 中 |
+| D-11 | 无正文总时限、有读写空闲时限 | 响应头发出后的普通文件和 Range 传输不受 `request-timeout` 或最低速率限制，但每个源文件分块等待/读取和套接字写入分别有 30 秒 idle deadline；公网总时长/速率策略仍由网关补充 | 避免永久卡死的源文件或写端，同时不对持续有进展的慢速大文件设硬总时限 | 建议保留 | 中 |
 
 ## 7. 已移除的目录归档下载
 
@@ -268,7 +268,7 @@
 | --- | --- | --- | --- | --- |
 | R-01 | 全局连接上限 | 每个 listener backlog 为 1024；各 listener 先等待可读，再竞争所有监听器共享的 256 个连接槽，取得许可后才 `try_accept`，所以用户态已接受 socket 严格受上限约束，空闲监听地址也不会预占许可 | 防止连接耗尽进程，同时避免监听地址数量超过许可数时出现确定性地址饥饿 | 保障 |
 | R-02 | HTTP/1 请求头预算 | 10 秒读取时限、64 KiB 最大缓冲 | 防止慢头和异常大头占用连接 | 保障 |
-| R-03 | 普通请求与响应时限 | 300 秒内完成处理和响应头；已经交给提交任务的 mkdir/move/rename/delete 即使外层超时返回带 operation ID/state 的 `504`，仍会在后台完成并更新 registry，首方客户端随后只查询一次最终状态。响应正文无总时长，但底层套接字连续 30 秒无写入进展会超时 | 防止处理、提交等待或完全停滞的客户端无限占用资源，同时不截断持续有进展的大文件传输 | 保障 |
+| R-03 | 普通请求与响应时限 | 300 秒内完成处理和响应头；已经交给提交任务的 mkdir/move/rename/delete 即使外层超时返回带 operation ID/state 的 `504`，仍会在后台完成并更新 registry，首方客户端随后只查询一次最终状态。响应正文无总时长，但每个源文件分块等待/读取和底层套接字写入分别有 30 秒 idle deadline | 防止处理、提交等待、故障源文件或完全停滞的客户端无限占用资源，同时不截断持续有进展的大文件传输 | 保障 |
 | R-04 | Blocking 工作隔离 | RootedFs、列表/搜索、磁盘空间查询、上传维护及持久化 `fsync` 共用 64 个全局 blocking-I/O 准入槽；等待准入的磁盘探针保留在调用方 future 中，取消后不会留下脱离请求的排队任务。许可被移动到实际 blocking closure，内核调用开始后即使外层 future 超时或取消，也不会在调用退出前提前释放。搜索逐条累计结果容量，并在稳定归并排序的索引构造、合并和置换步骤检查取消/deadline | 防止故障 FUSE/NFS 让不可取消 syscall 或已取消请求的等待者无界占满 Tokio blocking pool，也避免先无界物化再事后检查 | 保障 |
 | R-05 | 有界、一致性复核遍历 | 递归搜索使用显式 DFS，深度最多 1024、工作集最多 32 MiB，条目最多 100000；active-ancestor `HashSet` 按最大深度一次性预留并保守预检，结果 `Vec` 和路径字符串扩容前同时扣算旧、新缓冲区峰值。访问前和完成后复核所有访问目录，变化时以 `409` 失败；这仍不是原子文件系统快照 | 不会在结果之外再完整收集中间目录项向量，也不会因结果扩容瞬时越过预算；目录变化不会静默产生明显混合结果，强一致读取仍需存储快照 | 保障 |
 | R-06 | 有界、公平分页快照 | 普通列表和递归搜索都最多物化 100000 项；结果以共享不可变切片保存并只排序一次，页读取只复制一个 `Arc` 后借用当前范围。默认进程级共享缓存绝对 TTL 为 120 秒，总计最多 32 个/64 MiB、每账号最多 8 个/32 MiB；library builder 可显式选择同上限的实例隔离缓存 | 同时控制大目录内存，阻止单账号驱逐其他账号全部快照，消除每页重新扫描/排序及字符串重复克隆；显式隔离适用于多租户 embedder | 保障 |
@@ -524,7 +524,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 | 登录与密码 | `src/auth.rs`、`src/server/session.rs`、`src/server/login_rate_limit.rs` | `argon2`、`rpassword`、`getrandom`、`subtle` | `rpassword` 主要用于 hash-password；其他部分属于认证、会话或登录限流核心 |
 | 会话、摘要和编码 | `src/auth.rs`、`src/server/assets.rs`、`src/server/listing.rs`、`src/server/listing/snapshot.rs`、`src/server/operation_registry.rs`、`src/server/upload.rs`、`src/server/upload/record.rs` | `sha2`、`base64` | 摘要与 Base64 同时用于会话/账号、资源、页面上下文、抗篡改 cursor、operation 指纹或上传内部名称；固定小写十六进制编解码由 `utils.rs` 的有测试小函数完成，不再引入 `hex` |
 | 统一控制状态 | `src/server/operation_registry.rs`、`src/server/state_store.rs`、`src/server/upload/record.rs`、`src/server/purge.rs` | `rusqlite`（bundled SQLite） | schema v5 文件数据库同时持久化管理 operations/upload_sessions/purge_jobs；SQLite 是唯一状态权威，`state-dir` 必填，不存在内存模式，支持从 v2/v3/v4 事务迁移 |
-| HTTP 服务 | `src/main.rs`、`src/server.rs`、`src/server/router.rs`、`src/server/assets.rs` | `tokio`、`tokio-util`、`hyper`、`hyper-util`、`http-body-util`、`headers`、`bytes`、`futures-util` | 核心运行栈；下载以 `StreamBody` 驱动受全局门控的 fd-relative 分块读取；`tokio-util` 只启用任务生命周期所需的 `rt`，`hyper-util` 只提供 Tokio I/O 和计时适配，生产依赖图不包含 `h2` |
+| HTTP 服务 | `src/main.rs`、`src/server.rs`、`src/server/router.rs`、`src/server/assets.rs` | `tokio`、`tokio-util`、`hyper`、`hyper-util`、`http-body-util`、`headers`、`bytes`、`futures-util` | 核心运行栈；下载以 `StreamBody` 驱动受全局门控的 fd-relative 分块读取，每次门控等待与读取共用 30 秒源 idle deadline；`tokio-util` 只启用任务生命周期所需的 `rt`，`hyper-util` 只提供 Tokio I/O 和计时适配，生产依赖图不包含 `h2` |
 | TCP 监听 | `src/main.rs` | `socket2` | 用于 Linux listener 配置和 backlog |
 | Linux 系统边界与会话计时 | `src/args.rs`、`src/auth.rs`、`src/server/rooted_fs.rs`、`src/server/rooted_fs/purge.rs`、`storage.rs`、`disk_space.rs` | `rustix` | 配置 ACL 探测使用 fd-relative xattr；`CLOCK_BOOTTIME` 让会话期限包含系统休眠；`openat2`、`*at`、`fsync`、fd-relative 递归删除、`fstatvfs` 等构成文件系统边界 |
 | 路由和表单编码 | `src/server.rs`、`src/server/router.rs`、`session.rs`、前端 URL | `percent-encoding`、`form_urlencoded` | 登录、查询和路径编码共同使用 |

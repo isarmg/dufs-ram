@@ -140,7 +140,7 @@ TCP `accept` 返回的对端 `SocketAddr` 会作为必填参数依次传入 `han
 
 所有监听器共享一个连接信号量，默认最多保留 256 个活跃 TCP 连接。每个 listener 先独立等待可读，确认已有连接进入 backlog 后才可取消地竞争许可，取得许可后立即用 `try_accept` 接收；`WouldBlock` 会释放许可并重新等待，不做错误退避。这样空闲 listener 不占槽，多 bind 和低连接上限不会让某个已公布地址确定性饥饿，而且所有进入用户态的 socket 从接受之初就计入全局上限；超额握手只留在有界内核 backlog。停机可以同时打断可读等待、许可等待和错误退避。后端使用 Hyper HTTP/1 连接处理器，接受 HTTP/1.0 和 HTTP/1.1；HTTP/2 prior knowledge 和 HTTP/1.1 `Upgrade: h2c` 均不受支持。浏览器侧 HTTP/2 或 HTTP/3 必须终止在外部 HTTPS 网关，网关固定用 HTTP/1.1 回源。全部后端连接统一使用 10 秒请求头读取时限和 64 KiB 接收缓冲上限；HTTP/1.0/1.1 单连接请求串行处理，因此一个连接不能再通过并发 HTTP/2 stream 绕过连接预算。
 
-普通请求处理并生成响应头默认限时 300 秒；普通文件和单段 Range 的响应正文没有应用内总时长或最低速率限制，但底层套接字连续 30 秒没有写入进展会超时关闭，公网网关仍应施加自己的总时长/速率策略。登录表单另有正文读取前来源 admission 和短正文总时限。上传使用独立的正文空闲时限、全生命周期总时限、并发数和声明长度预算。空间快照在 blocking 任务中、不持有共享预留 mutex 时读取，返回后只在同设备 revision 未变化时登记，最多重试 8 次，持续竞争失败关闭且其他设备变化不触发重试。上传把逻辑长度及约 1 MiB + 64 KiB 的元数据余量分别按 `f_frsize` 向上取整后预留。
+普通请求处理并生成响应头默认限时 300 秒；普通文件和单段 Range 的响应正文没有应用内总时长或最低速率限制，但每个源文件分块的门控等待及读取连续 30 秒未完成会使正文报错，已经取得的分块在底层套接字连续 30 秒没有写入进展也会超时关闭。两项 idle deadline 相互独立，公网网关仍应施加自己的总时长/速率策略。登录表单另有正文读取前来源 admission 和短正文总时限。上传使用独立的正文空闲时限、全生命周期总时限、并发数和声明长度预算。空间快照在 blocking 任务中、不持有共享预留 mutex 时读取，返回后只在同设备 revision 未变化时登记，最多重试 8 次，持续竞争失败关闭且其他设备变化不触发重试。上传把逻辑长度及约 1 MiB + 64 KiB 的元数据余量分别按 `f_frsize` 向上取整后预留。
 
 列表与搜索分别有并发、遍历项数和内存上限。预算用尽时在能够形成 HTTP 响应的层级返回 `408`、`413`、`429` 或 `504`，并在请求结束、取消或失败后由 RAII guard 释放槽位；移入阻塞 worker 的列表或搜索 permit 会保持到 worker 真正退出。
 
@@ -432,13 +432,13 @@ flowchart TD
     CACHE -- 否 --> RANGE{"Range"}
     RANGE -- 无 --> FULL["200，正文限长至打开时 metadata size"]
     RANGE -- 未知单位 --> FULL
-    RANGE -- 单段有效 --> SINGLE["206，seek 后限长发送"]
+    RANGE -- 单段有效 --> SINGLE["206，按 fd 偏移限长读取"]
     RANGE -- 重复头、多段或非法 --> BAD["416 Range Not Satisfiable"]
 ```
 
 普通文件和单段 Range 都直接使用会话 Cookie。文件 GET 始终返回附件下载响应，查询参数不会切换为其他文件模式；浏览器端不提供预览、编辑或保存入口。
 
-文件从共享根目录文件描述符经 `openat2(O_RDONLY|O_NONBLOCK)` 打开一次，并从同一 fd 的 `fstat` 确认仍为普通文件；路由 metadata 与最终打开之间被外部写者换成 FIFO 时不会在等待 peer 的 open 上挂住，特殊类型也不会进入正文读取。metadata 和正文来自这个已经分类的句柄；附件 MIME 只按请求路径扩展名映射，未知名称固定为 `application/octet-stream`，不再读取样本、seek 回起点或猜测字符集。完整 GET 和 Range 都以这次打开取得的 metadata size 为正文硬上限，因此并发原子替换只影响后续新请求，当前响应的正文、`Content-Length` 和验证器保持同一 inode 版本；外部进程随后向同一 inode 原地追加也不会让本次响应越界。
+文件从共享根目录文件描述符经 `openat2(O_RDONLY|O_NONBLOCK)` 打开一次，并从同一 fd 的 `fstat` 确认仍为普通文件；路由 metadata 与最终打开之间被外部写者换成 FIFO 时不会在等待 peer 的 open 上挂住，特殊类型也不会进入正文读取。metadata 和正文来自这个已经分类的句柄，且 metadata 与每个 fd-relative `read_at` 分块都经过全局阻塞 I/O 门控。每次分块的门控等待与文件系统读取共用一个 30 秒 idle deadline；超时后正文返回带 `TimedOut` 来源的诊断错误，若 blocking worker 已经开始，门控许可仍由它持有到实际系统调用结束。附件 MIME 只按请求路径扩展名映射，未知名称固定为 `application/octet-stream`，不再读取样本、seek 回起点或猜测字符集。完整 GET 和 Range 都以这次打开取得的 metadata size 为正文硬上限，因此并发原子替换只影响后续新请求，当前响应的正文、`Content-Length` 和验证器保持同一 inode 版本；外部进程随后向同一 inode 原地追加也不会让本次响应越界。
 
 ETag 使用设备号、inode、长度及纳秒级 mtime/ctime 生成，并明确带 `W/`，它用于区分通常的文件版本但不是内容摘要。条件请求按 HTTP 优先级执行：`If-Match` 优先于 `If-Unmodified-Since`，`If-None-Match` 优先于 `If-Modified-Since`。相同 `If-None-Match` 可按弱比较得到 `304`；`If-Match` 要求强比较，回放服务端发出的弱 ETag 会得到 `412`，而存在文件上的 `If-Match: *` 仍可通过。
 
