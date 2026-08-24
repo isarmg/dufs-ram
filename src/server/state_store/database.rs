@@ -2,11 +2,15 @@ use super::*;
 use rusqlite::{OpenFlags, config::DbConfig};
 use std::{
     fs::{self, File, OpenOptions, Permissions},
-    io::{self, ErrorKind, Seek, SeekFrom},
+    io::{self, ErrorKind, Read, Seek, SeekFrom},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Repository row counts and Linux root-relative path limits keep legitimate
+// state well below this value. Refuse a corrupt or misplaced multi-gigabyte
+// file before duplicating it into the system temporary filesystem.
+const MAX_RAW_DATABASE_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub(super) const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 pub(super) const SCHEMA_V5: &str = r#"
@@ -693,15 +697,11 @@ fn validate_raw_main_database(
         .mode(0o600)
         .open(&snapshot_path)
         .context("Failed to create a private state database validation snapshot")?;
-    let mut source = main_database
-        .file
-        .try_clone()
-        .context("Failed to duplicate the state database validation handle")?;
-    source
-        .seek(SeekFrom::Start(0))
-        .context("Failed to rewind the state database validation handle")?;
-    io::copy(&mut source, &mut destination)
-        .context("Failed to copy the raw state database validation snapshot")?;
+    copy_raw_main_database_snapshot(
+        main_database,
+        &mut destination,
+        MAX_RAW_DATABASE_SNAPSHOT_BYTES,
+    )?;
     drop(destination);
     main_database.revalidate()?;
     sidecars.revalidate()?;
@@ -724,6 +724,60 @@ fn validate_raw_main_database(
     main_database.revalidate()?;
     sidecars.revalidate()?;
     Ok(())
+}
+
+fn copy_raw_main_database_snapshot(
+    main_database: &MainDatabaseGuard,
+    destination: &mut File,
+    max_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        main_database.snapshot.size <= max_bytes,
+        "State database `{}` is {} bytes and exceeds the raw validation snapshot limit of {} bytes",
+        main_database.path.display(),
+        main_database.snapshot.size,
+        max_bytes
+    );
+    let copy_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Raw state database snapshot limit cannot be incremented"))?;
+    let mut source = main_database
+        .file
+        .try_clone()
+        .context("Failed to duplicate the state database validation handle")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .context("Failed to rewind the state database validation handle")?;
+    let mut bounded = source.take(copy_limit);
+    let copied = io::copy(&mut bounded, destination)
+        .context("Failed to copy the raw state database validation snapshot")?;
+    ensure!(
+        copied <= max_bytes,
+        "State database `{}` grew beyond the raw validation snapshot limit of {} bytes while it was being copied",
+        main_database.path.display(),
+        max_bytes
+    );
+    ensure!(
+        copied == main_database.snapshot.size,
+        "State database `{}` changed size while its raw validation snapshot was being copied",
+        main_database.path.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn copy_raw_main_database_snapshot_after_inspect_for_test<F>(
+    source_path: &Path,
+    destination: &mut File,
+    max_bytes: u64,
+    after_inspect: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let main_database = MainDatabaseGuard::inspect(source_path)?;
+    after_inspect()?;
+    copy_raw_main_database_snapshot(&main_database, destination, max_bytes)
 }
 
 #[cfg(test)]

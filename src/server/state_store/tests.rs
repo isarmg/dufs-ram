@@ -1,5 +1,6 @@
 use super::*;
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command as ProcessCommand;
 use tempfile::tempdir;
@@ -1702,6 +1703,61 @@ fn detects_a_sidecar_replacement_before_sqlite_can_open_it() -> Result<()> {
     assert_eq!(fs::read(&path)?, main_before);
     assert_eq!(fs::read(&original)?, b"validated journal");
     assert_eq!(fs::read(&sidecar)?, b"replacement journal");
+    Ok(())
+}
+
+#[test]
+fn raw_main_snapshot_copy_enforces_its_limit_before_and_during_copy() -> Result<()> {
+    let directory = tempdir()?;
+    let source = directory.path().join("state.sqlite3");
+    let oversized_snapshot = directory.path().join("oversized.snapshot");
+    fs::write(&source, [b'x'; 64])?;
+    let mut destination = File::create(&oversized_snapshot)?;
+    let error = database::copy_raw_main_database_snapshot_after_inspect_for_test(
+        &source,
+        &mut destination,
+        8,
+        || Ok(()),
+    )
+    .expect_err("an already oversized raw database was copied");
+    assert!(
+        format!("{error:#}").contains("exceeds the raw validation snapshot limit of 8 bytes"),
+        "unexpected oversized snapshot error: {error:#}"
+    );
+    assert_eq!(destination.metadata()?.len(), 0);
+
+    fs::write(&source, [b'y'; 8])?;
+    let raced_snapshot = directory.path().join("raced.snapshot");
+    let mut destination = File::create(&raced_snapshot)?;
+    let error = database::copy_raw_main_database_snapshot_after_inspect_for_test(
+        &source,
+        &mut destination,
+        8,
+        || {
+            OpenOptions::new()
+                .append(true)
+                .open(&source)?
+                .write_all(&[b'z'; 56])?;
+            Ok(())
+        },
+    )
+    .expect_err("a database growth race crossed the snapshot copy budget");
+    assert!(
+        format!("{error:#}").contains("grew beyond the raw validation snapshot limit of 8 bytes"),
+        "unexpected growth-race error: {error:#}"
+    );
+    assert_eq!(destination.metadata()?.len(), 9);
+
+    fs::write(&source, [b'w'; 8])?;
+    let exact_snapshot = directory.path().join("exact.snapshot");
+    let mut destination = File::create(&exact_snapshot)?;
+    database::copy_raw_main_database_snapshot_after_inspect_for_test(
+        &source,
+        &mut destination,
+        8,
+        || Ok(()),
+    )?;
+    assert_eq!(fs::read(exact_snapshot)?, [b'w'; 8]);
     Ok(())
 }
 
