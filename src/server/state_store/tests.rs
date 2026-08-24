@@ -1,5 +1,7 @@
 use super::*;
+use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::process::Command as ProcessCommand;
 use tempfile::tempdir;
 
 const CAPACITY: usize = 8;
@@ -7,6 +9,18 @@ const PER_OWNER: usize = 4;
 const TTL: Duration = Duration::from_secs(60);
 type SchemaRow = (String, String, String);
 type DatabaseSchemaSnapshot = (i64, i64, String, Vec<SchemaRow>);
+const HOT_ROLLBACK_FIXTURE_PATH: &str = "DUFS_TEST_HOT_ROLLBACK_FIXTURE_PATH";
+
+#[derive(Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+}
 
 const DOWNGRADE_UPLOAD_SCHEMA_TO_V2: &str = r#"
 DROP INDEX upload_sessions_expiry;
@@ -51,6 +65,28 @@ fn set_fixture_schema_version(connection: &Connection, version: i32) -> Result<(
     }
     connection.pragma_update(None, "user_version", version)?;
     Ok(())
+}
+
+#[test]
+fn sqlite_hot_rollback_crash_fixture_helper() -> Result<()> {
+    let Some(path) = std::env::var_os(HOT_ROLLBACK_FIXTURE_PATH) else {
+        return Ok(());
+    };
+    let connection = Connection::open(PathBuf::from(path))?;
+    let mode: String =
+        connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
+    ensure!(mode.eq_ignore_ascii_case("delete"));
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         UPDATE store_meta
+            SET value = X'FFFFFFFFFFFFFFFF'
+          WHERE key = 'root-device-be';",
+    )?;
+    connection.cache_flush()?;
+    // Exit without Rust or SQLite destructors so the rollback journal remains
+    // genuinely hot and the flushed main page still needs recovery.
+    std::process::exit(86);
 }
 
 fn key(owner: u8, id: u8) -> OperationKey {
@@ -148,6 +184,30 @@ fn database_schema_snapshot(path: &Path) -> Result<DatabaseSchemaSnapshot> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((application_id, user_version, journal_mode, schema))
+}
+
+fn state_database_files_snapshot(path: &Path) -> Result<Vec<Option<FileSnapshot>>> {
+    std::iter::once("")
+        .chain(database::SQLITE_SIDECAR_SUFFIXES)
+        .map(|suffix| {
+            let mut snapshot_path = path.as_os_str().to_os_string();
+            snapshot_path.push(suffix);
+            let snapshot_path = PathBuf::from(snapshot_path);
+            match fs::symlink_metadata(&snapshot_path) {
+                Ok(metadata) => Ok(Some(FileSnapshot {
+                    bytes: fs::read(&snapshot_path)?,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    mode: metadata.mode(),
+                    links: metadata.nlink(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                })),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1529,6 +1589,204 @@ fn rejects_tampered_v5_column_constraints_and_index_predicates() -> Result<()> {
         assert_eq!(database_schema_snapshot(&path)?, schema_before);
         assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o640);
     }
+    Ok(())
+}
+
+#[test]
+fn rejects_unsafe_sqlite_sidecars_before_creating_the_main_database() -> Result<()> {
+    for (suffix, kind, expected_error) in [
+        ("-journal", "symlink", "cannot be a symbolic link"),
+        ("-wal", "directory", "must be a regular file"),
+        ("-shm", "hard-link", "cannot have multiple hard links"),
+    ] {
+        let directory = tempdir()?;
+        let path = directory.path().join("state.sqlite3");
+        let mut sidecar_name = path.as_os_str().to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar = PathBuf::from(sidecar_name);
+        let auxiliary = directory.path().join("auxiliary");
+        match kind {
+            "symlink" => {
+                fs::write(&auxiliary, b"symlink target must remain unchanged")?;
+                symlink(&auxiliary, &sidecar)?;
+            }
+            "directory" => fs::create_dir(&sidecar)?,
+            "hard-link" => {
+                fs::write(&sidecar, b"hard-linked sidecar must remain unchanged")?;
+                fs::hard_link(&sidecar, &auxiliary)?;
+            }
+            _ => unreachable!("the sidecar fixture kind is fixed"),
+        }
+
+        let result = StateStore::open(&path, &root(701, 709), CAPACITY, PER_OWNER, TTL);
+        let error = result
+            .err()
+            .expect("an unsafe SQLite sidecar must fail before database creation");
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "unexpected {kind} error: {error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&path).is_err_and(|error| error.kind() == ErrorKind::NotFound),
+            "the main database was created for an unsafe {kind} sidecar"
+        );
+        match kind {
+            "symlink" => {
+                assert!(fs::symlink_metadata(&sidecar)?.file_type().is_symlink());
+                assert_eq!(
+                    fs::read(&auxiliary)?,
+                    b"symlink target must remain unchanged"
+                );
+            }
+            "directory" => assert!(fs::symlink_metadata(&sidecar)?.is_dir()),
+            "hard-link" => {
+                assert_eq!(fs::metadata(&sidecar)?.nlink(), 2);
+                assert_eq!(
+                    fs::read(&sidecar)?,
+                    b"hard-linked sidecar must remain unchanged"
+                );
+            }
+            _ => unreachable!("the sidecar fixture kind is fixed"),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_an_orphan_regular_sidecar_without_creating_the_main_database() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let wal = directory.path().join("state.sqlite3-wal");
+    fs::write(&wal, b"orphan regular WAL must remain unchanged")?;
+    fs::set_permissions(&wal, Permissions::from_mode(0o600))?;
+    let wal_before = state_database_files_snapshot(&path)?;
+
+    let result = StateStore::open(&path, &root(711, 713), CAPACITY, PER_OWNER, TTL);
+    let error = result
+        .err()
+        .expect("an orphan regular sidecar must not initialize a main database");
+    assert!(format!("{error:#}").contains("while a SQLite sidecar already exists"));
+    assert!(fs::symlink_metadata(&path).is_err_and(|error| error.kind() == ErrorKind::NotFound));
+    assert_eq!(state_database_files_snapshot(&path)?, wal_before);
+    Ok(())
+}
+
+#[test]
+fn detects_a_sidecar_replacement_before_sqlite_can_open_it() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let sidecar = directory.path().join("state.sqlite3-journal");
+    let original = directory.path().join("original-journal");
+    fs::write(&path, b"main database bytes must remain unchanged")?;
+    fs::write(&sidecar, b"validated journal")?;
+
+    let main_before = fs::read(&path)?;
+    let result = database::open_existing_database_after_sidecar_snapshot_for_test(
+        &path,
+        root(719, 727),
+        || {
+            fs::rename(&sidecar, &original)?;
+            fs::write(&sidecar, b"replacement journal")?;
+            Ok(())
+        },
+    );
+    let error = result
+        .err()
+        .expect("a sidecar replacement must be rejected before SQLite opens the database");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("SQLite sidecar")
+            && (error.contains("changed identity or security metadata")
+                || error.contains("replaced after validation")),
+        "unexpected sidecar replacement error: {error}"
+    );
+    assert_eq!(fs::read(&path)?, main_before);
+    assert_eq!(fs::read(&original)?, b"validated journal");
+    assert_eq!(fs::read(&sidecar)?, b"replacement journal");
+    Ok(())
+}
+
+#[test]
+fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(733, 739);
+    let mut connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TABLE foreign_records(id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
+         INSERT INTO foreign_records(value) VALUES ('foreign main must survive');",
+    )?;
+    connection.pragma_update(None, "application_id", 0x1122_3344_i32)?;
+    connection.pragma_update(None, "user_version", 1_i32)?;
+    let mode: String =
+        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    assert!(mode.eq_ignore_ascii_case("wal"));
+    connection.pragma_update(None, "wal_autocheckpoint", 0_i64)?;
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch("DROP TABLE foreign_records;")?;
+    transaction.execute_batch(database::SCHEMA_V5)?;
+    transaction.execute(
+        "INSERT INTO store_meta(key, value) VALUES
+         ('root-device-be', ?1), ('root-inode-be', ?2)",
+        params![
+            identity.device.to_be_bytes().as_slice(),
+            identity.inode.to_be_bytes().as_slice()
+        ],
+    )?;
+    transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+
+    let wal = directory.path().join("state.sqlite3-wal");
+    let shm = directory.path().join("state.sqlite3-shm");
+    assert!(fs::metadata(&wal)?.is_file());
+    assert!(fs::metadata(&shm)?.is_file());
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let files_before = state_database_files_snapshot(&path)?;
+
+    let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
+    let error = result
+        .err()
+        .expect("a DUFS v5 WAL must not be allowed to shadow a foreign main database");
+    assert!(
+        format!("{error:#}").contains("raw main state database"),
+        "unexpected WAL-shadow error: {error:#}"
+    );
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
+    drop(connection);
+    Ok(())
+}
+
+#[test]
+fn hot_rollback_baseline_is_rejected_without_recovery_or_modification() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(743, 751);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    store.shutdown_for_test();
+
+    let status = ProcessCommand::new(std::env::current_exe()?)
+        .arg("sqlite_hot_rollback_crash_fixture_helper")
+        .arg("--test-threads=1")
+        .env(HOT_ROLLBACK_FIXTURE_PATH, path.as_os_str())
+        .status()?;
+    assert_eq!(status.code(), Some(86));
+    let journal = directory.path().join("state.sqlite3-journal");
+    assert!(fs::metadata(&journal)?.is_file());
+    assert_eq!(fs::metadata(&journal)?.nlink(), 1);
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let files_before = state_database_files_snapshot(&path)?;
+
+    let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
+    let error = result
+        .err()
+        .expect("a hot rollback database with an untrusted raw baseline must be rejected");
+    assert!(
+        format!("{error:#}").contains("raw main state database"),
+        "unexpected hot-rollback error: {error:#}"
+    );
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
 }
 
