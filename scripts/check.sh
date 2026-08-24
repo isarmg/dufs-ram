@@ -94,7 +94,13 @@ fi
 # 发布自测统一聚合 normalize-sbom、third-party notices 与 npm cache seed，
 # 避免在总检查入口重复执行或让三者的验证范围发生漂移。
 run ./scripts/package-release.sh --self-test
-run ./scripts/check-deployment.sh
+if [[ "${DUFS_ISOLATED_QUALITY_GATE:-}" == "1" ]]; then
+  # 发布输出路径可以包含 shell 元字符，但 Nginx/sed 部署夹具的临时路径
+  # 只接受安全字符。部署脚本仍会在 /tmp 下创建并清理私有随机目录。
+  run env TMPDIR=/tmp ./scripts/check-deployment.sh
+else
+  run ./scripts/check-deployment.sh
+fi
 
 run cargo fmt --all --check
 run cargo clippy --locked --all-targets --all-features -- -D warnings
