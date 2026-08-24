@@ -1,11 +1,19 @@
 use std::{
     collections::HashMap,
+    pin::Pin,
     str::FromStr,
+    task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use chrono::{Local, SecondsFormat};
-use hyper::{Method, Request, Version, header::HeaderName};
+use http_body_util::combinators::BoxBody;
+use hyper::{
+    Method, Request, Version,
+    body::{Body, Frame, SizeHint},
+    header::HeaderName,
+};
 
 use crate::{logger::BoundedLogLine, utils::decode_uri};
 
@@ -156,6 +164,37 @@ impl HttpLogger {
         emit_http_access(&output, is_error);
     }
 
+    /// Delay an access-log record until the response body finishes producing
+    /// frames. Streaming failures and bodies dropped before completion are
+    /// therefore recorded as errors instead of an eager successful response.
+    pub(crate) fn log_response_body(
+        &self,
+        data: HashMap<String, String>,
+        body: BoxBody<Bytes, anyhow::Error>,
+        expected_body_bytes: Option<u64>,
+        handler_error: Option<String>,
+        omit_success: bool,
+    ) -> BoxBody<Bytes, anyhow::Error> {
+        if self.elements.is_empty() {
+            return body;
+        }
+
+        let logger = self.clone();
+        let completion: ResponseLogCompletion = Box::new(move |body_error| {
+            let error = combine_response_errors(handler_error, body_error);
+            if !omit_success || error.is_some() {
+                logger.log(&data, error);
+            }
+        });
+        let expected_body_bytes = expected_body_bytes.or_else(|| body.size_hint().exact());
+        if body.is_end_stream() {
+            completion(body_length_error(expected_body_bytes, 0));
+            body
+        } else {
+            BoxBody::new(AccessLogBody::new(body, expected_body_bytes, completion))
+        }
+    }
+
     fn render(&self, data: &HashMap<String, String>, err: Option<&str>) -> String {
         let wall_clock = (self.needs.contains(LogNeeds::TIME_LOCAL)
             || self.needs.contains(LogNeeds::TIME_ISO8601))
@@ -209,6 +248,107 @@ impl HttpLogger {
             append_sanitized_log_value(&mut output, err);
         }
         output.finish()
+    }
+}
+
+type ResponseLogCompletion = Box<dyn FnOnce(Option<String>) + Send + Sync + 'static>;
+
+struct AccessLogBody {
+    inner: BoxBody<Bytes, anyhow::Error>,
+    expected_body_bytes: Option<u64>,
+    produced_body_bytes: u64,
+    completion: Option<ResponseLogCompletion>,
+}
+
+impl AccessLogBody {
+    fn new(
+        inner: BoxBody<Bytes, anyhow::Error>,
+        expected_body_bytes: Option<u64>,
+        completion: ResponseLogCompletion,
+    ) -> Self {
+        Self {
+            inner,
+            expected_body_bytes,
+            produced_body_bytes: 0,
+            completion: Some(completion),
+        }
+    }
+
+    fn complete(&mut self, error: Option<String>) {
+        if let Some(completion) = self.completion.take() {
+            completion(error);
+        }
+    }
+}
+
+impl Body for AccessLogBody {
+    type Data = Bytes;
+    type Error = anyhow::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.produced_body_bytes =
+                        this.produced_body_bytes.saturating_add(data.len() as u64);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.complete(Some(format!("response body stream failed: {error:#}")));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.complete(body_length_error(
+                    this.expected_body_bytes,
+                    this.produced_body_bytes,
+                ));
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for AccessLogBody {
+    fn drop(&mut self) {
+        let error = match body_length_error(self.expected_body_bytes, self.produced_body_bytes) {
+            Some(error) => Some(error),
+            None if self.expected_body_bytes.is_some() => None,
+            None => Some("response body was dropped before stream completion".to_string()),
+        };
+        self.complete(error);
+    }
+}
+
+fn body_length_error(expected: Option<u64>, produced: u64) -> Option<String> {
+    expected
+        .filter(|expected| *expected != produced)
+        .map(|expected| {
+            format!("response body produced {produced} bytes but declared {expected} bytes")
+        })
+}
+
+fn combine_response_errors(
+    handler_error: Option<String>,
+    body_error: Option<String>,
+) -> Option<String> {
+    match (handler_error, body_error) {
+        (Some(handler), Some(body)) => Some(format!("{handler}; {body}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     }
 }
 
@@ -348,7 +488,71 @@ fn append_sanitized_log_value(output: &mut BoundedLogLine, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use http_body_util::{BodyExt, StreamBody};
     use hyper::Uri;
+    use std::sync::mpsc;
+
+    fn observed_body(
+        body: BoxBody<Bytes, anyhow::Error>,
+        expected_body_bytes: Option<u64>,
+    ) -> (
+        BoxBody<Bytes, anyhow::Error>,
+        mpsc::Receiver<Option<String>>,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let completion: ResponseLogCompletion = Box::new(move |error| {
+            sender.send(error).unwrap();
+        });
+        (
+            BoxBody::new(AccessLogBody::new(body, expected_body_bytes, completion)),
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn response_body_completion_distinguishes_success_failure_and_drop() {
+        let successful = crate::http_utils::body_full("complete");
+        let (successful, success) = observed_body(successful, Some(8));
+        assert_eq!(
+            successful.collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"complete")
+        );
+        assert_eq!(success.recv().unwrap(), None);
+
+        let failing = StreamBody::new(stream::iter([Err::<Frame<Bytes>, anyhow::Error>(
+            anyhow::anyhow!("synthetic read failure"),
+        )]))
+        .boxed();
+        let (failing, failure) = observed_body(failing, None);
+        assert!(failing.collect().await.is_err());
+        assert_eq!(
+            failure.recv().unwrap().as_deref(),
+            Some("response body stream failed: synthetic read failure")
+        );
+
+        let pending =
+            StreamBody::new(stream::pending::<Result<Frame<Bytes>, anyhow::Error>>()).boxed();
+        let (pending, dropped) = observed_body(pending, None);
+        drop(pending);
+        assert_eq!(
+            dropped.recv().unwrap().as_deref(),
+            Some("response body was dropped before stream completion")
+        );
+
+        // Hyper may stop polling after the declared Content-Length instead of
+        // asking a body for one final EOF frame. Dropping at that exact byte
+        // boundary is a completed response, not an aborted stream.
+        let exact = crate::http_utils::body_full("complete");
+        let (mut exact, exact_drop) = observed_body(exact, Some(8));
+        let frame = std::future::poll_fn(|context| Pin::new(&mut exact).poll_frame(context))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"complete"));
+        drop(exact);
+        assert_eq!(exact_drop.recv().unwrap(), None);
+    }
 
     #[test]
     fn request_header_variables_have_one_canonical_identity() {

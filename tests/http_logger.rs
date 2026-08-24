@@ -273,6 +273,69 @@ fn complete_request_line_keeps_raw_target_and_http_version(tmpdir: TempDir) -> R
 }
 
 #[rstest]
+fn truncated_download_is_logged_as_a_stream_failure(tmpdir: TempDir) -> Result<(), Error> {
+    let _test_guard = serialize_http_logger_test();
+    let download_path = tmpdir.path().join("truncated.bin");
+    let download = std::fs::File::create(&download_path)?;
+    download.set_len(64 * 1024 * 1024)?;
+    drop(download);
+
+    let (mut child, port, _state_dir) = spawn_logged_server(
+        &tmpdir,
+        &[
+            "--auth",
+            TEST_ACCOUNT,
+            "--log-format",
+            "STREAM $request $log_level $status",
+        ],
+    )?;
+    let session = login(port, TEST_USER, TEST_PASSWORD)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(
+        format!(
+            "GET /truncated.bin HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+            session.cookie
+        )
+        .as_bytes(),
+    )?;
+
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte)?;
+        headers.push(byte[0]);
+        if headers.len() > 64 * 1024 {
+            return Err("Download response headers exceeded their limit".into());
+        }
+    }
+    let headers = String::from_utf8(headers)?;
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers.contains("content-length: 67108864\r\n"),
+        "{headers}"
+    );
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&download_path)?
+        .set_len(0)?;
+    let mut remainder = Vec::new();
+    let _ = stream.read_to_end(&mut remainder);
+
+    let output = stop_and_read(&mut child)?;
+    assert!(
+        output.lines().any(|line| {
+            line.starts_with("STREAM GET /truncated.bin HTTP/1.1 ERROR 200 ")
+                && line.contains("response body stream failed:")
+                && line.contains("ended before its advertised length")
+        }),
+        "truncated download was not logged as a response stream failure:\n{output}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn authenticated_operation_id_is_available_to_access_logs(tmpdir: TempDir) -> Result<(), Error> {
     let _test_guard = serialize_http_logger_test();
     let (mut child, port, _state_dir) = spawn_logged_server(

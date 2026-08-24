@@ -11,7 +11,7 @@ use super::{
 use crate::{app_error::AppError, http_logger::HttpLogger, request_context::RequestContext};
 
 use anyhow::Result;
-use hyper::{Method, StatusCode};
+use hyper::{Method, StatusCode, header::CONTENT_LENGTH};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 mod dispatch;
@@ -98,7 +98,13 @@ impl Server {
                 );
             }
             set_private_no_store(&mut res);
-            log_server_stopping_response(&self.content.args.http_logger, &mut context, &res);
+            attach_access_log(
+                &self.content.args.http_logger,
+                &mut context,
+                &mut res,
+                Some("server is shutting down".to_string()),
+                false,
+            );
             return Ok(res);
         };
         let handle = self.clone().handle_inner(
@@ -137,28 +143,14 @@ impl Server {
                     } else {
                         status_error(&mut res, StatusCode::GATEWAY_TIMEOUT, "Request timed out");
                     }
-                    self.content.args.http_logger.set_runtime_value(
-                        context.access_log_mut(),
-                        "status",
-                        || StatusCode::GATEWAY_TIMEOUT.as_u16().to_string(),
-                    );
-                    if profile.operation_id().is_some() {
-                        let state = if mutation.outcome_can_be_unknown() {
-                            OperationPublicState::Unknown
-                        } else {
-                            OperationPublicState::Rejected
-                        };
-                        self.content.args.http_logger.set_runtime_value(
-                            context.access_log_mut(),
-                            "operation_state",
-                            || state.wire_name().to_owned(),
-                        );
-                    }
-                    self.content.args.http_logger.log(
-                        context.access_log(),
-                        Some("request time budget exceeded".to_string()),
-                    );
                     set_private_no_store(&mut res);
+                    attach_access_log(
+                        &self.content.args.http_logger,
+                        &mut context,
+                        &mut res,
+                        Some("request time budget exceeded".to_string()),
+                        false,
+                    );
                     return Ok(res);
                 }
             }
@@ -178,30 +170,16 @@ impl Server {
                     };
                     set_operation_headers(&mut res, operation_id, state);
                 }
-                if let Some(operation_state) = res
-                    .headers()
-                    .get(OPERATION_STATE_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                {
-                    self.content.args.http_logger.set_runtime_value(
-                        context.access_log_mut(),
-                        "operation_state",
-                        || operation_state.to_string(),
-                    );
-                }
                 let successful_public_asset =
                     profile.is_public_asset() && res.status() == StatusCode::OK;
-                self.content.args.http_logger.set_runtime_value(
-                    context.access_log_mut(),
-                    "status",
-                    || res.status().as_u16().to_string(),
+                let omit_success = profile.omit_success_log() && res.status() == StatusCode::OK;
+                attach_access_log(
+                    &self.content.args.http_logger,
+                    &mut context,
+                    &mut res,
+                    None,
+                    omit_success,
                 );
-                if !(profile.omit_success_log() && res.status() == StatusCode::OK) {
-                    self.content
-                        .args
-                        .http_logger
-                        .log(context.access_log(), None);
-                }
                 (res, successful_public_asset)
             }
             Err(err) => {
@@ -220,16 +198,6 @@ impl Server {
                         apply_operation_failure_before_commit(&mut res, operation_id)
                             .expect("serializing a fixed operation response cannot fail");
                     }
-                    let state = if mutation.outcome_can_be_unknown() {
-                        OperationPublicState::Unknown
-                    } else {
-                        OperationPublicState::Rejected
-                    };
-                    self.content.args.http_logger.set_runtime_value(
-                        context.access_log_mut(),
-                        "operation_state",
-                        || state.wire_name().to_owned(),
-                    );
                 } else if let Some(upload) = profile.upload_context() {
                     let (status, code, detail, recovery, state) =
                         if mutation.outcome_can_be_unknown() {
@@ -279,15 +247,13 @@ impl Server {
                 } else {
                     apply_app_error(&mut res, &error);
                 }
-                self.content.args.http_logger.set_runtime_value(
-                    context.access_log_mut(),
-                    "status",
-                    || res.status().as_u16().to_string(),
+                attach_access_log(
+                    &self.content.args.http_logger,
+                    &mut context,
+                    &mut res,
+                    Some(error.to_string()),
+                    false,
                 );
-                self.content
-                    .args
-                    .http_logger
-                    .log(context.access_log(), Some(error.to_string()));
                 (res, false)
             }
         };
@@ -299,10 +265,12 @@ impl Server {
     }
 }
 
-fn log_server_stopping_response(
+fn attach_access_log(
     logger: &HttpLogger,
     context: &mut RequestContext,
-    response: &Response,
+    response: &mut Response,
+    error: Option<String>,
+    omit_success: bool,
 ) {
     logger.set_runtime_value(context.access_log_mut(), "status", || {
         response.status().as_u16().to_string()
@@ -316,9 +284,27 @@ fn log_server_stopping_response(
             operation_state.to_string()
         });
     }
-    logger.log(
-        context.access_log(),
-        Some("server is shutting down".to_string()),
+    let body = std::mem::take(response.body_mut());
+    let expected_body_bytes = if context.is_head_request()
+        || response.status().is_informational()
+        || matches!(
+            response.status(),
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        ) {
+        Some(0)
+    } else {
+        response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    *response.body_mut() = logger.log_response_body(
+        context.access_log().clone(),
+        body,
+        expected_body_bytes,
+        error,
+        omit_success,
     );
 }
 
@@ -485,7 +471,13 @@ mod tests {
         *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
         set_operation_headers(&mut response, operation_id, OperationPublicState::Rejected);
 
-        log_server_stopping_response(&logger, &mut context, &response);
+        attach_access_log(
+            &logger,
+            &mut context,
+            &mut response,
+            Some("server is shutting down".to_string()),
+            false,
+        );
 
         assert_eq!(
             context.access_log().get("request").map(String::as_str),
