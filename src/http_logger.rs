@@ -5,9 +5,9 @@ use std::{
 };
 
 use chrono::{Local, SecondsFormat};
-use hyper::{Method, Version, header::HeaderName};
+use hyper::{Method, Request, Version, header::HeaderName};
 
-use crate::{logger::BoundedLogLine, server::Request, utils::decode_uri};
+use crate::{logger::BoundedLogLine, utils::decode_uri};
 
 pub const DEFAULT_LOG_FORMAT: &str = r#"$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state"#;
 const MAX_LOG_FORMAT_BYTES: usize = 4096;
@@ -80,7 +80,7 @@ impl LogNeeds {
 }
 
 impl HttpLogger {
-    pub fn data(&self, req: &Request) -> HashMap<String, String> {
+    pub fn data<B>(&self, req: &Request<B>) -> HashMap<String, String> {
         let mut data = HashMap::default();
         if self.needs.contains(LogNeeds::REQUEST) || self.needs.contains(LogNeeds::REQUEST_URI) {
             let uri = req.uri().to_string();

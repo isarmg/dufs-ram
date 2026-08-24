@@ -8,7 +8,7 @@ use super::{
     protocol::{OperationPublicState, UploadPublicState},
     set_private_no_store, status_error, upload,
 };
-use crate::{app_error::AppError, request_context::RequestContext};
+use crate::{app_error::AppError, http_logger::HttpLogger, request_context::RequestContext};
 
 use anyhow::Result;
 use hyper::{Method, StatusCode};
@@ -33,6 +33,14 @@ impl Server {
                 .is_some_and(|path| self.is_public_asset_path(path));
         let profile = RequestProfile::new(&req, relative_path.as_deref(), public_asset_request);
         let mutation = profile.mutation();
+        let mut context = RequestContext::new(&req, addr, &self.content.args.http_logger);
+        if let Some(operation_id) = profile.operation_id() {
+            self.content.args.http_logger.set_runtime_value(
+                context.access_log_mut(),
+                "operation_id",
+                || operation_id.hyphenated().to_string(),
+            );
+        }
 
         // An embedder may retain an Arc<Server> after ServerRuntime shutdown.
         // Reject new work before routing so closed trackers and a stopped
@@ -90,16 +98,9 @@ impl Server {
                 );
             }
             set_private_no_store(&mut res);
+            log_server_stopping_response(&self.content.args.http_logger, &mut context, &res);
             return Ok(res);
         };
-        let mut context = RequestContext::new(&req, addr, &self.content.args.http_logger);
-        if let Some(operation_id) = profile.operation_id() {
-            self.content.args.http_logger.set_runtime_value(
-                context.access_log_mut(),
-                "operation_id",
-                || operation_id.hyphenated().to_string(),
-            );
-        }
         let handle = self.clone().handle_inner(
             req,
             relative_path,
@@ -298,6 +299,29 @@ impl Server {
     }
 }
 
+fn log_server_stopping_response(
+    logger: &HttpLogger,
+    context: &mut RequestContext,
+    response: &Response,
+) {
+    logger.set_runtime_value(context.access_log_mut(), "status", || {
+        response.status().as_u16().to_string()
+    });
+    if let Some(operation_state) = response
+        .headers()
+        .get(OPERATION_STATE_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        logger.set_runtime_value(context.access_log_mut(), "operation_state", || {
+            operation_state.to_string()
+        });
+    }
+    logger.log(
+        context.access_log(),
+        Some("server is shutting down".to_string()),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_upload_problem(
     res: &mut Response,
@@ -439,5 +463,48 @@ mod tests {
         assert_eq!(response.headers()[OPERATION_STATE_HEADER], "unknown");
         assert_eq!(problem["code"], "operation_result_unknown");
         assert_eq!(problem["recovery"], "query_job");
+    }
+
+    #[test]
+    fn server_stopping_response_populates_access_log_fields() {
+        let logger = "$request $remote_addr $status $operation_id $operation_state"
+            .parse::<HttpLogger>()
+            .unwrap();
+        let request = hyper::Request::builder()
+            .method(Method::DELETE)
+            .uri("/late-request")
+            .body(())
+            .unwrap();
+        let peer = "192.0.2.10:41234".parse().unwrap();
+        let mut context = RequestContext::new(&request, peer, &logger);
+        let operation_id = uuid::Uuid::new_v4();
+        logger.set_runtime_value(context.access_log_mut(), "operation_id", || {
+            operation_id.hyphenated().to_string()
+        });
+        let mut response = Response::default();
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        set_operation_headers(&mut response, operation_id, OperationPublicState::Rejected);
+
+        log_server_stopping_response(&logger, &mut context, &response);
+
+        assert_eq!(
+            context.access_log().get("request").map(String::as_str),
+            Some("DELETE /late-request HTTP/1.1")
+        );
+        assert_eq!(
+            context.access_log().get("remote_addr").map(String::as_str),
+            Some("192.0.2.10")
+        );
+        assert_eq!(
+            context.access_log().get("status").map(String::as_str),
+            Some("503")
+        );
+        assert_eq!(
+            context
+                .access_log()
+                .get("operation_state")
+                .map(String::as_str),
+            Some("rejected")
+        );
     }
 }

@@ -948,7 +948,7 @@ flowchart TD
     FLUSH -. "刷新期间第二次信号" .-> DESTRUCTIVE
 ```
 
-Linux 上首次收到 SIGINT 或 SIGTERM 时先取消 listener、通知已有 Hyper 连接 graceful shutdown、关闭 work tracker 并开始排空已有连接；此时不立即把 `running` 设为 false，因此已经进入请求处理的搜索、下载和上传有机会自然结束。嵌入式晚到调用在等待 request gate 时同时监听停机 token；即使 shutdown writer 已经持有独占锁，也会立即得到停止响应，不会等完整 runtime drain 结束。HTTP/1.0/1.1 连接、后台遍历、游标化维护和分片 trash 回收都由 work tracker 跟踪；上传和普通写提交由独立 mutation task 持有请求体/租约/operation guard。首次信号后的同一个 30 秒窗口同时等待普通工作和提交。
+Linux 上首次收到 SIGINT 或 SIGTERM 时先取消 listener、通知已有 Hyper 连接 graceful shutdown、关闭 work tracker 并开始排空已有连接；此时不立即把 `running` 设为 false，因此已经进入请求处理的搜索、下载和上传有机会自然结束。嵌入式晚到调用在等待 request gate 时同时监听停机 token；即使 shutdown writer 已经持有独占锁，也会立即得到停止响应，不会等完整 runtime drain 结束。请求日志上下文在 gate 前建立，所以这类 `503 server_stopping` 仍记录 method、URI、peer、状态及可用的 operation ID/state。HTTP/1.0/1.1 连接、后台遍历、游标化维护和分片 trash 回收都由 work tracker 跟踪；上传和普通写提交由独立 mutation task 持有请求体/租约/operation guard。首次信号后的同一个 30 秒窗口同时等待普通工作和提交。
 
 30 秒到期后把 `running` 置为 false 以取消普通遍历，并以 force token 让仍在接收正文的上传停止、保存有效检查点或清理暂存。服务只再等待最多 10 秒让受跟踪工作和提交收尾；到首次信号约 40 秒的硬截止仍未退出时，记录错误并以状态 1 强制终止。卡在内核/文件系统调用中的 rename、目录 `fsync` 或其他提交此时不再得到持久性保证。
 
