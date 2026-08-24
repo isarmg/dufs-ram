@@ -11,6 +11,8 @@
 
 ## [未发布]
 
+## [0.49.3] - 2026-08-24
+
 ### 安全强化
 
 - 状态目录启动校验现在沿完整祖先链复核目录类型与所有者；祖先必须由 root 或当前有效服务用户拥有，组/其他用户可写的祖先还必须具备 sticky bit，且其中通向状态库的受保护子项由可信用户拥有，拒绝可由非受信本地用户换名或替换的状态库路径。
@@ -21,6 +23,11 @@
 
 - 修复多个未知单位的 `Range` 字段被误判为不可满足范围的问题：未知单位继续按 HTTP 语义忽略并返回完整 `200` 响应，重复的 `bytes` 范围仍按既有严格策略拒绝。
 - 浏览器在确认提交返回契约完整、满 offset 的 `AwaitingConfirmation/query_upload` 响应时，会用同一 upload ID 查询 HEAD checkpoint 并重新取得覆盖确认；phase、length、offset、状态或 recovery 不一致的响应仍失败关闭，不会误提交不完整暂存。
+
+### 升级说明
+
+- 从 `0.49.2` 升级无需修改 CLI、YAML、SQLite schema 或外部 API；升级前应确认状态目录的完整祖先链符合可信所有者与写权限要求，且原始 SQLite 主库不超过 1 GiB，否则新版本会在监听前拒绝启动。
+- 从 `0.48.x` 或更早版本直接升级时，仍必须完成 `0.49.0` 的全部破坏性迁移，尤其是把 `--auth`/`-a` 迁入受保护的 YAML `auth`，并为反向代理显式配置窄范围 `trusted-proxies`。
 
 ### 发布与维护
 
@@ -968,7 +975,8 @@
 
 <!-- 版本比较链接由本 fork 手工维护。 -->
 
-[未发布]: https://github.com/isarmg/dufs-ram/compare/v0.49.2...main
+[未发布]: https://github.com/isarmg/dufs-ram/compare/v0.49.3...main
+[0.49.3]: https://github.com/isarmg/dufs-ram/compare/v0.49.2...v0.49.3
 [0.49.2]: https://github.com/isarmg/dufs-ram/compare/v0.49.1...v0.49.2
 [0.49.1]: https://github.com/isarmg/dufs-ram/compare/v0.49.0...v0.49.1
 [0.49.0]: https://github.com/isarmg/dufs-ram/compare/v0.48.0...v0.49.0
