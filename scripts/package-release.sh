@@ -640,6 +640,38 @@ validate_output_directory() {
   }
 }
 
+validate_private_directory_binding() {
+  local anchored_directory="$1"
+  local physical_directory="$2"
+  local expected_metadata="$3"
+  local description="$4"
+  local anchored_metadata
+  local physical_metadata
+  local resolved_directory
+
+  [[ -d "$physical_directory" && ! -L "$physical_directory" ]] || {
+    printf '%s physical path is not a directory: %s\n' \
+      "$description" \
+      "$physical_directory" >&2
+    return 1
+  }
+  resolved_directory="$(realpath -e -- "$anchored_directory")" || return $?
+  [[ "$resolved_directory" == "$physical_directory" ]] || {
+    printf '%s path binding changed unexpectedly.\n' "$description" >&2
+    return 1
+  }
+  anchored_metadata="$(stat -Lc '%u:%a:%d:%i' -- "$anchored_directory")" || \
+    return $?
+  physical_metadata="$(stat -Lc '%u:%a:%d:%i' -- "$physical_directory")" || \
+    return $?
+  [[ "$anchored_metadata" == "$expected_metadata" && \
+    "$physical_metadata" == "$expected_metadata" ]] || {
+    printf '%s identity, owner, or mode changed unexpectedly.\n' \
+      "$description" >&2
+    return 1
+  }
+}
+
 validate_public_output_binding() {
   local public_directory="$1"
   local locked_directory="$2"
@@ -1911,6 +1943,7 @@ run_publication_self_test() {
   local locked_staged_release
   local locked_final_release
   local original_output_identity
+  local original_output_metadata
   local moved_output
   local replacement_output
   local test_repository
@@ -2394,6 +2427,12 @@ EOF
   flock --exclusive "$test_lock_fd"
   locked_output="/proc/self/fd/$test_lock_fd"
   original_output_identity="$(stat -Lc '%d:%i' -- "$locked_output")"
+  original_output_metadata="$(stat -Lc '%u:%a:%d:%i' -- "$locked_output")"
+  validate_private_directory_binding \
+    "$locked_output" \
+    "$physical_output" \
+    "$original_output_metadata" \
+    'release self-test output'
   if flock --exclusive --nonblock "$physical_output" true 2>/dev/null; then
     printf 'release self-test did not serialize the output directory\n' >&2
     return 1
@@ -2405,6 +2444,15 @@ EOF
   replacement_output="$physical_output"
   mv -T -- "$physical_output" "$moved_output"
   install -d -m 0700 "$replacement_output"
+  if validate_private_directory_binding \
+    "$locked_output" \
+    "$physical_output" \
+    "$original_output_metadata" \
+    'release self-test output' 2>/dev/null
+  then
+    printf 'release self-test did not detect a private path rebinding\n' >&2
+    return 1
+  fi
 
   staged_parent="$(
     mktemp -d --tmpdir="$locked_output" .dufs-release-stage.XXXXXXXX
@@ -2461,6 +2509,11 @@ EOF
     "$physical_output" \
     "$locked_output" \
     "$original_output_identity"
+  validate_private_directory_binding \
+    "$locked_output" \
+    "$physical_output" \
+    "$original_output_metadata" \
+    'release self-test output'
   [[ -d "$final_release" && ! -e "$staged_release" ]] || {
     printf 'release self-test did not publish one complete directory\n' >&2
     return 1
@@ -3407,6 +3460,7 @@ quality_target_dir="$release_stage/quality-cargo-target"
 quality_isolated_home="$release_stage/quality-home"
 quality_isolated_cargo_home="$release_stage/quality-cargo-home"
 quality_tmp_dir="$release_stage/quality-tmp"
+quality_tmp_dir_physical="$release_stage_physical_at_creation/quality-tmp"
 quality_vendor="$release_stage/quality-vendor"
 quality_npm_cache="$release_stage/quality-npm-cache"
 quality_source_archive="$release_stage/quality-source.tar"
@@ -3437,6 +3491,16 @@ install -d -m 0700 \
   "$release_tmp_dir"
 install -m 0600 /dev/null "$quality_isolated_home/npm-userconfig"
 install -m 0600 /dev/null "$quality_isolated_home/npm-globalconfig"
+quality_tmp_metadata="$(stat -Lc '%u:%a:%d:%i' -- "$quality_tmp_dir")"
+[[ "$quality_tmp_metadata" == "$current_uid:700:"* ]] || {
+  printf 'Quality-gate temporary directory is not private.\n' >&2
+  exit 1
+}
+validate_private_directory_binding \
+  "$quality_tmp_dir" \
+  "$quality_tmp_dir_physical" \
+  "$quality_tmp_metadata" \
+  'Quality-gate temporary directory'
 initialize_source_snapshot \
   "$project_dir" \
   "$release_snapshot_git" \
@@ -3821,7 +3885,7 @@ quality_environment=(
   "RUSTC=$rustc_command"
   "RUSTUP_TOOLCHAIN=$required_rust_version"
   "SOURCE_DATE_EPOCH=$release_epoch"
-  "TMPDIR=$quality_tmp_dir"
+  "TMPDIR=$quality_tmp_dir_physical"
   "TZ=UTC"
   "XDG_CACHE_HOME=$quality_isolated_home/.cache"
   "XDG_CONFIG_HOME=$quality_isolated_home/.config"
@@ -3857,10 +3921,30 @@ done
 printf \
   'Running the mandatory isolated quality gate for commit %s.\n' \
   "$source_sha"
+validate_output_directory "$output_dir" "$current_uid"
+validate_public_output_binding \
+  "$output_dir" \
+  "$locked_output_directory" \
+  "$output_identity"
+validate_private_directory_binding \
+  "$quality_tmp_dir" \
+  "$quality_tmp_dir_physical" \
+  "$quality_tmp_metadata" \
+  'Quality-gate temporary directory'
 (
   cd "$quality_source"
   "${quality_environment[@]}" ./scripts/check.sh
 )
+validate_output_directory "$output_dir" "$current_uid"
+validate_public_output_binding \
+  "$output_dir" \
+  "$locked_output_directory" \
+  "$output_identity"
+validate_private_directory_binding \
+  "$quality_tmp_dir" \
+  "$quality_tmp_dir_physical" \
+  "$quality_tmp_metadata" \
+  'Quality-gate temporary directory'
 validate_advisory_database_state \
   "$quality_audit_db" \
   "$rustsec_advisory_db_revision" \
