@@ -122,6 +122,8 @@ flowchart TD
 
 logger 完成初始化后，绑定、共享根、持久状态恢复或后续服务流程返回的错误都会先以完整错误链进入同一异步日志，并执行有界 flush，再由进程返回非零状态。logger 自身初始化失败仍只能直接返回 stderr，因为此时尚没有可用的日志 sink。
 
+运行时构建并统一发布 listener task 后，stdout 只输出便于脚本读取的监听地址。该输出写入失败（包括管道读端提前关闭的 `EPIPE`）会记录 WARN，但不会 panic、撤销 listener 或绕过正常停机；readiness/health 才是判断服务是否可用的权威信号。
+
 配置覆盖关系：
 
 ```text

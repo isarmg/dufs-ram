@@ -11,7 +11,7 @@ use reqwest::blocking::Client;
 use rstest::rstest;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
@@ -234,5 +234,57 @@ fn validate_printed_url(tmpdir: TempDir) -> Result<(), Error> {
         .get_with(&session, server.url())?
         .error_for_status()?;
 
+    Ok(())
+}
+
+#[rstest]
+fn closed_stdout_does_not_abort_the_server(tmpdir: TempDir) -> Result<(), Error> {
+    let port_probe = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = port_probe.local_addr()?.port();
+    drop(port_probe);
+
+    let state_dir = private_state_dir()?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("--port")
+        .arg(port.to_string())
+        .args(["--auth", TEST_ACCOUNT])
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    drop(child.stdout.take().ok_or("Missing child stdout")?);
+
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(200))
+        .build()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if client
+            .get(format!("http://127.0.0.1:{port}/__dufs__/health"))
+            .send()
+            .is_ok_and(|response| response.status() == 200)
+        {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("server exited after stdout closed: {status}").into());
+        }
+        if Instant::now() >= deadline {
+            return Err("server did not become healthy after stdout closed".into());
+        }
+        sleep(Duration::from_millis(20));
+    }
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    if !signal.success() {
+        return Err("Failed to send SIGTERM to test server".into());
+    }
+    let status = child.wait()?;
+    assert!(status.success(), "server did not stop cleanly: {status}");
     Ok(())
 }
