@@ -206,7 +206,7 @@ install -d -m 0700 ./dist
 ```sh
 set -eu
 
-bundle=/secure/releases/dufs-0.48.0-x86_64-unknown-linux-gnu-0123456789ab.release
+bundle=/secure/releases/dufs-0.49.0-x86_64-unknown-linux-gnu-0123456789ab.release
 pinned_public_key=/secure/trust/dufs-release-public.pem
 test -d "$bundle"
 test ! -L "$bundle"
@@ -231,7 +231,7 @@ test ! -L "$release_dir"
 (cd "$release_dir" && sha256sum --check SHA256SUMS)
 
 # 从独立可信的发布记录填写完整值，不从同一下载目录自行推断。
-expected_version=0.48.0
+expected_version=0.49.0
 expected_sha=0123456789abcdef0123456789abcdef01234567
 expected_target=x86_64-unknown-linux-gnu
 test "$("$release_dir/dufs" --version)" = \
