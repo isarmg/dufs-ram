@@ -1,3 +1,6 @@
+# Install this template as a single-link file owned by root or the service
+# euid, with mode 0400/0440/0600/0640 and no extended POSIX access ACL.
+# Group-readable modes require the file gid to match the service egid.
 serve-path: /srv/dufs
 state-dir: /var/lib/dufs
 bind:

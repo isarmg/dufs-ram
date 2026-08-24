@@ -1,10 +1,15 @@
 use anyhow::{Context, Result, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, value_parser};
 use ipnet::IpNet;
+use rustix::{
+    fs::fgetxattr,
+    io::Errno,
+    process::{getegid, geteuid},
+};
 use serde::{Deserialize, Deserializer};
 use std::env;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::net::IpAddr;
 use std::ops::Deref;
@@ -28,6 +33,10 @@ const DEFAULT_MAX_CONCURRENT_SEARCHES: usize = 2;
 const DEFAULT_REQUEST_TIMEOUT: u64 = 300;
 const MAX_TIMEOUT_SECONDS: u64 = 365 * 24 * 60 * 60;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const CONFIG_FILE_TYPE_MASK: u32 = 0o170000;
+const CONFIG_REGULAR_FILE_TYPE: u32 = 0o100000;
+const CONFIG_PERMISSION_MASK: u32 = 0o7777;
+const CONFIG_POSIX_ACL_XATTR: &str = "system.posix_acl_access";
 const MAX_BIND_ADDRESSES: usize = 128;
 const MAX_TRUSTED_PROXIES: usize = 128;
 const STATE_DATABASE_FILE_NAME: &str = "state.sqlite3";
@@ -711,29 +720,64 @@ impl Args {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConfigFileSnapshot {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl ConfigFileSnapshot {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
 fn read_config(path: &Path) -> Result<String> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         // Opening a FIFO or device supplied in place of the config must not
         // block startup before the descriptor type can be verified.
         .custom_flags((rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
         .open(path)
         .with_context(|| format!("Failed to read config at {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("Failed to inspect config at {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("Config at {} must be a regular file", path.display());
-    }
-    if metadata.len() > MAX_CONFIG_BYTES {
-        bail!(
-            "Config at {} exceeds the {MAX_CONFIG_BYTES}-byte limit",
-            path.display()
-        );
-    }
+    let expected_uid = geteuid().as_raw();
+    let expected_gid = getegid().as_raw();
+    read_open_config(&mut file, path, |file| {
+        inspect_open_config(file, path, expected_uid, expected_gid)
+    })
+}
 
-    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_CONFIG_BYTES) as usize);
-    file.take(MAX_CONFIG_BYTES + 1)
+fn read_open_config(
+    file: &mut File,
+    path: &Path,
+    mut inspect: impl FnMut(&File) -> Result<ConfigFileSnapshot>,
+) -> Result<String> {
+    let before = inspect(file)?;
+
+    let mut bytes = Vec::with_capacity(before.size.min(MAX_CONFIG_BYTES) as usize);
+    file.by_ref()
+        .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("Failed to read config at {}", path.display()))?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
@@ -742,8 +786,137 @@ fn read_config(path: &Path) -> Result<String> {
             path.display()
         );
     }
+    let after = inspect(file)?;
+    ensure_config_snapshot_stable(before, after, path, "while it was being read")?;
+
     String::from_utf8(bytes)
         .with_context(|| format!("Config at {} is not valid UTF-8", path.display()))
+}
+
+fn inspect_open_config(
+    file: &File,
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<ConfigFileSnapshot> {
+    inspect_open_config_with(
+        path,
+        expected_uid,
+        expected_gid,
+        || snapshot_open_config(file, path),
+        || config_has_extended_acl(file, path),
+    )
+}
+
+fn inspect_open_config_with(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    mut snapshot: impl FnMut() -> Result<ConfigFileSnapshot>,
+    inspect_acl: impl FnOnce() -> Result<bool>,
+) -> Result<ConfigFileSnapshot> {
+    let before_acl = snapshot()?;
+    let has_extended_acl = inspect_acl()?;
+    validate_config_security(
+        before_acl,
+        has_extended_acl,
+        expected_uid,
+        expected_gid,
+        path,
+    )?;
+    let after_acl = snapshot()?;
+    ensure_config_snapshot_stable(
+        before_acl,
+        after_acl,
+        path,
+        "while its security properties were being verified",
+    )?;
+    Ok(after_acl)
+}
+
+fn snapshot_open_config(file: &File, path: &Path) -> Result<ConfigFileSnapshot> {
+    // `File::metadata` performs fstat on this already-open descriptor; it
+    // never resolves the configured path again.
+    file.metadata()
+        .map(|metadata| ConfigFileSnapshot::from_metadata(&metadata))
+        .with_context(|| format!("Failed to inspect config at {}", path.display()))
+}
+
+fn config_has_extended_acl(file: &File, path: &Path) -> Result<bool> {
+    let mut empty_value = [0_u8; 0];
+    match fgetxattr(file, CONFIG_POSIX_ACL_XATTR, &mut empty_value) {
+        Ok(_) => Ok(true),
+        Err(error) if error == Errno::NODATA || error == Errno::NOTSUP => Ok(false),
+        Err(error) => Err(std::io::Error::from(error)).with_context(|| {
+            format!(
+                "Failed to inspect the POSIX access ACL on config at {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn validate_config_security(
+    snapshot: ConfigFileSnapshot,
+    has_extended_acl: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+    path: &Path,
+) -> Result<()> {
+    if snapshot.mode & CONFIG_FILE_TYPE_MASK != CONFIG_REGULAR_FILE_TYPE {
+        bail!("Config at {} must be a regular file", path.display());
+    }
+    if snapshot.links != 1 {
+        bail!(
+            "Config at {} must have exactly one hard link",
+            path.display()
+        );
+    }
+    if snapshot.uid != 0 && snapshot.uid != expected_uid {
+        bail!(
+            "Config at {} must be owned by root (uid 0) or the effective service user (uid {expected_uid})",
+            path.display(),
+        );
+    }
+
+    let permissions = snapshot.mode & CONFIG_PERMISSION_MASK;
+    if !matches!(permissions, 0o400 | 0o440 | 0o600 | 0o640) {
+        bail!(
+            "Config at {} must have permissions 0400, 0440, 0600, or 0640",
+            path.display()
+        );
+    }
+    if permissions & 0o040 != 0 && snapshot.gid != expected_gid {
+        bail!(
+            "Config at {} with group-read permissions must belong to the effective service group (gid {expected_gid})",
+            path.display(),
+        );
+    }
+    if has_extended_acl {
+        bail!(
+            "Config at {} must not have an extended POSIX access ACL",
+            path.display()
+        );
+    }
+    if snapshot.size > MAX_CONFIG_BYTES {
+        bail!(
+            "Config at {} exceeds the {MAX_CONFIG_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_config_snapshot_stable(
+    before: ConfigFileSnapshot,
+    after: ConfigFileSnapshot,
+    path: &Path,
+    operation: &str,
+) -> Result<()> {
+    if before != after {
+        bail!("Config at {} changed {operation}", path.display());
+    }
+    Ok(())
 }
 
 fn validate_timeout(name: &str, seconds: u64, origin: Instant) -> Result<()> {

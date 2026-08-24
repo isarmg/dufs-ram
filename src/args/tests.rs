@@ -2,6 +2,7 @@ use super::*;
 
 use assert_fs::prelude::*;
 use std::ffi::OsStr;
+use std::os::fd::AsRawFd;
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 
@@ -9,6 +10,32 @@ fn private_state_dir() -> assert_fs::TempDir {
     let state_dir = assert_fs::TempDir::new().unwrap();
     std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     state_dir
+}
+
+fn make_config_private(path: &Path) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if let Err(error) = rustix::fs::removexattr(path, CONFIG_POSIX_ACL_XATTR) {
+        assert!(
+            error == Errno::NODATA || error == Errno::NOTSUP,
+            "failed to remove an inherited config ACL: {error}"
+        );
+    }
+}
+
+fn config_snapshot(mode: u32, uid: u32, gid: u32) -> ConfigFileSnapshot {
+    ConfigFileSnapshot {
+        device: 1,
+        inode: 2,
+        mode: CONFIG_REGULAR_FILE_TYPE | mode,
+        links: 1,
+        uid,
+        gid,
+        size: 128,
+        modified_seconds: 3,
+        modified_nanoseconds: 4,
+        changed_seconds: 5,
+        changed_nanoseconds: 6,
+    }
 }
 
 fn matches_with_state<I, T>(values: I, state_dir: &Path) -> ArgMatches
@@ -88,6 +115,7 @@ fn trusted_proxy_cli_values_replace_yaml_values() {
             "trusted-proxies:\n  - 10.0.0.7/24\n  - 127.0.0.1\nauth:\n  - {TEST_ACCOUNT}\n"
         ))
         .unwrap();
+    make_config_private(config_file.path());
 
     let yaml_matches =
         matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
@@ -132,6 +160,7 @@ fn trusted_proxy_yaml_accepts_a_scalar() {
             "trusted-proxies: 2001:db8::1\nauth:\n  - {TEST_ACCOUNT}\n"
         ))
         .unwrap();
+    make_config_private(config_file.path());
 
     let matches = matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
     let args = Args::parse(matches).unwrap();
@@ -220,6 +249,7 @@ fn test_args_from_empty_config_file_requires_auth() {
     let tmpdir = assert_fs::TempDir::new().unwrap();
     let config_file = tmpdir.child("config.yaml");
     config_file.write_str("").unwrap();
+    make_config_private(config_file.path());
 
     let cli = build_cli();
     let matches = cli
@@ -236,6 +266,7 @@ fn oversized_config_file_is_rejected_before_parsing() {
     config_file
         .write_binary(&vec![b' '; MAX_CONFIG_BYTES as usize + 1])
         .unwrap();
+    make_config_private(config_file.path());
 
     let matches = build_cli()
         .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
@@ -262,6 +293,245 @@ fn symbolic_link_config_file_is_rejected() {
         error.to_string().contains("Failed to read config"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn config_security_accepts_only_the_documented_owner_group_and_mode_combinations() {
+    let expected_uid = 1000;
+    let expected_gid = 2000;
+    for (mode, uid, gid) in [
+        (0o400, expected_uid, 3000),
+        (0o600, 0, 3000),
+        (0o440, 0, expected_gid),
+        (0o440, expected_uid, expected_gid),
+        (0o640, 0, expected_gid),
+        (0o640, expected_uid, expected_gid),
+    ] {
+        validate_config_security(
+            config_snapshot(mode, uid, gid),
+            false,
+            expected_uid,
+            expected_gid,
+            Path::new("config.yaml"),
+        )
+        .unwrap();
+    }
+
+    let wrong_owner = validate_config_security(
+        config_snapshot(0o600, expected_uid + 1, expected_gid),
+        false,
+        expected_uid,
+        expected_gid,
+        Path::new("config.yaml"),
+    )
+    .expect_err("a config owned by an unrelated user was accepted");
+    assert!(wrong_owner.to_string().contains("root (uid 0)"));
+
+    let wrong_group = validate_config_security(
+        config_snapshot(0o640, 0, expected_gid + 1),
+        false,
+        expected_uid,
+        expected_gid,
+        Path::new("config.yaml"),
+    )
+    .expect_err("group-readable config with an unrelated group was accepted");
+    assert!(wrong_group.to_string().contains("effective service group"));
+
+    for mode in [0o000, 0o444, 0o460, 0o620, 0o660, 0o700, 0o4600] {
+        let error = validate_config_security(
+            config_snapshot(mode, expected_uid, expected_gid),
+            false,
+            expected_uid,
+            expected_gid,
+            Path::new("config.yaml"),
+        )
+        .expect_err("an undocumented config mode was accepted");
+        assert!(error.to_string().contains("0400, 0440, 0600, or 0640"));
+    }
+}
+
+#[test]
+fn config_security_rejects_hard_links_and_extended_access_acls() {
+    let mut hard_linked = config_snapshot(0o600, 1000, 2000);
+    hard_linked.links = 2;
+    let hard_link_error =
+        validate_config_security(hard_linked, false, 1000, 2000, Path::new("config.yaml"))
+            .expect_err("a multiply-linked config was accepted");
+    assert!(
+        hard_link_error
+            .to_string()
+            .contains("exactly one hard link")
+    );
+
+    let acl_error = validate_config_security(
+        config_snapshot(0o600, 1000, 2000),
+        true,
+        1000,
+        2000,
+        Path::new("config.yaml"),
+    )
+    .expect_err("a config with an extended access ACL was accepted");
+    assert!(acl_error.to_string().contains("extended POSIX access ACL"));
+}
+
+#[test]
+fn config_snapshot_stability_covers_identity_content_and_security_metadata() {
+    let before = config_snapshot(0o600, 1000, 2000);
+    let changed = [
+        ConfigFileSnapshot {
+            device: before.device + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            inode: before.inode + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            mode: before.mode ^ 0o200,
+            ..before
+        },
+        ConfigFileSnapshot {
+            links: before.links + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            uid: before.uid + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            gid: before.gid + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            size: before.size + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            modified_seconds: before.modified_seconds + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            modified_nanoseconds: before.modified_nanoseconds + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            changed_seconds: before.changed_seconds + 1,
+            ..before
+        },
+        ConfigFileSnapshot {
+            changed_nanoseconds: before.changed_nanoseconds + 1,
+            ..before
+        },
+    ];
+
+    ensure_config_snapshot_stable(
+        before,
+        before,
+        Path::new("config.yaml"),
+        "while it was being read",
+    )
+    .unwrap();
+    for after in changed {
+        let error = ensure_config_snapshot_stable(
+            before,
+            after,
+            Path::new("config.yaml"),
+            "while it was being read",
+        )
+        .expect_err("a changed config snapshot was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was being read")
+        );
+    }
+}
+
+#[test]
+fn injected_acl_inspection_rejects_acl_and_probe_time_metadata_changes() {
+    let before = config_snapshot(0o600, 1000, 2000);
+    let acl_error = inspect_open_config_with(
+        Path::new("config.yaml"),
+        1000,
+        2000,
+        || Ok(before),
+        || Ok(true),
+    )
+    .expect_err("an injected extended ACL was accepted");
+    assert!(acl_error.to_string().contains("extended POSIX access ACL"));
+
+    let after = ConfigFileSnapshot {
+        mode: before.mode ^ 0o200,
+        ..before
+    };
+    let mut snapshots = [before, after].into_iter();
+    let changed_error = inspect_open_config_with(
+        Path::new("config.yaml"),
+        1000,
+        2000,
+        || {
+            Ok(snapshots
+                .next()
+                .expect("the inspector requested two snapshots"))
+        },
+        || Ok(false),
+    )
+    .expect_err("metadata changed during ACL inspection was accepted");
+    assert!(
+        changed_error
+            .to_string()
+            .contains("changed while its security properties were being verified")
+    );
+}
+
+#[test]
+fn injected_reader_reuses_one_fd_and_rejects_changed_post_read_snapshot() {
+    let tmpdir = assert_fs::TempDir::new().unwrap();
+    let config = tmpdir.child("config.yaml");
+    config.write_str("auth: []\n").unwrap();
+    make_config_private(config.path());
+    let mut file = OpenOptions::new().read(true).open(config.path()).unwrap();
+
+    let mut before = config_snapshot(0o600, 1000, 2000);
+    before.size = "auth: []\n".len() as u64;
+    let after = ConfigFileSnapshot {
+        changed_nanoseconds: before.changed_nanoseconds + 1,
+        ..before
+    };
+    let mut calls = 0;
+    let mut observed_fds = Vec::new();
+    let error = read_open_config(&mut file, config.path(), |opened| {
+        observed_fds.push(opened.as_raw_fd());
+        calls += 1;
+        Ok(if calls == 1 { before } else { after })
+    })
+    .expect_err("metadata changed during config reading was accepted");
+
+    assert_eq!(calls, 2);
+    assert_eq!(observed_fds.len(), 2);
+    assert_eq!(observed_fds[0], observed_fds[1]);
+    assert!(
+        error
+            .to_string()
+            .contains("changed while it was being read")
+    );
+}
+
+#[test]
+fn read_config_rejects_a_real_hard_link_and_insecure_mode() {
+    let tmpdir = assert_fs::TempDir::new().unwrap();
+    let insecure = tmpdir.child("insecure.yaml");
+    insecure.write_str("auth: []\n").unwrap();
+    std::fs::set_permissions(insecure.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mode_error = read_config(insecure.path()).expect_err("a 0644 config was accepted");
+    assert!(mode_error.to_string().contains("0400, 0440, 0600, or 0640"));
+
+    let linked = tmpdir.child("linked.yaml");
+    linked.write_str("auth: []\n").unwrap();
+    make_config_private(linked.path());
+    std::fs::hard_link(linked.path(), tmpdir.child("alias.yaml").path()).unwrap();
+    let link_error = read_config(linked.path()).expect_err("a hard-linked config was accepted");
+    assert!(link_error.to_string().contains("exactly one hard link"));
 }
 
 #[test]
@@ -304,6 +574,7 @@ fn config_without_bind_uses_the_loopback_default() {
     config_file
         .write_str(&format!("auth:\n  - {TEST_ACCOUNT}\n"))
         .unwrap();
+    make_config_private(config_file.path());
 
     let matches = matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
     let args = Args::parse(matches).unwrap();
@@ -326,6 +597,7 @@ auth:
         tmpdir.display()
     );
     config_file.write_str(&contents).unwrap();
+    make_config_private(config_file.path());
 
     let matches = matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
     let args = Args::parse(matches).unwrap();
@@ -349,6 +621,7 @@ auth:
         shared_file.display()
     );
     config_file.write_str(&contents).unwrap();
+    make_config_private(config_file.path());
 
     let cli = build_cli();
     let matches = cli
@@ -376,6 +649,7 @@ auth:
 "#
     );
     config_file.write_str(&contents).unwrap();
+    make_config_private(config_file.path());
 
     let matches = matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
     let args = Args::parse(matches).unwrap();
@@ -395,6 +669,7 @@ fn empty_bind_list_is_rejected() {
     config_file
         .write_str(&format!("bind: []\nauth:\n  - {TEST_ACCOUNT}\n"))
         .unwrap();
+    make_config_private(config_file.path());
 
     let matches = build_cli()
         .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
@@ -417,6 +692,7 @@ auth:
         tmpdir.display()
     );
     config_file.write_str(&contents).unwrap();
+    make_config_private(config_file.path());
 
     let cli = build_cli();
     let matches = cli
