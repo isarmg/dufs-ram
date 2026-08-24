@@ -303,17 +303,16 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
                 }
             }
             Ok(WriterCommand::Flush(done)) => {
-                let _ = report_dropped_if_due(
+                dirty |= report_dropped_if_due(
                     &mut output,
                     dropped,
                     &mut last_drop_report,
                     Instant::now(),
                     true,
                 );
-                if let Err(error) = output.flush() {
+                if let Err(error) = flush_if_dirty(&mut dirty, || output.flush()) {
                     report_internal_log_error("log_flush_error", &error);
                 }
-                dirty = false;
                 next_flush = Instant::now() + LOG_FLUSH_INTERVAL;
                 let _ = done.send(());
             }
@@ -329,16 +328,27 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
                 Instant::now(),
                 false,
             );
-            if dirty && let Err(error) = output.flush() {
+            if let Err(error) = flush_if_dirty(&mut dirty, || output.flush()) {
                 report_internal_log_error("log_flush_error", &error);
             }
-            dirty = false;
             next_flush = Instant::now() + LOG_FLUSH_INTERVAL;
         }
     }
 
     report_dropped(&mut output, dropped);
     let _ = output.flush();
+}
+
+fn flush_if_dirty(
+    dirty: &mut bool,
+    flush: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if !*dirty {
+        return Ok(());
+    }
+    flush()?;
+    *dirty = false;
+    Ok(())
 }
 
 fn report_internal_log_error(event: &str, error: &std::io::Error) {
@@ -468,6 +478,28 @@ mod tests {
             .expect_err("closed diagnostic sink unexpectedly accepted the fallback log");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn failed_flush_stays_dirty_until_a_retry_succeeds() {
+        let mut dirty = true;
+        let mut attempts = 0;
+
+        let error = flush_if_dirty(&mut dirty, || {
+            attempts += 1;
+            Err(io::Error::other("first flush failed"))
+        })
+        .expect_err("failed flush unexpectedly succeeded");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(dirty, "a failed flush discarded the pending state");
+
+        flush_if_dirty(&mut dirty, || {
+            attempts += 1;
+            Ok(())
+        })
+        .expect("flush retry failed");
+        assert!(!dirty, "a successful flush left stale pending state");
+        assert_eq!(attempts, 2);
     }
 
     #[test]
