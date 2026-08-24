@@ -85,6 +85,7 @@ jobs:
       - name: Check JavaScript and Markdown
         run: |
           node scripts/extract-release-notes.mjs --self-test
+          node scripts/check-release-workflow.mjs
           npm run check:js
           npm run check:types
           npm run check:docs
