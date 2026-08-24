@@ -477,7 +477,7 @@ Rust 中表示将来可能完成的异步计算。丢弃 Future 不会撤销已�
 先持久记录待执行副作用，再由 worker 可靠消费的模式。删除 purge job 是文件系统与 SQLite 之间的 durable outbox。
 
 **owner digest**
-按具体用途从账号生成的不可逆 `OwnerId`。operation/upload/purge 的持久记录使用兼容历史格式的 `OwnerId::persistent`；列表快照和登录限流使用各自 domain-separated 摘要。它们避免在这些边界直接保存或比较用户名，但不能混成一个全局通用摘要。
+按具体用途从账号生成的假名化 `OwnerId`。operation/upload/purge 的持久记录使用兼容历史格式的 `OwnerId::persistent`；列表快照和登录限流使用各自 domain-separated 摘要。它们避免在这些边界直接保存或比较用户名，但都只是未加密盐的 SHA-256；低熵账号名可被字典枚举，不能视为匿名化或保密边界，也不能混成一个全局通用摘要。
 
 ### P
 
