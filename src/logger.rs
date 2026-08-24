@@ -297,11 +297,7 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
                     false,
                 );
                 if let Err(error) = output.write_line(&entry) {
-                    eprintln!(
-                        "{} ERROR log_writer_error={}",
-                        timestamp(),
-                        sanitize_log_line(&error.to_string())
-                    );
+                    report_internal_log_error("log_writer_error", &error);
                 } else {
                     dirty = true;
                 }
@@ -315,11 +311,7 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
                     true,
                 );
                 if let Err(error) = output.flush() {
-                    eprintln!(
-                        "{} ERROR log_flush_error={}",
-                        timestamp(),
-                        sanitize_log_line(&error.to_string())
-                    );
+                    report_internal_log_error("log_flush_error", &error);
                 }
                 dirty = false;
                 next_flush = Instant::now() + LOG_FLUSH_INTERVAL;
@@ -338,11 +330,7 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
                 false,
             );
             if dirty && let Err(error) = output.flush() {
-                eprintln!(
-                    "{} ERROR log_flush_error={}",
-                    timestamp(),
-                    sanitize_log_line(&error.to_string())
-                );
+                report_internal_log_error("log_flush_error", &error);
             }
             dirty = false;
             next_flush = Instant::now() + LOG_FLUSH_INTERVAL;
@@ -351,6 +339,24 @@ fn writer_loop(receiver: Receiver<WriterCommand>, mut output: LogOutput, dropped
 
     report_dropped(&mut output, dropped);
     let _ = output.flush();
+}
+
+fn report_internal_log_error(event: &str, error: &std::io::Error) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = write_internal_log_error(&mut stderr, event, error);
+}
+
+fn write_internal_log_error(
+    output: &mut impl Write,
+    event: &str,
+    error: &std::io::Error,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "{} ERROR {event}={}",
+        timestamp(),
+        sanitize_log_line(&error.to_string())
+    )
 }
 
 fn report_dropped_if_due(
@@ -435,7 +441,34 @@ pub fn sanitize_log_line(value: &str) -> String {
 mod tests {
     use super::*;
     use log::Log as _;
+    use std::io;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "diagnostic sink is closed",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn internal_log_error_write_failure_is_returned_without_panicking() {
+        let source = io::Error::other("original write failure");
+        let mut output = FailingWriter;
+
+        let error = write_internal_log_error(&mut output, "log_writer_error", &source)
+            .expect_err("closed diagnostic sink unexpectedly accepted the fallback log");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
 
     #[test]
     fn arbitrary_values_are_reduced_to_one_physical_line() {
