@@ -60,6 +60,29 @@ fn removed_options_are_rejected(tmpdir: TempDir, #[case] option: &str) -> Result
 }
 
 #[rstest]
+fn unknown_cli_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
+    let state_dir = private_state_dir()?;
+    let matches = build_cli().try_get_matches_from([
+        "dufs",
+        tmpdir.path().to_str().expect("UTF-8 test path"),
+        "--auth",
+        TEST_ACCOUNT,
+        "--state-dir",
+        state_dir.path().to_str().expect("UTF-8 state path"),
+        "--log-format",
+        "$stauts",
+    ])?;
+    let error = Args::parse(matches).expect_err("unknown CLI log variable was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("Unknown HTTP log variable `$stauts`"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn state_dir_is_required(tmpdir: TempDir) -> Result<(), Error> {
     let matches = build_cli().try_get_matches_from([
         "dufs",

@@ -49,7 +49,15 @@ impl LogNeeds {
     const OPERATION_STATE: u16 = 1 << 10;
 
     fn record(&mut self, name: &str) {
-        self.0 |= match name {
+        self.0 |= Self::variable_flag(name).unwrap_or(0);
+    }
+
+    fn supports(name: &str) -> bool {
+        Self::variable_flag(name).is_some()
+    }
+
+    fn variable_flag(name: &str) -> Option<u16> {
+        Some(match name {
             "request" => Self::REQUEST,
             "request_method" => Self::REQUEST_METHOD,
             "request_uri" => Self::REQUEST_URI,
@@ -61,8 +69,9 @@ impl LogNeeds {
             "status" => Self::STATUS,
             "operation_id" => Self::OPERATION_ID,
             "operation_state" => Self::OPERATION_STATE,
-            _ => 0,
-        };
+            "log_level" => 0,
+            _ => return None,
+        })
     }
 
     fn contains(self, flag: u16) -> bool {
@@ -247,6 +256,9 @@ impl FromStr for HttpLogger {
                     let sensitive = is_sensitive_header(&name);
                     elements.push(LogElement::Header { name, sensitive });
                 } else if let Some(value) = cache.strip_prefix('$') {
+                    if !LogNeeds::supports(value) {
+                        return Err(anyhow::anyhow!("Unknown HTTP log variable `${value}`"));
+                    }
                     elements.push(LogElement::Variable(value.to_string()));
                 }
                 cache.clear();
@@ -378,6 +390,17 @@ mod tests {
                 error
                     .to_string()
                     .contains("Invalid HTTP request header log variable"),
+                "unexpected error for {format:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_fixed_variables_are_rejected() {
+        for format in ["$stauts", "$request_path", "prefix $"] {
+            let error = format.parse::<HttpLogger>().unwrap_err();
+            assert!(
+                error.to_string().contains("Unknown HTTP log variable"),
                 "unexpected error for {format:?}: {error:#}"
             );
         }
