@@ -8,6 +8,51 @@ const TTL: Duration = Duration::from_secs(60);
 type SchemaRow = (String, String, String);
 type DatabaseSchemaSnapshot = (i64, i64, String, Vec<SchemaRow>);
 
+const DOWNGRADE_UPLOAD_SCHEMA_TO_V2: &str = r#"
+DROP INDEX upload_sessions_expiry;
+ALTER TABLE upload_sessions RENAME TO upload_sessions_v3_source;
+CREATE TABLE upload_sessions (
+    owner_digest BLOB NOT NULL CHECK(length(owner_digest) = 32),
+    upload_id BLOB NOT NULL CHECK(length(upload_id) = 16),
+    target_path BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
+    stage_path BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
+    upload_length INTEGER NOT NULL CHECK(upload_length >= 0),
+    durable_offset INTEGER NOT NULL CHECK(durable_offset >= 0),
+    state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4)),
+    stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
+    stage_inode_be BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
+    updated_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(owner_digest, upload_id),
+    CHECK(target_path != stage_path),
+    CHECK(durable_offset <= upload_length),
+    CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
+    CHECK(state != 2 OR durable_offset = upload_length),
+    CHECK(state != 1 OR durable_offset = upload_length)
+) STRICT, WITHOUT ROWID;
+INSERT INTO upload_sessions
+SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
+       durable_offset, state, stage_device_be, stage_inode_be,
+       updated_at_ms, expires_at_ms
+  FROM upload_sessions_v3_source;
+DROP TABLE upload_sessions_v3_source;
+CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
+"#;
+
+fn set_fixture_schema_version(connection: &Connection, version: i32) -> Result<()> {
+    match version {
+        2 => {
+            connection.execute_batch(DOWNGRADE_UPLOAD_SCHEMA_TO_V2)?;
+            connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?;
+        }
+        3 => connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?,
+        4 | SCHEMA_VERSION => {}
+        _ => bail!("unsupported schema fixture version {version}"),
+    }
+    connection.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
+
 fn key(owner: u8, id: u8) -> OperationKey {
     OperationKey {
         owner: [owner; 32],
@@ -1254,38 +1299,7 @@ async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> 
     // Rebuild only the upload table in its exact v2 shape. All other
     // schema objects and root binding came from the real initializer.
     let connection = Connection::open(&path)?;
-    connection.execute_batch(
-        "DROP INDEX upload_sessions_expiry;
-         ALTER TABLE upload_sessions RENAME TO upload_sessions_v3_source;
-         CREATE TABLE upload_sessions (
-             owner_digest BLOB NOT NULL CHECK(length(owner_digest) = 32),
-             upload_id BLOB NOT NULL CHECK(length(upload_id) = 16),
-             target_path BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
-             stage_path BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
-             upload_length INTEGER NOT NULL CHECK(upload_length >= 0),
-             durable_offset INTEGER NOT NULL CHECK(durable_offset >= 0),
-             state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4)),
-             stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
-             stage_inode_be BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
-             updated_at_ms INTEGER NOT NULL,
-             expires_at_ms INTEGER NOT NULL,
-             PRIMARY KEY(owner_digest, upload_id),
-             CHECK(target_path != stage_path),
-             CHECK(durable_offset <= upload_length),
-             CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
-             CHECK(state != 2 OR durable_offset = upload_length),
-             CHECK(state != 1 OR durable_offset = upload_length)
-         ) STRICT, WITHOUT ROWID;
-         INSERT INTO upload_sessions
-         SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-                durable_offset, state, stage_device_be, stage_inode_be,
-                updated_at_ms, expires_at_ms
-           FROM upload_sessions_v3_source;
-         DROP TABLE upload_sessions_v3_source;
-         CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
-         ALTER TABLE purge_jobs DROP COLUMN trash_revision;",
-    )?;
-    connection.pragma_update(None, "user_version", 2_i32)?;
+    set_fixture_schema_version(&connection, 2)?;
     drop(connection);
 
     let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
@@ -1338,8 +1352,7 @@ async fn v3_purge_rows_migrate_with_an_untrusted_null_trash_revision() -> Result
     store.shutdown_for_test();
 
     let connection = Connection::open(&path)?;
-    connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?;
-    connection.pragma_update(None, "user_version", 3_i32)?;
+    set_fixture_schema_version(&connection, 3)?;
     drop(connection);
 
     let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
@@ -1368,7 +1381,7 @@ async fn v4_stage_path_semantics_migrate_to_v5_before_reopen() -> Result<()> {
     store.shutdown_for_test();
 
     let connection = Connection::open(&path)?;
-    connection.pragma_update(None, "user_version", 4_i32)?;
+    set_fixture_schema_version(&connection, 4)?;
     drop(connection);
 
     let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
@@ -1378,6 +1391,144 @@ async fn v4_stage_path_semantics_migrate_to_v5_before_reopen() -> Result<()> {
     );
     assert_eq!(migrated.upload_session(session.key).await?, Some(session));
     migrated.shutdown_for_test();
+    Ok(())
+}
+
+#[test]
+fn rejects_object_drift_in_every_supported_schema_without_migration() -> Result<()> {
+    let cases = [
+        (
+            2,
+            "CREATE TRIGGER unexpected_state_trigger
+             AFTER INSERT ON operations BEGIN SELECT 1; END;",
+        ),
+        (3, "DROP INDEX purge_jobs_due;"),
+        (
+            4,
+            "CREATE INDEX unexpected_state_index ON operations(updated_at_ms);",
+        ),
+        (
+            SCHEMA_VERSION,
+            "CREATE TABLE unexpected_state_table(value BLOB) STRICT;",
+        ),
+    ];
+
+    for (version, drift) in cases {
+        let directory = tempdir()?;
+        let path = directory.path().join(format!("drifted-v{version}.sqlite3"));
+        let identity = root(300 + version as u64, 400 + version as u64);
+        let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+        store.shutdown_for_test();
+
+        let connection = Connection::open(&path)?;
+        set_fixture_schema_version(&connection, version)?;
+        connection.execute_batch(drift)?;
+        drop(connection);
+        fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+
+        let bytes_before = fs::read(&path)?;
+        let schema_before = database_schema_snapshot(&path)?;
+        let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
+        let error = result
+            .err()
+            .expect("a supported version with schema-object drift must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("schema version {version}"))
+                && message.contains("does not exactly match"),
+            "unexpected error for v{version}: {message}"
+        );
+        assert_eq!(fs::read(&path)?, bytes_before);
+        assert_eq!(database_schema_snapshot(&path)?, schema_before);
+        assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o640);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_tampered_v5_column_constraints_and_index_predicates() -> Result<()> {
+    let cases = [
+        (
+            "declared type",
+            "store_meta",
+            "value BLOB NOT NULL",
+            "value TEXT NOT NULL",
+        ),
+        (
+            "not-null flag",
+            "store_meta",
+            "value BLOB NOT NULL",
+            "value BLOB",
+        ),
+        (
+            "default value",
+            "store_meta",
+            "value BLOB NOT NULL",
+            "value BLOB NOT NULL DEFAULT X''",
+        ),
+        (
+            "primary key order",
+            "operations",
+            "PRIMARY KEY(owner_digest, operation_id)",
+            "PRIMARY KEY(operation_id, owner_digest)",
+        ),
+        (
+            "check constraint",
+            "operations",
+            "CHECK(length(owner_digest) = 32)",
+            "CHECK(length(owner_digest) <= 32)",
+        ),
+        (
+            "partial-index predicate",
+            "operations_expiry",
+            "WHERE state = 2",
+            "WHERE state = 1",
+        ),
+    ];
+
+    for (case_index, (label, object, original, replacement)) in cases.into_iter().enumerate() {
+        let directory = tempdir()?;
+        let path = directory
+            .path()
+            .join(format!("tampered-v5-{case_index}.sqlite3"));
+        let identity = root(500 + case_index as u64, 600 + case_index as u64);
+        let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+        store.shutdown_for_test();
+
+        let connection = Connection::open(&path)?;
+        connection.pragma_update(None, "writable_schema", true)?;
+        assert_eq!(
+            connection.execute(
+                "UPDATE sqlite_schema
+                    SET sql = replace(sql, ?2, ?3)
+                  WHERE name = ?1 AND instr(sql, ?2) > 0",
+                params![object, original, replacement],
+            )?,
+            1,
+            "the {label} fixture must alter exactly one schema object"
+        );
+        connection.pragma_update(None, "writable_schema", false)?;
+        let schema_cookie: i64 =
+            connection.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+        connection.pragma_update(None, "schema_version", schema_cookie + 1)?;
+        drop(connection);
+        fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+
+        let bytes_before = fs::read(&path)?;
+        let schema_before = database_schema_snapshot(&path)?;
+        let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
+        let error = result
+            .err()
+            .expect("a v5 database with a tampered contract must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("schema version 5") && message.contains("does not exactly match"),
+            "unexpected {label} error: {message}"
+        );
+        assert_eq!(fs::read(&path)?, bytes_before);
+        assert_eq!(database_schema_snapshot(&path)?, schema_before);
+        assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o640);
+    }
     Ok(())
 }
 
