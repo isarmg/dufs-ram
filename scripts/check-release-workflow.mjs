@@ -75,7 +75,9 @@ function checkWorkflow(source) {
   }
 
   const requiredVerifyFragments = [
+    "timeout-minutes: 240",
     "dependency-audit.yml 'dependency audit'",
+    "formal-release-e2e.yml 'formal release package E2E'",
     '.headSha == $sha',
     '.headBranch == $ref',
     '.conclusion == "success"',
@@ -146,6 +148,10 @@ const mutationFixtures = [
     "actions/download-artifact@main",
   ),
   workflow.replace("dependency-audit.yml 'dependency audit'", "missing-audit"),
+  workflow.replace(
+    "formal-release-e2e.yml 'formal release package E2E'",
+    "missing-formal-release-e2e",
+  ),
   workflow.replace("gh release download", "gh release view"),
   workflow.replaceAll('.state == "starter"', '.state == "uploaded"'),
   workflow.replaceAll(".size == 0", ".size > 0"),
