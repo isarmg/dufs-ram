@@ -97,7 +97,7 @@ FD（file descriptor，文件描述符）是 Linux 进程中指向一个已打�
 
 Linux 目录项中的名字不是文件本身。`report.txt` 可以在两个系统调用之间指向不同对象。
 
-项目把不同身份放在最接近用途的类型中：[identity.rs](../../src/server/identity.rs) 只负责账号的不可逆 `OwnerId` 摘要；运行时文件身份主要由 [rooted_fs.rs](../../src/server/rooted_fs.rs) 中的 `ReplacementTargetIdentity`、`DeleteIdentity`、`FileIdentity` 等类型表达，持久化形式位于 [state_store/model.rs](../../src/server/state_store/model.rs)。文件身份常见字段包括：
+项目把不同身份放在最接近用途的类型中：[identity.rs](../../src/server/identity.rs) 只负责账号的假名化 `OwnerId` 摘要；它是未加密盐的 SHA-256，不直接保存账号名，但低熵账号名仍可被字典枚举，不能视为保密或匿名化边界。运行时文件身份主要由 [rooted_fs.rs](../../src/server/rooted_fs.rs) 中的 `ReplacementTargetIdentity`、`DeleteIdentity`、`FileIdentity` 等类型表达，持久化形式位于 [state_store/model.rs](../../src/server/state_store/model.rs)。文件身份常见字段包括：
 
 - device：对象所在设备；
 - inode：文件系统中的对象编号；

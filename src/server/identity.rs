@@ -3,8 +3,11 @@ use crate::utils::{decode_hex_to_slice, encode_hex};
 
 use sha2::{Digest, Sha256};
 
-/// Opaque, non-reversible identifier used wherever durable state must be
-/// partitioned by authenticated owner without persisting the account name.
+/// Pseudonymous identifier used wherever state must be partitioned by an
+/// authenticated owner without storing the account name directly.
+///
+/// This is an unkeyed SHA-256 digest, not a secrecy boundary: low-entropy
+/// account names can be recovered by dictionary enumeration.
 ///
 /// `persistent` deliberately keeps the historical unscoped SHA-256 wire
 /// representation: operation, upload, and purge rows written by older
