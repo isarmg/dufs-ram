@@ -758,6 +758,46 @@ fn state_database_sidecar_conflicts_include_entry_and_object_aliases() {
 }
 
 #[test]
+fn state_directory_rejects_a_renameable_ancestor_chain() {
+    let shared = assert_fs::TempDir::new().unwrap();
+    let container = assert_fs::TempDir::new().unwrap();
+    let writable_parent = container.child("writable-parent");
+    std::fs::create_dir(writable_parent.path()).unwrap();
+    std::fs::set_permissions(
+        writable_parent.path(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let state_dir = writable_parent.child("state");
+    std::fs::create_dir(state_dir.path()).unwrap();
+    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let validate = || {
+        Args {
+            serve_path: shared.path().to_path_buf(),
+            state_dir: Some(state_dir.path().to_path_buf()),
+            auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
+            ..Args::default()
+        }
+        .validate()
+    };
+    let error = validate().expect_err("a state directory under a renameable parent was accepted");
+    assert!(
+        error
+            .to_string()
+            .contains("can be renamed by untrusted local users"),
+        "unexpected error: {error:#}"
+    );
+
+    std::fs::set_permissions(
+        writable_parent.path(),
+        std::fs::Permissions::from_mode(0o1777),
+    )
+    .unwrap();
+    validate().expect("a sticky parent protecting a service-owned child was rejected");
+}
+
+#[test]
 fn direct_validation_enforces_runtime_invariants() {
     let tmpdir = assert_fs::TempDir::new().unwrap();
     let args = Args {
