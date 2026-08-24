@@ -54,6 +54,27 @@ async fn shutdown_gate_drains_admitted_requests_and_rejects_late_entries() {
     );
 }
 
+#[tokio::test]
+async fn late_request_stops_waiting_when_shutdown_holds_the_gate() {
+    let lifecycle = ServerLifecycle::new();
+    let exclusive = lifecycle.request_gate.clone().write_owned().await;
+    let waiter = {
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move { lifecycle.enter_request().await.is_none() })
+    };
+    tokio::task::yield_now().await;
+
+    lifecycle.shutdown.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("late request remained blocked behind the shutdown gate")
+            .expect("late request task panicked"),
+        "late request entered after shutdown cancellation"
+    );
+    drop(exclusive);
+}
+
 #[test]
 fn server_init_rejects_a_non_directory_root() {
     let temp = assert_fs::TempDir::new().unwrap();

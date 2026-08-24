@@ -266,7 +266,11 @@ impl ServerLifecycle {
     }
 
     async fn enter_request(&self) -> Option<OwnedRwLockReadGuard<()>> {
-        let guard = self.request_gate.clone().read_owned().await;
+        let guard = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return None,
+            guard = self.request_gate.clone().read_owned() => guard,
+        };
         (!self.shutdown.is_cancelled()).then_some(guard)
     }
 }
