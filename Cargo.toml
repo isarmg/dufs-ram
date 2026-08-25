@@ -1,6 +1,6 @@
 [package]
 name = "dufs"
-version = "0.49.3"
+version = "0.49.4"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A Linux browser file manager"
