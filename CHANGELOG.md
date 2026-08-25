@@ -13,7 +13,7 @@
 
 ## [0.49.6] - 2026-08-24
 
-> **发布说明：** `0.49.6` 是未形成公开 GitHub Release 的 `0.49.3`、`0.49.4` 和 `0.49.5` 的累计替代补丁版本，包含三个标签的全部安全强化、问题修复、发布流程与文档变更，以及本版本的隐藏草稿回读修复；完整累计清单见 [0.49.5 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0495---2026-08-24)、[0.49.4 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0494---2026-08-24) 与 [0.49.3 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0493---2026-08-24)。
+> **发布状态：** [Dufs 0.49.6 GitHub Release](https://github.com/isarmg/dufs-ram/releases/tag/v0.49.6) 已于 `2026-08-25T04:24:45Z` 公开并成为 latest；附注标签 `v0.49.6` 精确指向提交 `65df01c8da10e63714ff68ab11d6b68910586eac`。同一 tag/SHA 的只读 CI、依赖审计、正式签名包 E2E 与 Linux Release 无写权限验证/构建四类门禁均成功；唯一持有 `contents: write` 的发布 job 完成隐藏草稿按精确 Release ID 回读、资产上传、远端摘要校验、逐字节回下载复核和公开操作。Release 正文与标签内提取结果逐字节一致，并恰好提供 `dufs-0.49.6-x86_64-unknown-linux-gnu` 二进制（`5901272` 字节，SHA-256 `9c0b05aa60fa7232d2d3a0e044f79fa199ca2fabd471fdeca230592ed003db46`）和 `dufs-0.49.6-x86_64-unknown-linux-gnu.sha256` 校验和文件（`103` 字节，文件自身 SHA-256 `427c50ff422dda06fe6f01c783fab96665a103ba8ea0ecb53b6a929a4b1b4ee9`）；后者精确描述前者。`0.49.6` 是未形成公开 GitHub Release 的 `0.49.3`、`0.49.4` 和 `0.49.5` 的累计替代补丁版本，包含三个标签的全部安全强化、问题修复、发布流程与文档变更，以及本版本的隐藏草稿回读修复；完整累计清单见 [0.49.5 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0495---2026-08-24)、[0.49.4 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0494---2026-08-24) 与 [0.49.3 变更记录](https://github.com/isarmg/dufs-ram/blob/v0.49.6/CHANGELOG.md#0493---2026-08-24)。
 
 ### 问题修复
 
