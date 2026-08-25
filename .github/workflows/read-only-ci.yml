@@ -232,6 +232,7 @@ jobs:
         run: |
           set -euo pipefail
           mv --version | sed -n '1p'
+          umask 077
           ./scripts/package-release.sh --self-test
       - name: Build and execute the release binary
         if: ${{ !cancelled() && steps.quality_source.outcome == 'success' && steps.quality_rust.outcome == 'success' }}
