@@ -42,6 +42,31 @@ function checkYankedAuditPreparation(source, label) {
   }
 }
 
+function isolatedEdgePolicyBlock(source) {
+  const startMarker = "run npm run test:frontend\n";
+  const endMarker = "run npm audit --audit-level=high\n";
+  const start = source.indexOf(startMarker);
+  if (start === -1 || source.indexOf(startMarker, start + 1) !== -1) {
+    throw new Error("local quality gate must have one required browser-matrix entry");
+  }
+  const blockStart = start + startMarker.length;
+  const end = source.indexOf(endMarker, blockStart);
+  if (end === -1 || source.indexOf(endMarker, end + 1) !== -1) {
+    throw new Error("local quality gate must have one npm audit entry");
+  }
+  return source.slice(blockStart, end);
+}
+
+function checkIsolatedEdgePolicy(source) {
+  const block = isolatedEdgePolicyBlock(source);
+  const expectedPolicy = /^if \[\[ "\$\{DUFS_ISOLATED_QUALITY_GATE:-\}" == "1" \]\]; then\n  printf '[^\n]+'\nelif command -v microsoft-edge >\/dev\/null 2>&1 \|\| command -v microsoft-edge-stable >\/dev\/null 2>&1; then\n  run npm run test:frontend:edge\nelse\n  printf '[^\n]+'\nfi\n$/u;
+  if (!expectedPolicy.test(block)) {
+    throw new Error(
+      "isolated release gate must skip unpinned host Edge before optional discovery",
+    );
+  }
+}
+
 function checkWorkflow(source) {
   if (source.includes("\r") || !source.endsWith("\n")) {
     throw new Error("release workflow must use LF and end with a newline");
@@ -160,9 +185,36 @@ try {
     "dependency audit workflow",
   );
   checkYankedAuditPreparation(qualityGate, "local quality gate");
+  checkIsolatedEdgePolicy(qualityGate);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`check-release-workflow: ${message}\n`);
+  process.exit(1);
+}
+
+const edgePolicyBlock = isolatedEdgePolicyBlock(qualityGate);
+const mutatedEdgePolicyBlock = edgePolicyBlock.replace(
+  '== "1" ]]; then',
+  '== "0" ]]; then',
+);
+if (mutatedEdgePolicyBlock === edgePolicyBlock) {
+  process.stderr.write(
+    "check-release-workflow: unable to construct isolated Edge policy fixture\n",
+  );
+  process.exit(1);
+}
+let rejectedEdgePolicyMutation = false;
+try {
+  checkIsolatedEdgePolicy(
+    qualityGate.replace(edgePolicyBlock, mutatedEdgePolicyBlock),
+  );
+} catch {
+  rejectedEdgePolicyMutation = true;
+}
+if (!rejectedEdgePolicyMutation) {
+  process.stderr.write(
+    "check-release-workflow: isolated Edge policy regression was accepted\n",
+  );
   process.exit(1);
 }
 
