@@ -116,7 +116,9 @@ run npm run check:types
 run npm run check:docs
 run npm run test:frontend:unit
 run npm run test:frontend
-if command -v microsoft-edge >/dev/null 2>&1 || command -v microsoft-edge-stable >/dev/null 2>&1; then
+if [[ "${DUFS_ISOLATED_QUALITY_GATE:-}" == "1" ]]; then
+  printf '\n==> SKIP: 隔离正式发布门不运行未固定的宿主 Microsoft Edge；Chromium 与 Firefox 已作为必需矩阵执行。\n'
+elif command -v microsoft-edge >/dev/null 2>&1 || command -v microsoft-edge-stable >/dev/null 2>&1; then
   run npm run test:frontend:edge
 else
   printf '\n==> SKIP: 未安装 Microsoft Edge；Chromium 与 Firefox 已作为必需矩阵执行。\n'
