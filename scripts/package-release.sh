@@ -2383,7 +2383,8 @@ EOF
       --extract \
       --file=- \
       --directory="$documentation_unpack_root" \
-      --no-same-owner
+      --no-same-owner \
+      --same-permissions
   verify_release_documentation_layout \
     "$documentation_unpack_root/$documentation_package_name" \
     "$node_command"
