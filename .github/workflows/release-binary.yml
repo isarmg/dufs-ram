@@ -372,7 +372,7 @@ jobs:
             exit 1
           fi
 
-          release_query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){tagName name description isDraft isPrerelease}}}'
+          release_query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId tagName name description isDraft isPrerelease}}}'
 
           verify_tag_target() {
             local remote_sha=""
@@ -416,14 +416,37 @@ jobs:
               printf 'GraphQL release lookup returned an invalid state.\n' >&2
               return 2
             fi
-            if ! gh api "repos/${GH_REPO}/releases/tags/${tag}" \
+            release_id="$(
+              jq -er '
+                .data.repository.release.databaseId as $id |
+                select(
+                  ($id | type) == "number" and
+                  $id > 0 and
+                  $id <= 2147483647 and
+                  ($id | floor) == $id
+                ) |
+                $id | tostring
+              ' "$release_state"
+            )" || {
+              printf 'GraphQL release ID is invalid.\n' >&2
+              return 2
+            }
+            if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+              printf 'Release ID is invalid.\n' >&2
+              return 2
+            fi
+            if ! gh api "repos/${GH_REPO}/releases/${release_id}" \
               > "$release_rest_state"
             then
               return 2
             fi
-            release_id="$(jq -r .id "$release_rest_state")" || return 2
-            if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-              printf 'Release ID is invalid.\n' >&2
+            if ! jq -e \
+              --arg release_id "$release_id" \
+              '(.id | type) == "number" and
+               (.id | tostring) == $release_id' \
+              "$release_rest_state" >/dev/null
+            then
+              printf 'GraphQL and REST release IDs do not match.\n' >&2
               return 2
             fi
             if ! gh api --paginate --slurp \

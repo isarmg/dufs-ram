@@ -141,6 +141,17 @@ function checkWorkflow(source) {
     "require_complete_matching_draft",
     "gh api --paginate --slurp",
     "release_assets_state",
+    "release(tagName:$tag){databaseId tagName",
+    ".data.repository.release.databaseId",
+    '($id | type) == "number"',
+    "$id > 0",
+    "$id <= 2147483647",
+    "($id | floor) == $id",
+    '^[1-9][0-9]*$',
+    '"repos/${GH_REPO}/releases/${release_id}"',
+    '(.id | tostring) == $release_id',
+    ".data.repository.release.tagName == $tag",
+    ".tag_name == $tag",
     "verify_tag_target",
     "verify_tag_target || return 1",
     "gh release download",
@@ -169,6 +180,9 @@ function checkWorkflow(source) {
   }
   if (publish.includes("releaseAssets(")) {
     throw new Error("publish must enumerate assets through the paginated REST API");
+  }
+  if (publish.includes('releases/tags/${tag}')) {
+    throw new Error("publish must resolve draft releases through their database ID");
   }
 }
 
@@ -254,6 +268,32 @@ const mutationFixtures = [
   workflow.replaceAll('.state == "starter"', '.state == "uploaded"'),
   workflow.replaceAll(".size == 0", ".size > 0"),
   workflow.replace("gh api --paginate --slurp", "gh api"),
+  workflow.replace("databaseId tagName", "tagName"),
+  workflow.replace(
+    ".data.repository.release.databaseId",
+    ".data.repository.release.id",
+  ),
+  workflow.replace(
+    '($id | type) == "number"',
+    '($id | type) == "string"',
+  ),
+  workflow.replace("$id > 0", "$id >= 0"),
+  workflow.replace("$id <= 2147483647", "$id <= 0"),
+  workflow.replace("($id | floor) == $id", "($id | floor) != $id"),
+  workflow.replace("^[1-9][0-9]*$", "^[0-9]+$"),
+  workflow.replace(
+    '"repos/${GH_REPO}/releases/${release_id}"',
+    '"repos/${GH_REPO}/releases/tags/${tag}"',
+  ),
+  workflow.replace(
+    "(.id | tostring) == $release_id",
+    "(.id | tostring) != $release_id",
+  ),
+  workflow.replace(
+    ".data.repository.release.tagName == $tag",
+    ".data.repository.release.tagName != $tag",
+  ),
+  workflow.replace(".tag_name == $tag", ".tag_name != $tag"),
   workflow.replace("gh api --include --method DELETE", "gh api --method DELETE"),
   workflow.replace(
     '^HTTP/[0-9.]+[[:space:]]+204',
