@@ -206,6 +206,9 @@ impl StoreWorker {
                 Command::ListPurgeJobs { limit, reply } => {
                     let _ = reply.send(self.purge_jobs(limit));
                 }
+                Command::IsStatePathBoundBlocking { path, reply } => {
+                    let _ = reply.send(self.state_path_is_bound(&path));
+                }
                 Command::ListStateBlockingPaths {
                     after,
                     limit,

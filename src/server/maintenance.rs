@@ -51,7 +51,7 @@ fn notify_claim_change() {
 
 pub(super) struct MaintenanceScanState {
     pub(super) directories: Vec<MaintenanceDirectory>,
-    pub(super) pending_purge: Option<TrashEntry>,
+    pub(super) pending_purge: Option<PendingMaintenancePurge>,
     trash_ttl: Duration,
     upload_session_cleanup_complete: bool,
     upload_session_cleanup_cursor: Option<super::state_store::UploadSessionKey>,
@@ -62,6 +62,11 @@ pub(super) struct MaintenanceScanState {
     purge_job_snapshot_complete: bool,
     protected_trash_entries: HashSet<RootedEntryKey>,
     skip_untracked_trash_cleanup: bool,
+}
+
+pub(super) struct PendingMaintenancePurge {
+    path: PathBuf,
+    entry: TrashEntry,
 }
 
 pub(super) struct MaintenanceDirectory {
@@ -263,6 +268,7 @@ impl Server {
         let active = self.admission.active_upload_files.clone();
         let shutdown = self.lifecycle.shutdown.clone();
         let purge_queue = self.state.purge_queue.clone();
+        let state_store = self.state.state_store.clone();
         let gate = blocking_io_gate().clone();
         let (state, removed, _, complete, _) = self
             .lifecycle
@@ -282,6 +288,7 @@ impl Server {
                             },
                         },
                         &shutdown,
+                        |path| state_store.state_path_is_bound_blocking(path),
                         |entry| purge_queue.try_schedule(entry),
                     )
                 })
@@ -682,12 +689,44 @@ async fn remove_expired_upload_record(
         .then_some(stage_removed))
 }
 
-pub(super) fn collect_stale_internal_files_batch<S>(
+fn should_preserve_stale_state_path<G>(
+    rooted_fs: &RootedFs,
+    path: &Path,
+    description: &str,
+    state_path_is_bound: &mut G,
+) -> bool
+where
+    G: FnMut(&Path) -> Result<bool>,
+{
+    let state_path = match rooted_fs.state_relative_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(
+                "Failed to encode stale {description} path before state recheck path={} error={error}",
+                path.display()
+            );
+            return true;
+        }
+    };
+    match state_path_is_bound(&state_path) {
+        Ok(bound) => bound,
+        Err(error) => {
+            warn!(
+                "Failed to recheck stale {description} state binding; preserving it path={} error={error:#}",
+                path.display()
+            );
+            true
+        }
+    }
+}
+
+pub(super) fn collect_stale_internal_files_batch<G, S>(
     rooted_fs: &RootedFs,
     mut state: MaintenanceScanState,
     active: &Mutex<HashSet<RootedEntryKey>>,
     options: MaintenanceBatchOptions,
     shutdown: &CancellationToken,
+    mut state_path_is_bound: G,
     mut schedule_purge: S,
 ) -> (
     MaintenanceScanState,
@@ -697,6 +736,7 @@ pub(super) fn collect_stale_internal_files_batch<S>(
     usize,
 )
 where
+    G: FnMut(&Path) -> Result<bool>,
     S: FnMut(TrashEntry) -> std::result::Result<(), Box<TrashEntry>>,
 {
     let mut removed = Vec::new();
@@ -706,9 +746,16 @@ where
         .checked_add(options.budget.max_duration)
         .unwrap_or_else(StdInstant::now);
 
-    if let Some(entry) = state.pending_purge.take() {
-        match schedule_purge(entry) {
-            Ok(()) => {}
+    if let Some(pending) = state.pending_purge.take()
+        && !should_preserve_stale_state_path(
+            rooted_fs,
+            &pending.path,
+            "trash",
+            &mut state_path_is_bound,
+        )
+    {
+        match schedule_purge(pending.entry) {
+            Ok(()) => scheduled.push(pending.path),
             Err(entry) => {
                 // The hidden trash entry remains on disk and a later full scan
                 // can capture it again. Do not pin this scan behind a saturated
@@ -815,6 +862,14 @@ where
                     if state.protected_trash_entries.contains(&entry_key) {
                         return Ok(true);
                     }
+                    if should_preserve_stale_state_path(
+                        rooted_fs,
+                        &entry.path,
+                        "trash",
+                        &mut state_path_is_bound,
+                    ) {
+                        return Ok(true);
+                    }
                     let purge =
                         match rooted_fs.capture_entry_for_purge_blocking(&entry.path, is_dir) {
                             Ok(Some(purge)) => purge,
@@ -830,7 +885,10 @@ where
                     match schedule_purge(purge) {
                         Ok(()) => scheduled.push(entry.path),
                         Err(purge) => {
-                            pending_purge = Some(*purge);
+                            pending_purge = Some(PendingMaintenancePurge {
+                                path: entry.path,
+                                entry: *purge,
+                            });
                             return Ok(false);
                         }
                     }
@@ -864,6 +922,14 @@ where
                 let Some(_cleanup_claim) = try_claim_stale_entry(active, &entry_key) else {
                     return Ok(true);
                 };
+                if should_preserve_stale_state_path(
+                    rooted_fs,
+                    &entry.path,
+                    "upload",
+                    &mut state_path_is_bound,
+                ) {
+                    return Ok(true);
+                }
                 match rooted_fs.remove_entry_blocking(&entry.path, is_dir) {
                     Ok(true) => removed.push(entry.path),
                     Ok(false) => {}
@@ -975,6 +1041,7 @@ pub(super) fn collect_and_remove_stale_internal_files(
                 },
             },
             shutdown,
+            |_| Ok(false),
             |entry| {
                 if let Err(error) = entry.purge_all_blocking() {
                     warn!("Failed to purge test trash entry error={error}");

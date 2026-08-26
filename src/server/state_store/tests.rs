@@ -988,6 +988,70 @@ async fn purge_jobs_are_idempotent_bounded_and_owner_scoped() -> Result<()> {
 }
 
 #[tokio::test]
+async fn maintenance_binding_query_covers_live_state_without_retaining_terminal_uploads()
+-> Result<()> {
+    let store = temporary_with_repository_limits(repository_limits(16, 16, 8, 8))?;
+    for (id, state, expected_bound) in [
+        (1, StoredUploadState::Running, true),
+        (2, StoredUploadState::CommitStarted, true),
+        (3, StoredUploadState::AwaitingConfirmation, true),
+        (4, StoredUploadState::Committed, false),
+        (5, StoredUploadState::Rejected, false),
+        (6, StoredUploadState::Unknown, false),
+    ] {
+        let mut session = upload(
+            1,
+            id,
+            if state == StoredUploadState::Running {
+                4
+            } else {
+                10
+            },
+        );
+        session.state = state;
+        assert_eq!(
+            store.save_upload_session(session.clone(), TTL).await?,
+            StoreUploadSession::Inserted
+        );
+        assert_eq!(
+            store.state_path_is_bound_blocking(&session.stage_path)?,
+            expected_bound,
+            "unexpected maintenance binding for {state:?}"
+        );
+        assert!(
+            !store.state_path_is_bound_blocking(&session.target_path)?,
+            "upload targets are not maintenance-cleaned internal artifacts"
+        );
+    }
+
+    let prepared = purge(2, 1);
+    let claimed = purge(2, 2);
+    let ready = purge(2, 3);
+    for job in [&prepared, &claimed, &ready] {
+        assert_eq!(
+            store.prepare_purge_job(job.clone()).await?,
+            StorePurgeJob::Inserted
+        );
+    }
+    assert!(store.mark_purge_job_ready(claimed.key, [7; 32]).await?);
+    assert!(store.mark_purge_job_ready(ready.key, [8; 32]).await?);
+    assert_eq!(
+        store
+            .claim_due_purge_job()
+            .await?
+            .expect("the first ready purge job must be claimable")
+            .key,
+        claimed.key
+    );
+    for job in [&prepared, &claimed, &ready] {
+        assert!(store.state_path_is_bound_blocking(&job.trash_path)?);
+        assert!(!store.state_path_is_bound_blocking(&job.target_path)?);
+    }
+    assert!(!store.state_path_is_bound_blocking(Path::new("ordinary/file"))?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn state_blocking_paths_are_complete_and_keyset_paginated() -> Result<()> {
     let store = temporary_with_repository_limits(repository_limits(8, 8, 8, 8))?;
 

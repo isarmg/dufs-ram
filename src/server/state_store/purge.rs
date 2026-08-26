@@ -91,6 +91,27 @@ impl StoreWorker {
         )
     }
 
+    pub(super) fn state_path_is_bound(&mut self, path: &Path) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM upload_sessions
+                      WHERE stage_path = ?1
+                        AND state IN (?2, ?3, ?4)
+                     UNION ALL
+                     SELECT 1 FROM purge_jobs WHERE trash_path = ?1
+                 )",
+                params![
+                    path.as_os_str().as_bytes(),
+                    UPLOAD_RUNNING,
+                    UPLOAD_COMMIT_STARTED,
+                    UPLOAD_AWAITING_CONFIRMATION,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub(super) fn state_blocking_paths(
         &mut self,
         after: Option<StatePathCursor>,
