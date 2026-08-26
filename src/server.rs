@@ -227,6 +227,9 @@ struct DurableStateServices {
     purge_receiver: Mutex<Option<mpsc::Receiver<PurgeSignal>>>,
 }
 
+#[cfg(test)]
+type UploadPreflightProbeHook = Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>;
+
 /// Bounded admission and accounting resources. Grouping these makes capacity
 /// policy independently reviewable from routing and persistence.
 struct AdmissionControl {
@@ -234,11 +237,14 @@ struct AdmissionControl {
     login_slots: Arc<Semaphore>,
     login_body_admission: LoginBodyAdmission,
     login_rate_limiter: LoginRateLimiter,
+    upload_preflight_slots: Arc<Semaphore>,
     upload_slots: Arc<Semaphore>,
     mutation_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
     disk_space: DiskSpaceTracker,
     login_errors: Mutex<LoginErrorStore>,
+    #[cfg(test)]
+    upload_preflight_probe_hook: UploadPreflightProbeHook,
 }
 
 /// Process lifecycle and task ownership. Only this context decides when new
@@ -332,11 +338,16 @@ impl Server {
                 login_slots: Arc::new(Semaphore::new(2)),
                 login_body_admission: LoginBodyAdmission::default(),
                 login_rate_limiter: LoginRateLimiter::new(),
+                upload_preflight_slots: Arc::new(Semaphore::new(
+                    browser_api::UPLOAD_PREFLIGHT_CONCURRENCY,
+                )),
                 upload_slots: Arc::new(Semaphore::new(max_concurrent_uploads)),
                 mutation_slots: Arc::new(Semaphore::new(NON_UPLOAD_MUTATION_CAPACITY)),
                 search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
                 disk_space: DiskSpaceTracker::new(),
                 login_errors: Mutex::new(LoginErrorStore::default()),
+                #[cfg(test)]
+                upload_preflight_probe_hook: Mutex::new(None),
             },
             lifecycle,
         })
