@@ -598,11 +598,53 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("a protected upload stage is not delete trash"),
         );
         assert!(complete);
         assert!(removed.is_empty());
         assert_eq!(std::fs::read(stage)?, b"do-not-delete");
+        Ok(())
+    }
+
+    #[test]
+    fn state_recheck_failures_preserve_stale_upload_and_trash_candidates() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let target = temp.path().join("guard-error.bin");
+        let stage = upload_temp_path(&target, Uuid::new_v4())?;
+        std::fs::create_dir(upload_stage_directory(&stage).unwrap())?;
+        std::fs::write(&stage, b"preserved stage")?;
+        let trash = rooted_fs.trash_path_for_id(&target, Uuid::new_v4())?;
+        std::fs::write(&trash, b"preserved trash")?;
+        let mut checked = HashSet::new();
+
+        let (_, removed, scheduled, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO),
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60),
+                upload_ttl: UPLOAD_SESSION_TTL,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            |path| {
+                checked.insert(path.to_path_buf());
+                Err(anyhow::anyhow!("injected state binding query failure"))
+            },
+            |_| unreachable!("a failed state recheck must not schedule orphan trash"),
+        );
+        assert!(complete);
+        assert!(removed.is_empty());
+        assert!(scheduled.is_empty());
+        assert!(checked.contains(&rooted_fs.state_relative_path(&stage)?));
+        assert!(checked.contains(&rooted_fs.state_relative_path(&trash)?));
+        assert_eq!(std::fs::read(stage)?, b"preserved stage");
+        assert_eq!(std::fs::read(trash)?, b"preserved trash");
         Ok(())
     }
 
@@ -653,11 +695,78 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("a protected upload stage is not delete trash"),
         );
         assert!(complete);
         assert!(removed.is_empty());
         assert_eq!(std::fs::read(stage)?, b"live checkpoint");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_created_after_snapshot_is_rechecked_before_stage_cleanup() -> Result<()> {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let mut state = MaintenanceScanState::new(temp.path().to_path_buf(), Duration::ZERO);
+        load_tracked_upload_snapshot_page(&rooted_fs, &store, &mut state).await;
+        assert!(state.upload_session_snapshot_complete);
+        assert!(state.protected_upload_entries.is_empty());
+
+        let upload_id = Uuid::new_v4();
+        let target = temp.path().join("late-session.bin");
+        let stage = upload_temp_path(&target, upload_id)?;
+        let file = create_stage(&rooted_fs, &stage, b"late live checkpoint").await;
+        let metadata = file.metadata().await?;
+        let old_modified = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::open(&stage)?
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))?;
+        let session = stored_session(
+            &rooted_fs,
+            [9; 32],
+            upload_id,
+            &target,
+            &stage,
+            StoredUploadState::Running,
+            Some(StoredFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        );
+        assert_eq!(
+            store
+                .save_upload_session(session.clone(), Duration::from_secs(9 * 24 * 60 * 60))
+                .await?,
+            StoreUploadSession::Inserted
+        );
+        assert_eq!(
+            store
+                .save_upload_session(session, Duration::from_secs(9 * 24 * 60 * 60))
+                .await?,
+            StoreUploadSession::Unchanged
+        );
+
+        let guard_store = store.clone();
+        let (_, removed, _, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            state,
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now(),
+                upload_ttl: UPLOAD_SESSION_TTL,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            move |path| guard_store.state_path_is_bound_blocking(path),
+            |_| unreachable!("a state-bound upload stage is not delete trash"),
+        );
+        assert!(complete);
+        assert!(removed.is_empty());
+        assert_eq!(std::fs::read(stage)?, b"late live checkpoint");
         Ok(())
     }
 
@@ -688,6 +797,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("an upload stage is not delete trash"),
         );
 
@@ -751,11 +861,75 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("tracked trash must be owned only by the durable purge worker"),
         );
         assert!(complete);
         assert!(scheduled.is_empty());
         assert_eq!(std::fs::read(trash)?, b"replacement");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_created_after_snapshot_is_rechecked_before_orphan_scheduling() -> Result<()>
+    {
+        let temp = assert_fs::TempDir::new()?;
+        let rooted_fs = RootedFs::new(temp.path())?;
+        let store = temporary_store();
+        let mut state =
+            MaintenanceScanState::new(temp.path().to_path_buf(), Duration::from_secs(60 * 60));
+        load_tracked_purge_snapshot(&rooted_fs, &store, &mut state).await;
+        assert!(state.purge_job_snapshot_complete);
+        assert!(state.protected_trash_entries.is_empty());
+
+        let job_id = Uuid::new_v4();
+        let target = temp.path().join("late-delete.bin");
+        let trash = rooted_fs.trash_path_for_id(&target, job_id)?;
+        std::fs::write(&target, b"late tracked trash")?;
+        let source = std::fs::metadata(&target)?;
+        std::fs::rename(&target, &trash)?;
+        assert_eq!(
+            store
+                .prepare_purge_job(StoredPurgeJob {
+                    key: PurgeJobKey {
+                        owner: [5; 32],
+                        id: *job_id.as_bytes(),
+                    },
+                    target_path: rooted_fs.state_relative_path(&target)?,
+                    trash_path: rooted_fs.state_relative_path(&trash)?,
+                    source_identity: StoredFileIdentity {
+                        device: source.dev(),
+                        inode: source.ino(),
+                    },
+                    trash_revision: None,
+                    is_directory: false,
+                    state: StoredPurgeState::Prepared,
+                    attempts: 0,
+                })
+                .await?,
+            StorePurgeJob::Inserted
+        );
+
+        let guard_store = store.clone();
+        let (_, _, scheduled, complete, _) = collect_stale_internal_files_batch(
+            &rooted_fs,
+            state,
+            &Mutex::new(HashSet::new()),
+            MaintenanceBatchOptions {
+                now: SystemTime::now() + Duration::from_secs(2 * 60 * 60),
+                upload_ttl: UPLOAD_SESSION_TTL,
+                budget: MaintenanceBudget {
+                    max_entries: 16,
+                    max_duration: Duration::from_secs(1),
+                },
+            },
+            &CancellationToken::new(),
+            move |path| guard_store.state_path_is_bound_blocking(path),
+            |_| unreachable!("state-bound trash must not enter the orphan purge queue"),
+        );
+        assert!(complete);
+        assert!(scheduled.is_empty());
+        assert_eq!(std::fs::read(trash)?, b"late tracked trash");
         Ok(())
     }
 
@@ -782,6 +956,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |entry| {
                 entry.purge_all_blocking().unwrap();
                 Ok(())
@@ -834,6 +1009,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("quarantine entries must never be rescheduled as orphan trash"),
         );
         assert!(complete);
@@ -883,6 +1059,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |entry| {
                 recaptured = Some(entry);
                 Ok(())
@@ -953,6 +1130,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("newly renamed trash is still inside its grace period"),
         );
         assert!(complete);
@@ -1014,6 +1192,7 @@ mod sqlite_cleanup_tests {
                 },
             },
             &CancellationToken::new(),
+            |_| Ok(false),
             |_| unreachable!("a failed purge snapshot must disable orphan-trash scheduling"),
         );
         assert!(complete);

@@ -333,6 +333,10 @@ enum Command {
         limit: i64,
         reply: oneshot::Sender<Result<Vec<StoredPurgeJob>>>,
     },
+    IsStatePathBoundBlocking {
+        path: PathBuf,
+        reply: SyncSender<Result<bool>>,
+    },
     ListStateBlockingPaths {
         after: Option<StatePathCursor>,
         limit: i64,
@@ -825,6 +829,21 @@ impl StateStore {
         let (reply, receiver) = oneshot::channel();
         self.send(Command::ListPurgeJobs { limit, reply })?;
         self.receive(receiver).await
+    }
+
+    /// Recheck one canonical rooted path immediately before maintenance acts on
+    /// it. The synchronous reply keeps this read ordered with every upload and
+    /// purge mutation already accepted by the state-store actor.
+    pub(super) fn state_path_is_bound_blocking(&self, path: &Path) -> Result<bool> {
+        model::validate_stored_path(path, "Maintenance state")?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(Command::IsStatePathBoundBlocking {
+            path: path.to_path_buf(),
+            reply,
+        })?;
+        receiver
+            .recv()
+            .context("The state store thread exited while checking a maintenance path")?
     }
 
     /// Return a bounded, keyset-paginated snapshot of paths whose physical

@@ -905,6 +905,7 @@ fn maintenance_batches_resume_to_reach_deep_directories() {
                 },
             },
             &shutdown,
+            |_| Ok(false),
             |entry| {
                 entry.purge_all_blocking().unwrap();
                 Ok::<(), Box<TrashEntry>>(())
@@ -957,6 +958,7 @@ fn maintenance_preserves_a_trash_candidate_when_the_queue_is_full() {
             },
         },
         &shutdown,
+        |_| Ok(false),
         |entry| {
             if reject {
                 reject = false;
@@ -984,6 +986,7 @@ fn maintenance_preserves_a_trash_candidate_when_the_queue_is_full() {
             },
         },
         &shutdown,
+        |_| Ok(false),
         |entry| {
             entry.purge_all_blocking().unwrap();
             Ok::<(), Box<TrashEntry>>(())
@@ -1027,6 +1030,7 @@ fn saturated_purge_queue_does_not_starve_other_maintenance_entries() {
                 },
             },
             &shutdown,
+            |_| Ok(false),
             |entry| Err(Box::new(entry)),
         );
         state = next;
@@ -1071,6 +1075,7 @@ fn maintenance_time_budget_can_pause_before_examining_entries() {
             },
         },
         &shutdown,
+        |_| Ok(false),
         |_| unreachable!("a zero-time batch cannot discover trash"),
     );
 
