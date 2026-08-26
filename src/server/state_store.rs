@@ -22,6 +22,8 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use super::StatePathScanLease;
+
 mod actor;
 mod database;
 mod model;
@@ -340,6 +342,7 @@ enum Command {
     ListStateBlockingPaths {
         after: Option<StatePathCursor>,
         limit: i64,
+        scan_lease: StatePathScanLease,
         reply: oneshot::Sender<Result<StatePathPage>>,
     },
     MarkPurgeJobReady {
@@ -855,12 +858,14 @@ impl StateStore {
         &self,
         after: Option<StatePathCursor>,
         limit: usize,
+        scan_lease: StatePathScanLease,
     ) -> Result<StatePathPage> {
         let limit = query_limit(limit)?;
         let (reply, receiver) = oneshot::channel();
         self.send(Command::ListStateBlockingPaths {
             after,
             limit,
+            scan_lease,
             reply,
         })?;
         self.receive(receiver).await
