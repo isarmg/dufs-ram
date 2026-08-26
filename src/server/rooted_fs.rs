@@ -262,14 +262,16 @@ impl RootedEntryKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum SemanticPathComponent {
-    Directory(FileIdentity),
-    Name(OsString),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ResolvedPathKey {
-    pub(super) components: Vec<SemanticPathComponent>,
+    /// The deepest existing directory reached while resolving the lexical
+    /// parent, followed by every still-unresolved name through the final entry.
+    /// This identifies namespace entries without conflating distinct hardlinks.
+    pub(super) resolved_parent: FileIdentity,
+    pub(super) unresolved_tail: Vec<OsString>,
+    /// Physical directory ancestry from the anchored root through
+    /// `resolved_parent`. Walking descriptor-relative `..` entries is necessary
+    /// because one relative symlink can hide multiple real ancestors.
+    pub(super) ancestor_directories: Vec<FileIdentity>,
     pub(super) target_directory: Option<FileIdentity>,
 }
 
@@ -475,7 +477,9 @@ impl RootedFs {
 
     pub(super) fn conservative_path_key(&self) -> ResolvedPathKey {
         ResolvedPathKey {
-            components: vec![SemanticPathComponent::Directory(self.inner.root_identity)],
+            resolved_parent: self.inner.root_identity,
+            unresolved_tail: Vec::new(),
+            ancestor_directories: vec![self.inner.root_identity],
             target_directory: Some(self.inner.root_identity),
         }
     }
@@ -653,20 +657,16 @@ impl RootedFs {
                 )),
             })
             .collect::<std::io::Result<Vec<_>>>()?;
-        let root_identity = file_identity(&self.inner.root.metadata()?);
-        let mut semantic = vec![SemanticPathComponent::Directory(root_identity)];
         let mut prefix = PathBuf::new();
+        let mut resolved_parent = dup(&self.inner.root).map_err(std::io::Error::from)?;
+        let mut unresolved_tail = Vec::new();
         let mut resolving_directories = true;
 
         for component in components.iter().take(components.len().saturating_sub(1)) {
             prefix.push(component);
             if resolving_directories {
                 match self.open_directory_from_root(&prefix) {
-                    Ok(directory) => {
-                        semantic.push(SemanticPathComponent::Directory(file_identity(
-                            &File::from(directory).metadata()?,
-                        )));
-                    }
+                    Ok(directory) => resolved_parent = directory,
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -676,12 +676,12 @@ impl RootedFs {
                         ) =>
                     {
                         resolving_directories = false;
-                        semantic.push(SemanticPathComponent::Name(component.clone()));
+                        unresolved_tail.push(component.clone());
                     }
                     Err(error) => return Err(error),
                 }
             } else {
-                semantic.push(SemanticPathComponent::Name(component.clone()));
+                unresolved_tail.push(component.clone());
             }
         }
 
@@ -689,15 +689,19 @@ impl RootedFs {
             .last()
             .ok_or_else(|| std::io::Error::other("the shared root has no entry key"))?
             .clone();
-        semantic.push(SemanticPathComponent::Name(final_name.clone()));
+        unresolved_tail.push(final_name.clone());
+
+        let ancestor_directories = self.directory_ancestry_from_root(&resolved_parent)?;
+        let resolved_parent_identity = *ancestor_directories
+            .last()
+            .expect("a rooted directory ancestry always contains its root");
 
         let target_directory = if resolving_directories {
-            let parent = self.open_parent_blocking(path, false)?;
-            match statat(&parent.fd, &parent.name, AtFlags::SYMLINK_NOFOLLOW) {
+            match statat(&resolved_parent, &final_name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
                     let directory = openat(
-                        &parent.fd,
-                        &parent.name,
+                        &resolved_parent,
+                        &final_name,
                         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     )
@@ -712,9 +716,58 @@ impl RootedFs {
         };
 
         Ok(ResolvedPathKey {
-            components: semantic,
+            resolved_parent: resolved_parent_identity,
+            unresolved_tail,
+            ancestor_directories,
             target_directory,
         })
+    }
+
+    fn directory_ancestry_from_root<F: AsFd>(
+        &self,
+        directory: &F,
+    ) -> std::io::Result<Vec<FileIdentity>> {
+        // A Linux pathname is bounded to 4096 bytes, so even one-byte component
+        // names cannot normally approach this many ancestors. Keep an explicit
+        // bound because a descriptor can concurrently become detached or be
+        // reached through an unusual mount topology.
+        const MAX_DIRECTORY_ANCESTORS: usize = 4096;
+
+        let mut current = dup(directory).map_err(std::io::Error::from)?;
+        let mut reversed = Vec::new();
+        for _ in 0..MAX_DIRECTORY_ANCESTORS {
+            let stat = fstat(&current).map_err(std::io::Error::from)?;
+            let identity = FileIdentity {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            };
+            reversed.push(identity);
+            if identity == self.inner.root_identity {
+                reversed.reverse();
+                return Ok(reversed);
+            }
+
+            let parent = openat(
+                &current,
+                "..",
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let parent_stat = fstat(&parent).map_err(std::io::Error::from)?;
+            if parent_stat.st_dev == stat.st_dev && parent_stat.st_ino == stat.st_ino {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "resolved directory ancestry does not reach the shared root",
+                ));
+            }
+            current = parent;
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resolved directory ancestry exceeds the safety limit",
+        ))
     }
 
     #[cfg(test)]
