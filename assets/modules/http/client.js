@@ -1279,8 +1279,11 @@ function uploadStatusMessage(state, status) {
     return "The server did not record this upload ID.";
   }
   if (state === "unknown") {
-    return status === 429
-      ? "The upload status could not be checked because status queries are temporarily busy. Refresh the folder before trying again."
+    if (status === 429) {
+      return "The upload status could not be checked because status queries are temporarily busy. Refresh the folder before trying again.";
+    }
+    return status === 503
+      ? "The upload status could not be checked because the status service is temporarily unavailable. Refresh the folder before trying again."
       : "The server could not confirm the final upload status. Refresh the folder before trying again.";
   }
   return (

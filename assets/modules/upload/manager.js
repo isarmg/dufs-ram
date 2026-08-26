@@ -1087,9 +1087,11 @@ export function createUploadManager(options) {
           return;
         }
         if (classification.kind === "unknown") {
-          if (response.status === 429) {
+          if ([429, 503].includes(response.status)) {
             this.unknown(
-              "Upload status queries are temporarily busy. Check the upload status again before trying to upload",
+              response.status === 429
+                ? "Upload status queries are temporarily busy. Check the upload status again before trying to upload"
+                : "Upload status is temporarily unavailable. Check the upload status again before trying to upload",
               "query_upload",
               response.headers.get("Retry-After"),
             );
