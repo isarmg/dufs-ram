@@ -1,5 +1,5 @@
 use super::{
-    StatePathScanLease,
+    RequestPathAdmissionLease, StatePathScanLease,
     rooted_fs::{ResolvedPathKey, RootedFs},
     state_store::StateBlockingPath,
 };
@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::{OwnedSemaphorePermit, watch};
+use tokio::sync::watch;
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -65,7 +65,7 @@ enum WaiterState {
 pub(super) struct PathLease {
     inner: Arc<CoordinatorInner>,
     id: u64,
-    _request_permit: Option<OwnedSemaphorePermit>,
+    _request_admission: Option<RequestPathAdmissionLease>,
 }
 
 struct WaiterRegistration {
@@ -109,6 +109,30 @@ impl PathCoordinator {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.acquire_inner(paths, None).await
+    }
+
+    pub(super) async fn acquire_for_request<I, P>(
+        &self,
+        paths: I,
+        admission: RequestPathAdmissionLease,
+    ) -> PathLease
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.acquire_inner(paths, Some(admission)).await
+    }
+
+    async fn acquire_inner<I, P>(
+        &self,
+        paths: I,
+        mut request_admission: Option<RequestPathAdmissionLease>,
+    ) -> PathLease
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         let mut lexical_paths: Vec<PathBuf> = paths
             .into_iter()
             .map(|path| normalize_key(path.as_ref()))
@@ -139,7 +163,10 @@ impl PathCoordinator {
                 }
                 let mut paths = Vec::with_capacity(lexical_paths.len());
                 for lexical in &lexical_paths {
-                    let resolved = match self.resolve_path_key(lexical).await {
+                    let resolved = match self
+                        .resolve_path_key(lexical, request_admission.clone())
+                        .await
+                    {
                         Ok(resolved) => resolved,
                         // Never drop down to lexical-only coordination. A
                         // global root key serializes this request with every
@@ -164,7 +191,12 @@ impl PathCoordinator {
                 .expect("the current lease epoch has resolved path keys")
                 .1;
 
-            match self.try_acquire(paths, expected_epoch, registration.id) {
+            match self.try_acquire(
+                paths,
+                expected_epoch,
+                registration.id,
+                &mut request_admission,
+            ) {
                 AcquireAttempt::Acquired(lease) => {
                     registration.disarm();
                     return lease;
@@ -245,9 +277,21 @@ impl PathCoordinator {
         }
     }
 
-    async fn resolve_path_key(&self, lexical: &Path) -> std::io::Result<ResolvedPathKey> {
+    async fn resolve_path_key(
+        &self,
+        lexical: &Path,
+        request_admission: Option<RequestPathAdmissionLease>,
+    ) -> std::io::Result<ResolvedPathKey> {
         self.inner.begin_path_key_resolution()?;
-        self.inner.rooted_fs.resolved_path_key(lexical).await
+        match request_admission {
+            Some(admission) => {
+                self.inner
+                    .rooted_fs
+                    .resolved_path_key_guarded(lexical, admission)
+                    .await
+            }
+            None => self.inner.rooted_fs.resolved_path_key(lexical).await,
+        }
     }
 
     fn try_acquire(
@@ -255,6 +299,7 @@ impl PathCoordinator {
         requested: &[LeaseKey],
         expected_epoch: u64,
         waiter_id: u64,
+        request_admission: &mut Option<RequestPathAdmissionLease>,
     ) -> AcquireAttempt {
         let mut leases = self
             .inner
@@ -303,7 +348,7 @@ impl PathCoordinator {
         AcquireAttempt::Acquired(PathLease {
             inner: self.inner.clone(),
             id,
-            _request_permit: None,
+            _request_admission: request_admission.take(),
         })
     }
 }
@@ -436,14 +481,6 @@ impl StatePathScanner {
                     })
             }
         }
-    }
-}
-
-impl PathLease {
-    pub(super) fn with_request_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
-        debug_assert!(self._request_permit.is_none());
-        self._request_permit = Some(permit);
-        self
     }
 }
 

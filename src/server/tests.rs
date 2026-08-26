@@ -279,6 +279,116 @@ async fn request_path_leases_fail_fast_and_retain_admission_until_drop() {
 }
 
 #[tokio::test]
+async fn cancelled_request_path_resolution_retains_admission_until_the_probe_finishes() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let mut args = authenticated_args(temp.path().to_path_buf(), state_dir.path());
+    args.max_connections = 2;
+    let server = Arc::new(Server::init_with_lifecycle(args, ServerLifecycle::new()).unwrap());
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 1);
+
+    let first_parent = temp.path().join("a-blocked");
+    let later_parent = temp.path().join("z-later");
+    std::fs::create_dir(&first_parent).unwrap();
+    std::fs::create_dir(&later_parent).unwrap();
+    let first = first_parent.join("first.txt");
+    let later = later_parent.join("later.txt");
+
+    let _ = server.content.rooted_fs.take_resolved_path_prefix_probes();
+    let (entered_sender, entered_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    server
+        .content
+        .rooted_fs
+        .inject_before_resolved_path_prefix_probe_once(1, move || {
+            let _ = entered_sender.send(());
+            release_receiver
+                .recv()
+                .expect("path-resolution probe release sender dropped");
+        });
+
+    let request = {
+        let server = server.clone();
+        let first = first.clone();
+        tokio::spawn(async move { server.acquire_request_path_lease([first, later]).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), entered_receiver)
+        .await
+        .expect("request path resolution did not enter its blocking probe")
+        .unwrap();
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+
+    request.abort();
+    assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+    assert_eq!(
+        server.admission.path_wait_slots.available_permits(),
+        0,
+        "cancelling the waiter released path admission before its probe exited"
+    );
+    assert!(
+        server
+            .acquire_request_path_lease([temp.path().join("rejected.txt")])
+            .await
+            .is_none(),
+        "a new request bypassed the cancelled probe's retained admission"
+    );
+
+    release_sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.admission.path_wait_slots.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("path admission was not restored after the blocking probe exited");
+    assert_eq!(
+        server.content.rooted_fs.take_resolved_path_prefix_probes(),
+        1,
+        "a cancelled waiter continued resolving later paths"
+    );
+
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.acquire_request_path_lease([&first]),
+    )
+    .await
+    .expect("the cancelled waiter registration remained in the coordinator")
+    .expect("path admission was not restored after the probe exited");
+    drop(recovered);
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn background_path_acquire_bypasses_saturated_request_admission() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let mut args = authenticated_args(temp.path().to_path_buf(), state_dir.path());
+    args.max_connections = 2;
+    let server = Server::init_with_lifecycle(args, ServerLifecycle::new()).unwrap();
+
+    let request_lease = server
+        .acquire_request_path_lease([temp.path().join("request.txt")])
+        .await
+        .expect("request path admission was unexpectedly unavailable");
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+
+    let background_lease = tokio::time::timeout(
+        Duration::from_secs(1),
+        server
+            .content
+            .path_coordinator
+            .acquire([temp.path().join("background.txt")]),
+    )
+    .await
+    .expect("background path acquisition was limited by request admission");
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+
+    drop(background_lease);
+    drop(request_lease);
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn root_containment_guard_probes_a_deep_missing_path_once() {
     let temp = assert_fs::TempDir::new().unwrap();
     let state_dir = private_state_dir();

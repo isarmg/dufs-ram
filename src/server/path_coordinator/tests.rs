@@ -68,6 +68,7 @@ async fn resolving_waiter_does_not_block_an_unrelated_lexical_path() {
         &unrelated_request,
         expected_epoch,
         unrelated_registration.id,
+        &mut None,
     ) {
         AcquireAttempt::Acquired(lease) => lease,
         _ => panic!("a resolving waiter globally blocked an unrelated path"),
@@ -94,6 +95,7 @@ async fn resolving_waiter_does_not_block_an_unrelated_lexical_path() {
             &descendant_request,
             expected_epoch,
             descendant_registration.id,
+            &mut None,
         ),
         AcquireAttempt::Blocked
     ));
@@ -703,11 +705,11 @@ async fn unrelated_lease_start_does_not_invalidate_resolved_keys() {
         coordinator.inner.clone(),
         std::slice::from_ref(&requested[0].lexical),
     );
-    let requested_lease = match coordinator.try_acquire(&requested, expected_epoch, registration.id)
-    {
-        AcquireAttempt::Acquired(lease) => lease,
-        _ => panic!("an unrelated lease start invalidated a resolved semantic key"),
-    };
+    let requested_lease =
+        match coordinator.try_acquire(&requested, expected_epoch, registration.id, &mut None) {
+            AcquireAttempt::Acquired(lease) => lease,
+            _ => panic!("an unrelated lease start invalidated a resolved semantic key"),
+        };
     registration.disarm();
     assert_eq!(
         coordinator
