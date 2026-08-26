@@ -1,7 +1,9 @@
 use super::{purge::PreparePurge, *};
+use futures_util::poll;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    task::Poll,
     time::Duration,
 };
 use tokio::sync::oneshot;
@@ -436,4 +438,87 @@ async fn non_upload_mutations_wait_for_bounded_admission() {
     drop(permits);
     commit_tasks.close();
     commit_tasks.wait().await;
+}
+
+#[tokio::test]
+async fn durable_state_path_scans_fail_fast_without_filling_the_actor_queue() {
+    const SCAN_REQUESTS: usize = 300;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Arc::new(
+        Server::init_with_lifecycle(
+            authenticated_args(temp.path().to_path_buf(), state_dir.path()),
+            ServerLifecycle::new(),
+        )
+        .unwrap(),
+    );
+    let release_actor = server.state.state_store.block_actor_for_test().unwrap();
+    let mut scans = Vec::with_capacity(SCAN_REQUESTS);
+    for _ in 0..SCAN_REQUESTS {
+        let server = server.clone();
+        scans.push(tokio::spawn(async move {
+            server
+                .has_persisted_path_conflict(&[server.content.args.serve_path.as_path()])
+                .await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rejected = scans.iter().filter(|scan| scan.is_finished()).count();
+            if rejected == SCAN_REQUESTS - STATE_PATH_SCAN_CAPACITY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("excess durable-state scans did not fail fast");
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        0,
+        "the admitted scans did not retain their permits while awaiting the actor"
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        server.has_persisted_path_descendant(temp.path()),
+    )
+    .await
+    .expect("a saturated durable-state scan waited instead of failing fast")
+    .expect_err("the shared durable-state scan limit was bypassed");
+    assert_eq!(error.to_string(), STATE_PATH_SCAN_ADMISSION_ERROR);
+
+    // `probe_readiness` sends its command on the first poll. Pending therefore
+    // proves the actor queue still has room behind all admitted scans; a full
+    // queue would return `StateStoreDispatchError::QueueFull` immediately.
+    let state_store = server.state.state_store.clone();
+    let mut readiness = Box::pin(state_store.probe_readiness());
+    assert!(
+        matches!(poll!(readiness.as_mut()), Poll::Pending),
+        "durable-state scans filled the actor queue"
+    );
+
+    release_actor.send(()).unwrap();
+    readiness.await.unwrap();
+    let mut admitted = 0;
+    let mut rejected = 0;
+    for scan in scans {
+        match scan.await.unwrap() {
+            Ok(false) => admitted += 1,
+            Ok(true) => panic!("an empty durable state store reported a path conflict"),
+            Err(error) => {
+                assert_eq!(error.to_string(), STATE_PATH_SCAN_ADMISSION_ERROR);
+                rejected += 1;
+            }
+        }
+    }
+    assert_eq!(admitted, STATE_PATH_SCAN_CAPACITY);
+    assert_eq!(rejected, SCAN_REQUESTS - STATE_PATH_SCAN_CAPACITY);
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        STATE_PATH_SCAN_CAPACITY,
+        "completed scans retained admission permits"
+    );
 }

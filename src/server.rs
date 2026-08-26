@@ -78,6 +78,8 @@ const READINESS_CHECK_PATH: &str = "__dufs__/ready";
 const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
 const CSRF_AUTH_ERROR: &str = "csrf";
 const NON_UPLOAD_MUTATION_CAPACITY: usize = 64;
+const STATE_PATH_SCAN_CAPACITY: usize = 4;
+const STATE_PATH_SCAN_ADMISSION_ERROR: &str = "Durable state path scan admission is at capacity";
 const STATE_PATH_ADMISSION_PAGE_SIZE: usize = 256;
 
 /// Builds a reusable server together with the lifecycle resources required by
@@ -240,6 +242,7 @@ struct AdmissionControl {
     upload_preflight_slots: Arc<Semaphore>,
     upload_slots: Arc<Semaphore>,
     mutation_slots: Arc<Semaphore>,
+    state_path_scan_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
     disk_space: DiskSpaceTracker,
     login_errors: Mutex<LoginErrorStore>,
@@ -343,6 +346,7 @@ impl Server {
                 )),
                 upload_slots: Arc::new(Semaphore::new(max_concurrent_uploads)),
                 mutation_slots: Arc::new(Semaphore::new(NON_UPLOAD_MUTATION_CAPACITY)),
+                state_path_scan_slots: Arc::new(Semaphore::new(STATE_PATH_SCAN_CAPACITY)),
                 search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
                 disk_space: DiskSpaceTracker::new(),
                 login_errors: Mutex::new(LoginErrorStore::default()),
@@ -436,6 +440,12 @@ impl Server {
     /// prevents a newly imported upload session or purge intent from appearing
     /// behind the pagination cursor.
     async fn has_persisted_path_conflict(&self, paths: &[&Path]) -> Result<bool> {
+        let _scan_permit = self
+            .admission
+            .state_path_scan_slots
+            .clone()
+            .try_acquire_owned()
+            .context(STATE_PATH_SCAN_ADMISSION_ERROR)?;
         let mut after = None;
         loop {
             let page = self
@@ -464,6 +474,12 @@ impl Server {
     /// target remains valid. It must still reject replacing a directory or
     /// symlink that gives any durable upload/purge path its current meaning.
     async fn has_persisted_path_descendant(&self, path: &Path) -> Result<bool> {
+        let _scan_permit = self
+            .admission
+            .state_path_scan_slots
+            .clone()
+            .try_acquire_owned()
+            .context(STATE_PATH_SCAN_ADMISSION_ERROR)?;
         let mut after = None;
         loop {
             let page = self
