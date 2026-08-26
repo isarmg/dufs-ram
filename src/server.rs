@@ -302,6 +302,9 @@ type RootContainmentProbeHook = Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>;
 #[cfg(test)]
 type PathWaitAcquireHook = Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>;
 
+#[cfg(test)]
+type ListMetadataPhaseHook = Mutex<Option<Arc<dyn Fn(listing::ListMetadataPhase) + Send + Sync>>>;
+
 /// Bounded admission and accounting resources. Grouping these makes capacity
 /// policy independently reviewable from routing and persistence.
 struct AdmissionControl {
@@ -323,6 +326,8 @@ struct AdmissionControl {
     root_containment_probe_hook: RootContainmentProbeHook,
     #[cfg(test)]
     path_wait_acquire_hook: PathWaitAcquireHook,
+    #[cfg(test)]
+    list_metadata_phase_hook: ListMetadataPhaseHook,
 }
 
 /// Process lifecycle and task ownership. Only this context decides when new
@@ -433,6 +438,8 @@ impl Server {
                 root_containment_probe_hook: Mutex::new(None),
                 #[cfg(test)]
                 path_wait_acquire_hook: Mutex::new(None),
+                #[cfg(test)]
+                list_metadata_phase_hook: Mutex::new(None),
             },
             lifecycle,
         })
