@@ -232,6 +232,9 @@ struct DurableStateServices {
 #[cfg(test)]
 type UploadPreflightProbeHook = Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>;
 
+#[cfg(test)]
+type RootContainmentProbeHook = Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>;
+
 /// Bounded admission and accounting resources. Grouping these makes capacity
 /// policy independently reviewable from routing and persistence.
 struct AdmissionControl {
@@ -248,6 +251,8 @@ struct AdmissionControl {
     login_errors: Mutex<LoginErrorStore>,
     #[cfg(test)]
     upload_preflight_probe_hook: UploadPreflightProbeHook,
+    #[cfg(test)]
+    root_containment_probe_hook: RootContainmentProbeHook,
 }
 
 /// Process lifecycle and task ownership. Only this context decides when new
@@ -352,6 +357,8 @@ impl Server {
                 login_errors: Mutex::new(LoginErrorStore::default()),
                 #[cfg(test)]
                 upload_preflight_probe_hook: Mutex::new(None),
+                #[cfg(test)]
+                root_containment_probe_hook: Mutex::new(None),
             },
             lifecycle,
         })
@@ -643,33 +650,40 @@ impl Server {
         }
     }
 
+    async fn root_containment_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .admission
+            .root_containment_probe_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(path);
+        }
+        self.content.rooted_fs.metadata(path).await
+    }
+
     async fn guard_root_contained(&self, path: &Path) -> std::io::Result<bool> {
-        let mut check_path = path.to_path_buf();
-        loop {
-            match self.content.rooted_fs.metadata(&check_path).await {
-                Ok(_) => return Ok(false),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    match check_path.parent() {
-                        Some(parent) if check_path != self.content.args.serve_path => {
-                            check_path = parent.to_path_buf();
-                        }
-                        _ => return Ok(true),
-                    }
-                }
-                // openat2 reports XDEV when a symlink would leave the rooted
-                // filesystem. That case is intentionally hidden as 404.
-                Err(error)
-                    if error.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) =>
-                {
-                    return Ok(true);
-                }
-                Err(error) => return Err(error),
+        match self.root_containment_metadata(path).await {
+            Ok(_) => Ok(false),
+            // Resolution is left-to-right. Once openat2 reports a missing or
+            // non-directory component, no unresolved suffix can introduce a
+            // symlink escape, so walking every ancestor adds no information.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
             }
+            // openat2 reports XDEV when a symlink would leave the rooted
+            // filesystem. That case is intentionally hidden as 404.
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
+                Ok(true)
+            }
+            Err(error) => Err(error),
         }
     }
 
