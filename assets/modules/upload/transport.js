@@ -1,4 +1,8 @@
 import { parseUnsignedHeader } from "../http/headers.js";
+import {
+  AUTH_ERROR_HEADER,
+  authFailureMessage,
+} from "../http/client.js";
 
 /**
  * @typedef {{
@@ -17,11 +21,11 @@ import { parseUnsignedHeader } from "../http/headers.js";
 export function createUploadRequest(options) {
   const request = new XMLHttpRequest();
   const responseLimit = options.responseLimit;
-  let oversized = false;
+  let settled = false;
 
   const rejectOversizedResponse = () => {
-    if (oversized) return;
-    oversized = true;
+    if (settled) return;
+    settled = true;
     options.onOversizedResponse();
     request.abort();
   };
@@ -29,7 +33,27 @@ export function createUploadRequest(options) {
   request.upload.addEventListener("progress", options.onProgress);
   request.upload.addEventListener("load", options.onBodySent);
   request.addEventListener("readystatechange", () => {
-    if (request.readyState !== XMLHttpRequest.HEADERS_RECEIVED) return;
+    if (
+      settled ||
+      request.readyState !== XMLHttpRequest.HEADERS_RECEIVED
+    ) {
+      return;
+    }
+    if (authFailureMessage(
+      request.status,
+      request.getResponseHeader(AUTH_ERROR_HEADER),
+    )) {
+      // Authentication is complete at the response-header boundary. Mark the
+      // transport settled before invoking application code because its reload
+      // callback can synchronously cause an abort event.
+      settled = true;
+      try {
+        options.onResponse(request);
+      } finally {
+        request.abort();
+      }
+      return;
+    }
     const declaredLength = parseUnsignedHeader(
       request.getResponseHeader("Content-Length"),
     );
@@ -38,20 +62,31 @@ export function createUploadRequest(options) {
     }
   });
   request.addEventListener("progress", event => {
+    if (settled) return;
     if (event.loaded > responseLimit) rejectOversizedResponse();
   });
   request.addEventListener("load", () => {
-    if (oversized || responseTextExceedsLimit(
+    if (settled) return;
+    if (responseTextExceedsLimit(
       request.responseText,
       responseLimit,
     )) {
       rejectOversizedResponse();
       return;
     }
+    settled = true;
     options.onResponse(request);
   });
-  request.addEventListener("error", options.onNetworkError);
-  request.addEventListener("abort", options.onAbort);
+  request.addEventListener("error", event => {
+    if (settled) return;
+    settled = true;
+    options.onNetworkError(event);
+  });
+  request.addEventListener("abort", event => {
+    if (settled) return;
+    settled = true;
+    options.onAbort(event);
+  });
   return request;
 }
 
