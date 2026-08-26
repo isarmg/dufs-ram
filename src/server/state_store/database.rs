@@ -342,6 +342,7 @@ struct SqliteSidecarGuard {
 }
 
 struct SqliteSidecarEntry {
+    suffix: &'static str,
     path: PathBuf,
     state: SqliteSidecarState,
 }
@@ -398,7 +399,11 @@ impl SqliteSidecarGuard {
                     });
                 }
             };
-            entries.push(SqliteSidecarEntry { path, state });
+            entries.push(SqliteSidecarEntry {
+                suffix,
+                path,
+                state,
+            });
         }
         let guard = Self { entries };
         guard.revalidate()?;
@@ -459,6 +464,20 @@ impl SqliteSidecarGuard {
         self.entries
             .iter()
             .any(|entry| matches!(&entry.state, SqliteSidecarState::Present { .. }))
+    }
+
+    fn rollback_journal(&self) -> Option<(&Path, &File, SidecarMetadataSnapshot)> {
+        self.entries.iter().find_map(|entry| {
+            if entry.suffix != "-journal" {
+                return None;
+            }
+            match &entry.state {
+                SqliteSidecarState::Absent => None,
+                SqliteSidecarState::Present { file, snapshot } => {
+                    Some((entry.path.as_path(), file, *snapshot))
+                }
+            }
+        })
     }
 }
 
@@ -640,13 +659,8 @@ fn open_connection(path: &Path, root: RootIdentity) -> Result<Connection> {
     open_connection_with_sidecar_guard(path, root, flags, "open", || Ok(()))
 }
 
-fn open_existing_database_read_only(path: &Path, root: RootIdentity) -> Result<Connection> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW
-        | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    open_connection_with_sidecar_guard(path, root, flags, "inspect existing", || Ok(()))
+fn open_existing_database_for_preflight(path: &Path, root: RootIdentity) -> Result<Connection> {
+    open_existing_database_for_preflight_after_snapshot(path, root, || Ok(()))
 }
 
 fn open_connection_with_sidecar_guard<F>(
@@ -673,6 +687,61 @@ where
         .with_context(|| format!("Failed to {action} state database `{}`", path.display()))?;
     // sqlite3_open_v2 has only opened the main handle at this point. Recheck
     // before any pragma or prepared statement can make SQLite adopt a sidecar.
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    drop(main_database);
+    drop(sidecars);
+    harden_connection(&connection)?;
+    Ok(connection)
+}
+
+fn open_existing_database_for_preflight_after_snapshot<F>(
+    path: &Path,
+    root: RootIdentity,
+    after_snapshot: F,
+) -> Result<Connection>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let sidecars = SqliteSidecarGuard::inspect(path)?;
+    let main_database = MainDatabaseGuard::inspect(path)?;
+    after_snapshot()?;
+    // Keep the raw-main trust boundary ahead of every sidecar-assisted view.
+    // In particular, a WAL or rollback journal cannot make a foreign main
+    // database appear to be a DUFS database.
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    validate_raw_main_database(&main_database, &sidecars, root)?;
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+
+    // A read-only SQLite handle cannot recover a hot rollback journal. First
+    // prove on private copies that recovery produces the exact supported DUFS
+    // contract and root identity; only then permit SQLite to recover the
+    // guarded originals.
+    let recover_rollback_journal =
+        validate_private_rollback_journal_recovery(&main_database, &sidecars, root)?;
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+
+    let access = if recover_rollback_journal {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let flags = access
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let connection = Connection::open_with_flags(path, flags).with_context(|| {
+        format!(
+            "Failed to inspect existing state database `{}`",
+            path.display()
+        )
+    })?;
+    // sqlite3_open_v2 has only opened the main handle at this point. Recheck
+    // before hardening or validation can make SQLite adopt the journal.
     main_database.revalidate()?;
     sidecars.revalidate()?;
     drop(main_database);
@@ -765,6 +834,107 @@ fn copy_raw_main_database_snapshot(
     Ok(())
 }
 
+fn validate_private_rollback_journal_recovery(
+    main_database: &MainDatabaseGuard,
+    sidecars: &SqliteSidecarGuard,
+    root: RootIdentity,
+) -> Result<bool> {
+    let Some((journal_path, journal, journal_snapshot)) = sidecars.rollback_journal() else {
+        return Ok(false);
+    };
+
+    let directory = tempfile::Builder::new()
+        .prefix("dufs-state-rollback-")
+        .tempdir()
+        .context("Failed to create a private rollback-journal validation directory")?;
+    let snapshot_path = directory.path().join("state.sqlite3");
+    let mut main_destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&snapshot_path)
+        .context("Failed to create a private rollback-journal database snapshot")?;
+    copy_raw_main_database_snapshot(
+        main_database,
+        &mut main_destination,
+        MAX_RAW_DATABASE_SNAPSHOT_BYTES,
+    )?;
+    drop(main_destination);
+
+    let journal_snapshot_path = sqlite_sidecar_path(&snapshot_path, "-journal");
+    let mut journal_destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&journal_snapshot_path)
+        .context("Failed to create a private rollback-journal snapshot")?;
+    copy_rollback_journal_snapshot(
+        journal_path,
+        journal,
+        journal_snapshot,
+        &mut journal_destination,
+        MAX_RAW_DATABASE_SNAPSHOT_BYTES,
+    )?;
+    drop(journal_destination);
+
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let connection = Connection::open_with_flags(&snapshot_path, flags)
+        .context("Failed to open the private rollback-journal validation snapshot")?;
+    harden_connection(&connection)?;
+    validate_database_before_mutation(&connection, root).context(
+        "The privately recovered rollback-journal snapshot does not have a trusted DUFS contract",
+    )?;
+    main_database.revalidate()?;
+    sidecars.revalidate()?;
+    Ok(true)
+}
+
+fn copy_rollback_journal_snapshot(
+    path: &Path,
+    journal: &File,
+    snapshot: SidecarMetadataSnapshot,
+    destination: &mut File,
+    max_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        snapshot.size <= max_bytes,
+        "SQLite rollback journal `{}` is {} bytes and exceeds the validation snapshot limit of {} bytes",
+        path.display(),
+        snapshot.size,
+        max_bytes
+    );
+    let copy_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Rollback-journal snapshot limit cannot be incremented"))?;
+    let mut source = journal
+        .try_clone()
+        .context("Failed to duplicate the rollback-journal validation handle")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .context("Failed to rewind the rollback-journal validation handle")?;
+    let mut bounded = source.take(copy_limit);
+    let copied = io::copy(&mut bounded, destination)
+        .context("Failed to copy the rollback-journal validation snapshot")?;
+    ensure!(
+        copied <= max_bytes,
+        "SQLite rollback journal `{}` grew beyond the validation snapshot limit of {} bytes while it was being copied",
+        path.display(),
+        max_bytes
+    );
+    ensure!(
+        copied == snapshot.size,
+        "SQLite rollback journal `{}` changed size while its validation snapshot was being copied",
+        path.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn copy_raw_main_database_snapshot_after_inspect_for_test<F>(
     source_path: &Path,
@@ -789,12 +959,7 @@ pub(super) fn open_existing_database_after_sidecar_snapshot_for_test<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW
-        | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    open_connection_with_sidecar_guard(path, root, flags, "inspect existing", after_snapshot)
+    open_existing_database_for_preflight_after_snapshot(path, root, after_snapshot)
 }
 
 fn harden_connection(connection: &Connection) -> Result<()> {
@@ -846,7 +1011,7 @@ fn initialize_database(
     upload_ttl_ms: i64,
     recovery_now_ms: i64,
 ) -> Result<()> {
-    // Repeat the read-only path preflight on the actor connection before the
+    // Repeat the validated path preflight on the actor connection before the
     // first persistent pragma, schema mutation, or recovery write.
     validate_database_before_mutation(connection, root)?;
     configure_validated_connection(connection)?;
@@ -855,7 +1020,7 @@ fn initialize_database(
 }
 
 fn preflight_existing_database(path: &Path, root: RootIdentity) -> Result<()> {
-    let connection = open_existing_database_read_only(path, root)?;
+    let connection = open_existing_database_for_preflight(path, root)?;
     validate_database_before_mutation(&connection, root).with_context(|| {
         format!(
             "Refusing to modify unrecognized state database `{}`",

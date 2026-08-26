@@ -11,6 +11,11 @@ const TTL: Duration = Duration::from_secs(60);
 type SchemaRow = (String, String, String);
 type DatabaseSchemaSnapshot = (i64, i64, String, Vec<SchemaRow>);
 const HOT_ROLLBACK_FIXTURE_PATH: &str = "DUFS_TEST_HOT_ROLLBACK_FIXTURE_PATH";
+const HOT_ROLLBACK_FIXTURE_KIND: &str = "DUFS_TEST_HOT_ROLLBACK_FIXTURE_KIND";
+const HOT_ROLLBACK_ORDINARY_OPERATION: &str = "ordinary-operation";
+const HOT_ROLLBACK_TRUSTED_MAIN: &str = "trusted-main";
+const HOT_ROLLBACK_TRUSTED_ROOT_DEVICE: u64 = 769;
+const HOT_ROLLBACK_TRUSTED_ROOT_INODE: u64 = 773;
 
 #[derive(Debug, Eq, PartialEq)]
 struct FileSnapshot {
@@ -78,12 +83,39 @@ fn sqlite_hot_rollback_crash_fixture_helper() -> Result<()> {
         connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
     ensure!(mode.eq_ignore_ascii_case("delete"));
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         UPDATE store_meta
-            SET value = X'FFFFFFFFFFFFFFFF'
-          WHERE key = 'root-device-be';",
-    )?;
+    match std::env::var(HOT_ROLLBACK_FIXTURE_KIND).as_deref() {
+        Ok(HOT_ROLLBACK_ORDINARY_OPERATION) => connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO operations(
+                 owner_digest, operation_id, fingerprint, lease_token, state,
+                 created_at_ms, updated_at_ms
+             ) VALUES (
+                 zeroblob(32), zeroblob(16), zeroblob(32), zeroblob(16), 0,
+                 1, 1
+             );",
+        )?,
+        Ok(HOT_ROLLBACK_TRUSTED_MAIN) => {
+            connection.execute_batch("BEGIN IMMEDIATE;")?;
+            connection.execute(
+                "UPDATE store_meta
+                    SET value = CASE key
+                        WHEN 'root-device-be' THEN ?1
+                        ELSE ?2
+                    END
+                  WHERE key IN ('root-device-be', 'root-inode-be')",
+                params![
+                    HOT_ROLLBACK_TRUSTED_ROOT_DEVICE.to_be_bytes().as_slice(),
+                    HOT_ROLLBACK_TRUSTED_ROOT_INODE.to_be_bytes().as_slice()
+                ],
+            )?;
+        }
+        _ => connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE store_meta
+                SET value = X'FFFFFFFFFFFFFFFF'
+              WHERE key = 'root-device-be';",
+        )?,
+    }
     connection.cache_flush()?;
     // Exit without Rust or SQLite destructors so the rollback journal remains
     // genuinely hot and the flushed main page still needs recovery.
@@ -1904,6 +1936,93 @@ fn hot_rollback_baseline_is_rejected_without_recovery_or_modification() -> Resul
     assert!(
         format!("{error:#}").contains("raw main state database"),
         "unexpected hot-rollback error: {error:#}"
+    );
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
+    Ok(())
+}
+
+#[test]
+fn trusted_hot_rollback_journal_is_recovered_before_preflight() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(757, 761);
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    store.shutdown_for_test();
+
+    let status = ProcessCommand::new(std::env::current_exe()?)
+        .arg("sqlite_hot_rollback_crash_fixture_helper")
+        .arg("--test-threads=1")
+        .env(HOT_ROLLBACK_FIXTURE_PATH, path.as_os_str())
+        .env(HOT_ROLLBACK_FIXTURE_KIND, HOT_ROLLBACK_ORDINARY_OPERATION)
+        .status()?;
+    assert_eq!(status.code(), Some(86));
+    let journal = directory.path().join("state.sqlite3-journal");
+    assert!(fs::metadata(&journal)?.is_file());
+    assert_eq!(fs::metadata(&journal)?.nlink(), 1);
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+
+    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    reopened.shutdown_for_test();
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
+    assert!(
+        fs::symlink_metadata(&journal).is_err_and(|error| error.kind() == ErrorKind::NotFound),
+        "successful recovery must consume the hot rollback journal"
+    );
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let operation_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))?;
+    assert_eq!(
+        operation_count, 0,
+        "the uncommitted operation must be rolled back during startup recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn rollback_journal_that_restores_an_untrusted_root_is_rejected_without_modification() -> Result<()>
+{
+    let directory = tempdir()?;
+    let path = directory.path().join("state.sqlite3");
+    let identity = root(
+        HOT_ROLLBACK_TRUSTED_ROOT_DEVICE,
+        HOT_ROLLBACK_TRUSTED_ROOT_INODE,
+    );
+    let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    store.shutdown_for_test();
+
+    // Commit an untrusted root first. The crash transaction below flushes the
+    // expected root into the raw main file, while its journal still restores
+    // this committed untrusted identity.
+    let connection = Connection::open(&path)?;
+    connection.execute(
+        "UPDATE store_meta
+            SET value = CASE key
+                WHEN 'root-device-be' THEN ?1
+                ELSE ?2
+            END
+          WHERE key IN ('root-device-be', 'root-inode-be')",
+        params![
+            1_u64.to_be_bytes().as_slice(),
+            2_u64.to_be_bytes().as_slice()
+        ],
+    )?;
+    drop(connection);
+
+    let status = ProcessCommand::new(std::env::current_exe()?)
+        .arg("sqlite_hot_rollback_crash_fixture_helper")
+        .arg("--test-threads=1")
+        .env(HOT_ROLLBACK_FIXTURE_PATH, path.as_os_str())
+        .env(HOT_ROLLBACK_FIXTURE_KIND, HOT_ROLLBACK_TRUSTED_MAIN)
+        .status()?;
+    assert_eq!(status.code(), Some(86));
+    let files_before = state_database_files_snapshot(&path)?;
+
+    let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
+        .err()
+        .expect("a journal that rolls back to an untrusted root must be rejected");
+    assert!(
+        format!("{error:#}").contains("privately recovered rollback-journal snapshot"),
+        "the trusted raw main must be rejected only after private recovery: {error:#}"
     );
     assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
