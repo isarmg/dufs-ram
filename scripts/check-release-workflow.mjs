@@ -34,6 +34,71 @@ function jobBlock(source, name) {
   return source.slice(start, nextJob ? start + marker.length + nextJob.index : undefined);
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function shellFunctionBlock(source, name) {
+  const definitionPattern = new RegExp(
+    `^([ \\t]*)${escapeRegExp(name)}\\(\\)[ \\t]*\\{[ \\t]*\\n`,
+    "gmu",
+  );
+  const definitions = [...source.matchAll(definitionPattern)];
+  if (definitions.length !== 1) {
+    throw new Error(`expected exactly one ${name} shell function`);
+  }
+
+  const definition = definitions[0];
+  const bodyStart = definition.index + definition[0].length;
+  const closingPattern = new RegExp(
+    `^${escapeRegExp(definition[1])}\\}[ \\t]*(?:\\n|$)`,
+    "gmu",
+  );
+  closingPattern.lastIndex = bodyStart;
+  const closing = closingPattern.exec(source);
+  if (!closing) {
+    throw new Error(`missing closing brace for ${name} shell function`);
+  }
+  return {
+    body: source.slice(bodyStart, closing.index),
+    bodyStart,
+    bodyEnd: closing.index,
+  };
+}
+
+function requireExclusiveShellLine(source, command, message) {
+  const matches = source
+    .split("\n")
+    .filter(line => line.trim() === command);
+  if (matches.length !== 1) {
+    throw new Error(message);
+  }
+}
+
+function mutateExclusiveFunctionLine(source, name, command, replacement) {
+  const block = shellFunctionBlock(source, name);
+  const lines = block.body.split("\n");
+  const matches = lines
+    .map((line, index) => ({ index, line }))
+    .filter(({ line }) => line.trim() === command);
+  if (matches.length !== 1) {
+    throw new Error(`unable to construct ${name} mutation fixture`);
+  }
+
+  const { index, line } = matches[0];
+  if (replacement === null) {
+    lines.splice(index, 1);
+  } else {
+    const indentation = /^[ \\t]*/u.exec(line)?.[0] ?? "";
+    lines[index] = `${indentation}${replacement}`;
+  }
+  return (
+    source.slice(0, block.bodyStart) +
+    lines.join("\n") +
+    source.slice(block.bodyEnd)
+  );
+}
+
 function checkYankedAuditPreparation(source, label) {
   const fetch = source.indexOf("cargo fetch --locked");
   const audit = source.indexOf("cargo audit --deny yanked");
@@ -74,6 +139,7 @@ function checkWorkflow(source) {
 
   const verify = jobBlock(source, "verify_build");
   const publish = jobBlock(source, "publish");
+  const matchingDraft = shellFunctionBlock(publish, "require_matching_draft");
   requireMatch(
     verify,
     /    permissions:\n      actions: read\n      contents: read\n/u,
@@ -153,7 +219,6 @@ function checkWorkflow(source) {
     ".data.repository.release.tagName == $tag",
     ".tag_name == $tag",
     "verify_tag_target",
-    "verify_tag_target || return 1",
     "gh release download",
     "sha256sum \"$remote_path\"",
     "gh release upload",
@@ -172,6 +237,11 @@ function checkWorkflow(source) {
       throw new Error(`publish is missing: ${fragment}`);
     }
   }
+  requireExclusiveShellLine(
+    matchingDraft.body,
+    "verify_tag_target || return 1",
+    "require_matching_draft must exclusively verify the tag target",
+  );
   if (source.includes("--generate-notes")) {
     throw new Error("release notes must not be generated from a previous tag");
   }
@@ -253,6 +323,19 @@ for (const [source, label] of [
   process.exit(1);
 }
 
+const missingMatchingDraftTagCheck = mutateExclusiveFunctionLine(
+  workflow,
+  "require_matching_draft",
+  "verify_tag_target || return 1",
+  null,
+);
+const commentedMatchingDraftTagCheck = mutateExclusiveFunctionLine(
+  workflow,
+  "require_matching_draft",
+  "verify_tag_target || return 1",
+  "# verify_tag_target || return 1",
+);
+
 const mutationFixtures = [
   workflow.replace("      contents: write\n", "      contents: read\n"),
   workflow.replace(
@@ -299,7 +382,8 @@ const mutationFixtures = [
     '^HTTP/[0-9.]+[[:space:]]+204',
     '^HTTP/[0-9.]+[[:space:]]+200',
   ),
-  workflow.replaceAll("verify_tag_target || return 1", "verify_tag_target"),
+  missingMatchingDraftTagCheck,
+  commentedMatchingDraftTagCheck,
 ];
 for (const mutated of mutationFixtures) {
   try {
