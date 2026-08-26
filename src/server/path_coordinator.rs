@@ -1,4 +1,5 @@
 use super::{
+    StatePathScanLease,
     rooted_fs::{ResolvedPathKey, RootedFs},
     state_store::StateBlockingPath,
 };
@@ -173,10 +174,25 @@ impl PathCoordinator {
     /// lease, so no cooperating mutation can retarget a symlink between these
     /// resolutions and the eventual commit. Resolution failures deliberately
     /// use the global root key and therefore fail closed.
+    #[cfg(test)]
     pub(super) async fn conflicts_with_state_paths(
         &self,
         source: &Path,
         state_paths: &[StateBlockingPath],
+    ) -> bool {
+        self.conflicts_with_state_paths_for_scan(
+            source,
+            state_paths,
+            &StatePathScanLease::for_test(),
+        )
+        .await
+    }
+
+    pub(super) async fn conflicts_with_state_paths_for_scan(
+        &self,
+        source: &Path,
+        state_paths: &[StateBlockingPath],
+        scan_lease: &StatePathScanLease,
     ) -> bool {
         if state_paths.is_empty() {
             return false;
@@ -184,7 +200,7 @@ impl PathCoordinator {
         let source = normalize_key(source);
         let source = [LeaseKey {
             resolved: self
-                .resolve_path_key(&source)
+                .resolve_path_key_for_state_scan(&source, scan_lease.clone())
                 .await
                 .unwrap_or_else(|_| self.inner.rooted_fs.conservative_path_key()),
             lexical: source,
@@ -196,7 +212,7 @@ impl PathCoordinator {
             };
             let candidate = [LeaseKey {
                 resolved: self
-                    .resolve_path_key(&lexical)
+                    .resolve_path_key_for_state_scan(&lexical, scan_lease.clone())
                     .await
                     .unwrap_or_else(|_| self.inner.rooted_fs.conservative_path_key()),
                 lexical,
@@ -214,16 +230,34 @@ impl PathCoordinator {
     /// state path: a fresh PUT may supersede an idle Running upload target,
     /// while CommitStarted uploads and purge intents remain protected.
     /// Resolution failures fail closed.
+    #[cfg(test)]
     pub(super) async fn has_state_path_descendant(
         &self,
         ancestor: &Path,
         state_paths: &[StateBlockingPath],
     ) -> bool {
+        self.has_state_path_descendant_for_scan(
+            ancestor,
+            state_paths,
+            &StatePathScanLease::for_test(),
+        )
+        .await
+    }
+
+    pub(super) async fn has_state_path_descendant_for_scan(
+        &self,
+        ancestor: &Path,
+        state_paths: &[StateBlockingPath],
+        scan_lease: &StatePathScanLease,
+    ) -> bool {
         if state_paths.is_empty() {
             return false;
         }
         let ancestor = normalize_key(ancestor);
-        let resolved = match self.resolve_path_key(&ancestor).await {
+        let resolved = match self
+            .resolve_path_key_for_state_scan(&ancestor, scan_lease.clone())
+            .await
+        {
             Ok(resolved) => resolved,
             Err(_) => return true,
         };
@@ -236,7 +270,10 @@ impl PathCoordinator {
                 Ok(path) => normalize_key(&path),
                 Err(_) => return true,
             };
-            let resolved = match self.resolve_path_key(&lexical).await {
+            let resolved = match self
+                .resolve_path_key_for_state_scan(&lexical, scan_lease.clone())
+                .await
+            {
                 Ok(resolved) => resolved,
                 Err(_) => return true,
             };
@@ -255,6 +292,23 @@ impl PathCoordinator {
     }
 
     async fn resolve_path_key(&self, lexical: &Path) -> std::io::Result<ResolvedPathKey> {
+        self.begin_path_key_resolution()?;
+        self.inner.rooted_fs.resolved_path_key(lexical).await
+    }
+
+    async fn resolve_path_key_for_state_scan(
+        &self,
+        lexical: &Path,
+        scan_lease: StatePathScanLease,
+    ) -> std::io::Result<ResolvedPathKey> {
+        self.begin_path_key_resolution()?;
+        self.inner
+            .rooted_fs
+            .resolved_path_key_for_state_scan(lexical, scan_lease)
+            .await
+    }
+
+    fn begin_path_key_resolution(&self) -> std::io::Result<()> {
         #[cfg(test)]
         {
             self.inner
@@ -273,7 +327,7 @@ impl PathCoordinator {
                 ));
             }
         }
-        self.inner.rooted_fs.resolved_path_key(lexical).await
+        Ok(())
     }
 
     fn try_acquire(

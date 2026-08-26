@@ -212,9 +212,12 @@ impl StoreWorker {
                 Command::ListStateBlockingPaths {
                     after,
                     limit,
+                    scan_lease: _scan_lease,
                     reply,
                 } => {
-                    let _ = reply.send(self.state_blocking_paths(after, limit));
+                    let result = self.state_blocking_paths(after, limit);
+                    drop(_scan_lease);
+                    let _ = reply.send(result);
                 }
                 Command::MarkPurgeJobReady {
                     key,

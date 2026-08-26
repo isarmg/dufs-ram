@@ -1,4 +1,5 @@
 use super::{
+    StatePathScanLease,
     blocking_io::blocking_io_gate,
     internal_names::{
         InternalEntryName, classify_internal_name, delete_trash_name, quarantine_name,
@@ -409,7 +410,7 @@ impl RootedFs {
     }
 
     #[cfg(test)]
-    fn inject_before_resolved_path_prefix_probe_once(
+    pub(super) fn inject_before_resolved_path_prefix_probe_once(
         &self,
         probe: usize,
         hook: impl FnOnce() + Send + 'static,
@@ -673,9 +674,31 @@ impl RootedFs {
     }
 
     pub(super) async fn resolved_path_key(&self, path: &Path) -> std::io::Result<ResolvedPathKey> {
+        self.resolved_path_key_with_scan_lease(path, None).await
+    }
+
+    pub(super) async fn resolved_path_key_for_state_scan(
+        &self,
+        path: &Path,
+        scan_lease: StatePathScanLease,
+    ) -> std::io::Result<ResolvedPathKey> {
+        self.resolved_path_key_with_scan_lease(path, Some(scan_lease))
+            .await
+    }
+
+    async fn resolved_path_key_with_scan_lease(
+        &self,
+        path: &Path,
+        scan_lease: Option<StatePathScanLease>,
+    ) -> std::io::Result<ResolvedPathKey> {
         let this = self.clone();
         let path = path.to_path_buf();
-        run_blocking(move || this.resolved_path_key_blocking(&path)).await
+        run_blocking(move || {
+            let result = this.resolved_path_key_blocking(&path);
+            drop(scan_lease);
+            result
+        })
+        .await
     }
 
     fn resolved_path_key_blocking(&self, path: &Path) -> std::io::Result<ResolvedPathKey> {
@@ -804,7 +827,7 @@ impl RootedFs {
     }
 
     #[cfg(test)]
-    fn take_resolved_path_prefix_probes(&self) -> usize {
+    pub(super) fn take_resolved_path_prefix_probes(&self) -> usize {
         self.inner
             .resolved_path_prefix_probes
             .swap(0, Ordering::SeqCst)

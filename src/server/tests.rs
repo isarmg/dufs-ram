@@ -783,3 +783,152 @@ async fn durable_state_path_scans_fail_fast_without_filling_the_actor_queue() {
         "completed scans retained admission permits"
     );
 }
+
+#[tokio::test]
+async fn cancelled_state_scans_retain_admission_until_actor_commands_finish() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Arc::new(
+        Server::init_with_lifecycle(
+            authenticated_args(temp.path().to_path_buf(), state_dir.path()),
+            ServerLifecycle::new(),
+        )
+        .unwrap(),
+    );
+    let release_actor = server.state.state_store.block_actor_for_test().unwrap();
+    let mut scans = Vec::with_capacity(STATE_PATH_SCAN_CAPACITY);
+    for index in 0..STATE_PATH_SCAN_CAPACITY {
+        let server = server.clone();
+        scans.push(tokio::spawn(async move {
+            let path = server
+                .content
+                .args
+                .serve_path
+                .join(format!("actor-scan-{index}"));
+            server.has_persisted_path_conflict(&[&path]).await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.admission.state_path_scan_slots.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("state scans did not submit their actor commands");
+    for scan in &scans {
+        scan.abort();
+    }
+    for scan in scans {
+        assert!(scan.await.unwrap_err().is_cancelled());
+    }
+
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        0,
+        "cancelled scan waiters released permits while actor commands were still queued"
+    );
+    let error = server
+        .has_persisted_path_descendant(temp.path())
+        .await
+        .expect_err("a new scan bypassed actor-owned admission leases");
+    assert_eq!(error.to_string(), STATE_PATH_SCAN_ADMISSION_ERROR);
+
+    release_actor.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.admission.state_path_scan_slots.available_permits() != STATE_PATH_SCAN_CAPACITY
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor commands retained state scan permits after completing");
+}
+
+#[tokio::test]
+async fn cancelled_state_scan_retains_admission_until_blocking_lookup_finishes() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Arc::new(
+        Server::init_with_lifecycle(
+            authenticated_args(temp.path().to_path_buf(), state_dir.path()),
+            ServerLifecycle::new(),
+        )
+        .unwrap(),
+    );
+
+    let protected = temp.path().join("protected.txt");
+    std::fs::write(&protected, "protected").unwrap();
+    let PreparePurge::Prepared(_prepared) = server.prepare_purge("user", &protected).await.unwrap()
+    else {
+        panic!("durable purge store unexpectedly full");
+    };
+    let scan_parent = temp.path().join("scan-source");
+    std::fs::create_dir(&scan_parent).unwrap();
+    let scan_path = scan_parent.join("item.txt");
+
+    let _ = server.content.rooted_fs.take_resolved_path_prefix_probes();
+    let (entered_sender, entered_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    server
+        .content
+        .rooted_fs
+        .inject_before_resolved_path_prefix_probe_once(1, move || {
+            let _ = entered_sender.send(());
+            release_receiver
+                .recv()
+                .expect("blocking state-path lookup release sender dropped");
+        });
+
+    let mut held_permits = Vec::new();
+    for _ in 1..STATE_PATH_SCAN_CAPACITY {
+        held_permits.push(
+            server
+                .admission
+                .state_path_scan_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+    }
+    let scan = {
+        let server = server.clone();
+        tokio::spawn(async move { server.has_persisted_path_conflict(&[&scan_path]).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), entered_receiver)
+        .await
+        .expect("state scan did not enter its blocking path lookup")
+        .unwrap();
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        0
+    );
+
+    scan.abort();
+    assert!(scan.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        0,
+        "cancelling a scan waiter released its in-flight blocking lookup permit"
+    );
+    let error = server
+        .has_persisted_path_descendant(temp.path())
+        .await
+        .expect_err("a new scan bypassed a blocking lookup's admission lease");
+    assert_eq!(error.to_string(), STATE_PATH_SCAN_ADMISSION_ERROR);
+
+    release_sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.admission.state_path_scan_slots.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed blocking lookup retained its state scan permit");
+    drop(held_permits);
+    assert_eq!(
+        server.admission.state_path_scan_slots.available_permits(),
+        STATE_PATH_SCAN_CAPACITY
+    );
+}

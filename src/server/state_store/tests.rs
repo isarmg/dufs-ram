@@ -1136,7 +1136,9 @@ async fn state_blocking_paths_are_complete_and_keyset_paginated() -> Result<()> 
     loop {
         // A one-row page proves the cursor cannot skip the second path
         // belonging to the same owner/id record.
-        let page = store.state_blocking_paths(cursor, 1).await?;
+        let page = store
+            .state_blocking_paths(cursor, 1, StatePathScanLease::for_test())
+            .await?;
         paths.extend(page.paths);
         let Some(next) = page.next else {
             break;

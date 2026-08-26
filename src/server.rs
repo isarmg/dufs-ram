@@ -65,7 +65,7 @@ use std::{
     },
     time::SystemTime,
 };
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, Semaphore, mpsc};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
 use tokio::time::timeout_at;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -83,6 +83,34 @@ const STATE_PATH_SCAN_ADMISSION_ERROR: &str = "Durable state path scan admission
 const STATE_PATH_ADMISSION_PAGE_SIZE: usize = 256;
 const PATH_WAIT_CAPACITY_LIMIT: usize = 64;
 const PATH_WAIT_LIMIT_DETAIL: &str = "Too many path-coordinated requests are active";
+
+/// Keeps one durable-state scan admission slot tied to work that cannot be
+/// cancelled after dispatch. The request owns one clone, while each accepted
+/// actor command and each started blocking filesystem lookup owns another.
+/// Dropping the request therefore stops later pages without admitting a
+/// replacement scan before its already-started work has actually finished.
+#[derive(Clone)]
+struct StatePathScanLease {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl StatePathScanLease {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let slots = Arc::new(Semaphore::new(1));
+        Self::new(
+            slots
+                .try_acquire_owned()
+                .expect("a fresh state-path test slot is available"),
+        )
+    }
+}
 
 /// Builds a reusable server together with the lifecycle resources required by
 /// its background maintenance work.
@@ -488,24 +516,25 @@ impl Server {
     /// prevents a newly imported upload session or purge intent from appearing
     /// behind the pagination cursor.
     async fn has_persisted_path_conflict(&self, paths: &[&Path]) -> Result<bool> {
-        let _scan_permit = self
-            .admission
-            .state_path_scan_slots
-            .clone()
-            .try_acquire_owned()
-            .context(STATE_PATH_SCAN_ADMISSION_ERROR)?;
+        let scan_lease = StatePathScanLease::new(
+            self.admission
+                .state_path_scan_slots
+                .clone()
+                .try_acquire_owned()
+                .context(STATE_PATH_SCAN_ADMISSION_ERROR)?,
+        );
         let mut after = None;
         loop {
             let page = self
                 .state
                 .state_store
-                .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE)
+                .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE, scan_lease.clone())
                 .await?;
             for path in paths {
                 if self
                     .content
                     .path_coordinator
-                    .conflicts_with_state_paths(path, &page.paths)
+                    .conflicts_with_state_paths_for_scan(path, &page.paths, &scan_lease)
                     .await
                 {
                     return Ok(true);
@@ -522,23 +551,24 @@ impl Server {
     /// target remains valid. It must still reject replacing a directory or
     /// symlink that gives any durable upload/purge path its current meaning.
     async fn has_persisted_path_descendant(&self, path: &Path) -> Result<bool> {
-        let _scan_permit = self
-            .admission
-            .state_path_scan_slots
-            .clone()
-            .try_acquire_owned()
-            .context(STATE_PATH_SCAN_ADMISSION_ERROR)?;
+        let scan_lease = StatePathScanLease::new(
+            self.admission
+                .state_path_scan_slots
+                .clone()
+                .try_acquire_owned()
+                .context(STATE_PATH_SCAN_ADMISSION_ERROR)?,
+        );
         let mut after = None;
         loop {
             let page = self
                 .state
                 .state_store
-                .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE)
+                .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE, scan_lease.clone())
                 .await?;
             if self
                 .content
                 .path_coordinator
-                .has_state_path_descendant(path, &page.paths)
+                .has_state_path_descendant_for_scan(path, &page.paths, &scan_lease)
                 .await
             {
                 return Ok(true);
