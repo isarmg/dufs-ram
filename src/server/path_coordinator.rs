@@ -112,7 +112,15 @@ impl PathCoordinator {
                 .as_ref()
                 .is_none_or(|(epoch, _)| *epoch != expected_epoch)
             {
-                registration.mark_resolving(lexical_paths.as_slice());
+                let previous_paths = resolved_paths.as_ref().map(|(_, paths)| paths.as_slice());
+                if !registration
+                    .mark_resolving_if_eligible(lexical_paths.as_slice(), previous_paths)
+                {
+                    if changes.changed().await.is_err() {
+                        unreachable!("the path coordinator owns the change sender");
+                    }
+                    continue;
+                }
                 let mut paths = Vec::with_capacity(lexical_paths.len());
                 for lexical in &lexical_paths {
                     let resolved = match self.resolve_path_key(lexical).await {
@@ -146,7 +154,9 @@ impl PathCoordinator {
                     return lease;
                 }
                 AcquireAttempt::Stale => {
-                    resolved_paths = None;
+                    // Keep the old semantic key only as a conservative queue
+                    // hint. The epoch check above always forces a fresh
+                    // resolution before this waiter can acquire a lease.
                     continue;
                 }
                 AcquireAttempt::Blocked => {}
@@ -310,6 +320,11 @@ impl PathCoordinator {
         // inserting this key. A mutation that can change resolution will bump
         // lease_epoch when its lease is released. Avoiding an epoch bump here
         // keeps unrelated waiters from repeating rooted filesystem lookups.
+        // Still wake the queue because removing its earliest waiter can make a
+        // later, unrelated request eligible to resolve or retry immediately.
+        self.inner.changes.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
         AcquireAttempt::Acquired(PathLease {
             inner: self.inner.clone(),
             id,
@@ -332,15 +347,29 @@ impl WaiterRegistration {
         }
     }
 
-    fn mark_resolving(&self, lexical_paths: &[PathBuf]) {
+    fn mark_resolving_if_eligible(
+        &self,
+        lexical_paths: &[PathBuf],
+        previous_paths: Option<&[LeaseKey]>,
+    ) -> bool {
         let mut waiters = self
             .inner
             .waiters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let blocked_by_earlier = waiters.range(..self.id).any(|(_, earlier)| {
+            previous_paths.map_or_else(
+                || waiter_lexically_conflicts(earlier, lexical_paths),
+                |paths| waiter_conflicts(earlier, paths),
+            )
+        });
+        if blocked_by_earlier {
+            return false;
+        }
         if let Some(waiter) = waiters.get_mut(&self.id) {
             *waiter = WaiterState::Resolving(lexical_paths.to_vec());
         }
+        true
     }
 
     fn disarm(&mut self) {
@@ -425,6 +454,21 @@ fn waiter_conflicts(waiter: &WaiterState, requested: &[LeaseKey]) -> bool {
                 .any(|right| left.starts_with(&right.lexical) || right.lexical.starts_with(left))
         }),
         WaiterState::Resolved(paths) => paths_conflict(paths, requested),
+    }
+}
+
+fn waiter_lexically_conflicts(waiter: &WaiterState, requested: &[PathBuf]) -> bool {
+    match waiter {
+        WaiterState::Resolving(lexical_paths) => lexical_paths.iter().any(|left| {
+            requested
+                .iter()
+                .any(|right| left.starts_with(right) || right.starts_with(left))
+        }),
+        WaiterState::Resolved(paths) => paths.iter().any(|left| {
+            requested
+                .iter()
+                .any(|right| left.lexical.starts_with(right) || right.starts_with(&left.lexical))
+        }),
     }
 }
 
