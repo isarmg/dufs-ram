@@ -15,6 +15,7 @@ concurrency:
 env:
   NODE_VERSION: "24.8.0"
   RUST_TOOLCHAIN: "1.97.1"
+  CARGO_AUDIT_VERSION: "0.22.2"
   TARGET: x86_64-unknown-linux-gnu
   CARGO_TERM_COLOR: always
 
@@ -29,6 +30,7 @@ jobs:
     outputs:
       release_artifact_id: ${{ steps.upload_release_input.outputs.artifact-id }}
       release_input_digest: ${{ steps.prepare_release_inputs.outputs.release_input_digest }}
+      verification_run_attempt: ${{ steps.record_verification_attempt.outputs.run_attempt }}
     steps:
       - name: Check out the exact tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -155,19 +157,33 @@ jobs:
           require_successful_run dependency-audit.yml 'dependency audit'
           require_successful_run formal-release-e2e.yml 'formal release package E2E'
 
-      - name: Install the fixed Rust toolchain
+      - name: Install the fixed Rust toolchain and cargo-audit
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" install cargo-audit \
+            --version "$CARGO_AUDIT_VERSION" \
+            --locked
           rustc +"$RUST_TOOLCHAIN" --version --verbose
           cargo +"$RUST_TOOLCHAIN" --version --verbose
+          test "$(cargo audit --version)" = \
+            "cargo-audit-audit $CARGO_AUDIT_VERSION"
 
       - name: Use the fixed Node.js release
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
+
+      - name: Audit dependencies for this release attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo audit --deny yanked
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm audit --audit-level=high
 
       - name: Build the release binary
         shell: bash
@@ -250,6 +266,18 @@ jobs:
           compression-level: 0
           include-hidden-files: false
 
+      - name: Record the successful verification attempt
+        id: record_verification_attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'Workflow run attempt is invalid: %s.\n' \
+              "$GITHUB_RUN_ATTEMPT" >&2
+            exit 1
+          fi
+          printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Publish verified inputs with contents write only
     needs: verify_build
@@ -258,6 +286,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Require verification from this workflow attempt
+        shell: bash
+        env:
+          VERIFIED_RUN_ATTEMPT: ${{ needs.verify_build.outputs.verification_run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERIFIED_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ || \
+            ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ || \
+            "$VERIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]
+          then
+            printf '%s\n' \
+              'Publishing requires verification from this workflow attempt; use Re-run all jobs.' >&2
+            exit 1
+          fi
+
       - name: Download the exact build artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

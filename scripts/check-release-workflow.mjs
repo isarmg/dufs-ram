@@ -34,6 +34,22 @@ function jobBlock(source, name) {
   return source.slice(start, nextJob ? start + marker.length + nextJob.index : undefined);
 }
 
+function stepBlock(source, name) {
+  const marker = `      - name: ${name}\n`;
+  const start = source.indexOf(marker);
+  if (start === -1 || source.indexOf(marker, start + marker.length) !== -1) {
+    throw new Error(`expected exactly one ${name} step`);
+  }
+  const rest = source.slice(start + marker.length);
+  const nextStep = /^      - name: /mu.exec(rest);
+  const end = nextStep ? start + marker.length + nextStep.index : source.length;
+  return {
+    body: source.slice(start, end),
+    bodyStart: start,
+    bodyEnd: end,
+  };
+}
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
@@ -69,20 +85,27 @@ function shellFunctionBlock(source, name) {
 function requireExclusiveShellLine(source, command, message) {
   const matches = source
     .split("\n")
-    .filter(line => line.trim() === command);
+    .map((line, index) => ({ index, line }))
+    .filter(({ line }) => line.trim() === command);
   if (matches.length !== 1) {
     throw new Error(message);
   }
+  return matches[0].index;
 }
 
-function mutateExclusiveFunctionLine(source, name, command, replacement) {
-  const block = shellFunctionBlock(source, name);
+function mutateExclusiveBlockLine(
+  source,
+  block,
+  command,
+  replacement,
+  label,
+) {
   const lines = block.body.split("\n");
   const matches = lines
     .map((line, index) => ({ index, line }))
     .filter(({ line }) => line.trim() === command);
   if (matches.length !== 1) {
-    throw new Error(`unable to construct ${name} mutation fixture`);
+    throw new Error(`unable to construct ${label} mutation fixture`);
   }
 
   const { index, line } = matches[0];
@@ -96,6 +119,59 @@ function mutateExclusiveFunctionLine(source, name, command, replacement) {
     source.slice(0, block.bodyStart) +
     lines.join("\n") +
     source.slice(block.bodyEnd)
+  );
+}
+
+function mutateExclusiveFunctionLine(source, name, command, replacement) {
+  return mutateExclusiveBlockLine(
+    source,
+    shellFunctionBlock(source, name),
+    command,
+    replacement,
+    name,
+  );
+}
+
+function mutateExclusiveStepLine(source, name, command, replacement) {
+  return mutateExclusiveBlockLine(
+    source,
+    stepBlock(source, name),
+    command,
+    replacement,
+    name,
+  );
+}
+
+function replaceExactlyOnce(source, expected, replacement, label) {
+  const start = source.indexOf(expected);
+  if (
+    start === -1 ||
+    source.indexOf(expected, start + expected.length) !== -1
+  ) {
+    throw new Error(`unable to construct ${label} mutation fixture`);
+  }
+  return (
+    source.slice(0, start) +
+    replacement +
+    source.slice(start + expected.length)
+  );
+}
+
+function moveStepAfter(source, movingName, targetName) {
+  const moving = stepBlock(source, movingName);
+  const target = stepBlock(source, targetName);
+  if (moving.bodyStart >= target.bodyStart) {
+    throw new Error(`unable to move ${movingName} after ${targetName}`);
+  }
+
+  const movingSource = source.slice(moving.bodyStart, moving.bodyEnd);
+  const withoutMoving =
+    source.slice(0, moving.bodyStart) + source.slice(moving.bodyEnd);
+  const shiftedTarget = stepBlock(withoutMoving, targetName);
+  return (
+    withoutMoving.slice(0, shiftedTarget.bodyEnd) +
+    movingSource +
+    withoutMoving.slice(shiftedTarget.bodyEnd)
   );
 }
 
@@ -132,6 +208,125 @@ function checkIsolatedEdgePolicy(source) {
   }
 }
 
+function checkFreshReleaseAudit(source, verify) {
+  requireExclusiveShellLine(
+    source,
+    'CARGO_AUDIT_VERSION: "0.22.2"',
+    "release workflow must pin cargo-audit 0.22.2 exactly once",
+  );
+
+  const install = stepBlock(
+    verify,
+    "Install the fixed Rust toolchain and cargo-audit",
+  );
+  const setupNode = stepBlock(verify, "Use the fixed Node.js release");
+  const audit = stepBlock(verify, "Audit dependencies for this release attempt");
+  const build = stepBlock(verify, "Build the release binary");
+  if (
+    install.bodyStart >= audit.bodyStart ||
+    setupNode.bodyStart >= audit.bodyStart ||
+    audit.bodyStart >= build.bodyStart
+  ) {
+    throw new Error(
+      "fresh dependency audit must follow fixed tool setup and precede the build",
+    );
+  }
+
+  for (const command of [
+    'cargo +"$RUST_TOOLCHAIN" install cargo-audit \\',
+    '--version "$CARGO_AUDIT_VERSION" \\',
+    "--locked",
+    'test "$(cargo audit --version)" = \\',
+    '"cargo-audit-audit $CARGO_AUDIT_VERSION"',
+  ]) {
+    requireExclusiveShellLine(
+      install.body,
+      command,
+      `cargo-audit setup is missing an active exclusive line: ${command}`,
+    );
+  }
+
+  const cargoFetch = requireExclusiveShellLine(
+    audit.body,
+    "cargo fetch --locked",
+    "fresh release audit must fetch the locked Cargo graph",
+  );
+  const cargoAudit = requireExclusiveShellLine(
+    audit.body,
+    "cargo audit --deny yanked",
+    "fresh release audit must check RustSec advisories and yanked crates",
+  );
+  const npmInstall = requireExclusiveShellLine(
+    audit.body,
+    "npm ci --ignore-scripts --no-audit --no-fund",
+    "fresh release audit must install the locked npm graph without scripts",
+  );
+  const npmAudit = requireExclusiveShellLine(
+    audit.body,
+    "npm audit --audit-level=high",
+    "fresh release audit must check current high-severity npm advisories",
+  );
+  if (cargoFetch >= cargoAudit || npmInstall >= npmAudit) {
+    throw new Error("fresh release audits must prepare each locked graph first");
+  }
+}
+
+function checkReleaseAttemptBinding(verify, publish) {
+  const audit = stepBlock(verify, "Audit dependencies for this release attempt");
+  const upload = stepBlock(verify, "Transfer the verified release inputs");
+  const record = stepBlock(verify, "Record the successful verification attempt");
+  if (audit.bodyStart >= record.bodyStart || upload.bodyStart >= record.bodyStart) {
+    throw new Error("verification attempt must be recorded after audit and upload");
+  }
+  requireExclusiveShellLine(
+    verify,
+    "verification_run_attempt: ${{ steps.record_verification_attempt.outputs.run_attempt }}",
+    "verify_build must expose the attempt captured by its successful step",
+  );
+  requireExclusiveShellLine(
+    record.body,
+    "id: record_verification_attempt",
+    "verification attempt recorder must have the expected step ID",
+  );
+  requireExclusiveShellLine(
+    record.body,
+    `printf 'run_attempt=%s\\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"`,
+    "verification attempt recorder must persist the executed run attempt",
+  );
+
+  const guard = stepBlock(
+    publish,
+    "Require verification from this workflow attempt",
+  );
+  const download = stepBlock(publish, "Download the exact build artifact");
+  const stepsMarker = "    steps:\n";
+  const stepsStart = publish.indexOf(stepsMarker);
+  if (
+    stepsStart === -1 ||
+    guard.bodyStart !== stepsStart + stepsMarker.length ||
+    guard.bodyStart >= download.bodyStart
+  ) {
+    throw new Error("publish must validate the run attempt in its first step");
+  }
+  requireExclusiveShellLine(
+    guard.body,
+    "VERIFIED_RUN_ATTEMPT: ${{ needs.verify_build.outputs.verification_run_attempt }}",
+    "publish must consume the attempt captured by verify_build",
+  );
+  for (const command of [
+    'if [[ ! "$VERIFIED_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ || \\',
+    '! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ || \\',
+    '"$VERIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]',
+    "exit 1",
+  ]) {
+    requireExclusiveShellLine(
+      guard.body,
+      command,
+      `publish attempt guard is missing an active exclusive line: ${command}`,
+    );
+  }
+}
+
 function checkWorkflow(source) {
   if (source.includes("\r") || !source.endsWith("\n")) {
     throw new Error("release workflow must use LF and end with a newline");
@@ -140,6 +335,8 @@ function checkWorkflow(source) {
   const verify = jobBlock(source, "verify_build");
   const publish = jobBlock(source, "publish");
   const matchingDraft = shellFunctionBlock(publish, "require_matching_draft");
+  checkFreshReleaseAudit(source, verify);
+  checkReleaseAttemptBinding(verify, publish);
   requireMatch(
     verify,
     /    permissions:\n      actions: read\n      contents: read\n/u,
@@ -213,7 +410,7 @@ function checkWorkflow(source) {
     "$id > 0",
     "$id <= 2147483647",
     "($id | floor) == $id",
-    '^[1-9][0-9]*$',
+    'if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then',
     '"repos/${GH_REPO}/releases/${release_id}"',
     '(.id | tostring) == $release_id',
     ".data.repository.release.tagName == $tag",
@@ -323,6 +520,77 @@ for (const [source, label] of [
   process.exit(1);
 }
 
+const freshAuditStepName = "Audit dependencies for this release attempt";
+const verificationAttemptStepName =
+  "Record the successful verification attempt";
+const publishAttemptGuardStepName =
+  "Require verification from this workflow attempt";
+const missingFreshCargoAudit = mutateExclusiveStepLine(
+  workflow,
+  freshAuditStepName,
+  "cargo audit --deny yanked",
+  null,
+);
+const commentedFreshCargoAudit = mutateExclusiveStepLine(
+  workflow,
+  freshAuditStepName,
+  "cargo audit --deny yanked",
+  "# cargo audit --deny yanked",
+);
+const unlockedFreshCargoFetch = mutateExclusiveStepLine(
+  workflow,
+  freshAuditStepName,
+  "cargo fetch --locked",
+  "cargo fetch",
+);
+const missingFreshNpmAudit = mutateExclusiveStepLine(
+  workflow,
+  freshAuditStepName,
+  "npm audit --audit-level=high",
+  null,
+);
+const commentedFreshNpmAudit = mutateExclusiveStepLine(
+  workflow,
+  freshAuditStepName,
+  "npm audit --audit-level=high",
+  "# npm audit --audit-level=high",
+);
+const missingVerificationAttemptCapture = mutateExclusiveStepLine(
+  workflow,
+  verificationAttemptStepName,
+  `printf 'run_attempt=%s\\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"`,
+  null,
+);
+const contextOnlyVerificationAttempt = replaceExactlyOnce(
+  workflow,
+  "verification_run_attempt: ${{ steps.record_verification_attempt.outputs.run_attempt }}",
+  "verification_run_attempt: ${{ github.run_attempt }}",
+  "context-only verification attempt",
+);
+const unboundPublishAttempt = mutateExclusiveStepLine(
+  workflow,
+  publishAttemptGuardStepName,
+  "VERIFIED_RUN_ATTEMPT: ${{ needs.verify_build.outputs.verification_run_attempt }}",
+  "VERIFIED_RUN_ATTEMPT: ${{ github.run_attempt }}",
+);
+const invertedPublishAttemptGuard = mutateExclusiveStepLine(
+  workflow,
+  publishAttemptGuardStepName,
+  '"$VERIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]',
+  '"$VERIFIED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]',
+);
+const commentedPublishAttemptGuard = mutateExclusiveStepLine(
+  workflow,
+  publishAttemptGuardStepName,
+  '"$VERIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]',
+  '# "$VERIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]',
+);
+const latePublishAttemptGuard = moveStepAfter(
+  workflow,
+  publishAttemptGuardStepName,
+  "Download the exact build artifact",
+);
+
 const missingMatchingDraftTagCheck = mutateExclusiveFunctionLine(
   workflow,
   "require_matching_draft",
@@ -337,6 +605,17 @@ const commentedMatchingDraftTagCheck = mutateExclusiveFunctionLine(
 );
 
 const mutationFixtures = [
+  missingFreshCargoAudit,
+  commentedFreshCargoAudit,
+  unlockedFreshCargoFetch,
+  missingFreshNpmAudit,
+  commentedFreshNpmAudit,
+  missingVerificationAttemptCapture,
+  contextOnlyVerificationAttempt,
+  unboundPublishAttempt,
+  invertedPublishAttemptGuard,
+  commentedPublishAttemptGuard,
+  latePublishAttemptGuard,
   workflow.replace("      contents: write\n", "      contents: read\n"),
   workflow.replace(
     "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
@@ -363,7 +642,10 @@ const mutationFixtures = [
   workflow.replace("$id > 0", "$id >= 0"),
   workflow.replace("$id <= 2147483647", "$id <= 0"),
   workflow.replace("($id | floor) == $id", "($id | floor) != $id"),
-  workflow.replace("^[1-9][0-9]*$", "^[0-9]+$"),
+  workflow.replace(
+    'if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then',
+    'if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then',
+  ),
   workflow.replace(
     '"repos/${GH_REPO}/releases/${release_id}"',
     '"repos/${GH_REPO}/releases/tags/${tag}"',
