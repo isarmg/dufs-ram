@@ -112,6 +112,23 @@ impl StatePathScanLease {
     }
 }
 
+/// Keeps one batch-preflight admission slot tied to the currently executing
+/// blocking probe. The request owns the base lease and each dispatched probe
+/// owns a clone, so cancellation stops later paths without admitting a new
+/// batch before an already-started syscall has actually returned.
+#[derive(Clone)]
+struct UploadPreflightLease {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl UploadPreflightLease {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+}
+
 /// Builds a reusable server together with the lifecycle resources required by
 /// its background maintenance work.
 pub struct ServerBuilder {
@@ -712,13 +729,34 @@ impl Server {
     /// Resolve the target for method dispatch without following an invalid
     /// final symlink or exposing a link that leaves the rooted namespace.
     async fn route_metadata(&self, path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
-        match self.content.rooted_fs.metadata(path).await {
+        self.route_metadata_guarded(path, ()).await
+    }
+
+    async fn route_metadata_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<Option<std::fs::Metadata>>
+    where
+        G: Clone + Send + 'static,
+    {
+        match self
+            .content
+            .rooted_fs
+            .metadata_guarded(path, guard.clone())
+            .await
+        {
             Ok(metadata) => Ok(Some(metadata)),
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound
                     || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
             {
-                match self.content.rooted_fs.metadata_nofollow(path).await {
+                match self
+                    .content
+                    .rooted_fs
+                    .metadata_nofollow_guarded(path, guard)
+                    .await
+                {
                     Ok(metadata) => Ok(Some(metadata)),
                     Err(fallback)
                         if matches!(
@@ -742,7 +780,14 @@ impl Server {
         }
     }
 
-    async fn root_containment_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    async fn root_containment_metadata_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<std::fs::Metadata>
+    where
+        G: Send + 'static,
+    {
         #[cfg(test)]
         if let Some(hook) = self
             .admission
@@ -753,11 +798,18 @@ impl Server {
         {
             hook(path);
         }
-        self.content.rooted_fs.metadata(path).await
+        self.content.rooted_fs.metadata_guarded(path, guard).await
     }
 
     async fn guard_root_contained(&self, path: &Path) -> std::io::Result<bool> {
-        match self.root_containment_metadata(path).await {
+        self.guard_root_contained_guarded(path, ()).await
+    }
+
+    async fn guard_root_contained_guarded<G>(&self, path: &Path, guard: G) -> std::io::Result<bool>
+    where
+        G: Send + 'static,
+    {
+        match self.root_containment_metadata_guarded(path, guard).await {
             Ok(_) => Ok(false),
             // Resolution is left-to-right. Once openat2 reports a missing or
             // non-directory component, no unresolved suffix can introduce a

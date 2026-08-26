@@ -1,5 +1,5 @@
 use super::{
-    Request, Response, Server, body_full,
+    Request, Response, Server, UploadPreflightLease, body_full,
     identity::OwnerId,
     operation_registry::{
         BeginOperation, OperationFingerprint, OperationGuard, OperationOutcome,
@@ -451,10 +451,16 @@ impl Server {
     async fn upload_preflight_has_untraversable_ancestor(
         &self,
         path: &Path,
+        lease: &UploadPreflightLease,
     ) -> std::io::Result<bool> {
         let mut ancestor = path.parent();
         while let Some(current) = ancestor {
-            match self.content.rooted_fs.metadata(current).await {
+            match self
+                .content
+                .rooted_fs
+                .metadata_guarded(current, lease.clone())
+                .await
+            {
                 Ok(metadata) => return Ok(!metadata.is_dir()),
                 Err(error)
                     if matches!(
@@ -463,7 +469,12 @@ impl Server {
                     ) || error.raw_os_error()
                         == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
                 {
-                    match self.content.rooted_fs.metadata_nofollow(current).await {
+                    match self
+                        .content
+                        .rooted_fs
+                        .metadata_nofollow_guarded(current, lease.clone())
+                        .await
+                    {
                         Ok(_) => return Ok(true),
                         Err(fallback)
                             if matches!(
@@ -567,13 +578,13 @@ impl Server {
         }
         drop(unique_paths);
 
-        let _preflight_permit = match self
+        let preflight_lease = match self
             .admission
             .upload_preflight_slots
             .clone()
             .try_acquire_owned()
         {
-            Ok(permit) => permit,
+            Ok(permit) => UploadPreflightLease::new(permit),
             Err(_) => {
                 render_problem(
                     res,
@@ -612,7 +623,10 @@ impl Server {
             {
                 hook(targets.len());
             }
-            let target_exists = match self.route_metadata(&path).await {
+            let target_exists = match self
+                .route_metadata_guarded(&path, preflight_lease.clone())
+                .await
+            {
                 Ok(metadata) => metadata.is_some(),
                 Err(error) if is_invalid_preflight_path_error(&error) => {
                     status_api_error(
@@ -627,7 +641,7 @@ impl Server {
                 Err(error) => return Err(error.into()),
             };
             let has_untraversable_ancestor = match self
-                .upload_preflight_has_untraversable_ancestor(&path)
+                .upload_preflight_has_untraversable_ancestor(&path, &preflight_lease)
                 .await
             {
                 Ok(invalid) => invalid,
@@ -637,7 +651,10 @@ impl Server {
             let escapes_root = if target_exists {
                 false
             } else {
-                match self.guard_root_contained(&path).await {
+                match self
+                    .guard_root_contained_guarded(&path, preflight_lease.clone())
+                    .await
+                {
                     Ok(escapes) => escapes,
                     Err(error) if is_invalid_preflight_path_error(&error) => true,
                     Err(error) => return Err(error.into()),
@@ -653,7 +670,9 @@ impl Server {
                 )?;
                 return Ok(());
             }
-            let inspection = self.inspect_upload_target(owner, &path).await?;
+            let inspection = self
+                .inspect_upload_target_guarded(owner, &path, preflight_lease.clone())
+                .await?;
             targets.push(UploadPreflightTarget {
                 path: logical_path,
                 exists: inspection.exists,

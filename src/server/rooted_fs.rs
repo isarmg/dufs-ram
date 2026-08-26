@@ -67,6 +67,8 @@ struct RootedFsInner {
     #[cfg(test)]
     before_quarantine_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    before_metadata_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     resolved_path_prefix_probes: AtomicUsize,
     #[cfg(test)]
     before_resolved_path_prefix_probe: ResolvedPathPrefixProbeHook,
@@ -350,6 +352,8 @@ impl RootedFs {
                 #[cfg(test)]
                 before_quarantine_sync: Mutex::new(None),
                 #[cfg(test)]
+                before_metadata_probe: Mutex::new(None),
+                #[cfg(test)]
                 resolved_path_prefix_probes: AtomicUsize::new(0),
                 #[cfg(test)]
                 before_resolved_path_prefix_probe: Mutex::new(None),
@@ -380,6 +384,34 @@ impl RootedFs {
         let hook = self
             .inner
             .before_missing_rename
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_before_metadata_probe_once(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self
+            .inner
+            .before_metadata_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "a metadata-probe hook is already installed"
+        );
+    }
+
+    fn run_before_metadata_probe_hook(&self) {
+        #[cfg(test)]
+        let hook = self
+            .inner
+            .before_metadata_probe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -530,9 +562,20 @@ impl RootedFs {
         &self,
         path: &Path,
     ) -> std::io::Result<std::fs::Metadata> {
+        self.metadata_nofollow_guarded(path, ()).await
+    }
+
+    pub(super) async fn metadata_nofollow_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<std::fs::Metadata>
+    where
+        G: Send + 'static,
+    {
         let this = self.clone();
         let path = path.to_path_buf();
-        run_blocking(move || {
+        run_blocking_guarded(guard, move || {
             let relative = this.relative_path_or_dot(&path)?;
             let fd = openat2(
                 &this.inner.root,
@@ -548,12 +591,24 @@ impl RootedFs {
     }
 
     pub(super) async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        self.metadata_guarded(path, ()).await
+    }
+
+    pub(super) async fn metadata_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<std::fs::Metadata>
+    where
+        G: Send + 'static,
+    {
         let this = self.clone();
         let path = path.to_path_buf();
-        run_blocking(move || this.metadata_blocking(&path)).await
+        run_blocking_guarded(guard, move || this.metadata_blocking(&path)).await
     }
 
     pub(super) fn metadata_blocking(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        self.run_before_metadata_probe_hook();
         let relative = self.relative_path_or_dot(path)?;
         let fd = openat2(
             &self.inner.root,
@@ -1054,9 +1109,20 @@ impl RootedFs {
         &self,
         path: &Path,
     ) -> std::io::Result<ReplacementTargetIdentity> {
+        self.replacement_identity_guarded(path, ()).await
+    }
+
+    pub(super) async fn replacement_identity_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<ReplacementTargetIdentity>
+    where
+        G: Send + 'static,
+    {
         let this = self.clone();
         let path = path.to_path_buf();
-        run_blocking(move || this.replacement_identity_blocking(&path)).await
+        run_blocking_guarded(guard, move || this.replacement_identity_blocking(&path)).await
     }
 
     fn replacement_identity_blocking(
@@ -3281,7 +3347,16 @@ where
     T: Send + 'static,
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
 {
-    blocking_io_gate().run_io(task).await
+    run_blocking_guarded((), task).await
+}
+
+async fn run_blocking_guarded<G, T, F>(guard: G, task: F) -> std::io::Result<T>
+where
+    G: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    blocking_io_gate().run_io_guarded(guard, task).await
 }
 
 #[cfg(test)]
