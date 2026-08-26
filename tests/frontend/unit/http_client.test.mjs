@@ -273,6 +273,112 @@ test("operation authentication is classified before its result envelope", async 
   }
 });
 
+test("authentication headers bypass oversized and stalled Fetch bodies", async () => {
+  const previousWindow = globalThis.window;
+  const previousFetch = globalThis.fetch;
+  globalThis.window = globalThis;
+  try {
+    const {
+      AUTH_ERROR_HEADER,
+      ERROR_RESPONSE_BODY_LIMIT,
+      assertResponse,
+      isAuthenticationError,
+      requestJson,
+      requestNoContent,
+    } = await import("../../../assets/modules/http/client.js");
+    const requesters = [
+      {
+        name: "JSON 401",
+        status: 401,
+        headers: {},
+        code: "authentication_required",
+        async request() {
+          const result = await requestJson(
+            "https://example.invalid/auth-json",
+            {},
+            { timeoutMs: 25 },
+          );
+          assert.equal(result.payload, null);
+          return result.response;
+        },
+      },
+      {
+        name: "no-content CSRF",
+        status: 403,
+        headers: { [AUTH_ERROR_HEADER]: "csrf" },
+        code: "csrf_failed",
+        request() {
+          return requestNoContent(
+            "https://example.invalid/auth-no-content",
+            { method: "POST" },
+            { timeoutMs: 25, outcomeUnknown: true },
+          );
+        },
+      },
+    ];
+
+    for (const mode of ["declared", "streamed", "stalled"]) {
+      for (const requester of requesters) {
+        let cancellations = 0;
+        globalThis.fetch = async (_input, init) => {
+          let chunk = 0;
+          const body = new ReadableStream({
+            start(controller) {
+              if (mode !== "stalled") return;
+              init.signal.addEventListener("abort", () => {
+                controller.error(new DOMException("Aborted", "AbortError"));
+              }, { once: true });
+            },
+            pull(controller) {
+              if (mode === "stalled") return new Promise(() => {});
+              if (mode === "declared") {
+                controller.enqueue(new Uint8Array([1]));
+                return;
+              }
+              controller.enqueue(new Uint8Array(
+                chunk++ === 0 ? ERROR_RESPONSE_BODY_LIMIT : 1,
+              ));
+            },
+            cancel() {
+              cancellations++;
+              return mode === "stalled" ? new Promise(() => {}) : undefined;
+            },
+          });
+          return new Response(body, {
+            status: requester.status,
+            headers: {
+              ...requester.headers,
+              ...(mode === "declared"
+                ? {
+                  "Content-Length": String(ERROR_RESPONSE_BODY_LIMIT + 1),
+                }
+                : {}),
+            },
+          });
+        };
+
+        const response = await requester.request();
+        let unauthorizedCalls = 0;
+        await assert.rejects(
+          assertResponse(response, () => unauthorizedCalls++),
+          error => isAuthenticationError(error) &&
+            error.code === requester.code,
+          `${requester.name} with ${mode} body was not classified as authentication`,
+        );
+        assert.equal(unauthorizedCalls, 1);
+        assert.equal(cancellations, 1);
+      }
+    }
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
 test("mutation reconciliation returns a discriminated result", async () => {
   const {
     runMutationWithReconciliation,

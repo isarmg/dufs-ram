@@ -1588,6 +1588,38 @@ test("XHR 对超限错误响应立即中止且不读取无界 responseText", asy
   })).toBeVisible();
 });
 
+test("XHR 在超限认证正文前按响应头刷新会话", async ({
+  appPage: page,
+}) => {
+  let putCount = 0;
+  await page.route("**/oversized-upload-auth.txt", async route => {
+    putCount++;
+    const body = "x".repeat(20 * 1024);
+    await route.fulfill({
+      status: 401,
+      contentType: "text/plain",
+      headers: { "Content-Length": String(Buffer.byteLength(body)) },
+      body,
+    });
+  });
+
+  const reloaded = page.waitForEvent("framenavigated", frame =>
+    frame === page.mainFrame()
+  );
+  await selectFiles(page, "#file", [{
+    name: "oversized-upload-auth.txt",
+    buffer: Buffer.from("upload payload"),
+    lastModified: 1_722_000_000_399,
+  }]);
+  await reloaded;
+
+  await expect(page.locator(".index-page")).toBeVisible();
+  await expect(page.getByRole("button", {
+    name: "Check upload status oversized-upload-auth.txt",
+  })).toHaveCount(0);
+  expect(putCount).toBe(1);
+});
+
 test("Retry-After 到期后先查询原会话再按 not-seen 新建", async ({
   appPage: page,
 }) => {

@@ -162,12 +162,39 @@ export class RequestError extends Error {
  * @returns {Promise<Response>}
  */
 export async function bufferResponse(response, method = "GET", options = {}) {
+  if (authFailureMessage(
+    response.status,
+    response.headers.get(AUTH_ERROR_HEADER),
+  )) {
+    cancelUnreadResponseBody(response.body);
+    return response;
+  }
   return await bufferBoundedResponse(
     response,
     method,
     options,
     (message, errorOptions) => new RequestError(message, errorOptions),
   );
+}
+
+/**
+ * Authentication is authoritative from the status and response headers. Do
+ * not wait for, or apply the ordinary error-body limit to, a body that no
+ * caller will inspect after `assertResponse` classifies the response.
+ *
+ * Cancellation is intentionally fire-and-forget: a broken response stream
+ * must not be able to delay session recovery by returning a pending or
+ * rejected cancellation promise.
+ *
+ * @param {ReadableStream<Uint8Array> | null} body
+ */
+function cancelUnreadResponseBody(body) {
+  try {
+    void body?.cancel().catch(() => {});
+  } catch {
+    // The authentication result remains authoritative even if cancellation
+    // fails after the response headers have arrived.
+  }
 }
 
 class AuthenticationError extends RequestError {
