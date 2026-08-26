@@ -28,6 +28,7 @@ shell_scripts=(
   scripts/check.sh
   scripts/check-coverage.sh
   scripts/check-deployment.sh
+  scripts/check-formal-release-e2e.sh
   scripts/package-release.sh
   tests/data/generate_tls_certs.sh
 )
