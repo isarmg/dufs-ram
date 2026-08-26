@@ -1,7 +1,11 @@
 use super::super::ServerLifecycle;
 use super::*;
 use crate::{Args, auth::AuthConfig};
-use std::{os::unix::fs::PermissionsExt, time::Duration};
+use std::{
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 
@@ -19,6 +23,82 @@ fn test_server(root: &Path) -> (Server, assert_fs::TempDir) {
     )
     .unwrap();
     (server, state_dir)
+}
+
+#[tokio::test]
+async fn upload_preflight_admission_rejects_without_probing_and_covers_the_batch() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = test_server(temp.path());
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    let slots = server.admission.upload_preflight_slots.clone();
+    *server
+        .admission
+        .upload_preflight_probe_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move |index| {
+        observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((index, slots.available_permits()));
+    }));
+
+    let mut held = Vec::new();
+    for _ in 0..UPLOAD_PREFLIGHT_CONCURRENCY {
+        held.push(
+            server
+                .admission
+                .upload_preflight_slots
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
+        );
+    }
+
+    let mut over_limit = Response::default();
+    server
+        .handle_upload_preflight_paths("owner", Vec::new(), &mut over_limit)
+        .await
+        .unwrap();
+    assert_eq!(over_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let mut rejected = Response::default();
+    server
+        .handle_upload_preflight_paths("owner", vec!["/rejected.txt".to_string()], &mut rejected)
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(rejected.headers().get("retry-after").unwrap(), "1");
+    let problem = rejected.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&problem).unwrap();
+    assert_eq!(problem["code"], "upload_preflight_concurrency_limit");
+    assert!(
+        observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "an admission-rejected preflight reached its first filesystem probe"
+    );
+
+    drop(held.pop());
+    let mut accepted = Response::default();
+    server
+        .handle_upload_preflight_paths(
+            "owner",
+            vec!["/first.txt".to_string(), "/second.txt".to_string()],
+            &mut accepted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(
+        *observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [(0, 0), (1, 0)],
+        "the preflight permit did not cover every target in the batch"
+    );
+    drop(held);
 }
 
 #[tokio::test]

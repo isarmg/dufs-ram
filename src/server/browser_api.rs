@@ -43,6 +43,7 @@ const API_BODY_LIMIT: usize = 16 * 1024;
 const UPLOAD_PREFLIGHT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const UPLOAD_PREFLIGHT_PATH_LIMIT: usize = 512;
 const UPLOAD_PREFLIGHT_PATH_BYTES_LIMIT: usize = 256 * 1024;
+pub(super) const UPLOAD_PREFLIGHT_CONCURRENCY: usize = 4;
 pub(in crate::server) const SOURCE_REVISION_HEADER: &str = "x-dufs-source-revision";
 type TrackedOperation = Option<(Uuid, OperationGuard)>;
 
@@ -516,7 +517,17 @@ impl Server {
                 return Ok(());
             }
         };
-        if request.paths.is_empty() || request.paths.len() > UPLOAD_PREFLIGHT_PATH_LIMIT {
+        self.handle_upload_preflight_paths(owner, request.paths, res)
+            .await
+    }
+
+    async fn handle_upload_preflight_paths(
+        &self,
+        owner: &str,
+        paths: Vec<String>,
+        res: &mut Response,
+    ) -> Result<()> {
+        if paths.is_empty() || paths.len() > UPLOAD_PREFLIGHT_PATH_LIMIT {
             status_api_error(
                 res,
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -527,8 +538,8 @@ impl Server {
             return Ok(());
         }
         let mut total_path_bytes = 0_usize;
-        let mut unique_paths = HashSet::with_capacity(request.paths.len());
-        for path in &request.paths {
+        let mut unique_paths = HashSet::with_capacity(paths.len());
+        for path in &paths {
             total_path_bytes = match total_path_bytes.checked_add(path.len()) {
                 Some(total) if total <= UPLOAD_PREFLIGHT_PATH_BYTES_LIMIT => total,
                 _ => {
@@ -555,8 +566,29 @@ impl Server {
         }
         drop(unique_paths);
 
-        let mut targets = Vec::with_capacity(request.paths.len());
-        for logical_path in request.paths {
+        let _preflight_permit = match self
+            .admission
+            .upload_preflight_slots
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                render_problem(
+                    res,
+                    &ApiError::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorCode::UPLOAD_PREFLIGHT_CONCURRENCY_LIMIT,
+                        "Too many upload preflight requests are running",
+                    )
+                    .with_recovery(RecoveryAdvice::RetryAfterSeconds(1)),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let mut targets = Vec::with_capacity(paths.len());
+        for logical_path in paths {
             let Some(path) = self.resolve_browser_path(&logical_path) else {
                 status_api_error(
                     res,
@@ -567,6 +599,18 @@ impl Server {
                 )?;
                 return Ok(());
             };
+            // This hook marks the boundary immediately before the first rooted
+            // filesystem probe for an admitted preflight batch.
+            #[cfg(test)]
+            if let Some(hook) = self
+                .admission
+                .upload_preflight_probe_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                hook(targets.len());
+            }
             let target_exists = match self.route_metadata(&path).await {
                 Ok(metadata) => metadata.is_some(),
                 Err(error) if is_invalid_preflight_path_error(&error) => {

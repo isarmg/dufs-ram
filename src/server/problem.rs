@@ -168,6 +168,7 @@ declare_error_codes! {
     UPLOAD_OUTCOME_UNKNOWN => "upload_outcome_unknown",
     UPLOAD_PATH_WAIT_TIMEOUT => "upload_path_wait_timeout",
     UPLOAD_PRECOMMIT_FAILED => "upload_precommit_failed",
+    UPLOAD_PREFLIGHT_CONCURRENCY_LIMIT => "upload_preflight_concurrency_limit",
     UPLOAD_PUBLICATION_DURABILITY_UNKNOWN => "upload_publication_durability_unknown",
     UPLOAD_PUBLICATION_OUTCOME_UNKNOWN => "upload_publication_outcome_unknown",
     UPLOAD_RESULT_UNKNOWN => "upload_result_unknown",
