@@ -26,6 +26,101 @@ fn test_server(root: &Path) -> (Server, assert_fs::TempDir) {
 }
 
 #[tokio::test]
+async fn path_wait_capacity_rejects_tracked_mutation_and_preserves_same_id_retry() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = test_server(temp.path());
+    let capacity = server.admission.path_wait_slots.available_permits();
+    let _saturated = server
+        .admission
+        .path_wait_slots
+        .clone()
+        .try_acquire_many_owned(capacity.try_into().unwrap())
+        .unwrap();
+    let operation_id = Uuid::new_v4();
+    let fingerprint = OperationFingerprint::new(&[b"path wait capacity retry"]);
+    let BeginOperation::Started(operation) = server
+        .state
+        .operation_registry
+        .begin("owner", operation_id, fingerprint)
+        .await
+        .unwrap()
+    else {
+        panic!("a fresh operation ID was not reserved");
+    };
+    let mutation = MutationProgress::default();
+    mutation.mark_reserved();
+    let mut response = Response::default();
+
+    server
+        .handle_api_mkdir(
+            MkdirRequest {
+                path: "/new-directory".to_string(),
+            },
+            Some((operation_id, operation)),
+            mutation,
+            &mut response,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(
+        response.headers()["x-dufs-operation-id"],
+        operation_id.to_string()
+    );
+    assert_eq!(response.headers()["x-dufs-operation-state"], "rejected");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "path_wait_concurrency_limit");
+    assert_eq!(body["recovery"], "retry");
+    assert_eq!(body["retry_after"], 1);
+    assert_eq!(body["state"], "rejected");
+
+    let retry = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match server
+                .state
+                .operation_registry
+                .begin("owner", operation_id, fingerprint)
+                .await
+                .unwrap()
+            {
+                BeginOperation::Started(operation) => return operation,
+                BeginOperation::Running | BeginOperation::Unavailable => {
+                    tokio::task::yield_now().await;
+                }
+                BeginOperation::Replay(_) | BeginOperation::Conflict | BeginOperation::Full => {
+                    panic!("a capacity rejection became terminal or conflicted")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the safely rejected operation ID did not become retryable");
+    drop(retry);
+    assert!(!temp.path().join("new-directory").exists());
+}
+
+#[tokio::test]
+async fn untracked_path_wait_capacity_uses_a_plain_api_problem() {
+    let mut response = Response::default();
+    render_path_wait_limit(&mut response, None).unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(!response.headers().contains_key("x-dufs-operation-id"));
+    assert!(!response.headers().contains_key("x-dufs-upload-id"));
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "path_wait_concurrency_limit");
+    assert_eq!(body["recovery"], "retry");
+    assert_eq!(body["retry_after"], 1);
+    assert!(body.get("operation_id").is_none());
+    assert!(body.get("upload_id").is_none());
+}
+
+#[tokio::test]
 async fn upload_preflight_admission_rejects_without_probing_and_covers_the_batch() {
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = test_server(temp.path());

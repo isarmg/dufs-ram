@@ -353,9 +353,9 @@ impl Server {
         owner: &str,
         path: &Path,
         upload_id: Uuid,
+        _path_lease: PathLease,
         res: &mut Response,
     ) -> Result<()> {
-        let _path_lease = self.content.path_coordinator.acquire([path]).await;
         let owner_id = OwnerId::persistent(owner);
         let upload_path = upload_temp_path(path, upload_id)?;
         let decision = match self

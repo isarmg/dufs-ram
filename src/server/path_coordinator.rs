@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -50,6 +50,7 @@ enum WaiterState {
 pub(super) struct PathLease {
     inner: Arc<CoordinatorInner>,
     id: u64,
+    _request_permit: Option<OwnedSemaphorePermit>,
 }
 
 struct WaiterRegistration {
@@ -328,7 +329,16 @@ impl PathCoordinator {
         AcquireAttempt::Acquired(PathLease {
             inner: self.inner.clone(),
             id,
+            _request_permit: None,
         })
+    }
+}
+
+impl PathLease {
+    pub(super) fn with_request_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        debug_assert!(self._request_permit.is_none());
+        self._request_permit = Some(permit);
+        self
     }
 }
 

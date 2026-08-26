@@ -130,6 +130,7 @@ declare_error_codes! {
     OPERATION_RESULT_UNKNOWN => "operation_result_unknown",
     OPERATION_STORE_UNAVAILABLE => "operation_store_unavailable",
     OUTCOME_UNCERTAIN => "outcome_uncertain",
+    PATH_WAIT_CONCURRENCY_LIMIT => "path_wait_concurrency_limit",
     PATH_EXISTS => "path_exists",
     PURGE_BACKLOG_FULL => "purge_backlog_full",
     PURGE_STATE_UNAVAILABLE => "purge_state_unavailable",
@@ -207,6 +208,7 @@ pub(super) enum RecoveryAdvice {
     ResumeUpload,
     QueryJob,
     QueryUpload,
+    QueryUploadAfterSeconds(u64),
     RefreshTarget,
 }
 
@@ -218,14 +220,16 @@ impl RecoveryAdvice {
             Self::RetryWithNewId => Some("retry_with_new_id"),
             Self::ResumeUpload => Some("resume_upload"),
             Self::QueryJob => Some("query_job"),
-            Self::QueryUpload => Some("query_upload"),
+            Self::QueryUpload | Self::QueryUploadAfterSeconds(_) => Some("query_upload"),
             Self::RefreshTarget => Some("refresh_target"),
         }
     }
 
     const fn retry_after_seconds(self) -> Option<u64> {
         match self {
-            Self::RetryAfterSeconds(seconds) => Some(seconds),
+            Self::RetryAfterSeconds(seconds) | Self::QueryUploadAfterSeconds(seconds) => {
+                Some(seconds)
+            }
             _ => None,
         }
     }

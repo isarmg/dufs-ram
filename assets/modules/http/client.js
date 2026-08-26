@@ -1221,7 +1221,7 @@ export async function queryUnknownUpload(
       state: classification.kind,
       status: response.status,
       code: "",
-      message: uploadStatusMessage(classification.kind),
+      message: uploadStatusMessage(classification.kind, response.status),
       authenticationFailed: false,
     });
   } catch (statusError) {
@@ -1267,8 +1267,8 @@ function normalizeErrorMessage(value) {
   return message;
 }
 
-/** @param {string} state @returns {string} */
-function uploadStatusMessage(state) {
+/** @param {string} state @param {number} status @returns {string} */
+function uploadStatusMessage(state, status) {
   if (state === "committed") {
     return "The server confirms that the upload was committed.";
   }
@@ -1277,6 +1277,11 @@ function uploadStatusMessage(state) {
   }
   if (state === "not-seen") {
     return "The server did not record this upload ID.";
+  }
+  if (state === "unknown") {
+    return status === 429
+      ? "The upload status could not be checked because status queries are temporarily busy. Refresh the folder before trying again."
+      : "The server could not confirm the final upload status. Refresh the folder before trying again.";
   }
   return (
     "The server reports that the upload is still running. " +

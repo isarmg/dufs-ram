@@ -24,12 +24,14 @@ use crate::{
         path_policy::{RootedPath, RoutePath},
         problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
         protocol::{OperationPublicState, UploadPublicState},
+        render_path_wait_limit,
         session::{LOGIN_ERROR_QUERY, LOGIN_PATH, LOGOUT_PATH},
         status_bad_request, status_csrf_forbid, status_method_not_allowed, status_not_found,
         upload::{
-            TargetRevision, UploadMode, UploadOptions, UploadOverwriteParseError,
-            UploadOverwritePolicy, parse_upload_id, parse_upload_length, parse_upload_offset,
-            parse_upload_overwrite, target_revision,
+            TargetRevision, UploadErrorContext, UploadMode, UploadOptions,
+            UploadOverwriteParseError, UploadOverwritePolicy, apply_upload_problem,
+            parse_upload_id, parse_upload_length, parse_upload_offset, parse_upload_overwrite,
+            target_revision,
         },
     },
 };
@@ -703,7 +705,12 @@ impl<'a> RequestDispatcher<'a> {
                 .expect("upload timeout was validated at startup")
         });
         let Some((mut path_lease, mut upload_permit)) = self
-            .acquire_target_admission(path, headers.upload, upload_deadline)
+            .acquire_target_admission(
+                path,
+                headers.upload,
+                upload_deadline,
+                delete_operation.as_ref().map(|(id, _)| *id),
+            )
             .await?
         else {
             return Ok(None);
@@ -746,19 +753,27 @@ impl<'a> RequestDispatcher<'a> {
         path: &RootedPath,
         upload: Option<UploadRequest>,
         deadline: Option<Instant>,
+        delete_operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<(Option<PathLease>, Option<OwnedSemaphorePermit>)>> {
         // Path-conflicting uploads wait before consuming a global slot.
         let path_lease = if let Some(upload) = upload {
             match timeout_at(
                 deadline.expect("upload request has a deadline"),
-                self.server
-                    .content
-                    .path_coordinator
-                    .acquire([path.as_path()]),
+                self.server.acquire_request_path_lease([path.as_path()]),
             )
             .await
             {
-                Ok(lease) => Some(lease),
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    self.render_upload_rejection(
+                        upload,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorCode::PATH_WAIT_CONCURRENCY_LIMIT,
+                        "Too many path-coordinated requests are active",
+                        RecoveryAdvice::RetryAfterSeconds(1),
+                    )?;
+                    return Ok(None);
+                }
                 Err(_) => {
                     self.render_upload_rejection(
                         upload,
@@ -771,13 +786,17 @@ impl<'a> RequestDispatcher<'a> {
                 }
             }
         } else if self.method == Method::DELETE {
-            Some(
-                self.server
-                    .content
-                    .path_coordinator
-                    .acquire([path.as_path()])
-                    .await,
-            )
+            match self
+                .server
+                .acquire_request_path_lease([path.as_path()])
+                .await
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    render_path_wait_limit(&mut self.response, delete_operation_id)?;
+                    return Ok(None);
+                }
+            }
         } else {
             None
         };
@@ -908,12 +927,21 @@ impl<'a> RequestDispatcher<'a> {
         }
         match parse_upload_id(&self.headers) {
             Ok(Some(id)) => {
-                let _lease = self
+                let Some(_lease) = self
                     .server
-                    .content
-                    .path_coordinator
-                    .acquire([target.path.as_path()])
-                    .await;
+                    .acquire_request_path_lease([target.path.as_path()])
+                    .await
+                else {
+                    apply_upload_problem(
+                        &mut self.response,
+                        UploadErrorContext::new(id, UploadPublicState::Unknown, None, None),
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorCode::PATH_WAIT_CONCURRENCY_LIMIT,
+                        "Too many path-coordinated requests are active",
+                        RecoveryAdvice::QueryUploadAfterSeconds(1),
+                    )?;
+                    return Ok(Phase::Complete);
+                };
                 self.server
                     .handle_upload_status(target.path.as_path(), owner, id, &mut self.response)
                     .await?;
@@ -1275,6 +1303,7 @@ mod tests {
         net::{Ipv4Addr, SocketAddr},
         os::unix::fs::PermissionsExt,
         path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
         task::Poll,
     };
     use uuid::Uuid;
@@ -1343,6 +1372,287 @@ mod tests {
                 .to_bytes()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_path_admission_rejects_upload_before_body_or_coordinator() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let (server, _state_dir) = upload_test_server(root.path());
+        let capacity = server.admission.path_wait_slots.available_permits();
+        let _saturated = server
+            .admission
+            .path_wait_slots
+            .clone()
+            .try_acquire_many_owned(capacity.try_into().unwrap())
+            .unwrap();
+        let coordinator_entries = Arc::new(AtomicUsize::new(0));
+        let observed = coordinator_entries.clone();
+        *server
+            .admission
+            .path_wait_acquire_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let route_path = server
+            .content
+            .path_policy
+            .parse_route("/capacity.bin")
+            .unwrap();
+        let target_path = server
+            .content
+            .path_policy
+            .parse_browser_target("/capacity.bin")
+            .unwrap();
+        let upload_id = Uuid::new_v4();
+        let upload = UploadRequest {
+            id: upload_id,
+            length: 7,
+            mode: UploadMode::Fresh,
+            overwrite: UploadOverwritePolicy::NoReplace,
+        };
+        let mut context = RequestContext::for_test(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let mut dispatcher = RequestDispatcher {
+            server,
+            // A capacity rejection must be complete before an upload body is
+            // needed; any attempted body take would panic in this fixture.
+            request: None,
+            route_path,
+            internal_api_request: false,
+            mutation: MutationProgress::default(),
+            context: &mut context,
+            method: Method::PUT,
+            uri: Uri::from_static("/capacity.bin"),
+            headers: HeaderMap::new(),
+            request_path: "/capacity.bin".to_owned(),
+            query_params: HashMap::new(),
+            response: Response::default(),
+        };
+
+        assert!(
+            dispatcher
+                .prepare_target_after_delete(
+                    &target_path,
+                    MutationHeaders {
+                        upload: Some(upload),
+                        ..MutationHeaders::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(coordinator_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatcher.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(dispatcher.response.headers()["retry-after"], "1");
+        assert_eq!(
+            dispatcher.response.headers()["x-dufs-upload-id"],
+            upload_id.to_string()
+        );
+        assert_eq!(dispatcher.response.headers()["x-dufs-upload-length"], "7");
+        assert_eq!(
+            dispatcher.response.headers()["x-dufs-operation-state"],
+            "not-started"
+        );
+        let body = std::mem::take(&mut dispatcher.response)
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "path_wait_concurrency_limit");
+        assert_eq!(body["recovery"], "retry");
+        assert_eq!(body["retry_after"], 1);
+        assert_eq!(body["upload_state"], "not-started");
+    }
+
+    #[tokio::test]
+    async fn saturated_upload_status_is_bound_unknown_with_query_recovery() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let (server, _state_dir) = upload_test_server(root.path());
+        let capacity = server.admission.path_wait_slots.available_permits();
+        let _saturated = server
+            .admission
+            .path_wait_slots
+            .clone()
+            .try_acquire_many_owned(capacity.try_into().unwrap())
+            .unwrap();
+        let route_path = server
+            .content
+            .path_policy
+            .parse_route("/status.bin")
+            .unwrap();
+        let target_path = server
+            .content
+            .path_policy
+            .parse_browser_target("/status.bin")
+            .unwrap();
+        let upload_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dufs-upload-id", upload_id.to_string().parse().unwrap());
+        let mut context = RequestContext::for_test(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let mut dispatcher = RequestDispatcher {
+            server,
+            request: None,
+            route_path,
+            internal_api_request: false,
+            mutation: MutationProgress::default(),
+            context: &mut context,
+            method: Method::HEAD,
+            uri: Uri::from_static("/status.bin"),
+            headers,
+            request_path: "/status.bin".to_owned(),
+            query_params: HashMap::new(),
+            response: Response::default(),
+        };
+        let target = PreparedTarget {
+            path: target_path,
+            is_miss: true,
+            miss_is_hidden: false,
+            is_dir: false,
+            is_file: false,
+            delete_operation: None,
+            path_lease: None,
+            upload_permit: None,
+            upload_deadline: None,
+        };
+
+        assert!(matches!(
+            dispatcher
+                .dispatch_upload_status(&target, "user")
+                .await
+                .unwrap(),
+            Phase::Complete
+        ));
+        assert_eq!(dispatcher.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(dispatcher.response.headers()["retry-after"], "1");
+        assert_eq!(
+            dispatcher.response.headers()["x-dufs-upload-id"],
+            upload_id.to_string()
+        );
+        assert_eq!(
+            dispatcher.response.headers()["x-dufs-operation-state"],
+            "unknown"
+        );
+        assert!(
+            !dispatcher
+                .response
+                .headers()
+                .contains_key("x-dufs-upload-length")
+        );
+        let body = std::mem::take(&mut dispatcher.response)
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "path_wait_concurrency_limit");
+        assert_eq!(body["recovery"], "query_upload");
+        assert_eq!(body["retry_after"], 1);
+        assert_eq!(body["upload_state"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn saturated_delete_is_rejected_and_same_operation_id_becomes_retryable() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let (server, _state_dir) = upload_test_server(root.path());
+        let capacity = server.admission.path_wait_slots.available_permits();
+        let _saturated = server
+            .admission
+            .path_wait_slots
+            .clone()
+            .try_acquire_many_owned(capacity.try_into().unwrap())
+            .unwrap();
+        let route_path = server
+            .content
+            .path_policy
+            .parse_route("/delete.txt")
+            .unwrap();
+        let target_path = server
+            .content
+            .path_policy
+            .parse_browser_target("/delete.txt")
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let fingerprint = OperationFingerprint::new(&[b"path wait delete retry"]);
+        let BeginOperation::Started(operation) = server
+            .state
+            .operation_registry
+            .begin("user", operation_id, fingerprint)
+            .await
+            .unwrap()
+        else {
+            panic!("a fresh DELETE operation was not reserved");
+        };
+        let mut context = RequestContext::for_test(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let mut dispatcher = RequestDispatcher {
+            server: server.clone(),
+            request: None,
+            route_path,
+            internal_api_request: false,
+            mutation: MutationProgress::default(),
+            context: &mut context,
+            method: Method::DELETE,
+            uri: Uri::from_static("/delete.txt"),
+            headers: HeaderMap::new(),
+            request_path: "/delete.txt".to_owned(),
+            query_params: HashMap::new(),
+            response: Response::default(),
+        };
+
+        assert!(
+            dispatcher
+                .prepare_target_after_delete(
+                    &target_path,
+                    MutationHeaders::default(),
+                    Some((operation_id, operation)),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(dispatcher.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(dispatcher.response.headers()["retry-after"], "1");
+        assert_eq!(
+            dispatcher.response.headers()["x-dufs-operation-state"],
+            "rejected"
+        );
+        let body = std::mem::take(&mut dispatcher.response)
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "path_wait_concurrency_limit");
+        assert_eq!(body["state"], "rejected");
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match server
+                    .state
+                    .operation_registry
+                    .begin("user", operation_id, fingerprint)
+                    .await
+                    .unwrap()
+                {
+                    BeginOperation::Started(operation) => return operation,
+                    BeginOperation::Running | BeginOperation::Unavailable => {
+                        tokio::task::yield_now().await;
+                    }
+                    BeginOperation::Replay(_) | BeginOperation::Conflict | BeginOperation::Full => {
+                        panic!("a path-capacity DELETE rejection became terminal")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the rejected DELETE operation ID did not become retryable");
+        drop(retry);
     }
 
     #[tokio::test]

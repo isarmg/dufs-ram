@@ -1087,6 +1087,14 @@ export function createUploadManager(options) {
           return;
         }
         if (classification.kind === "unknown") {
+          if (response.status === 429) {
+            this.unknown(
+              "Upload status queries are temporarily busy. Check the upload status again before trying to upload",
+              "query_upload",
+              response.headers.get("Retry-After"),
+            );
+            return;
+          }
           this.unknown(
             "The server recorded an uncertain publication outcome. Refresh the folder and inspect the target before selecting the file again",
           );

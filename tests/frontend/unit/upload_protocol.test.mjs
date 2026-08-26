@@ -54,7 +54,7 @@ test("upload response classifier enforces the phase status-state matrix", () => 
       rejected: [409],
       "not-seen": [404],
       "not-started": [],
-      unknown: [500, 503],
+      unknown: [429, 500, 503],
     },
     discard: {
       running: [],
@@ -104,6 +104,24 @@ test("upload response classifier enforces the phase status-state matrix", () => 
     status: 200,
     state: "committed",
     offset: "4",
+  }).kind, "invalid");
+  assert.deepEqual(classify({
+    phase: "checkpoint",
+    status: 429,
+    state: "unknown",
+    length: null,
+    offset: null,
+  }), {
+    kind: "unknown",
+    outcomeUnknown: true,
+  });
+  assert.equal(classify({
+    phase: "checkpoint",
+    status: 429,
+    state: "unknown",
+    uploadId: "00000000-0000-4000-8000-000000000002",
+    length: null,
+    offset: null,
   }).kind, "invalid");
   assert.equal(classify({
     phase: "discard",
