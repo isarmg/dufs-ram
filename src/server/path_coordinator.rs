@@ -43,6 +43,20 @@ struct LeaseKey {
     resolved: ResolvedPathKey,
 }
 
+#[derive(Clone, Copy)]
+enum StatePathScanRelation {
+    SymmetricConflict,
+    StrictDescendant,
+}
+
+pub(super) struct StatePathScanner {
+    inner: Arc<CoordinatorInner>,
+    sources: Vec<PathBuf>,
+    resolved_sources: Option<Vec<LeaseKey>>,
+    relation: StatePathScanRelation,
+    scan_lease: StatePathScanLease,
+}
+
 enum WaiterState {
     Resolving(Vec<PathBuf>),
     Resolved(Vec<LeaseKey>),
@@ -180,48 +194,24 @@ impl PathCoordinator {
         source: &Path,
         state_paths: &[StateBlockingPath],
     ) -> bool {
-        self.conflicts_with_state_paths_for_scan(
-            source,
-            state_paths,
-            &StatePathScanLease::for_test(),
-        )
-        .await
+        let mut scanner =
+            self.state_path_conflict_scanner(&[source], StatePathScanLease::for_test());
+        scanner.page_conflicts(state_paths.to_vec()).await
     }
 
-    pub(super) async fn conflicts_with_state_paths_for_scan(
+    pub(super) fn state_path_conflict_scanner(
         &self,
-        source: &Path,
-        state_paths: &[StateBlockingPath],
-        scan_lease: &StatePathScanLease,
-    ) -> bool {
-        if state_paths.is_empty() {
-            return false;
+        sources: &[&Path],
+        scan_lease: StatePathScanLease,
+    ) -> StatePathScanner {
+        debug_assert!(!sources.is_empty());
+        StatePathScanner {
+            inner: self.inner.clone(),
+            sources: sources.iter().map(|path| normalize_key(path)).collect(),
+            resolved_sources: None,
+            relation: StatePathScanRelation::SymmetricConflict,
+            scan_lease,
         }
-        let source = normalize_key(source);
-        let source = [LeaseKey {
-            resolved: self
-                .resolve_path_key_for_state_scan(&source, scan_lease.clone())
-                .await
-                .unwrap_or_else(|_| self.inner.rooted_fs.conservative_path_key()),
-            lexical: source,
-        }];
-        for state_path in state_paths {
-            let lexical = match self.inner.rooted_fs.resolve_state_path(&state_path.path) {
-                Ok(path) => normalize_key(&path),
-                Err(_) => return true,
-            };
-            let candidate = [LeaseKey {
-                resolved: self
-                    .resolve_path_key_for_state_scan(&lexical, scan_lease.clone())
-                    .await
-                    .unwrap_or_else(|_| self.inner.rooted_fs.conservative_path_key()),
-                lexical,
-            }];
-            if paths_conflict(&source, &candidate) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Check whether replacing `ancestor` would change the physical meaning
@@ -236,98 +226,28 @@ impl PathCoordinator {
         ancestor: &Path,
         state_paths: &[StateBlockingPath],
     ) -> bool {
-        self.has_state_path_descendant_for_scan(
-            ancestor,
-            state_paths,
-            &StatePathScanLease::for_test(),
-        )
-        .await
+        let mut scanner =
+            self.state_path_descendant_scanner(ancestor, StatePathScanLease::for_test());
+        scanner.page_conflicts(state_paths.to_vec()).await
     }
 
-    pub(super) async fn has_state_path_descendant_for_scan(
+    pub(super) fn state_path_descendant_scanner(
         &self,
         ancestor: &Path,
-        state_paths: &[StateBlockingPath],
-        scan_lease: &StatePathScanLease,
-    ) -> bool {
-        if state_paths.is_empty() {
-            return false;
+        scan_lease: StatePathScanLease,
+    ) -> StatePathScanner {
+        StatePathScanner {
+            inner: self.inner.clone(),
+            sources: vec![normalize_key(ancestor)],
+            resolved_sources: None,
+            relation: StatePathScanRelation::StrictDescendant,
+            scan_lease,
         }
-        let ancestor = normalize_key(ancestor);
-        let resolved = match self
-            .resolve_path_key_for_state_scan(&ancestor, scan_lease.clone())
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(_) => return true,
-        };
-        let ancestor = LeaseKey {
-            resolved,
-            lexical: ancestor,
-        };
-        for state_path in state_paths {
-            let lexical = match self.inner.rooted_fs.resolve_state_path(&state_path.path) {
-                Ok(path) => normalize_key(&path),
-                Err(_) => return true,
-            };
-            let resolved = match self
-                .resolve_path_key_for_state_scan(&lexical, scan_lease.clone())
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(_) => return true,
-            };
-            let candidate = LeaseKey { resolved, lexical };
-            if paths_identify_same_entry(&ancestor, &candidate) {
-                if !state_path.allows_exact_replacement {
-                    return true;
-                }
-                continue;
-            }
-            if path_strictly_contains(&ancestor, &candidate) {
-                return true;
-            }
-        }
-        false
     }
 
     async fn resolve_path_key(&self, lexical: &Path) -> std::io::Result<ResolvedPathKey> {
-        self.begin_path_key_resolution()?;
+        self.inner.begin_path_key_resolution()?;
         self.inner.rooted_fs.resolved_path_key(lexical).await
-    }
-
-    async fn resolve_path_key_for_state_scan(
-        &self,
-        lexical: &Path,
-        scan_lease: StatePathScanLease,
-    ) -> std::io::Result<ResolvedPathKey> {
-        self.begin_path_key_resolution()?;
-        self.inner
-            .rooted_fs
-            .resolved_path_key_for_state_scan(lexical, scan_lease)
-            .await
-    }
-
-    fn begin_path_key_resolution(&self) -> std::io::Result<()> {
-        #[cfg(test)]
-        {
-            self.inner
-                .resolution_attempts
-                .fetch_add(1, Ordering::SeqCst);
-            if self
-                .inner
-                .resolution_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(std::io::Error::other(
-                    "injected semantic path resolution failure",
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn try_acquire(
@@ -385,6 +305,137 @@ impl PathCoordinator {
             id,
             _request_permit: None,
         })
+    }
+}
+
+impl CoordinatorInner {
+    #[inline]
+    fn begin_path_key_resolution(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            self.resolution_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .resolution_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(std::io::Error::other(
+                    "injected semantic path resolution failure",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StatePathScanner {
+    /// Compare one durable-state page. Empty pages deliberately do no semantic
+    /// path resolution; the first non-empty page resolves and caches every
+    /// source in the same blocking batch as its candidates. Later pages only
+    /// resolve their candidates.
+    pub(super) async fn page_conflicts(&mut self, state_paths: Vec<StateBlockingPath>) -> bool {
+        if state_paths.is_empty() {
+            return false;
+        }
+
+        let mut candidates = Vec::with_capacity(state_paths.len());
+        for state_path in state_paths {
+            let lexical = match self.inner.rooted_fs.resolve_state_path(&state_path.path) {
+                Ok(path) => normalize_key(&path),
+                Err(_) => return true,
+            };
+            candidates.push((lexical, state_path.allows_exact_replacement));
+        }
+
+        let resolving_sources = self.resolved_sources.is_none();
+        let source_count = if resolving_sources {
+            self.sources.len()
+        } else {
+            0
+        };
+        let mut batch_paths = Vec::with_capacity(source_count + candidates.len());
+        if resolving_sources {
+            batch_paths.extend(self.sources.iter().cloned());
+        }
+        batch_paths.extend(candidates.iter().map(|(path, _)| path.clone()));
+        #[cfg(test)]
+        for _ in &batch_paths {
+            if self.inner.begin_path_key_resolution().is_err() {
+                return true;
+            }
+        }
+
+        let rooted_fs = self.inner.rooted_fs.clone();
+        let resolved = match rooted_fs
+            .resolved_path_keys_for_state_scan(batch_paths, self.scan_lease.clone())
+            .await
+        {
+            Ok(resolved) => resolved,
+            // On a non-empty page, mapping a failed source or candidate to the
+            // conservative root key necessarily conflicts with the other side.
+            // Returning immediately is therefore equivalent to the former
+            // per-path fail-closed behavior and avoids needless later I/O.
+            Err(_) => return true,
+        };
+        let mut resolved = resolved.into_iter();
+
+        if resolving_sources {
+            let source_keys = self
+                .sources
+                .iter()
+                .cloned()
+                .map(|lexical| LeaseKey {
+                    lexical,
+                    resolved: resolved
+                        .next()
+                        .expect("a state scan batch preserves its input length"),
+                })
+                .collect();
+            self.resolved_sources = Some(source_keys);
+        }
+
+        let candidate_keys: Vec<_> = candidates
+            .into_iter()
+            .map(|(lexical, allows_exact_replacement)| {
+                (
+                    LeaseKey {
+                        lexical,
+                        resolved: resolved
+                            .next()
+                            .expect("a state scan batch preserves its input length"),
+                    },
+                    allows_exact_replacement,
+                )
+            })
+            .collect();
+        debug_assert!(resolved.next().is_none());
+        let sources = self
+            .resolved_sources
+            .as_ref()
+            .expect("a non-empty state scan page resolves its sources");
+
+        match self.relation {
+            StatePathScanRelation::SymmetricConflict => sources.iter().any(|source| {
+                candidate_keys
+                    .iter()
+                    .any(|(candidate, _)| path_keys_conflict(source, candidate))
+            }),
+            StatePathScanRelation::StrictDescendant => {
+                let ancestor = sources
+                    .first()
+                    .expect("a directional state scan has one source");
+                candidate_keys
+                    .iter()
+                    .any(|(candidate, allows_exact_replacement)| {
+                        if paths_identify_same_entry(ancestor, candidate) {
+                            return !*allows_exact_replacement;
+                        }
+                        path_strictly_contains(ancestor, candidate)
+                    })
+            }
+        }
     }
 }
 
@@ -487,12 +538,16 @@ fn normalize_key(path: &Path) -> PathBuf {
 
 fn paths_conflict(left: &[LeaseKey], right: &[LeaseKey]) -> bool {
     left.iter().any(|left_path| {
-        right.iter().any(|right_path| {
-            left_path.lexical.starts_with(&right_path.lexical)
-                || right_path.lexical.starts_with(&left_path.lexical)
-                || resolved_paths_conflict(&left_path.resolved, &right_path.resolved)
-        })
+        right
+            .iter()
+            .any(|right_path| path_keys_conflict(left_path, right_path))
     })
+}
+
+fn path_keys_conflict(left: &LeaseKey, right: &LeaseKey) -> bool {
+    left.lexical.starts_with(&right.lexical)
+        || right.lexical.starts_with(&left.lexical)
+        || resolved_paths_conflict(&left.resolved, &right.resolved)
 }
 
 fn path_strictly_contains(ancestor: &LeaseKey, descendant: &LeaseKey) -> bool {

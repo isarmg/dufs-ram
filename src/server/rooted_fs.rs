@@ -70,6 +70,10 @@ struct RootedFsInner {
     resolved_path_prefix_probes: AtomicUsize,
     #[cfg(test)]
     before_resolved_path_prefix_probe: ResolvedPathPrefixProbeHook,
+    #[cfg(test)]
+    state_scan_blocking_tasks: AtomicUsize,
+    #[cfg(test)]
+    state_scan_path_resolutions: AtomicUsize,
 }
 
 struct OpenedParent {
@@ -349,6 +353,10 @@ impl RootedFs {
                 resolved_path_prefix_probes: AtomicUsize::new(0),
                 #[cfg(test)]
                 before_resolved_path_prefix_probe: Mutex::new(None),
+                #[cfg(test)]
+                state_scan_blocking_tasks: AtomicUsize::new(0),
+                #[cfg(test)]
+                state_scan_path_resolutions: AtomicUsize::new(0),
             }),
         })
     }
@@ -674,27 +682,36 @@ impl RootedFs {
     }
 
     pub(super) async fn resolved_path_key(&self, path: &Path) -> std::io::Result<ResolvedPathKey> {
-        self.resolved_path_key_with_scan_lease(path, None).await
-    }
-
-    pub(super) async fn resolved_path_key_for_state_scan(
-        &self,
-        path: &Path,
-        scan_lease: StatePathScanLease,
-    ) -> std::io::Result<ResolvedPathKey> {
-        self.resolved_path_key_with_scan_lease(path, Some(scan_lease))
-            .await
-    }
-
-    async fn resolved_path_key_with_scan_lease(
-        &self,
-        path: &Path,
-        scan_lease: Option<StatePathScanLease>,
-    ) -> std::io::Result<ResolvedPathKey> {
         let this = self.clone();
         let path = path.to_path_buf();
+        run_blocking(move || this.resolved_path_key_blocking(&path)).await
+    }
+
+    /// Resolve one non-empty durable-state page in a single blocking task.
+    /// The scan lease lives inside that task so cancelling its async waiter
+    /// cannot admit another expensive scan before the filesystem work exits.
+    pub(super) async fn resolved_path_keys_for_state_scan(
+        &self,
+        paths: Vec<PathBuf>,
+        scan_lease: StatePathScanLease,
+    ) -> std::io::Result<Vec<ResolvedPathKey>> {
+        debug_assert!(!paths.is_empty());
+        let this = self.clone();
         run_blocking(move || {
-            let result = this.resolved_path_key_blocking(&path);
+            #[cfg(test)]
+            this.inner
+                .state_scan_blocking_tasks
+                .fetch_add(1, Ordering::SeqCst);
+            let result = paths
+                .iter()
+                .map(|path| {
+                    #[cfg(test)]
+                    this.inner
+                        .state_scan_path_resolutions
+                        .fetch_add(1, Ordering::SeqCst);
+                    this.resolved_path_key_blocking(path)
+                })
+                .collect::<std::io::Result<Vec<_>>>();
             drop(scan_lease);
             result
         })
@@ -831,6 +848,18 @@ impl RootedFs {
         self.inner
             .resolved_path_prefix_probes
             .swap(0, Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_state_scan_work_counts(&self) -> (usize, usize) {
+        (
+            self.inner
+                .state_scan_blocking_tasks
+                .swap(0, Ordering::SeqCst),
+            self.inner
+                .state_scan_path_resolutions
+                .swap(0, Ordering::SeqCst),
+        )
     }
 
     fn directory_ancestry_from_root<F: AsFd>(
