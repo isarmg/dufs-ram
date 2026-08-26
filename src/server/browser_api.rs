@@ -15,6 +15,7 @@ use super::{
     status_no_content,
     upload::{TARGET_REVISION_HEADER, TargetRevision, target_revision},
 };
+use crate::http_utils::request_content_type_is;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -22,7 +23,7 @@ use headers::{ContentLength, ContentType, HeaderMapExt};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::{
     StatusCode,
-    header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue},
+    header::{CACHE_CONTROL, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -132,11 +133,7 @@ fn status_api_error(
 }
 
 fn request_has_json_content_type(req: &Request) -> bool {
-    req.headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    request_content_type_is(req.headers(), "application/json")
 }
 
 async fn collect_untracked_api_body(
@@ -327,12 +324,7 @@ impl Server {
                 return Ok(());
             }
         };
-        let is_json = req
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+        let is_json = request_content_type_is(req.headers(), "application/json");
         if !is_json {
             status_api_error(
                 res,

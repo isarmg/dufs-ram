@@ -6,7 +6,7 @@ use super::{
 use crate::{
     args::TrustedProxy,
     auth::{MAX_PASSWORD_BYTES, MAX_USERNAME_BYTES, session_token_from_cookie},
-    http_utils::body_full,
+    http_utils::{body_full, request_content_type_is},
     utils::{decode_hex_to_slice, encode_hex},
 };
 
@@ -16,8 +16,8 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::{
     Method, StatusCode, Uri,
     header::{
-        ACCEPT, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderMap, HeaderValue,
-        LOCATION, REFERRER_POLICY, SET_COOKIE,
+        ACCEPT, CACHE_CONTROL, CONTENT_SECURITY_POLICY, HOST, HeaderMap, HeaderValue, LOCATION,
+        REFERRER_POLICY, SET_COOKIE,
     },
 };
 use std::{
@@ -230,16 +230,8 @@ impl Server {
             return Ok(None);
         }
 
-        let content_type_ok = req
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| {
-                value
-                    .trim()
-                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-            });
+        let content_type_ok =
+            request_content_type_is(req.headers(), "application/x-www-form-urlencoded");
         if !content_type_ok {
             status_error(
                 res,
