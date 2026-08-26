@@ -159,6 +159,12 @@ export function classifyUploadResponse(options) {
     UPLOAD_RESPONSE_STATUS_MATRIX[phase][protocol.state];
   if (
     !acceptedStatuses.includes(status) ||
+    (
+      phase === "checkpoint" &&
+      status === 429 &&
+      protocol.state === "unknown" &&
+      (protocol.length !== null || protocol.offset !== null)
+    ) ||
     (protocol.state === "committed" && protocol.offset !== expectedLength) ||
     (
       phase === "discard" &&

@@ -123,6 +123,27 @@ test("upload response classifier enforces the phase status-state matrix", () => 
     length: null,
     offset: null,
   }).kind, "invalid");
+  for (const fields of [
+    { length: "8", offset: null },
+    { length: null, offset: "4" },
+    { length: "8", offset: "4" },
+  ]) {
+    assert.equal(classify({
+      phase: "checkpoint",
+      status: 429,
+      state: "unknown",
+      ...fields,
+    }).kind, "invalid");
+  }
+  for (const status of [500, 503]) {
+    assert.equal(classify({
+      phase: "checkpoint",
+      status,
+      state: "unknown",
+      length: "8",
+      offset: "4",
+    }).kind, "unknown");
+  }
   assert.equal(classify({
     phase: "discard",
     status: 204,
