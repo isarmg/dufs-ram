@@ -16,14 +16,38 @@ function normalizeMarkdown(source) {
   return normalized;
 }
 
+function maskFencedCode(source) {
+  let fence = null;
+  return source
+    .split("\n")
+    .map(line => {
+      if (fence === null) {
+        const opening = /^ {0,3}(`{3,}|~{3,})/u.exec(line);
+        if (!opening) return line;
+        fence = { marker: opening[1][0], length: opening[1].length };
+        return "";
+      }
+      const trimmed = line.replace(/^ {0,3}/u, "");
+      const closing = new RegExp(
+        `^${fence.marker}{${fence.length},}[ \\t]*$`,
+        "u",
+      );
+      if (closing.test(trimmed)) fence = null;
+      return "";
+    })
+    .join("\n");
+}
+
 function extractReleaseNotes(source, version) {
   if (!semverPattern.test(version)) {
     throw new Error(`invalid release version: ${version}`);
   }
 
-  const lines = normalizeMarkdown(source).split("\n");
+  const normalized = normalizeMarkdown(source);
+  const lines = normalized.split("\n");
+  const structuralLines = maskFencedCode(normalized).split("\n");
   const starts = [];
-  for (const [index, line] of lines.entries()) {
+  for (const [index, line] of structuralLines.entries()) {
     const match = versionHeadingPattern.exec(line);
     if (match?.[1] === version) {
       starts.push(index);
@@ -37,8 +61,8 @@ function extractReleaseNotes(source, version) {
 
   let start = starts[0] + 1;
   let end = lines.length;
-  for (let index = start; index < lines.length; index += 1) {
-    if (lines[index].startsWith("## ")) {
+  for (let index = start; index < structuralLines.length; index += 1) {
+    if (structuralLines[index].startsWith("## ")) {
       end = index;
       break;
     }
@@ -91,6 +115,43 @@ function selfTest() {
   const expected = "### Fixed\n\n- exact section\n";
   if (extractReleaseNotes(fixture, "1.2.3") !== expected) {
     throw new Error("exact-section fixture produced unexpected notes");
+  }
+
+  const fencedFixture = [
+    "# Changelog",
+    "",
+    "~~~text",
+    "## [1.2.3]",
+    "not a release heading",
+    "~~~",
+    "",
+    "## [1.2.3] - 2026-01-01",
+    "",
+    "before fence",
+    "````markdown",
+    "## not a section heading",
+    "```",
+    "still inside the long fence",
+    "````",
+    "after fence",
+    "",
+    "## [1.2.2]",
+    "",
+    "older section",
+    "",
+  ].join("\n");
+  const fencedExpected = [
+    "before fence",
+    "````markdown",
+    "## not a section heading",
+    "```",
+    "still inside the long fence",
+    "````",
+    "after fence",
+    "",
+  ].join("\n");
+  if (extractReleaseNotes(fencedFixture, "1.2.3") !== fencedExpected) {
+    throw new Error("fenced-code fixture produced unexpected notes");
   }
 
   expectFailure(fixture, "1.2.4", "found 0");
