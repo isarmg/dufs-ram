@@ -26,6 +26,116 @@ fn authenticated_args(serve_path: PathBuf, state_dir: &Path) -> Args {
     }
 }
 
+#[tokio::test]
+async fn pre_mutation_upload_timeout_retains_tracked_work_until_actor_reply() {
+    let root = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let mut args = authenticated_args(root.path().to_path_buf(), state_dir.path());
+    args.max_connections = 2;
+    args.max_concurrent_uploads = 1;
+    args.min_free_space = 0;
+    let server = Arc::new(Server::init_with_lifecycle(args, ServerLifecycle::new()).unwrap());
+    let release_actor = server.state.state_store.block_actor_for_test().unwrap();
+    let target = root.path().join("pre-mutation-timeout.bin");
+    let upload_id = uuid::Uuid::new_v4();
+    let stage = internal_names::upload_temp_path(&target, upload_id).unwrap();
+    let path_lease = server
+        .acquire_request_path_lease([&target])
+        .await
+        .expect("test upload could not acquire path admission");
+    let upload_permit = server
+        .admission
+        .upload_slots
+        .clone()
+        .try_acquire_owned()
+        .expect("test upload could not acquire upload admission");
+    let mutation = router::MutationProgress::default();
+    let task_mutation = mutation.clone();
+    let body_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_body_polls = body_polls.clone();
+    let task_stage = stage.clone();
+    let state_store = server.state.state_store.clone();
+    let (actor_waiting_sender, actor_waiting_receiver) = oneshot::channel();
+    let task = server.lifecycle.commit_tasks.spawn(async move {
+        let _upload_permit = upload_permit;
+        let _path_lease = path_lease;
+        let mut lookup = Box::pin(state_store.upload_session(state_store::UploadSessionKey {
+            owner: [7; 32],
+            id: *upload_id.as_bytes(),
+        }));
+        assert!(matches!(poll!(lookup.as_mut()), Poll::Pending));
+        let _ = actor_waiting_sender.send(());
+        let _ = lookup.await?;
+        // These model the first guarded namespace/body actions after the
+        // blocked read-only preparation. Closing MutationProgress must make
+        // both unreachable when the actor command eventually returns.
+        if task_mutation.begin_upload_mutation() {
+            task_body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::create_dir_all(task_stage.parent().unwrap())?;
+            std::fs::write(&task_stage, b"unexpected staged body")?;
+        }
+        Ok(Response::default())
+    });
+    tokio::time::timeout(Duration::from_secs(1), actor_waiting_receiver)
+        .await
+        .expect("tracked upload did not dispatch its actor command")
+        .expect("tracked upload exited before waiting for the actor");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        Server::await_tracked_upload_task(deadline, upload_id, 7, None, mutation.clone(), task),
+    )
+    .await
+    .expect("pre-mutation upload timeout did not return promptly")
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(response.headers()["x-dufs-operation-state"], "not-started");
+    assert!(!mutation.outcome_can_be_unknown());
+    assert_eq!(server.admission.upload_slots.available_permits(), 0);
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+    assert_eq!(server.lifecycle.commit_tasks.len(), 1);
+    assert_eq!(
+        body_polls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the timed-out task polled the request body"
+    );
+    assert!(!stage.exists(), "the timed-out task created a staging file");
+
+    let mut same_path = Box::pin(server.content.path_coordinator.acquire([&target]));
+    assert!(
+        matches!(poll!(same_path.as_mut()), Poll::Pending),
+        "the timed-out task released its path lease before actor work finished"
+    );
+
+    release_actor.send(()).unwrap();
+    let acquired = tokio::time::timeout(Duration::from_secs(1), same_path)
+        .await
+        .expect("tracked upload did not release its path lease after the actor replied");
+    drop(acquired);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.lifecycle.commit_tasks.is_empty()
+                && server.admission.upload_slots.available_permits() == 1
+                && server.admission.path_wait_slots.available_permits() == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tracked upload resources were not released after actor completion");
+
+    assert_eq!(
+        body_polls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the cancelled mutation boundary allowed a later body poll"
+    );
+    assert!(!stage.exists());
+}
+
 #[test]
 fn path_wait_capacity_reserves_a_connection_without_disabling_single_connection_servers() {
     assert_eq!(path_wait_capacity(1), 1);

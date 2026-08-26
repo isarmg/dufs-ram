@@ -592,7 +592,7 @@ impl Server {
         let upload_length = options.upload_length;
         let upload_offset = options.mode.offset();
         let mutation = options.mutation.clone();
-        let mut task = self.lifecycle.commit_tasks.spawn(async move {
+        let task = self.lifecycle.commit_tasks.spawn(async move {
             let _upload_permit = upload_permit;
             let mut response = Response::default();
             let result = server
@@ -603,11 +603,34 @@ impl Server {
             }
             result.map(|()| response)
         });
+        Self::await_tracked_upload_task(
+            deadline,
+            upload_id,
+            upload_length,
+            upload_offset,
+            mutation,
+            task,
+        )
+        .await
+    }
+
+    async fn await_tracked_upload_task(
+        deadline: tokio::time::Instant,
+        upload_id: uuid::Uuid,
+        upload_length: u64,
+        upload_offset: Option<u64>,
+        mutation: router::MutationProgress,
+        mut task: tokio::task::JoinHandle<Result<Response>>,
+    ) -> Result<Response> {
         match timeout_at(deadline, &mut task).await {
             Ok(result) => result?,
             Err(_) => {
                 if mutation.cancel_upload_before_mutation() {
-                    task.abort();
+                    // Actor commands and blocking filesystem probes cannot be
+                    // cancelled after dispatch. Detach this tracked task so
+                    // it retains both upload and path admission until that
+                    // work finishes; MutationProgress closes every later
+                    // mutation boundary before this definite response.
                     let mut response = Response::default();
                     upload::apply_upload_problem(
                         &mut response,
