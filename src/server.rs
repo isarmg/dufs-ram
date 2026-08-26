@@ -523,6 +523,10 @@ impl Server {
                 .try_acquire_owned()
                 .context(STATE_PATH_SCAN_ADMISSION_ERROR)?,
         );
+        let mut scanner = self
+            .content
+            .path_coordinator
+            .state_path_conflict_scanner(paths, scan_lease.clone());
         let mut after = None;
         loop {
             let page = self
@@ -530,17 +534,11 @@ impl Server {
                 .state_store
                 .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE, scan_lease.clone())
                 .await?;
-            for path in paths {
-                if self
-                    .content
-                    .path_coordinator
-                    .conflicts_with_state_paths_for_scan(path, &page.paths, &scan_lease)
-                    .await
-                {
-                    return Ok(true);
-                }
+            let next = page.next;
+            if scanner.page_conflicts(page.paths).await {
+                return Ok(true);
             }
-            let Some(next) = page.next else {
+            let Some(next) = next else {
                 return Ok(false);
             };
             after = Some(next);
@@ -558,6 +556,10 @@ impl Server {
                 .try_acquire_owned()
                 .context(STATE_PATH_SCAN_ADMISSION_ERROR)?,
         );
+        let mut scanner = self
+            .content
+            .path_coordinator
+            .state_path_descendant_scanner(path, scan_lease.clone());
         let mut after = None;
         loop {
             let page = self
@@ -565,15 +567,11 @@ impl Server {
                 .state_store
                 .state_blocking_paths(after, STATE_PATH_ADMISSION_PAGE_SIZE, scan_lease.clone())
                 .await?;
-            if self
-                .content
-                .path_coordinator
-                .has_state_path_descendant_for_scan(path, &page.paths, &scan_lease)
-                .await
-            {
+            let next = page.next;
+            if scanner.page_conflicts(page.paths).await {
                 return Ok(true);
             }
-            let Some(next) = page.next else {
+            let Some(next) = next else {
                 return Ok(false);
             };
             after = Some(next);

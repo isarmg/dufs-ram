@@ -467,6 +467,106 @@ async fn persisted_state_paths_detect_lexical_and_symlink_move_conflicts() {
 }
 
 #[tokio::test]
+async fn state_path_scan_batches_nonempty_pages_and_caches_move_sources() {
+    let (temp, coordinator) = coordinator();
+    let source_a = temp.path().join("source-a/file.txt");
+    let source_b = temp.path().join("source-b/file.txt");
+    let mut scanner = coordinator.state_path_conflict_scanner(
+        &[source_a.as_path(), source_b.as_path()],
+        StatePathScanLease::for_test(),
+    );
+
+    assert!(!scanner.page_conflicts(Vec::new()).await);
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (0, 0),
+        "an empty page resolved its sources"
+    );
+
+    assert!(
+        !scanner
+            .page_conflicts(vec![
+                state_path("candidate-a/file.txt", false),
+                state_path("candidate-b/file.txt", false),
+            ])
+            .await
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 4),
+        "the first page must resolve two MOVE sources and two candidates in one task"
+    );
+
+    assert!(
+        scanner
+            .page_conflicts(vec![state_path("source-b/file.txt/child", false)])
+            .await,
+        "a later-page candidate conflicting with the second cached MOVE source was missed"
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 1),
+        "a later page must resolve its candidate once without re-resolving either source"
+    );
+}
+
+#[tokio::test]
+async fn directional_state_scan_caches_its_source_but_resolves_retargeted_candidates_per_page() {
+    let (temp, coordinator) = coordinator();
+    std::fs::create_dir_all(temp.path().join("real/a/b")).unwrap();
+    std::fs::create_dir_all(temp.path().join("other/b")).unwrap();
+    let alias = temp.path().join("alias");
+    symlink("real/a", &alias).unwrap();
+    let exact = temp.path().join("real/a/b/exact.txt");
+    let mut scanner =
+        coordinator.state_path_descendant_scanner(&exact, StatePathScanLease::for_test());
+
+    assert!(!scanner.page_conflicts(Vec::new()).await);
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (0, 0)
+    );
+    assert!(
+        !scanner
+            .page_conflicts(vec![state_path("alias/b/exact.txt", true)])
+            .await,
+        "an aliased exact Running target remains replaceable"
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 2),
+        "the first directional page must batch one source and one candidate"
+    );
+
+    std::fs::remove_file(&alias).unwrap();
+    symlink("other", &alias).unwrap();
+    assert!(
+        !scanner
+            .page_conflicts(vec![state_path("alias/b/exact.txt", false)])
+            .await,
+        "a candidate retargeted away from the cached source must not conflict"
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 1),
+        "a later directional page re-resolved its source"
+    );
+
+    std::fs::remove_file(&alias).unwrap();
+    symlink("real/a", &alias).unwrap();
+    assert!(
+        scanner
+            .page_conflicts(vec![state_path("alias/b/exact.txt", false)])
+            .await,
+        "a protected exact candidate retargeted back to the source must conflict"
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
 async fn persisted_state_path_resolution_failure_blocks_move() {
     let (temp, coordinator) = coordinator();
     std::fs::create_dir(temp.path().join("source")).unwrap();
@@ -493,6 +593,47 @@ async fn persisted_state_path_resolution_failure_blocks_move() {
             )
             .await,
         "directional PUT admission must fail closed when a state path cannot be resolved"
+    );
+}
+
+#[tokio::test]
+async fn persisted_state_path_resolution_failure_short_circuits_and_blocks() {
+    let (temp, coordinator) = coordinator();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    symlink("/", temp.path().join("escape")).unwrap();
+
+    let escaping_source = temp.path().join("escape/etc/source.txt");
+    let ordinary_source = temp.path().join("source/file.txt");
+    let mut conflict_scanner = coordinator.state_path_conflict_scanner(
+        &[escaping_source.as_path(), ordinary_source.as_path()],
+        StatePathScanLease::for_test(),
+    );
+    assert!(
+        conflict_scanner
+            .page_conflicts(vec![state_path("unrelated/file.txt", false)])
+            .await
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 1),
+        "a failing first source did not stop the rest of its batch"
+    );
+
+    let mut descendant_scanner =
+        coordinator.state_path_descendant_scanner(&ordinary_source, StatePathScanLease::for_test());
+    assert!(
+        descendant_scanner
+            .page_conflicts(vec![
+                state_path("escape/etc/passwd", true),
+                state_path("later/file.txt", true),
+            ])
+            .await,
+        "directional PUT admission must fail closed when a state path cannot be resolved"
+    );
+    assert_eq!(
+        coordinator.inner.rooted_fs.take_state_scan_work_counts(),
+        (1, 2),
+        "a failing first candidate did not stop the rest of its batch"
     );
 }
 
