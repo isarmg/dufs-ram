@@ -1,18 +1,309 @@
 use super::*;
+use crate::{Args, server::ServerLifecycle};
+use http_body_util::BodyExt as _;
 use std::{
+    collections::HashMap,
     ffi::OsString,
-    os::unix::ffi::OsStringExt,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     sync::{
-        Condvar, Mutex as StdMutex,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        mpsc,
     },
+    time::Duration,
 };
 use tokio_util::task::TaskTracker;
 
+const LIST_API_TEST_ACCOUNT: &str = "listing-test:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+
+fn list_api_test_server(root: &assert_fs::TempDir) -> (Arc<Server>, assert_fs::TempDir) {
+    let state_dir = assert_fs::TempDir::new().expect("create listing state directory");
+    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict listing state directory");
+    let mut args = Args {
+        serve_path: root.path().to_path_buf(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        auth: crate::auth::AuthConfig::new(&[LIST_API_TEST_ACCOUNT])
+            .expect("parse listing test account"),
+        ..Args::default()
+    };
+    args.max_concurrent_searches = 1;
+    let server = Server::init_with_list_snapshot_cache(
+        args,
+        ServerLifecycle::new(),
+        ListSnapshotCache::isolated(),
+    )
+    .expect("initialize listing test server");
+    (Arc::new(server), state_dir)
+}
+
+fn list_query(parameters: &[(&str, &str)]) -> HashMap<String, String> {
+    parameters
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
+}
+
+async fn list_api_response(server: Arc<Server>, query: HashMap<String, String>) -> Response {
+    let mut response = Response::default();
+    server
+        .handle_list_api("listing-test", &query, &mut response)
+        .await
+        .expect("handle list API request");
+    response
+}
+
+async fn list_response_json(response: Response) -> serde_json::Value {
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect list API response")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("decode list API response")
+}
+
+fn set_list_metadata_phase_hook(
+    server: &Server,
+    hook: Option<Arc<dyn Fn(ListMetadataPhase) + Send + Sync>>,
+) {
+    *server
+        .admission
+        .list_metadata_phase_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+async fn wait_for_search_slot(server: &Server) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.admission.search_slots.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("listing metadata worker did not release search admission");
+}
+
+#[tokio::test]
+async fn first_page_admission_precedes_metadata_but_follows_parameter_validation() {
+    let root = assert_fs::TempDir::new().expect("create listing root");
+    let (server, _state_dir) = list_api_test_server(&root);
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = metadata_calls.clone();
+    set_list_metadata_phase_hook(
+        &server,
+        Some(Arc::new(move |_| {
+            observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        })),
+    );
+    let held = server
+        .admission
+        .search_slots
+        .clone()
+        .try_acquire_owned()
+        .expect("hold the only listing admission slot");
+
+    let saturated = list_api_response(server.clone(), list_query(&[])).await;
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(saturated.headers()["retry-after"], "1");
+    assert_eq!(
+        list_response_json(saturated).await["code"],
+        "directory_operation_limit"
+    );
+    assert_eq!(metadata_calls.load(AtomicOrdering::SeqCst), 0);
+
+    let long_query = "x".repeat(129);
+    for (invalid, expected_code) in [
+        (list_query(&[("limit", "0")]), "invalid_list_limit"),
+        (
+            list_query(&[("cursor", "not-a-cursor")]),
+            "invalid_list_cursor",
+        ),
+        (list_query(&[("q", &long_query)]), "search_query_too_long"),
+    ] {
+        let response = list_api_response(server.clone(), invalid).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(list_response_json(response).await["code"], expected_code);
+    }
+    assert_eq!(
+        metadata_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "saturated or invalid first-page requests reached metadata"
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn cursor_page_bypasses_saturated_search_admission_and_tracked_metadata_hook() {
+    let root = assert_fs::TempDir::new().expect("create listing root");
+    std::fs::write(root.path().join("one.txt"), "one").expect("create first listing entry");
+    std::fs::write(root.path().join("two.txt"), "two").expect("create second listing entry");
+    let (server, _state_dir) = list_api_test_server(&root);
+
+    let first = list_api_response(server.clone(), list_query(&[("limit", "1")])).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = list_response_json(first).await;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("first page has a continuation cursor")
+        .to_string();
+
+    let tracked_metadata_calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = tracked_metadata_calls.clone();
+    set_list_metadata_phase_hook(
+        &server,
+        Some(Arc::new(move |_| {
+            observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        })),
+    );
+    let held = server
+        .admission
+        .search_slots
+        .clone()
+        .try_acquire_owned()
+        .expect("hold the only listing admission slot");
+
+    let continuation = list_api_response(
+        server.clone(),
+        list_query(&[("limit", "1"), ("cursor", &cursor)]),
+    )
+    .await;
+    assert_eq!(continuation.status(), StatusCode::OK);
+    assert_eq!(
+        tracked_metadata_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "cursor lookup used first-page guarded metadata"
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn first_page_metadata_phases_hold_search_admission() {
+    let root = assert_fs::TempDir::new().expect("create listing root");
+    std::fs::write(root.path().join("entry.txt"), "entry").expect("create listing entry");
+    let (server, _state_dir) = list_api_test_server(&root);
+    let observations = Arc::new(StdMutex::new(Vec::new()));
+    let observed = observations.clone();
+    let search_slots = server.admission.search_slots.clone();
+    set_list_metadata_phase_hook(
+        &server,
+        Some(Arc::new(move |phase| {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((phase, search_slots.available_permits()));
+        })),
+    );
+
+    let response = list_api_response(server.clone(), list_query(&[])).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [
+            (ListMetadataPhase::BeforeWalk, 0),
+            (ListMetadataPhase::AfterWalk, 0),
+        ]
+    );
+    assert_eq!(server.admission.search_slots.available_permits(), 1);
+}
+
+async fn assert_aborted_metadata_retains_search_admission(target: ListMetadataPhase) {
+    let root = assert_fs::TempDir::new().expect("create listing root");
+    std::fs::write(root.path().join("entry.txt"), "entry").expect("create listing entry");
+    let (server, _state_dir) = list_api_test_server(&root);
+    let observations = Arc::new(StdMutex::new(Vec::new()));
+    let observed = observations.clone();
+    let (entered_sender, entered_receiver) = mpsc::channel();
+    let entered_sender = StdMutex::new(Some(entered_sender));
+    let (release_sender, release_receiver) = mpsc::channel();
+    let release_receiver = StdMutex::new(Some(release_receiver));
+    set_list_metadata_phase_hook(
+        &server,
+        Some(Arc::new(move |phase| {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(phase);
+            if phase == target {
+                entered_sender
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("target metadata phase ran once")
+                    .send(())
+                    .expect("report entered metadata phase");
+                release_receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("target metadata phase waited once")
+                    .recv()
+                    .expect("release metadata phase");
+            }
+        })),
+    );
+
+    let request = tokio::spawn(list_api_response(server.clone(), list_query(&[])));
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target metadata phase did not start")
+    })
+    .await
+    .expect("metadata-phase observer panicked");
+    request.abort();
+    assert!(
+        request
+            .await
+            .expect_err("aborted request returned")
+            .is_cancelled()
+    );
+
+    assert_eq!(
+        server.admission.search_slots.available_permits(),
+        0,
+        "request cancellation released admission before blocking metadata exited"
+    );
+    let saturated = list_api_response(server.clone(), list_query(&[])).await;
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    release_sender
+        .send(())
+        .expect("release blocked metadata phase");
+    wait_for_search_slot(&server).await;
+    let observed_phases = observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let expected = match target {
+        ListMetadataPhase::BeforeWalk => vec![ListMetadataPhase::BeforeWalk],
+        ListMetadataPhase::AfterWalk => {
+            vec![ListMetadataPhase::BeforeWalk, ListMetadataPhase::AfterWalk]
+        }
+    };
+    assert_eq!(
+        observed_phases, expected,
+        "an aborted request started a later metadata phase"
+    );
+
+    set_list_metadata_phase_hook(&server, None);
+    let recovered = list_api_response(server.clone(), list_query(&[])).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn aborted_first_and_final_metadata_retain_search_admission_until_worker_exit() {
+    assert_aborted_metadata_retains_search_admission(ListMetadataPhase::BeforeWalk).await;
+    assert_aborted_metadata_retains_search_admission(ListMetadataPhase::AfterWalk).await;
+}
+
 #[tokio::test]
 async fn listing_problem_protocol_ignores_diagnostic_reason_strings() {
-    use http_body_util::BodyExt as _;
-
     let root = Path::new("/srv/share");
     let error = ListingError::limit(
         "typed_protocol_test",
@@ -36,8 +327,6 @@ async fn listing_problem_protocol_ignores_diagnostic_reason_strings() {
 
 #[tokio::test]
 async fn list_snapshot_allocation_failure_uses_the_listing_error_code() {
-    use http_body_util::BodyExt as _;
-
     let root = Path::new("/srv/share");
     let error = ListingError::limit(
         "list_snapshot",

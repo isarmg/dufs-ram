@@ -1,5 +1,6 @@
 use super::{
     Response, Server,
+    blocking_io::blocking_io_gate,
     identity::OwnerId,
     internal_names::is_internal_name,
     problem::{ApiError, ErrorCode, RecoveryAdvice, render_problem},
@@ -63,6 +64,12 @@ const MAX_LIST_PAGE_SIZE: usize = 500;
 const MAX_LIST_SNAPSHOT_ENTRIES: usize = 100_000;
 pub(super) const MAX_DIRECTORY_WALK_DEPTH: usize = 1_024;
 pub(super) const MAX_DIRECTORY_WALK_WORKING_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ListMetadataPhase {
+    BeforeWalk,
+    AfterWalk,
+}
 
 pub(super) type ListingResult<T> = std::result::Result<T, ListingError>;
 
@@ -292,6 +299,35 @@ impl fmt::Display for ListingError {
 impl std::error::Error for ListingError {}
 
 impl Server {
+    async fn list_metadata_guarded(
+        &self,
+        path: &Path,
+        permit: Arc<OwnedSemaphorePermit>,
+        phase: ListMetadataPhase,
+    ) -> io::Result<Metadata> {
+        let rooted_fs = self.content.rooted_fs.clone();
+        let path = path.to_path_buf();
+        #[cfg(test)]
+        let phase_hook = self
+            .admission
+            .list_metadata_phase_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        blocking_io_gate()
+            .run_io_guarded(permit, move || {
+                #[cfg(test)]
+                if let Some(hook) = phase_hook {
+                    hook(phase);
+                }
+                #[cfg(not(test))]
+                let _ = phase;
+                rooted_fs.metadata_blocking(&path)
+            })
+            .await
+    }
+
     pub(super) async fn handle_list_api(
         &self,
         account: &str,
@@ -372,7 +408,35 @@ impl Server {
             None => None,
         };
 
-        let before = match self.content.rooted_fs.metadata(&path).await {
+        let list_permit = if cursor.is_none() {
+            match self.admission.search_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(_) => {
+                    warn!(
+                        "Listing rejected reason=concurrency_limit limit={}",
+                        self.content.args.max_concurrent_searches
+                    );
+                    respond_list_api_problem(
+                        res,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorCode::DIRECTORY_OPERATION_LIMIT,
+                        "Too many directory operations are running",
+                        RecoveryAdvice::RetryAfterSeconds(1),
+                    )?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        let before_metadata = if let Some(permit) = &list_permit {
+            self.list_metadata_guarded(&path, permit.clone(), ListMetadataPhase::BeforeWalk)
+                .await
+        } else {
+            self.content.rooted_fs.metadata(&path).await
+        };
+        let before = match before_metadata {
             Ok(metadata) if metadata.is_dir() => DirectorySnapshot::from_metadata(&metadata),
             Ok(_) => {
                 respond_list_api_problem(
@@ -455,23 +519,7 @@ impl Server {
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop::new(cancellation.clone());
 
-        let list_permit = match self.admission.search_slots.clone().try_acquire_owned() {
-            Ok(permit) => Arc::new(permit),
-            Err(_) => {
-                warn!(
-                    "Listing rejected reason=concurrency_limit limit={}",
-                    self.content.args.max_concurrent_searches
-                );
-                respond_list_api_problem(
-                    res,
-                    StatusCode::TOO_MANY_REQUESTS,
-                    ErrorCode::DIRECTORY_OPERATION_LIMIT,
-                    "Too many directory operations are running",
-                    RecoveryAdvice::RetryAfterSeconds(1),
-                )?;
-                return Ok(());
-            }
-        };
+        let list_permit = list_permit.expect("a first-page listing has search admission");
 
         let paths = if query.is_empty() {
             let rooted_fs = self.content.rooted_fs.clone();
@@ -535,8 +583,11 @@ impl Server {
             }
         };
 
+        let after_metadata = self
+            .list_metadata_guarded(&path, list_permit.clone(), ListMetadataPhase::AfterWalk)
+            .await;
         let after = match directory_snapshot_after_walk(
-            self.content.rooted_fs.metadata(&path).await,
+            after_metadata,
             &path,
             &self.content.args.serve_path,
         ) {
