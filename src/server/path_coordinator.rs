@@ -1,5 +1,5 @@
 use super::{
-    rooted_fs::{FileIdentity, ResolvedPathKey, RootedFs, SemanticPathComponent},
+    rooted_fs::{ResolvedPathKey, RootedFs},
     state_store::StateBlockingPath,
 };
 use std::{
@@ -408,7 +408,9 @@ fn path_strictly_contains(ancestor: &LeaseKey, descendant: &LeaseKey) -> bool {
 }
 
 fn paths_identify_same_entry(left: &LeaseKey, right: &LeaseKey) -> bool {
-    left.lexical == right.lexical || left.resolved.components == right.resolved.components
+    left.lexical == right.lexical
+        || (left.resolved.resolved_parent == right.resolved.resolved_parent
+            && left.resolved.unresolved_tail == right.resolved.unresolved_tail)
 }
 
 fn waiter_conflicts(waiter: &WaiterState, requested: &[LeaseKey]) -> bool {
@@ -427,35 +429,35 @@ fn waiter_conflicts(waiter: &WaiterState, requested: &[LeaseKey]) -> bool {
 }
 
 fn resolved_paths_conflict(left: &ResolvedPathKey, right: &ResolvedPathKey) -> bool {
-    components_are_prefix(&left.components, &right.components)
-        || components_are_prefix(&right.components, &left.components)
+    anchored_tail_is_prefix(left, right)
+        || anchored_tail_is_prefix(right, left)
         || left
             .target_directory
-            .is_some_and(|identity| contains_directory(&right.components, identity))
+            .is_some_and(|identity| right.ancestor_directories.contains(&identity))
         || right
             .target_directory
-            .is_some_and(|identity| contains_directory(&left.components, identity))
+            .is_some_and(|identity| left.ancestor_directories.contains(&identity))
 }
 
 fn resolved_path_strictly_contains(
     ancestor: &ResolvedPathKey,
     descendant: &ResolvedPathKey,
 ) -> bool {
-    (ancestor.components.len() < descendant.components.len()
-        && components_are_prefix(&ancestor.components, &descendant.components))
+    (ancestor.unresolved_tail.len() < descendant.unresolved_tail.len()
+        && anchored_tail_is_prefix(ancestor, descendant))
         || ancestor
             .target_directory
-            .is_some_and(|identity| contains_directory(&descendant.components, identity))
+            .is_some_and(|identity| descendant.ancestor_directories.contains(&identity))
 }
 
-fn components_are_prefix(left: &[SemanticPathComponent], right: &[SemanticPathComponent]) -> bool {
-    left.len() <= right.len() && left.iter().zip(right).all(|(left, right)| left == right)
-}
-
-fn contains_directory(components: &[SemanticPathComponent], identity: FileIdentity) -> bool {
-    components.iter().any(
-        |component| matches!(component, SemanticPathComponent::Directory(value) if *value == identity),
-    )
+fn anchored_tail_is_prefix(left: &ResolvedPathKey, right: &ResolvedPathKey) -> bool {
+    left.resolved_parent == right.resolved_parent
+        && left.unresolved_tail.len() <= right.unresolved_tail.len()
+        && left
+            .unresolved_tail
+            .iter()
+            .zip(&right.unresolved_tail)
+            .all(|(left, right)| left == right)
 }
 
 #[cfg(test)]
