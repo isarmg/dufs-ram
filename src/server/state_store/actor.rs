@@ -63,6 +63,8 @@ pub(super) fn run(runtime: ActorRuntime) {
         clock,
         limits,
         deferred_abandons: VecDeque::new(),
+        #[cfg(test)]
+        execution_counts: ActorExecutionCounts::default(),
     }
     .run(command_receiver, control_receiver, channels);
 }
@@ -85,6 +87,9 @@ impl StoreWorker {
             match command {
                 Command::Wake => continue,
                 Command::ProbeReadiness { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     // A failed probe describes this command, not the actor's
                     // lifecycle. A later probe may succeed after a transient
                     // lock, I/O, or capacity condition clears.
@@ -95,6 +100,17 @@ impl StoreWorker {
                     fingerprint,
                     reply,
                 } => {
+                    // If cancellation is already visible, no reservation was
+                    // transferred and there is nothing to clean up. A close
+                    // racing this check is still handled by the send failure
+                    // and BeginEnvelope cleanup paths below.
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        self.execution_counts.begin += 1;
+                    }
                     let result = self
                         .begin_operation(key, fingerprint)
                         .map(|begin| BeginEnvelope::new(begin, &channels, key));
@@ -119,6 +135,16 @@ impl StoreWorker {
                     }
                 }
                 Command::Status { key, reply } => {
+                    if reply.is_closed() {
+                        // Expiry reclamation is incidental to Status. Every
+                        // later live Status or Begin performs the same purge,
+                        // so cancellation does not leave required cleanup.
+                        continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        self.execution_counts.status += 1;
+                    }
                     let _ = reply.send(self.operation_status(key));
                 }
                 Command::MarkCommitStarted { key, lease, reply } => {
@@ -130,6 +156,10 @@ impl StoreWorker {
                     outcome,
                     reply,
                 } => {
+                    #[cfg(test)]
+                    {
+                        self.execution_counts.complete += 1;
+                    }
                     let _ = reply.send(self.complete_operation(key, lease, &outcome));
                 }
                 Command::SaveUploadSession {
@@ -140,6 +170,9 @@ impl StoreWorker {
                     let _ = reply.send(self.save_upload_session(&session, ttl_ms));
                 }
                 Command::LoadUploadSession { key, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(super::upload::load_upload_session(&self.connection, key));
                 }
                 Command::ListUploadSessionsPageBlocking {
@@ -154,6 +187,9 @@ impl StoreWorker {
                     limit,
                     reply,
                 } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.upload_sessions_page(after, limit));
                 }
                 Command::ReplaceUploadStagePathBlocking {
@@ -183,9 +219,15 @@ impl StoreWorker {
                     limit,
                     reply,
                 } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.expired_upload_sessions(after, limit));
                 }
                 Command::MatchExpiredUploadSession { expected, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.expired_upload_session_matches(&expected));
                 }
                 Command::RemoveUploadSessionIfMatches { expected, reply } => {
@@ -198,12 +240,21 @@ impl StoreWorker {
                     let _ = reply.send(self.prepare_purge_job(&job));
                 }
                 Command::LoadPurgeJob { key, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(super::purge::load_purge_job(&self.connection, key));
                 }
                 Command::ListPreparedPurgeJobs { limit, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.prepared_purge_jobs(limit));
                 }
                 Command::ListPurgeJobs { limit, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.purge_jobs(limit));
                 }
                 Command::IsStatePathBoundBlocking { path, reply } => {
@@ -212,11 +263,15 @@ impl StoreWorker {
                 Command::ListStateBlockingPaths {
                     after,
                     limit,
-                    scan_lease: _scan_lease,
+                    scan_lease,
                     reply,
                 } => {
+                    if reply.is_closed() {
+                        drop(scan_lease);
+                        continue;
+                    }
                     let result = self.state_blocking_paths(after, limit);
-                    drop(_scan_lease);
+                    drop(scan_lease);
                     let _ = reply.send(result);
                 }
                 Command::MarkPurgeJobReady {
@@ -244,7 +299,17 @@ impl StoreWorker {
                 }
                 #[cfg(test)]
                 Command::InspectPragmas { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.inspect_pragmas());
+                }
+                #[cfg(test)]
+                Command::InspectActorExecutionCounts { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let _ = reply.send(Ok(self.execution_counts));
                 }
                 #[cfg(test)]
                 Command::InjectSqlError { reply } => {

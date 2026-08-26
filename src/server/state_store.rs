@@ -371,6 +371,10 @@ enum Command {
         reply: oneshot::Sender<Result<PragmaSnapshot>>,
     },
     #[cfg(test)]
+    InspectActorExecutionCounts {
+        reply: oneshot::Sender<Result<ActorExecutionCounts>>,
+    },
+    #[cfg(test)]
     InjectSqlError {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -384,6 +388,14 @@ enum Command {
         entered: SyncSender<()>,
         release: Receiver<()>,
     },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ActorExecutionCounts {
+    begin: usize,
+    status: usize,
+    complete: usize,
 }
 
 enum ControlCommand {
@@ -967,6 +979,13 @@ impl StateStore {
     }
 
     #[cfg(test)]
+    async fn inspect_actor_execution_counts(&self) -> Result<ActorExecutionCounts> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::InspectActorExecutionCounts { reply })?;
+        self.receive(receiver).await
+    }
+
+    #[cfg(test)]
     async fn inject_sql_error(&self) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.send(Command::InjectSqlError { reply })?;
@@ -1072,6 +1091,8 @@ struct StoreWorker {
     clock: StoreClock,
     limits: Limits,
     deferred_abandons: VecDeque<(OperationKey, [u8; 16])>,
+    #[cfg(test)]
+    execution_counts: ActorExecutionCounts,
 }
 
 struct StoreClock {

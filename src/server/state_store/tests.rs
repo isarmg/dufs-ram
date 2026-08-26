@@ -330,8 +330,7 @@ async fn sqlite_command_error_does_not_stop_the_actor() -> Result<()> {
 async fn cancelled_begin_delivery_does_not_leave_a_reservation() -> Result<()> {
     let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
 
-    // Cancellation before the actor replies is detected by Sender::send
-    // and cleaned up immediately on the actor's SQLite connection.
+    // Cancellation already visible before execution skips the reservation.
     let cancelled_before_reply = key(1, 1);
     let (reply, receiver) = oneshot::channel();
     drop(receiver);
@@ -359,6 +358,93 @@ async fn cancelled_begin_delivery_does_not_leave_a_reservation() -> Result<()> {
     assert_eq!(
         store.operation_status(cancelled_after_reply).await?,
         StoreStatus::NotFound
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_cancelled_status_and_begin_are_skipped_before_execution() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+    let release = store.block_actor_for_test()?;
+
+    for id in 0..64 {
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver);
+        store.send(Command::Status {
+            key: key(2, id),
+            reply,
+        })?;
+    }
+    let cancelled_begin = key(3, 1);
+    let (reply, receiver) = oneshot::channel();
+    drop(receiver);
+    store.send(Command::Begin {
+        key: cancelled_begin,
+        fingerprint: fingerprint(3),
+        reply,
+    })?;
+
+    release.send(())?;
+    assert_eq!(
+        store.inspect_actor_execution_counts().await?,
+        ActorExecutionCounts::default(),
+        "cancelled result-only commands reached SQLite"
+    );
+    assert_eq!(
+        store.operation_status(cancelled_begin).await?,
+        StoreStatus::NotFound
+    );
+    assert_eq!(
+        store.inspect_actor_execution_counts().await?,
+        ActorExecutionCounts {
+            status: 1,
+            ..ActorExecutionCounts::default()
+        },
+        "the execution counter did not distinguish live from cancelled work"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_mutating_command_still_executes() -> Result<()> {
+    let store = StateStore::temporary_for_test(CAPACITY, PER_OWNER, TTL)?;
+    let operation = key(4, 1);
+    let lease = match store.begin_operation(operation, fingerprint(4)).await? {
+        StoreBegin::Started { lease } => lease,
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert_eq!(
+        store.inspect_actor_execution_counts().await?,
+        ActorExecutionCounts {
+            begin: 1,
+            ..ActorExecutionCounts::default()
+        }
+    );
+
+    let release = store.block_actor_for_test()?;
+    let outcome = success(204);
+    let (reply, receiver) = oneshot::channel();
+    drop(receiver);
+    store.send(Command::Complete {
+        key: operation,
+        lease,
+        outcome: outcome.clone(),
+        reply,
+    })?;
+    release.send(())?;
+
+    assert_eq!(
+        store.inspect_actor_execution_counts().await?,
+        ActorExecutionCounts {
+            begin: 1,
+            complete: 1,
+            ..ActorExecutionCounts::default()
+        },
+        "a mutating command was skipped because its reply was cancelled"
+    );
+    assert_eq!(
+        store.operation_status(operation).await?,
+        StoreStatus::Completed(outcome)
     );
     Ok(())
 }
