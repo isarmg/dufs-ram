@@ -53,7 +53,7 @@ use http_body_util::combinators::BoxBody;
 use hyper::{
     Method, StatusCode,
     body::Incoming,
-    header::{ALLOW, CACHE_CONTROL, CONTENT_DISPOSITION, HeaderValue},
+    header::{ALLOW, CACHE_CONTROL, CONTENT_DISPOSITION, HeaderValue, RETRY_AFTER},
 };
 use std::{
     collections::HashSet,
@@ -78,11 +78,19 @@ const READINESS_CHECK_PATH: &str = "__dufs__/ready";
 const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
 const CSRF_AUTH_ERROR: &str = "csrf";
 const NON_UPLOAD_MUTATION_CAPACITY: usize = 64;
+const READINESS_PROBE_CAPACITY: usize = 1;
 const STATE_PATH_SCAN_CAPACITY: usize = 4;
 const STATE_PATH_SCAN_ADMISSION_ERROR: &str = "Durable state path scan admission is at capacity";
 const STATE_PATH_ADMISSION_PAGE_SIZE: usize = 256;
 const PATH_WAIT_CAPACITY_LIMIT: usize = 64;
 const PATH_WAIT_LIMIT_DETAIL: &str = "Too many path-coordinated requests are active";
+
+#[derive(Clone, Copy)]
+enum ReadinessStatus {
+    Ready,
+    NotReady,
+    Busy,
+}
 
 /// Keeps one durable-state scan admission slot tied to work that cannot be
 /// cancelled after dispatch. The request owns one clone, while each accepted
@@ -315,6 +323,7 @@ struct AdmissionControl {
     upload_preflight_slots: Arc<Semaphore>,
     upload_slots: Arc<Semaphore>,
     mutation_slots: Arc<Semaphore>,
+    readiness_probe_slots: Arc<Semaphore>,
     state_path_scan_slots: Arc<Semaphore>,
     path_wait_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
@@ -427,6 +436,7 @@ impl Server {
                 )),
                 upload_slots: Arc::new(Semaphore::new(max_concurrent_uploads)),
                 mutation_slots: Arc::new(Semaphore::new(NON_UPLOAD_MUTATION_CAPACITY)),
+                readiness_probe_slots: Arc::new(Semaphore::new(READINESS_PROBE_CAPACITY)),
                 state_path_scan_slots: Arc::new(Semaphore::new(STATE_PATH_SCAN_CAPACITY)),
                 path_wait_slots: Arc::new(Semaphore::new(path_wait_capacity)),
                 search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
@@ -722,28 +732,20 @@ impl Server {
         }
     }
 
-    async fn send_readiness(&self, head_only: bool, res: &mut Response) {
+    fn render_readiness(res: &mut Response, head_only: bool, status: ReadinessStatus) {
         const READY: &str = r#"{"status":"ready"}"#;
         const NOT_READY: &str = r#"{"status":"not_ready"}"#;
-        let (root_probe, disk_probe, state_probe) = tokio::join!(
-            self.content.rooted_fs.probe_writable(),
-            self.admission.disk_space.reserve_async(
-                self.content.rooted_fs.root_handle(),
-                0,
-                self.content.args.min_free_space,
-            ),
-            self.state.state_store.probe_readiness(),
-        );
-        let ready = root_probe.is_ok()
-            && disk_probe.is_ok_and(|reservation| reservation.is_some())
-            && state_probe.is_ok()
-            && self.state.operation_registry.is_healthy()
-            && !self.lifecycle.shutdown.is_cancelled()
-            && !self.lifecycle.force_shutdown.is_cancelled();
+        let ready = matches!(status, ReadinessStatus::Ready);
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
         res.headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if matches!(status, ReadinessStatus::Busy) {
+            res.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        } else {
+            res.headers_mut().remove(RETRY_AFTER);
+        }
         *res.status_mut() = if ready {
             StatusCode::OK
         } else {
@@ -752,6 +754,60 @@ impl Server {
         if !head_only {
             *res.body_mut() = body_full(if ready { READY } else { NOT_READY });
         }
+    }
+
+    async fn send_readiness(&self, head_only: bool, res: &mut Response) {
+        let permit = match self
+            .admission
+            .readiness_probe_slots
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                Self::render_readiness(res, head_only, ReadinessStatus::Busy);
+                return;
+            }
+        };
+
+        let rooted_fs = self.content.rooted_fs.clone();
+        let disk_rooted_fs = rooted_fs.clone();
+        let disk_space = self.admission.disk_space.clone();
+        let state_store = self.state.state_store.clone();
+        let min_free_space = self.content.args.min_free_space;
+        let probes = self.lifecycle.work_tasks.spawn(async move {
+            let results = tokio::join!(
+                rooted_fs.probe_writable(),
+                disk_space.reserve_async(disk_rooted_fs.root_handle(), 0, min_free_space),
+                state_store.probe_readiness(),
+            );
+            drop(permit);
+            results
+        });
+        let probes_ready = match probes.await {
+            Ok((root_probe, disk_probe, state_probe)) => {
+                root_probe.is_ok()
+                    && disk_probe.is_ok_and(|reservation| reservation.is_some())
+                    && state_probe.is_ok()
+            }
+            Err(error) => {
+                warn!("Readiness probe task failed error={error}");
+                false
+            }
+        };
+        let ready = probes_ready
+            && self.state.operation_registry.is_healthy()
+            && !self.lifecycle.shutdown.is_cancelled()
+            && !self.lifecycle.force_shutdown.is_cancelled();
+        Self::render_readiness(
+            res,
+            head_only,
+            if ready {
+                ReadinessStatus::Ready
+            } else {
+                ReadinessStatus::NotReady
+            },
+        );
     }
 
     /// Resolve the target for method dispatch without following an invalid

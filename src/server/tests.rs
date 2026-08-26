@@ -1,5 +1,6 @@
 use super::{purge::PreparePurge, *};
 use futures_util::poll;
+use http_body_util::BodyExt as _;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -24,6 +25,152 @@ fn authenticated_args(serve_path: PathBuf, state_dir: &Path) -> Args {
         auth: crate::auth::AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
         ..Args::default()
     }
+}
+
+#[tokio::test]
+async fn readiness_admission_is_fail_fast_and_preserves_get_and_head_protocols() {
+    let root = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Server::init_with_lifecycle(
+        authenticated_args(root.path().to_path_buf(), state_dir.path()),
+        ServerLifecycle::new(),
+    )
+    .unwrap();
+    let held = server
+        .admission
+        .readiness_probe_slots
+        .clone()
+        .try_acquire_owned()
+        .expect("hold the only readiness probe slot");
+
+    let mut busy_get = Response::default();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        server.send_readiness(false, &mut busy_get),
+    )
+    .await
+    .expect("a saturated readiness GET waited instead of failing fast");
+    assert_eq!(busy_get.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy_get.headers()[RETRY_AFTER], "1");
+    assert_eq!(busy_get.headers()[CACHE_CONTROL], "no-store");
+    assert_eq!(
+        busy_get.headers()[hyper::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert_eq!(
+        busy_get.into_body().collect().await.unwrap().to_bytes(),
+        r#"{"status":"not_ready"}"#
+    );
+
+    let mut busy_head = Response::default();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        server.send_readiness(true, &mut busy_head),
+    )
+    .await
+    .expect("a saturated readiness HEAD waited instead of failing fast");
+    assert_eq!(busy_head.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy_head.headers()[RETRY_AFTER], "1");
+    assert_eq!(busy_head.headers()[CACHE_CONTROL], "no-store");
+    assert_eq!(
+        busy_head.headers()[hyper::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert!(
+        busy_head
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+
+    drop(held);
+    let mut ready = Response::default();
+    server.send_readiness(false, &mut ready).await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert!(!ready.headers().contains_key(RETRY_AFTER));
+    assert_eq!(ready.headers()[CACHE_CONTROL], "no-store");
+    assert_eq!(
+        ready.headers()[hyper::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert_eq!(
+        ready.into_body().collect().await.unwrap().to_bytes(),
+        r#"{"status":"ready"}"#
+    );
+}
+
+#[tokio::test]
+async fn cancelled_readiness_caller_retains_admission_until_the_tracked_probe_finishes() {
+    let root = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Arc::new(
+        Server::init_with_lifecycle(
+            authenticated_args(root.path().to_path_buf(), state_dir.path()),
+            ServerLifecycle::new(),
+        )
+        .unwrap(),
+    );
+    let release_actor = server.state.state_store.block_actor_for_test().unwrap();
+    let caller = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let mut response = Response::default();
+            server.send_readiness(false, &mut response).await;
+            response
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.admission.readiness_probe_slots.available_permits() == 0
+                && server.lifecycle.work_tasks.len() == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("readiness probe did not enter its tracked task");
+    caller.abort();
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+    assert_eq!(
+        server.admission.readiness_probe_slots.available_permits(),
+        0
+    );
+    assert_eq!(server.lifecycle.work_tasks.len(), 1);
+
+    let mut saturated = Response::default();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        server.send_readiness(false, &mut saturated),
+    )
+    .await
+    .expect("a saturated readiness request waited instead of failing fast");
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(saturated.headers()[RETRY_AFTER], "1");
+
+    release_actor.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.admission.readiness_probe_slots.available_permits() == 1
+                && server.lifecycle.work_tasks.is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tracked readiness probe did not release admission after actor completion");
+
+    let mut recovered = Response::default();
+    server.send_readiness(false, &mut recovered).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert!(!recovered.headers().contains_key(RETRY_AFTER));
 }
 
 #[tokio::test]

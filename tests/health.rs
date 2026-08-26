@@ -49,6 +49,13 @@ fn auth_health(#[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer) -> R
     let resp = server.get_with(&session, &ready_url)?;
     assert_no_store(&resp);
     assert_eq!(resp.text()?, READINESS_CHECK_RESPONSE);
+
+    let head = server
+        .request_with(&session, reqwest::Method::HEAD, &ready_url)
+        .send()?;
+    assert_eq!(head.status(), 200);
+    assert_no_store(&head);
+    assert_eq!(head.text()?, "");
     Ok(())
 }
 
@@ -76,6 +83,8 @@ fn readiness_reports_insufficient_protected_disk_space(
 
     let readiness = server.get(format!("{}{READINESS_CHECK_PATH}", server.url()))?;
     assert_eq!(readiness.status(), 503);
+    assert_no_store(&readiness);
+    assert!(readiness.headers().get("retry-after").is_none());
     assert_eq!(readiness.text()?, r#"{"status":"not_ready"}"#);
     Ok(())
 }
