@@ -42,7 +42,7 @@ const CHECKPOINT_UPLOAD_STATUSES = Object.freeze({
   rejected: Object.freeze([409]),
   "not-seen": Object.freeze([404]),
   "not-started": Object.freeze([]),
-  unknown: Object.freeze([500, 503]),
+  unknown: Object.freeze([429, 500, 503]),
 });
 const DISCARD_UPLOAD_STATUSES = Object.freeze({
   running: Object.freeze([]),

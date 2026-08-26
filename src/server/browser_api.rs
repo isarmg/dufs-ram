@@ -10,6 +10,7 @@ use super::{
     path_policy::BROWSER_COMPONENT_BYTES_LIMIT,
     problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
     protocol::OperationPublicState,
+    render_path_wait_limit,
     rooted_fs::{CheckedRelocationOutcome, ReplacementTargetIdentity, RootedFs},
     router::MutationProgress,
     status_no_content,
@@ -715,7 +716,11 @@ impl Server {
             )?;
             return Ok(());
         }
-        self.discard_awaiting_upload(owner, &path, upload_id, res)
+        let Some(path_lease) = self.acquire_request_path_lease([&path]).await else {
+            render_path_wait_limit(res, None)?;
+            return Ok(());
+        };
+        self.discard_awaiting_upload(owner, &path, upload_id, path_lease, res)
             .await
     }
 
@@ -739,7 +744,12 @@ impl Server {
                 return Ok(());
             }
         };
-        let path_lease = self.content.path_coordinator.acquire([&path]).await;
+        let Some(path_lease) = self.acquire_request_path_lease([&path]).await else {
+            let operation_id = operation.as_ref().map(|(id, _)| *id);
+            drop(operation.take());
+            render_path_wait_limit(res, operation_id)?;
+            return Ok(());
+        };
 
         if self.guard_root_contained(&path).await? {
             finish_api_error(
@@ -1069,11 +1079,15 @@ impl Server {
             .await?;
             return Ok(());
         }
-        let path_lease = self
-            .content
-            .path_coordinator
-            .acquire([&source, &destination])
-            .await;
+        let Some(path_lease) = self
+            .acquire_request_path_lease([&source, &destination])
+            .await
+        else {
+            let operation_id = operation.as_ref().map(|(id, _)| *id);
+            drop(operation.take());
+            render_path_wait_limit(res, operation_id)?;
+            return Ok(());
+        };
 
         let revision_owner = OwnerId::persistent(owner);
         let source_identity = self.content.rooted_fs.replacement_identity(&source).await?;

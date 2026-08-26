@@ -26,6 +26,148 @@ fn authenticated_args(serve_path: PathBuf, state_dir: &Path) -> Args {
     }
 }
 
+#[test]
+fn path_wait_capacity_reserves_a_connection_without_disabling_single_connection_servers() {
+    assert_eq!(path_wait_capacity(1), 1);
+    assert_eq!(path_wait_capacity(2), 1);
+    assert_eq!(path_wait_capacity(11), 10);
+    assert_eq!(path_wait_capacity(65), PATH_WAIT_CAPACITY_LIMIT);
+    assert_eq!(path_wait_capacity(256), PATH_WAIT_CAPACITY_LIMIT);
+}
+
+#[tokio::test]
+async fn single_connection_server_keeps_path_coordinated_requests_usable() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let mut args = authenticated_args(temp.path().to_path_buf(), state_dir.path());
+    args.max_connections = 1;
+    let server = Server::init_with_lifecycle(args, ServerLifecycle::new()).unwrap();
+
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 1);
+    let lease = server
+        .acquire_request_path_lease([temp.path().join("single.txt")])
+        .await
+        .expect("max-connections=1 disabled path-coordinated requests");
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+    drop(lease);
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn request_path_leases_fail_fast_and_retain_admission_until_drop() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let mut args = authenticated_args(temp.path().to_path_buf(), state_dir.path());
+    args.max_connections = 3;
+    let server = Arc::new(Server::init_with_lifecycle(args, ServerLifecycle::new()).unwrap());
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 2);
+
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    *server
+        .admission
+        .path_wait_acquire_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move |available| {
+        observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(available);
+    }));
+
+    let blocked_path = temp.path().join("blocked.txt");
+    let held = server
+        .content
+        .path_coordinator
+        .acquire([&blocked_path])
+        .await;
+    let waiter = {
+        let server = server.clone();
+        let blocked_path = blocked_path.clone();
+        tokio::spawn(async move {
+            server
+                .acquire_request_path_lease([blocked_path])
+                .await
+                .expect("the first request path lease was rejected")
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted path waiter never entered the coordinator");
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "a conflicting waiter bypassed its lease"
+    );
+    assert_eq!(
+        server.admission.path_wait_slots.available_permits(),
+        1,
+        "a blocked path waiter released admission early"
+    );
+
+    let unrelated = server
+        .acquire_request_path_lease([temp.path().join("unrelated.txt")])
+        .await
+        .expect("an unrelated path did not use the remaining admission slot");
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+    let entered_before_rejection = observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    assert!(
+        server
+            .acquire_request_path_lease([temp.path().join("rejected.txt")])
+            .await
+            .is_none(),
+        "a request bypassed saturated path admission"
+    );
+    assert_eq!(
+        observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        entered_before_rejection,
+        "an admission-rejected request entered the path coordinator"
+    );
+
+    drop(unrelated);
+    assert_eq!(
+        server.admission.path_wait_slots.available_permits(),
+        1,
+        "dropping one lease did not release exactly one permit"
+    );
+    let replacement = server
+        .acquire_request_path_lease([temp.path().join("replacement.txt")])
+        .await
+        .expect("an unrelated path could not enter after permit release");
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 0);
+    drop(replacement);
+
+    drop(held);
+    let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the admitted waiter did not acquire after conflict release")
+        .unwrap();
+    assert_eq!(
+        server.admission.path_wait_slots.available_permits(),
+        1,
+        "a newly acquired request lease released its attached permit"
+    );
+    drop(waited);
+    assert_eq!(server.admission.path_wait_slots.available_permits(), 2);
+}
+
 #[tokio::test]
 async fn root_containment_guard_probes_a_deep_missing_path_once() {
     let temp = assert_fs::TempDir::new().unwrap();

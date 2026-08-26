@@ -31,9 +31,9 @@ use self::{
     login_rate_limit::LoginRateLimiter,
     maintenance::UPLOAD_SESSION_TTL,
     operation_registry::OperationRegistry,
-    path_coordinator::PathCoordinator,
+    path_coordinator::{PathCoordinator, PathLease},
     path_policy::{PathPolicy, RootedPath, RoutePath},
-    problem::{ErrorCode, RecoveryAdvice},
+    problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
     protocol::UploadPublicState,
     purge::{PurgeQueue, PurgeSignal},
     rooted_fs::{RootedEntryKey, RootedFs},
@@ -81,6 +81,8 @@ const NON_UPLOAD_MUTATION_CAPACITY: usize = 64;
 const STATE_PATH_SCAN_CAPACITY: usize = 4;
 const STATE_PATH_SCAN_ADMISSION_ERROR: &str = "Durable state path scan admission is at capacity";
 const STATE_PATH_ADMISSION_PAGE_SIZE: usize = 256;
+const PATH_WAIT_CAPACITY_LIMIT: usize = 64;
+const PATH_WAIT_LIMIT_DETAIL: &str = "Too many path-coordinated requests are active";
 
 /// Builds a reusable server together with the lifecycle resources required by
 /// its background maintenance work.
@@ -235,6 +237,9 @@ type UploadPreflightProbeHook = Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>;
 #[cfg(test)]
 type RootContainmentProbeHook = Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>;
 
+#[cfg(test)]
+type PathWaitAcquireHook = Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>;
+
 /// Bounded admission and accounting resources. Grouping these makes capacity
 /// policy independently reviewable from routing and persistence.
 struct AdmissionControl {
@@ -246,6 +251,7 @@ struct AdmissionControl {
     upload_slots: Arc<Semaphore>,
     mutation_slots: Arc<Semaphore>,
     state_path_scan_slots: Arc<Semaphore>,
+    path_wait_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
     disk_space: DiskSpaceTracker,
     login_errors: Mutex<LoginErrorStore>,
@@ -253,6 +259,8 @@ struct AdmissionControl {
     upload_preflight_probe_hook: UploadPreflightProbeHook,
     #[cfg(test)]
     root_containment_probe_hook: RootContainmentProbeHook,
+    #[cfg(test)]
+    path_wait_acquire_hook: PathWaitAcquireHook,
 }
 
 /// Process lifecycle and task ownership. Only this context decides when new
@@ -310,6 +318,7 @@ impl Server {
         let path_policy = PathPolicy::new(args.serve_path.clone(), &assets_prefix);
         let max_concurrent_uploads = args.max_concurrent_uploads;
         let max_concurrent_searches = args.max_concurrent_searches;
+        let path_wait_capacity = path_wait_capacity(args.max_connections);
         let (purge_queue, purge_receiver) = PurgeQueue::new();
         let storage = DurableStorage::new(rooted_fs.clone());
         let state_database_path = args.state_database_path();
@@ -352,6 +361,7 @@ impl Server {
                 upload_slots: Arc::new(Semaphore::new(max_concurrent_uploads)),
                 mutation_slots: Arc::new(Semaphore::new(NON_UPLOAD_MUTATION_CAPACITY)),
                 state_path_scan_slots: Arc::new(Semaphore::new(STATE_PATH_SCAN_CAPACITY)),
+                path_wait_slots: Arc::new(Semaphore::new(path_wait_capacity)),
                 search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
                 disk_space: DiskSpaceTracker::new(),
                 login_errors: Mutex::new(LoginErrorStore::default()),
@@ -359,6 +369,8 @@ impl Server {
                 upload_preflight_probe_hook: Mutex::new(None),
                 #[cfg(test)]
                 root_containment_probe_hook: Mutex::new(None),
+                #[cfg(test)]
+                path_wait_acquire_hook: Mutex::new(None),
             },
             lifecycle,
         })
@@ -407,6 +419,35 @@ impl Server {
         T: Send + 'static,
     {
         self.run_commit_inner(Some(mutation), task).await
+    }
+
+    /// Acquire a request-owned path lease without allowing these leases and
+    /// their waiters to consume every TCP connection. The permit remains
+    /// attached across detached commits and is released with the lease.
+    /// Background reconciliation deliberately calls PathCoordinator directly.
+    async fn acquire_request_path_lease<I, P>(&self, paths: I) -> Option<PathLease>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let permit = self
+            .admission
+            .path_wait_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .admission
+            .path_wait_acquire_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(self.admission.path_wait_slots.available_permits());
+        }
+        let lease = self.content.path_coordinator.acquire(paths).await;
+        Some(lease.with_request_permit(permit))
     }
 
     async fn run_commit_inner<F, T>(
@@ -702,6 +743,38 @@ impl Server {
     pub(super) fn is_reserved_internal_component(&self, component: &str) -> bool {
         self.content.path_policy.is_reserved_component(component)
     }
+}
+
+fn path_wait_capacity(max_connections: usize) -> usize {
+    // With one configured connection there is no second connection to reserve;
+    // retain one request permit so path-coordinated features remain usable.
+    PATH_WAIT_CAPACITY_LIMIT.min(max_connections.saturating_sub(1).max(1))
+}
+
+fn path_wait_limit_error() -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::PATH_WAIT_CONCURRENCY_LIMIT,
+        PATH_WAIT_LIMIT_DETAIL,
+    )
+    .with_recovery(RecoveryAdvice::RetryAfterSeconds(1))
+}
+
+fn render_path_wait_limit(res: &mut Response, operation_id: Option<uuid::Uuid>) -> Result<()> {
+    let mut error = path_wait_limit_error();
+    if let Some(operation_id) = operation_id {
+        operation_registry::set_operation_headers(
+            res,
+            operation_id,
+            protocol::OperationPublicState::Rejected,
+        );
+        error = error.with_operation(OperationProblemContext::new(
+            operation_id.hyphenated().to_string(),
+            protocol::OperationPublicState::Rejected,
+            None,
+        ));
+    }
+    render_problem(res, &error)
 }
 
 fn to_timestamp(time: &SystemTime) -> u64 {

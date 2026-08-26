@@ -2339,6 +2339,81 @@ test("unknown 的 query_upload 只查询状态而不重放上传", async ({
   await expect(page.locator(".upload-queue-message")).toBeHidden();
 });
 
+test("状态查询繁忙时按 Retry-After 只重试 HEAD", async ({ appPage: page }) => {
+  await page.clock.install();
+  const methods = [];
+  let headCount = 0;
+  const contents = Buffer.from("query after admission");
+  await page.route("**/busy-upload-status.txt", route => {
+    const request = route.request();
+    methods.push(request.method());
+    if (request.method() === "HEAD") {
+      headCount++;
+      if (headCount === 1) {
+        return route.fulfill({
+          status: 429,
+          headers: {
+            "Retry-After": "1",
+            "X-Dufs-Upload-Id": request.headers()["x-dufs-upload-id"],
+            "X-Dufs-Operation-State": "unknown",
+          },
+          body: "",
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        headers: protocolHeaders(
+          request,
+          "committed",
+          contents.length,
+          contents.length,
+        ),
+        body: "",
+      });
+    }
+    return route.fulfill({
+      status: 408,
+      contentType: "application/problem+json",
+      headers: protocolHeaders(request, "unknown", "length"),
+      body: problemDetails(
+        408,
+        "upload_outcome_unknown",
+        "Upload result is unknown",
+        "query_upload",
+      ),
+    });
+  });
+
+  await selectFiles(page, "#file", [{
+    name: "busy-upload-status.txt",
+    buffer: contents,
+  }]);
+  const query = page.getByRole("button", {
+    name: "Check upload status busy-upload-status.txt",
+  });
+  await expect(query).toBeVisible();
+  await query.click();
+  await expect(page.locator(".upload-unknown")).toContainText(
+    "Upload status queries are temporarily busy",
+  );
+  await expect(query).toBeDisabled();
+
+  await query.evaluate(button => {
+    button.removeAttribute("disabled");
+    button.click();
+  });
+  expect(methods).toEqual(["PUT", "HEAD"]);
+
+  await page.clock.fastForward(1_001);
+  await expect(query).toBeEnabled();
+  await query.click();
+  await expect(page.locator(".upload-status")).toHaveAttribute(
+    "aria-label",
+    "busy-upload-status.txt: upload complete",
+  );
+  expect(methods).toEqual(["PUT", "HEAD", "HEAD"]);
+});
+
 test("状态查询返回持久 unknown 时停止重复查询", async ({ appPage: page }) => {
   const methods = [];
   await page.route("**/persisted-unknown-upload.txt", route => {
