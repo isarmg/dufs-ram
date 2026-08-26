@@ -40,9 +40,15 @@ use purge::remove_directory_at;
 pub(super) use purge::{TrashEntry, TrashPurgeProgress};
 
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
 #[cfg(test)]
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+type ResolvedPathPrefixProbeHook = Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>;
 
 #[derive(Clone)]
 pub(super) struct RootedFs {
@@ -59,6 +65,10 @@ struct RootedFsInner {
     before_missing_rename: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_quarantine_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    resolved_path_prefix_probes: AtomicUsize,
+    #[cfg(test)]
+    before_resolved_path_prefix_probe: ResolvedPathPrefixProbeHook,
 }
 
 struct OpenedParent {
@@ -334,6 +344,10 @@ impl RootedFs {
                 before_missing_rename: Mutex::new(None),
                 #[cfg(test)]
                 before_quarantine_sync: Mutex::new(None),
+                #[cfg(test)]
+                resolved_path_prefix_probes: AtomicUsize::new(0),
+                #[cfg(test)]
+                before_resolved_path_prefix_probe: Mutex::new(None),
             }),
         })
     }
@@ -392,6 +406,25 @@ impl RootedFs {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(test)]
+    fn inject_before_resolved_path_prefix_probe_once(
+        &self,
+        probe: usize,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        assert!(probe > 0, "a path-prefix probe number must be positive");
+        let previous = self
+            .inner
+            .before_resolved_path_prefix_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((probe, Box::new(hook)));
+        assert!(
+            previous.is_none(),
+            "a resolved-path prefix probe hook is already installed"
+        );
     }
 
     pub(super) fn root_handle(&self) -> &File {
@@ -657,39 +690,15 @@ impl RootedFs {
                 )),
             })
             .collect::<std::io::Result<Vec<_>>>()?;
-        let mut prefix = PathBuf::new();
-        let mut resolved_parent = dup(&self.inner.root).map_err(std::io::Error::from)?;
-        let mut unresolved_tail = Vec::new();
-        let mut resolving_directories = true;
-
-        for component in components.iter().take(components.len().saturating_sub(1)) {
-            prefix.push(component);
-            if resolving_directories {
-                match self.open_directory_from_root(&prefix) {
-                    Ok(directory) => resolved_parent = directory,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound
-                                | std::io::ErrorKind::NotADirectory
-                                | std::io::ErrorKind::PermissionDenied
-                        ) =>
-                    {
-                        resolving_directories = false;
-                        unresolved_tail.push(component.clone());
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                unresolved_tail.push(component.clone());
-            }
-        }
-
         let final_name = components
             .last()
             .ok_or_else(|| std::io::Error::other("the shared root has no entry key"))?
             .clone();
-        unresolved_tail.push(final_name.clone());
+        let parent_components = &components[..components.len() - 1];
+        let (resolved_parent, resolved_components) =
+            self.resolve_deepest_parent_prefix(parent_components)?;
+        let resolving_directories = resolved_components == parent_components.len();
+        let unresolved_tail = components[resolved_components..].to_vec();
 
         let ancestor_directories = self.directory_ancestry_from_root(&resolved_parent)?;
         let resolved_parent_identity = *ancestor_directories
@@ -721,6 +730,84 @@ impl RootedFs {
             ancestor_directories,
             target_directory,
         })
+    }
+
+    /// Resolve a lexical parent with one full-path probe in the common case.
+    /// If an ordinary missing/untraversable component prevents that, binary
+    /// search for the deepest openable prefix. Every probe remains anchored at
+    /// the root so relative symlinks retain the exact `RESOLVE_BENEATH`
+    /// semantics of a full lookup. Errors that can indicate an escape, loop, or
+    /// I/O failure are never converted into an unresolved lexical tail.
+    fn resolve_deepest_parent_prefix(
+        &self,
+        components: &[OsString],
+    ) -> std::io::Result<(OwnedFd, usize)> {
+        if components.is_empty() {
+            return Ok((dup(&self.inner.root).map_err(std::io::Error::from)?, 0));
+        }
+
+        let full_parent = path_from_components(components);
+        match self.open_resolved_path_prefix(&full_parent) {
+            Ok(directory) => return Ok((directory, components.len())),
+            Err(error) if unresolved_path_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut resolved_len = 0usize;
+        let mut unresolved_len = components.len();
+        let mut resolved_parent = dup(&self.inner.root).map_err(std::io::Error::from)?;
+        while resolved_len + 1 < unresolved_len {
+            let candidate_len = resolved_len + (unresolved_len - resolved_len) / 2;
+            let candidate = path_from_components(&components[..candidate_len]);
+            match self.open_resolved_path_prefix(&candidate) {
+                Ok(directory) => {
+                    resolved_len = candidate_len;
+                    resolved_parent = directory;
+                }
+                Err(error) if unresolved_path_error(&error) => {
+                    unresolved_len = candidate_len;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((resolved_parent, resolved_len))
+    }
+
+    fn open_resolved_path_prefix(&self, relative: &Path) -> std::io::Result<OwnedFd> {
+        #[cfg(test)]
+        let probe = self
+            .inner
+            .resolved_path_prefix_probes
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        #[cfg(test)]
+        let hook = {
+            let mut hook = self
+                .inner
+                .before_resolved_path_prefix_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected == probe)
+            {
+                hook.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.open_directory_from_root(relative)
+    }
+
+    #[cfg(test)]
+    fn take_resolved_path_prefix_probes(&self) -> usize {
+        self.inner
+            .resolved_path_prefix_probes
+            .swap(0, Ordering::SeqCst)
     }
 
     fn directory_ancestry_from_root<F: AsFd>(
@@ -2646,6 +2733,21 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+fn path_from_components(components: &[OsString]) -> PathBuf {
+    let mut path = PathBuf::new();
+    path.extend(components);
+    path
+}
+
+fn unresolved_path_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 fn ensure_private_upload_stage_directory_at<F: AsFd>(

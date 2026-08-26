@@ -1,5 +1,6 @@
 use super::*;
 use crate::server::internal_names::{legacy_upload_temp_path, upload_temp_path};
+use rustix::io::Errno;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tokio::io::AsyncWriteExt;
@@ -49,6 +50,121 @@ fn opened_directory_identity_detects_duplicate_parent_descriptors() {
 
     assert!(opened_directories_match(&first, &duplicate).unwrap());
     assert!(!opened_directories_match(&first, &distinct).unwrap());
+}
+
+#[tokio::test]
+async fn resolved_path_key_opens_a_complete_deep_parent_once() {
+    const DEPTH: usize = 128;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let mut parent = temp.path().to_path_buf();
+    for _ in 0..DEPTH {
+        parent.push("d");
+    }
+    std::fs::create_dir_all(&parent).unwrap();
+    let expected_parent = file_identity(&std::fs::metadata(&parent).unwrap());
+    let target = parent.join("leaf");
+
+    assert_eq!(rooted.take_resolved_path_prefix_probes(), 0);
+    let key = rooted.resolved_path_key(&target).await.unwrap();
+    let probes = rooted.take_resolved_path_prefix_probes();
+
+    assert_eq!(probes, 1, "a complete parent was reopened by prefix");
+    assert_eq!(key.resolved_parent, expected_parent);
+    assert_eq!(key.unresolved_tail, vec![OsString::from("leaf")]);
+    assert_eq!(key.ancestor_directories.len(), DEPTH + 1);
+}
+
+#[tokio::test]
+async fn resolved_path_key_finds_a_missing_tail_with_logarithmic_prefix_probes() {
+    const EXISTING_DEPTH: usize = 192;
+    const PARENT_DEPTH: usize = 256;
+
+    let temp = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(temp.path()).unwrap();
+    let mut target = temp.path().to_path_buf();
+    for _ in 0..EXISTING_DEPTH {
+        target.push("d");
+    }
+    std::fs::create_dir_all(&target).unwrap();
+    let expected_parent = file_identity(&std::fs::metadata(&target).unwrap());
+    for _ in EXISTING_DEPTH..PARENT_DEPTH {
+        target.push("d");
+    }
+    target.push("leaf");
+
+    assert_eq!(rooted.take_resolved_path_prefix_probes(), 0);
+    let key = rooted.resolved_path_key(&target).await.unwrap();
+    let probes = rooted.take_resolved_path_prefix_probes();
+    let probe_bound = 1 + PARENT_DEPTH.ilog2() as usize;
+
+    assert!(
+        probes <= probe_bound,
+        "a {PARENT_DEPTH}-component parent used {probes} probes; bound is {probe_bound}"
+    );
+    assert_eq!(key.resolved_parent, expected_parent);
+    assert_eq!(key.ancestor_directories.len(), EXISTING_DEPTH + 1);
+    assert_eq!(
+        key.unresolved_tail,
+        std::iter::repeat_n(OsString::from("d"), PARENT_DEPTH - EXISTING_DEPTH)
+            .chain(std::iter::once(OsString::from("leaf")))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn resolved_path_key_does_not_downgrade_escape_or_loop_errors() {
+    use std::os::unix::fs::symlink;
+
+    let root = assert_fs::TempDir::new().unwrap();
+    let outside = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(root.path()).unwrap();
+    symlink(outside.path(), root.path().join("escape")).unwrap();
+    symlink("loop", root.path().join("loop")).unwrap();
+
+    for (name, expected) in [("escape", Errno::XDEV), ("loop", Errno::LOOP)] {
+        assert_eq!(rooted.take_resolved_path_prefix_probes(), 0);
+        let error = rooted
+            .resolved_path_key(&root.path().join(name).join("child").join("leaf"))
+            .await
+            .expect_err("a hard resolution error was downgraded to an unresolved tail");
+        assert_eq!(error.raw_os_error(), Some(expected.raw_os_error()));
+        assert_eq!(
+            rooted.take_resolved_path_prefix_probes(),
+            1,
+            "a hard full-parent error entered fallback probing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolved_path_key_fails_closed_if_a_fallback_probe_hits_an_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = assert_fs::TempDir::new().unwrap();
+    let outside = assert_fs::TempDir::new().unwrap();
+    let rooted = RootedFs::new(root.path()).unwrap();
+    std::fs::create_dir_all(root.path().join("real/a")).unwrap();
+    symlink("real", root.path().join("alias")).unwrap();
+    let alias = root.path().join("alias");
+    let outside = outside.path().to_path_buf();
+    rooted.inject_before_resolved_path_prefix_probe_once(2, move || {
+        std::fs::remove_file(&alias).unwrap();
+        symlink(outside, alias).unwrap();
+    });
+
+    let error = rooted
+        .resolved_path_key(&root.path().join("alias/a/missing/tail/leaf"))
+        .await
+        .expect_err("an escape during fallback probing was downgraded");
+
+    assert_eq!(error.raw_os_error(), Some(Errno::XDEV.raw_os_error()));
+    assert_eq!(
+        rooted.take_resolved_path_prefix_probes(),
+        2,
+        "fallback continued after a hard intermediate error"
+    );
 }
 
 #[test]
