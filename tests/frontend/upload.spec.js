@@ -2414,6 +2414,86 @@ test("状态查询繁忙时按 Retry-After 只重试 HEAD", async ({ appPage: pa
   expect(methods).toEqual(["PUT", "HEAD", "HEAD"]);
 });
 
+test("状态服务 503 有无 Retry-After 都只允许重试 HEAD", async ({
+  appPage: page,
+}) => {
+  await page.clock.install();
+
+  for (const retryAfter of [null, "1"]) {
+    const suffix = retryAfter === null ? "immediate" : "delayed";
+    const name = `unavailable-upload-status-${suffix}.txt`;
+    const methods = [];
+    let headCount = 0;
+    const contents = Buffer.from(`query after 503 ${suffix}`);
+    await page.route(`**/${name}`, route => {
+      const request = route.request();
+      methods.push(request.method());
+      if (request.method() === "HEAD") {
+        headCount++;
+        if (headCount === 1) {
+          return route.fulfill({
+            status: 503,
+            headers: {
+              ...(retryAfter === null ? {} : { "Retry-After": retryAfter }),
+              "X-Dufs-Upload-Id": request.headers()["x-dufs-upload-id"],
+              "X-Dufs-Operation-State": "unknown",
+            },
+            body: "",
+          });
+        }
+        return route.fulfill({
+          status: 200,
+          headers: protocolHeaders(
+            request,
+            "committed",
+            contents.length,
+            contents.length,
+          ),
+          body: "",
+        });
+      }
+      return route.fulfill({
+        status: 408,
+        contentType: "application/problem+json",
+        headers: protocolHeaders(request, "unknown", "length"),
+        body: problemDetails(
+          408,
+          "upload_outcome_unknown",
+          "Upload result is unknown",
+          "query_upload",
+        ),
+      });
+    });
+
+    await selectFiles(page, "#file", [{ name, buffer: contents }]);
+    const query = page.getByRole("button", {
+      name: `Check upload status ${name}`,
+    });
+    await expect(query).toBeVisible();
+    await query.click();
+    await expect(page.locator(".upload-unknown")).toContainText(
+      "Upload status is temporarily unavailable",
+    );
+    expect(methods).toEqual(["PUT", "HEAD"]);
+
+    if (retryAfter === null) {
+      await expect(query).toBeEnabled();
+    } else {
+      await expect(query).toBeDisabled();
+      await page.clock.fastForward(1_001);
+      await expect(query).toBeEnabled();
+    }
+    await query.click();
+    await expect(page.getByLabel(
+      `${name}: upload complete`,
+      { exact: true },
+    )).toBeVisible();
+    expect(methods).toEqual(["PUT", "HEAD", "HEAD"]);
+    expect(methods.filter(method => ["PUT", "PATCH"].includes(method)))
+      .toEqual(["PUT"]);
+  }
+});
+
 test("状态查询返回持久 unknown 时停止重复查询", async ({ appPage: page }) => {
   const methods = [];
   await page.route("**/persisted-unknown-upload.txt", route => {

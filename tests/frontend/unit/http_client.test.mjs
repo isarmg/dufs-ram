@@ -274,6 +274,51 @@ test("upload status admission reports a temporarily busy query", async () => {
   }
 });
 
+test("upload status service unavailability is not reported as a final state", async () => {
+  const previousWindow = globalThis.window;
+  const previousFetch = globalThis.fetch;
+  globalThis.window = globalThis;
+  let requestMethod = "";
+  try {
+    globalThis.fetch = async (_input, init) => {
+      requestMethod = init.method;
+      return new Response(null, {
+        status: 503,
+        headers: {
+          "x-dufs-upload-id": uploadId,
+          "x-dufs-operation-state": "unknown",
+        },
+      });
+    };
+    const result = await queryUnknownUpload(
+      new RequestError("Upload outcome unknown", {
+        outcomeUnknown: true,
+        operationId: uploadId,
+      }),
+      "https://example.invalid/upload.bin",
+      8,
+    );
+
+    assert.equal(requestMethod, "HEAD");
+    assert.deepEqual(result, {
+      operationId: uploadId,
+      state: "unknown",
+      status: 503,
+      code: "",
+      message:
+        "The upload status could not be checked because the status service is temporarily unavailable. Refresh the folder before trying again.",
+      authenticationFailed: false,
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
 test("operation authentication is classified before its result envelope", async () => {
   const previousWindow = globalThis.window;
   const previousFetch = globalThis.fetch;
