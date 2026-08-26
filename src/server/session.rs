@@ -634,7 +634,7 @@ fn accepts_html(headers: &HeaderMap) -> bool {
                 let mut quality = None;
                 for parameter in parameters {
                     let Some((name, value)) = parameter.split_once('=') else {
-                        continue;
+                        return false;
                     };
                     if name.trim().eq_ignore_ascii_case("q") {
                         if quality.is_some() {

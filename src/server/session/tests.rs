@@ -105,6 +105,14 @@ fn html_acceptance_requires_an_exact_positive_media_range() {
     headers.insert(ACCEPT, HeaderValue::from_static("text/htmlx"));
     assert!(!accepts_html(&headers));
 
+    for malformed in ["text/html;q", "text/html; q", "text/html;level"] {
+        headers.insert(ACCEPT, HeaderValue::from_static(malformed));
+        assert!(
+            !accepts_html(&headers),
+            "malformed media parameter was accepted: {malformed}"
+        );
+    }
+
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/json, text/html; q=0.001"),
