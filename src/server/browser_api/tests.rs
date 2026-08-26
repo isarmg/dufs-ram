@@ -3,7 +3,7 @@ use super::*;
 use crate::{Args, auth::AuthConfig};
 use std::{
     os::unix::fs::PermissionsExt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -194,6 +194,106 @@ async fn upload_preflight_admission_rejects_without_probing_and_covers_the_batch
         "the preflight permit did not cover every target in the batch"
     );
     drop(held);
+}
+
+#[tokio::test]
+async fn cancelled_upload_preflight_retains_its_slot_until_the_started_probe_exits() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let (server, _state_dir) = test_server(temp.path());
+    let server = Arc::new(server);
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    *server
+        .admission
+        .upload_preflight_probe_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move |index| {
+        observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(index);
+    }));
+
+    let (entered_sender, entered_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    server
+        .content
+        .rooted_fs
+        .inject_before_metadata_probe_once(move || {
+            entered_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+    let batch_server = server.clone();
+    let batch = tokio::spawn(async move {
+        let mut response = Response::default();
+        batch_server
+            .handle_upload_preflight_paths(
+                "owner",
+                vec![
+                    "/first.txt".to_string(),
+                    "/second.txt".to_string(),
+                    "/third.txt".to_string(),
+                ],
+                &mut response,
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the first preflight filesystem probe did not start")
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server.admission.upload_preflight_slots.available_permits(),
+        UPLOAD_PREFLIGHT_CONCURRENCY - 1
+    );
+
+    batch.abort();
+    assert!(batch.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        server.admission.upload_preflight_slots.available_permits(),
+        UPLOAD_PREFLIGHT_CONCURRENCY - 1,
+        "request cancellation released admission while its blocking probe was running"
+    );
+    let remaining = server
+        .admission
+        .upload_preflight_slots
+        .clone()
+        .try_acquire_many_owned((UPLOAD_PREFLIGHT_CONCURRENCY - 1).try_into().unwrap())
+        .expect("the unoccupied preflight slots were not independently available");
+    assert!(
+        server
+            .admission
+            .upload_preflight_slots
+            .clone()
+            .try_acquire_owned()
+            .is_err(),
+        "a replacement batch bypassed the started probe's retained slot"
+    );
+    drop(remaining);
+
+    release_sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.admission.upload_preflight_slots.available_permits()
+                == UPLOAD_PREFLIGHT_CONCURRENCY
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("preflight admission was not released after the blocking probe exited");
+    assert_eq!(
+        *observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [0],
+        "a cancelled preflight continued to later batch paths"
+    );
 }
 
 #[tokio::test]

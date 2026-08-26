@@ -42,6 +42,21 @@ impl BlockingIoGate {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.run_guarded((), work).await
+    }
+
+    /// Run blocking work while retaining a caller-supplied admission guard.
+    ///
+    /// Before global admission, the returned future owns `guard`, so dropping
+    /// queued work releases it immediately and prevents `work` from starting.
+    /// After admission, both the guard and global permit move into the
+    /// blocking closure and remain held until the real worker exits.
+    pub(super) async fn run_guarded<G, T, F>(&self, guard: G, work: F) -> io::Result<T>
+    where
+        G: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let permit = self
             .slots
             .clone()
@@ -50,6 +65,7 @@ impl BlockingIoGate {
             .map_err(|_| io::Error::other("blocking I/O admission was closed"))?;
         task::spawn_blocking(move || {
             let _permit = permit;
+            let _guard = guard;
             work()
         })
         .await
@@ -61,7 +77,16 @@ impl BlockingIoGate {
         T: Send + 'static,
         F: FnOnce() -> io::Result<T> + Send + 'static,
     {
-        self.run(work).await?
+        self.run_io_guarded((), work).await
+    }
+
+    pub(super) async fn run_io_guarded<G, T, F>(&self, guard: G, work: F) -> io::Result<T>
+    where
+        G: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+    {
+        self.run_guarded(guard, work).await?
     }
 }
 
@@ -71,14 +96,16 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     #[tokio::test]
-    async fn detached_waiter_keeps_capacity_until_the_blocking_worker_exits() {
+    async fn detached_waiter_keeps_capacity_and_guard_until_the_blocking_worker_exits() {
         let gate = BlockingIoGate::new(1);
+        let guard_slots = Arc::new(Semaphore::new(1));
+        let guard = guard_slots.clone().try_acquire_owned().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let first_gate = gate.clone();
         let first = tokio::spawn(async move {
             first_gate
-                .run_io(move || {
+                .run_io_guarded(guard, move || {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     Ok(())
@@ -94,6 +121,11 @@ mod tests {
         .unwrap();
 
         first.abort();
+        assert_eq!(
+            guard_slots.available_permits(),
+            0,
+            "aborting the waiter released its guard before the worker exited"
+        );
         let second_gate = gate.clone();
         let mut second = tokio::spawn(async move { second_gate.run_io(|| Ok(7_u8)).await });
         assert!(
@@ -112,10 +144,11 @@ mod tests {
                 .expect("second blocking worker failed"),
             7
         );
+        assert_eq!(guard_slots.available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn dropping_a_queued_future_prevents_its_blocking_work_from_starting() {
+    async fn dropping_a_queued_guarded_future_releases_its_guard_without_starting_work() {
         let gate = BlockingIoGate::new(1);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -137,8 +170,10 @@ mod tests {
         .await
         .unwrap();
 
+        let guard_slots = Arc::new(Semaphore::new(1));
+        let guard = guard_slots.clone().try_acquire_owned().unwrap();
         let (queued_tx, queued_rx) = mpsc::channel();
-        let mut queued = Box::pin(gate.run_io(move || {
+        let mut queued = Box::pin(gate.run_io_guarded(guard, move || {
             queued_tx.send(()).unwrap();
             Ok(())
         }));
@@ -149,6 +184,11 @@ mod tests {
             "queued work unexpectedly acquired the occupied slot"
         );
         drop(queued);
+        assert_eq!(
+            guard_slots.available_permits(),
+            1,
+            "dropping globally queued work retained its caller guard"
+        );
 
         release_tx.send(()).unwrap();
         first

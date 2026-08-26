@@ -66,7 +66,23 @@ impl Server {
         owner: &str,
         path: &Path,
     ) -> Result<UploadTargetInspection> {
-        let identity = self.content.rooted_fs.replacement_identity(path).await?;
+        self.inspect_upload_target_guarded(owner, path, ()).await
+    }
+
+    pub(in crate::server) async fn inspect_upload_target_guarded<G>(
+        &self,
+        owner: &str,
+        path: &Path,
+        guard: G,
+    ) -> Result<UploadTargetInspection>
+    where
+        G: Send + 'static,
+    {
+        let identity = self
+            .content
+            .rooted_fs
+            .replacement_identity_guarded(path, guard)
+            .await?;
         let canonical_relative_path = self.content.rooted_fs.state_relative_path(path)?;
         Ok(inspect_target_identity(
             OwnerId::persistent(owner),
