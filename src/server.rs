@@ -129,6 +129,23 @@ impl UploadPreflightLease {
     }
 }
 
+/// Keeps request path admission tied to both semantic resolution work and the
+/// resulting namespace lease. A started blocking lookup owns a clone, so
+/// cancelling its async waiter cannot admit replacement work before the real
+/// lookup exits.
+#[derive(Clone)]
+struct RequestPathAdmissionLease {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl RequestPathAdmissionLease {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+}
+
 /// Builds a reusable server together with the lifecycle resources required by
 /// its background maintenance work.
 pub struct ServerBuilder {
@@ -491,8 +508,12 @@ impl Server {
         {
             hook(self.admission.path_wait_slots.available_permits());
         }
-        let lease = self.content.path_coordinator.acquire(paths).await;
-        Some(lease.with_request_permit(permit))
+        Some(
+            self.content
+                .path_coordinator
+                .acquire_for_request(paths, RequestPathAdmissionLease::new(permit))
+                .await,
+        )
     }
 
     async fn run_commit_inner<F, T>(

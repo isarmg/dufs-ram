@@ -737,9 +737,20 @@ impl RootedFs {
     }
 
     pub(super) async fn resolved_path_key(&self, path: &Path) -> std::io::Result<ResolvedPathKey> {
+        self.resolved_path_key_guarded(path, ()).await
+    }
+
+    pub(super) async fn resolved_path_key_guarded<G>(
+        &self,
+        path: &Path,
+        guard: G,
+    ) -> std::io::Result<ResolvedPathKey>
+    where
+        G: Send + 'static,
+    {
         let this = self.clone();
         let path = path.to_path_buf();
-        run_blocking(move || this.resolved_path_key_blocking(&path)).await
+        run_blocking_guarded(guard, move || this.resolved_path_key_blocking(&path)).await
     }
 
     /// Resolve one non-empty durable-state page in a single blocking task.
