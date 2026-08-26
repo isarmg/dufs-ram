@@ -1,8 +1,9 @@
 use super::{purge::PreparePurge, *};
 use futures_util::poll;
 use std::{
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     task::Poll,
     time::Duration,
 };
@@ -23,6 +24,124 @@ fn authenticated_args(serve_path: PathBuf, state_dir: &Path) -> Args {
         auth: crate::auth::AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
         ..Args::default()
     }
+}
+
+#[tokio::test]
+async fn root_containment_guard_probes_a_deep_missing_path_once() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Server::init_with_lifecycle(
+        authenticated_args(temp.path().to_path_buf(), state_dir.path()),
+        ServerLifecycle::new(),
+    )
+    .unwrap();
+
+    let mut target = temp.path().to_path_buf();
+    for index in 0..64 {
+        target.push(format!("existing-{index}"));
+        std::fs::create_dir(&target).unwrap();
+    }
+    for index in 0..64 {
+        target.push(format!("missing-{index}"));
+    }
+
+    let probes = Arc::new(Mutex::new(Vec::new()));
+    let observed = probes.clone();
+    *server
+        .admission
+        .root_containment_probe_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move |path| {
+        observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
+    }));
+
+    assert!(
+        !server.guard_root_contained(&target).await.unwrap(),
+        "an ordinary missing tail was classified as a root escape"
+    );
+    assert_eq!(
+        *probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [target],
+        "root containment regressed to probing missing ancestors"
+    );
+}
+
+#[tokio::test]
+async fn root_containment_guard_preserves_miss_and_symlink_semantics() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    let outside = assert_fs::TempDir::new().unwrap();
+    let state_dir = private_state_dir();
+    let server = Server::init_with_lifecycle(
+        authenticated_args(temp.path().to_path_buf(), state_dir.path()),
+        ServerLifecycle::new(),
+    )
+    .unwrap();
+
+    std::fs::create_dir(temp.path().join("inside")).unwrap();
+    symlink("inside", temp.path().join("inside-link")).unwrap();
+    symlink("missing-target", temp.path().join("dangling-link")).unwrap();
+    symlink("looping-link", temp.path().join("looping-link")).unwrap();
+    symlink(outside.path(), temp.path().join("outside-link")).unwrap();
+    std::fs::write(temp.path().join("file-parent"), b"not a directory").unwrap();
+
+    for path in [
+        temp.path().join("missing/child"),
+        temp.path().join("inside-link/missing/child"),
+        temp.path().join("dangling-link/child"),
+        temp.path().join("file-parent/child"),
+    ] {
+        assert!(
+            !server.guard_root_contained(&path).await.unwrap(),
+            "contained miss was classified as a root escape: {}",
+            path.display()
+        );
+    }
+
+    assert!(
+        server
+            .guard_root_contained(&temp.path().join("outside-link/missing"))
+            .await
+            .unwrap(),
+        "a root-escaping symlink was not hidden"
+    );
+    let loop_error = server
+        .guard_root_contained(&temp.path().join("looping-link"))
+        .await
+        .expect_err("a symlink loop must remain an error for the containment guard");
+    assert_eq!(
+        loop_error.raw_os_error(),
+        Some(rustix::io::Errno::LOOP.raw_os_error())
+    );
+
+    assert!(
+        server
+            .route_metadata(&temp.path().join("dangling-link"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a final dangling symlink must remain manageable"
+    );
+    assert!(
+        server
+            .route_metadata(&temp.path().join("looping-link"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a final looping symlink must remain manageable"
+    );
+    assert!(
+        server
+            .route_metadata(&temp.path().join("outside-link"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a final root-escaping symlink must remain hidden"
+    );
 }
 
 #[tokio::test]
