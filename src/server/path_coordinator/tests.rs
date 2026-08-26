@@ -164,6 +164,65 @@ async fn earlier_conflicting_waiter_cannot_be_starved_by_later_siblings() {
 }
 
 #[tokio::test]
+async fn same_path_waiters_resolve_only_linearly_across_lease_epochs() {
+    const WAITER_COUNT: usize = 24;
+
+    let (temp, coordinator) = coordinator();
+    let coordinator = Arc::new(coordinator);
+    let path = temp.path().join("same/file.txt");
+    let held = coordinator.acquire([&path]).await;
+    let attempts_before = coordinator.inner.resolution_attempts.load(Ordering::SeqCst);
+
+    let mut waiters = Vec::with_capacity(WAITER_COUNT);
+    for _ in 0..WAITER_COUNT {
+        let coordinator = coordinator.clone();
+        let path = path.clone();
+        waiters.push(tokio::spawn(async move {
+            let lease = coordinator.acquire([path]).await;
+            // Give every blocked peer a scheduling opportunity at each epoch;
+            // without queue-gated resolution this deterministically exercises
+            // the quadratic wake-and-resolve pattern.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(lease);
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if coordinator
+                .inner
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                == WAITER_COUNT
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-path waiters did not all register");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+    })
+    .await
+    .expect("same-path waiter queue did not drain");
+
+    let resolution_attempts =
+        coordinator.inner.resolution_attempts.load(Ordering::SeqCst) - attempts_before;
+    assert!(
+        resolution_attempts <= WAITER_COUNT * 2,
+        "{WAITER_COUNT} same-path waiters made {resolution_attempts} semantic resolution attempts"
+    );
+}
+
+#[tokio::test]
 async fn multi_path_lease_is_acquired_without_deadlock() {
     let (temp, coordinator) = coordinator();
     let coordinator = Arc::new(coordinator);
