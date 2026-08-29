@@ -653,7 +653,6 @@
 
 ### Bug Fixes
 
-- Set the STOPSIGNAL to SIGINT for Dockerfile
 - Remove Method::Options auth check (#168)
 - Clear search input also clear query (#178)
 

@@ -430,7 +430,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 - 内置 TLS 和证书参数；
 - 明文 HTTP/2 prior knowledge、h2c Upgrade 或其他 HTTP/2 后端协议；
 - Unix socket；
-- Docker 和远程 Git 发布；
+- 远程 Git 发布；
 - Shell completion 生成；
 - 环境变量配置；
 - URL 路径前缀和子路径部署；
