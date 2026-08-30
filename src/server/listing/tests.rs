@@ -309,7 +309,7 @@ async fn listing_problem_protocol_ignores_diagnostic_reason_strings() {
         "typed_protocol_test",
         root,
         root,
-        // This legacy value previously selected directory_entry_limit.
+        // Diagnostic details must never override the typed public problem.
         "entry_budget",
         ListingProblem::DirectoryOperationTimeout,
     );

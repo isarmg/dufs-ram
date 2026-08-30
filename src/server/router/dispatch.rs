@@ -1,7 +1,6 @@
 use super::{MutationProgress, render_upload_problem};
 use crate::{
     auth::{SessionInfo, session_token_from_cookie},
-    http_utils::body_full,
     request_context::RequestContext,
     server::{
         HEALTH_CHECK_PATH, READINESS_CHECK_PATH, Request, Response, Server,
@@ -111,7 +110,6 @@ enum DeletePreparation {
 
 struct PreparedTarget {
     path: RootedPath,
-    is_miss: bool,
     miss_is_hidden: bool,
     is_dir: bool,
     is_file: bool,
@@ -737,7 +735,6 @@ impl<'a> RequestDispatcher<'a> {
             };
         Ok(Some(PreparedTarget {
             path: path.clone(),
-            is_miss,
             miss_is_hidden,
             is_dir,
             is_file,
@@ -979,11 +976,7 @@ impl<'a> RequestDispatcher<'a> {
         session: &SessionInfo,
     ) -> Result<()> {
         let head_only = self.method == Method::HEAD;
-        let directory_shaped_target =
-            target.is_dir || (target.is_miss && self.request_path.ends_with('/'));
-        if directory_shaped_target && directory_archive_requested(&self.query_params) {
-            render_directory_archive_unsupported(&mut self.response, head_only)?;
-        } else if target.is_dir {
+        if target.is_dir {
             if self.query_params.contains_key("q") {
                 self.server
                     .handle_search_dir(
@@ -1250,28 +1243,6 @@ fn render_api_method_not_allowed(res: &mut Response, allow: &'static str) -> Res
     )
 }
 
-/// Keeps the former directory-archive route explicit during the compatibility
-/// window. Treat every value as the retired feature so `?zip=1` cannot
-/// silently fall through to an HTML listing while `?zip` returns a problem.
-fn directory_archive_requested(query_params: &HashMap<String, String>) -> bool {
-    query_params.contains_key("zip")
-}
-
-fn render_directory_archive_unsupported(res: &mut Response, head_only: bool) -> Result<()> {
-    render_problem(
-        res,
-        &ApiError::new(
-            StatusCode::GONE,
-            ErrorCode::DIRECTORY_ARCHIVE_UNSUPPORTED,
-            "Directory archive downloads are no longer supported",
-        ),
-    )?;
-    if head_only {
-        *res.body_mut() = body_full("");
-    }
-    Ok(())
-}
-
 fn apply_tracked_delete_rejection(
     operation_id: uuid::Uuid,
     res: &mut Response,
@@ -1325,53 +1296,6 @@ mod tests {
         )
         .unwrap();
         (Arc::new(server), state_dir)
-    }
-
-    #[test]
-    fn every_zip_query_value_selects_the_retired_archive_route() {
-        for value in ["", "1", "store"] {
-            let query = HashMap::from([("zip".to_string(), value.to_string())]);
-            assert!(directory_archive_requested(&query));
-        }
-        assert!(!directory_archive_requested(&HashMap::new()));
-    }
-
-    #[tokio::test]
-    async fn retired_directory_archive_get_returns_a_typed_gone_problem() {
-        let mut response = Response::default();
-        render_directory_archive_unsupported(&mut response, false).unwrap();
-
-        assert_eq!(response.status(), StatusCode::GONE);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            json!({
-                "type": "urn:dufs:problem:directory_archive_unsupported",
-                "title": "Gone",
-                "status": 410,
-                "detail": "Directory archive downloads are no longer supported",
-                "code": "directory_archive_unsupported"
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn retired_directory_archive_head_has_problem_headers_and_no_body() {
-        let mut response = Response::default();
-        render_directory_archive_unsupported(&mut response, true).unwrap();
-
-        assert_eq!(response.status(), StatusCode::GONE);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
-        assert!(
-            response
-                .into_body()
-                .collect()
-                .await
-                .unwrap()
-                .to_bytes()
-                .is_empty()
-        );
     }
 
     #[tokio::test]
@@ -1510,7 +1434,6 @@ mod tests {
         };
         let target = PreparedTarget {
             path: target_path,
-            is_miss: true,
             miss_is_hidden: false,
             is_dir: false,
             is_file: false,
@@ -1679,7 +1602,6 @@ mod tests {
         };
         let mut target = PreparedTarget {
             path: target_path.clone(),
-            is_miss: true,
             miss_is_hidden: false,
             is_dir: false,
             is_file: false,

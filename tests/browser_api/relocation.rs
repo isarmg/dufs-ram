@@ -98,7 +98,7 @@ fn rename_directory_within_its_parent(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn rename_rejects_invalid_names_and_legacy_destination_payloads(
+fn rename_rejects_invalid_names_and_unknown_destination_fields(
     server: TestServer,
 ) -> Result<(), Error> {
     let context = browser_context(&server, "")?;
@@ -121,7 +121,7 @@ fn rename_rejects_invalid_names_and_legacy_destination_payloads(
         );
     }
 
-    let legacy = post_json(
+    let unknown_field = post_json(
         &context,
         "move",
         json!({
@@ -131,8 +131,8 @@ fn rename_rejects_invalid_names_and_legacy_destination_payloads(
         }),
         Some(&context.csrf_token),
     )?;
-    assert_eq!(legacy.status(), 400);
-    assert_eq!(response_json(legacy)?["code"], "invalid_json");
+    assert_eq!(unknown_field.status(), 400);
+    assert_eq!(response_json(unknown_field)?["code"], "invalid_json");
     assert!(server.path().join("test.html").is_file());
     Ok(())
 }

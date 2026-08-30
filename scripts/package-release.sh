@@ -1195,11 +1195,6 @@ install_release_support_tree() {
     -exec chmod 0644 -- {} +
   validate_extracted_source_tree "$package_root"
 
-  # Preserve the former top-level report name as a compatibility alias while
-  # the canonical documentation hierarchy remains under docs/history/.
-  install -m 0644 \
-    "$source_root/docs/history/code-review-report.md" \
-    "$package_root/CODE_REVIEW_REPORT.md"
 }
 
 verify_release_documentation_layout() {
@@ -1211,8 +1206,7 @@ verify_release_documentation_layout() {
     docs/README.md \
     docs/beginner-guide/README.md \
     docs/history/browser-only-optimization-review.md \
-    docs/history/code-review-report.md \
-    CODE_REVIEW_REPORT.md
+    docs/history/code-review-report.md
   do
     [[ -f "$package_root/$required_path" && \
       ! -L "$package_root/$required_path" ]] || {

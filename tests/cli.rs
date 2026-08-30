@@ -4,9 +4,7 @@
 mod fixtures;
 
 use assert_cmd::prelude::*;
-use dufs::args::CLI_AUTH_REJECTION_MESSAGE;
 use fixtures::Error;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, is_match};
 use std::process::Command;
 
@@ -16,66 +14,7 @@ fn help_shows() -> Result<(), Error> {
     Command::new(assert_cmd::cargo::cargo_bin!())
         .arg("-h")
         .assert()
-        .success()
-        .stdout(predicates::str::contains("--auth").not())
-        .stdout(predicates::str::contains("-a,").not());
-
-    Ok(())
-}
-
-#[test]
-fn command_line_auth_is_rejected_early_without_echoing_the_value() -> Result<(), Error> {
-    const FAKE_SECRET: &str = "fake-user:fake-phc-secret-for-cli-rejection";
-    let attached_long = format!("--auth={FAKE_SECRET}");
-    let attached_short = format!("-a{FAKE_SECRET}");
-    let equals_short = format!("-a={FAKE_SECRET}");
-    let cases = [
-        vec!["--auth".to_string(), FAKE_SECRET.to_string()],
-        vec![attached_long],
-        vec!["-a".to_string(), FAKE_SECRET.to_string()],
-        vec![attached_short],
-        vec![equals_short],
-        vec!["--auth".to_string()],
-        vec!["-a".to_string()],
-    ];
-
-    for args in cases {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!())
-            .args(&args)
-            .output()?;
-        assert!(!output.status.success(), "accepted legacy argv: {args:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(CLI_AUTH_REJECTION_MESSAGE),
-            "unexpected stderr for {args:?}: {stderr}"
-        );
-        assert!(
-            !stderr.contains(FAKE_SECRET),
-            "stderr exposed the rejected auth value: {stderr}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn command_line_auth_is_rejected_before_config_is_opened() -> Result<(), Error> {
-    const FAKE_SECRET: &str = "fake-user:fake-secret-before-config";
-    let output = Command::new(assert_cmd::cargo::cargo_bin!())
-        .args([
-            "--config",
-            "/definitely/missing/dufs-auth-rejection.yaml",
-            "--auth",
-            FAKE_SECRET,
-        ])
-        .output()?;
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(CLI_AUTH_REJECTION_MESSAGE),
-        "stderr={stderr}"
-    );
-    assert!(!stderr.contains(FAKE_SECRET), "stderr={stderr}");
-    assert!(!stderr.contains("Failed to read config"), "stderr={stderr}");
+        .success();
     Ok(())
 }
 

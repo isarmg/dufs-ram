@@ -38,28 +38,6 @@ fn regular_file_cannot_be_used_as_shared_root(tmpdir: TempDir) -> Result<(), Err
 }
 
 #[rstest]
-#[case("--path-prefix")]
-#[case("--hidden")]
-#[case("--state-db")]
-#[case("--compress")]
-#[case("--max-zip-entries")]
-#[case("--max-zip-uncompressed-size")]
-#[case("--max-zip-output-size")]
-#[case("--max-concurrent-zips")]
-fn removed_options_are_rejected(tmpdir: TempDir, #[case] option: &str) -> Result<(), Error> {
-    let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
-    command
-        .arg(tmpdir.path())
-        .args([option, "value"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(format!(
-            "unexpected argument '{option}'"
-        )));
-    Ok(())
-}
-
-#[rstest]
 fn unknown_cli_log_variable_is_rejected(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
     let auth_config = test_auth_config(&[TEST_ACCOUNT]);

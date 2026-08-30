@@ -673,34 +673,6 @@ async fn upload_sessions_enforce_bindings_transitions_and_capacity() -> Result<(
 }
 
 #[tokio::test]
-async fn startup_stage_path_migration_is_an_exact_snapshot_cas() -> Result<()> {
-    let store = temporary_with_repository_limits(repository_limits(8, 4, 8, 4))?;
-    let session = upload(4, 5, 3);
-    assert_eq!(
-        store.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Inserted
-    );
-    assert_eq!(
-        store.upload_sessions_page_blocking(None, 16)?,
-        vec![session.clone()]
-    );
-
-    let replacement = PathBuf::from("targets/private-stages/4-5");
-    assert!(store.replace_upload_stage_path_blocking(session.clone(), replacement.clone())?);
-    let mut migrated = session.clone();
-    migrated.stage_path = replacement;
-    assert_eq!(store.upload_session(session.key).await?, Some(migrated));
-    assert!(
-        !store.replace_upload_stage_path_blocking(
-            session,
-            PathBuf::from("targets/private-stages/stale")
-        )?,
-        "a stale startup snapshot changed a newer binding"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn startup_upload_snapshot_is_bounded_and_keyset_paginated() -> Result<()> {
     let store = temporary_with_repository_limits(repository_limits(32, 32, 8, 4))?;
     let mut expected = Vec::new();

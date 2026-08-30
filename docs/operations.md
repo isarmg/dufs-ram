@@ -62,7 +62,7 @@ Dufs 启动时会对共享根目录取得非阻塞独占锁。第二个管理同
 
 ### 1.1 必需的文件型统一状态库
 
-服务只使用文件型 SQLite schema v5 的统一 state store，其中有 `operations`、`upload_sessions` 和 `purge_jobs` 三类状态。SQLite 是上传状态的唯一权威，服务不会在共享根内写入、读取或导入 JSON 上传状态文件。CLI `--state-dir` 或 YAML `state-dir` 必须提供一个目录，数据库固定使用 `<state-dir>/state.sqlite3`；没有进程内数据库或单独文件路径配置入口。
+服务只使用文件型 SQLite schema revision 1 的统一 state store，其中有 `operations`、`upload_sessions` 和 `purge_jobs` 三类状态。SQLite 是上传状态的唯一权威，服务不会在共享根内写入、读取或导入 JSON 上传状态文件。CLI `--state-dir` 或 YAML `state-dir` 必须提供一个目录，数据库固定使用 `<state-dir>/state.sqlite3`；没有进程内数据库或单独文件路径配置入口。
 
 operation 容量为全局 4096、每账号 1024，终态 TTL 为 15 分钟。启动恢复会删除未进入提交边界的 `Reserved`，把可能已经触碰文件系统的 operation `CommitStarted` 转为 `Completed/unknown` 并从恢复时开始新的 15 分钟终态 TTL；未过期的原有 `Completed` 只继续使用剩余 TTL。upload session 容量为全局 16384、每账号 4096，每次实际更新后保留 7 天；持久状态包含 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`，重启会把 upload `CommitStarted` 恢复为 `Unknown`，而 `AwaitingConfirmation` 保留完整 stage 等待明确发布或丢弃。首次 discard 原位写入 `Rejected` 并设置终态 TTL；对已有 `Rejected` 的幂等重试不写库、不续 TTL，只继续 identity-safe stage 清理。purge job 容量为全局 4096、每账号 1024，不使用 TTL 或固定失败次数丢弃普通 I/O 故障中的回收任务。
 
@@ -86,7 +86,7 @@ SQLite 提交与共享根中的 mkdir、rename、文件同步和目录 `fsync` �
 
 若完整 stage 在最后的条件检查中遇到目标出现或变化，服务保留同一 upload ID 和满 offset，并持久化为 `AwaitingConfirmation`；HEAD/冲突响应对外使用 `awaiting-confirmation`，同时给出当前 revision 和可替换提示。用户接受最新目标后，浏览器以同一 ID、满 offset、空正文 PATCH 和最新 revision 再次提交，因此通常无需重传文件；目标若再次变化会继续失败关闭并重新确认。每一个可信 target-change 都重新发出 `refresh-required`，不会因为该 uploader 先前已使列表失效就吞掉通知；两次冲突间点 Refresh 得到的新 snapshot 也会再次失效。用户跳过时，浏览器向 `POST /__dufs__/api/upload/discard` 提交同一路径和 upload ID。服务先以 owner/path/ID 绑定的原位 CAS 把 `AwaitingConfirmation` 持久化为 `Rejected`，再按已记录 stage identity 条件清理；已有 `Rejected` 的重试不续 TTL，但会继续清理。成功 `204` 表示终态已确定且本次安全清理步骤完成，可能是原 inode 已删除、已经不存在，或发现同名替换物并保留；仅由 HEAD 得到 `rejected` 只证明上传未发布和 discard 决定已持久化，不证明路径物理消失。
 
-每个目标父目录下的 stage 都放在精确名为 `.dufs-quarantine-00000000-0000-0000-0000-000000000000.hold` 的私有保留目录中。这个 nil-quarantine 形状在旧版本中已经隐藏且永不递归；新版本先把该唯一常量分类为 stage 目录，因此不会接管旧版本可见的普通用户目录。该目录必须是服务账号所有、真实目录、与目标父目录同一设备且精确为 `0700`；stage 初建为 `0600`。覆盖提交重放目标 mode/ACL/xattr 后，stage 本身可能不再是 `0600`，但父目录仍阻止其他本机账号遍历和读取未发布内容。schema v5 启动会在监听前以 16 行 keyset 页按数据库记录的 dev/inode，把旧版本直接放在目标父目录中的活跃或仍精确匹配的终态 stage 以 `RENAME_NOREPLACE` 迁入该目录，再以精确 SQLite 快照更新路径；活跃记录的身份歧义、同名占用或无 identity 占用会阻止启动，陈旧终态 identity 则不会干预后来会话。文件系统迁移在数据库路径更新前持久化，崩溃重启可从两者之间继续；v5 版本屏障会阻止旧二进制误读已经迁移的路径。
+每个目标父目录下的 stage 都放在精确名为 `.dufs-upload-stages` 的当前私有目录中。该目录必须是服务账号所有、真实目录、与目标父目录同一设备且精确为 `0700`；stage 初建为 `0600`。覆盖提交重放目标 mode/ACL/xattr 后，stage 本身可能不再是 `0600`，但父目录仍阻止其他本机账号遍历和读取未发布内容。启动在监听前以 16 行 keyset 页验证所有数据库记录只引用这一当前布局，并核对目录权限、owner、设备和活跃 stage inode；任何其他持久 stage 路径都会失败关闭且不会移动文件或改写数据库。
 
 有一个必须保留的 metadata 安全例外：已暂存的覆盖上传可能已经重放旧目标 uid/gid、mode 或允许的 xattr。若旧目标随后消失，服务以 `upload_metadata_preservation_refused` 拒绝用空 PATCH 把该 stage 当作全新文件发布；浏览器必须先 discard，再生成新 ID，以完整正文和 create-only PUT 重传。这样避免把旧对象的 metadata 意外赋给一个语义上新建的文件。
 
@@ -119,7 +119,7 @@ Dufs 的普通文件和 Range 正文没有总时长/最低速率限制，但每�
 - 当前二进制、发布包的 `SHA256SUMS`、`BUILD-ENVIRONMENT.txt`、CycloneDX SBOM、`THIRD_PARTY_LICENSES.txt`、`RUST-STANDARD-LIBRARY-COPYRIGHT.html`、外层 checksum、签名及独立取得的公钥；
 - systemd、nginx、防火墙和备份任务配置。
 
-会话 Cookie 状态只存在内存中，不需要备份。`.dufs-upload-*` 包含内部 stage、删除 trash，以及可能遗留的严格保留形状名称；这些遗留名称不会被解析成上传状态，只会保持隐藏并由有 TTL 的孤儿扫描清理。`.dufs-quarantine-<uuid>.hold` 则是永久保留的人工调查对象，永不自动清理。备份不得过滤任何内部项，否则 stage/outbox/quarantine 恢复时间点会不自洽。
+会话 Cookie 状态只存在内存中，不需要备份。每个目标父目录中的 `.dufs-upload-stages` 保存当前未完成上传的 stage，`.dufs-upload-delete-<uuid>.trash` 保存等待状态机确认或清理的删除对象；两者都受当前内部命名空间保护。`.dufs-quarantine-<uuid>.hold` 是永久保留的人工调查对象，永不自动清理。备份不得过滤任何当前内部项，否则 stage/outbox/quarantine 恢复时间点会不自洽。
 
 状态目录包含短 TTL operation 重放、7 天 upload session 和无 TTL 的未完成 purge outbox，但仍不是共享文件数据的替代备份。SQLite 与共享根没有跨域事务，因此最佳备份是在 Dufs 停止后同时复制共享根和状态目录，或对两者取同一受控时间点的存储快照；rollback journal 模式下不支持在事务进行时只复制主 `.sqlite3` 文件。恢复到新的共享根通常会得到不同的设备号或 inode，此时应使用新的空状态目录，并明确接受旧 Operation ID 不可重放、持久上传恢复记录丢失、隐藏 trash 只能由 orphan 扫描兜底；不能把绑定旧根的数据库强行接到新根。
 
@@ -181,7 +181,7 @@ SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA �
 
 包内 `BUILD-ENVIRONMENT.txt` 使用稳定的 `dufs-build-environment-v2` 键值格式，记录完整源码 SHA、源码版本、`SOURCE_DATE_EPOCH`、host target、cargo-audit 版本、RustSec advisory DB revision/最近 fetch epoch，以及本次实际使用或依赖的 Bash、rustc、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本。它与 SBOM、第三方 notice、Rust 标准库 notice 和项目双许可证均纳入包内 `SHA256SUMS`。该文件用于复现比较、故障归因和升级审计；它记录事实，不会把未固定的宿主工具变成可重复构建保证。
 
-二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。`CODE_REVIEW_REPORT.md` 是 `docs/history/code-review-report.md` 的兼容副本；新的规范链接只使用 `docs/history/`。发布脚本先用包内 `scripts/check-docs.mjs` 检查最终布局，再对除清单自身外的全部普通文件生成 `SHA256SUMS`，此后只读复核清单覆盖；`--self-test` 还放入深层 sentinel、验证篡改失败、两次归档一致并解包往返检查，避免源码树检查通过但最终制品或 checksum 失效。
+二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。审查历史的唯一位置是 `docs/history/code-review-report.md`。发布脚本先用包内 `scripts/check-docs.mjs` 检查最终布局，再对除清单自身外的全部普通文件生成 `SHA256SUMS`，此后只读复核清单覆盖；`--self-test` 还放入深层 sentinel、验证篡改失败、两次归档一致并解包往返检查，避免源码树检查通过但最终制品或 checksum 失效。
 
 输出目录必须由当前发布账号拥有且不能让 group/other 写入；它会被解析为物理路径并通过已验证 fd 持有独占 `flock`。stage 创建、构建、清理、最终 rename 和目录同步均从锁定的目录 fd 路径派生，公开字符串路径在此后只用于身份复核和结果展示，祖先目录换绑不能重定向 mutation。发布后还会核对公开路径、锁定目录和最终 release 的 dev/inode；若公开路径被换绑则报告失败，但不会回滚已经完整提交到锁定目录的制品。
 

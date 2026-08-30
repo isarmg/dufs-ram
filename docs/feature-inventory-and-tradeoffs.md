@@ -81,7 +81,7 @@
 | C-04 | `-b, --bind` / `bind` | `127.0.0.1`；可重复或逗号分隔；只接受 IP；最终列表不能为空 | 默认不暴露到外部网卡；跨主机网关必须显式绑定内网 IP，若始终单地址可简化 | 可选 |
 | C-05 | `-p, --port` / `port` | `5000`；允许 `0` 供测试动态分配 | 决定内网 TCP 端口，必须保留某种端口配置 | 核心 |
 | C-06 | `--trusted-proxy` / `trusted-proxies` | 默认空；IP/CIDR，可重复或逗号分隔；最多 128 个，拒绝单个或组合覆盖完整 IPv4/IPv6 地址空间 | 仅当直连 peer 匹配时接受单值 XFF/XFP；HTTPS 网关必须显式配置，列表本身不是代理身份认证 | 保障 |
-| C-08 | YAML `auth` | 至少一个账号；列表可含多个账号；配置文件须满足严格属主、权限和文件身份校验 | 配置完整权限账号；`--auth`/`-a` 固定脱敏拒绝，避免 PHC 暴露于 argv；认证本身必须保留，多账号能力可单独评估 | 核心 |
+| C-08 | YAML `auth` | 至少一个账号；列表可含多个账号；配置文件须满足严格属主、权限和文件身份校验 | 配置完整权限账号；CLI 不定义账号参数，未声明选项统一拒绝；认证本身必须保留，多账号能力可单独评估 | 核心 |
 | C-09 | `--log-format` / `log-format` | `$time_iso8601 $log_level - $remote_addr "$request" $status operation_id=$operation_id operation_state=$operation_state` | 自定义访问日志；空字符串关闭访问日志 | 可选 |
 | C-10 | `--log-file` / `log-file` | 不指定时全部日志输出到 stderr，stdout 只输出监听地址；路径及可解析别名必须在共享根外；已有文件必须是当前服务用户拥有、精确 `0600` 的单链接普通文件 | 与配置、`state.sqlite3` 及 `-journal/-wal/-shm` 比较规范目录项和已存在 dev/inode 身份；以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开；新文件原子创建并固定 `0600`，已有文件权限不安全则保持不变并拒绝；仅使用 systemd/journald 时可以删除文件输出 | 可选 |
 | C-12 | `--max-upload-size` | 100 GiB；允许设为 `0` | 单文件声明长度上限；`0` 表示只允许零字节上传，不是关闭限制 | 保障 |
@@ -96,7 +96,7 @@
 | C-25 | `-h/--help`、`-V/--version` | Clap 内置；版本同时显示构建源码 Git SHA，无法取得时显示 `unknown` | 基础命令行自描述和制品来源追踪，删除收益极低 | 开发/运维 |
 | C-26 | `--state-dir` / `state-dir` | 必填；固定使用私有 `0700` 目录内的 `state.sqlite3`，目录须由服务账号所有、非符号链接、与共享根分离，文件绑定共享根 dev/inode；数据库及 `-journal/-wal/-shm` 不得与配置/日志共享目录项或对象身份；只初始化空库并只接受五列 `product_metadata` 标识的当前应用版本/schema revision/统一指纹，不存在进程内数据库模式 | 文件型 store 在同一当前 schema 中持久化 operation 幂等结果、upload session 与 purge outbox；旧、无标记或漂移数据库在只读预检中零修改拒绝，格式转换由停服后的独立升级流程负责 | 保障 |
 
-所有信号量型配置还会拒绝超过 Tokio 最大 permit 数的值。上传时限互相矛盾、超过一年或平台单调时钟可表示范围的极端时限、零并发和零遍历上限都会阻止启动。已经退役的 `compress`、`max-zip-entries`、`max-zip-uncompressed-size`、`max-zip-output-size` 和 `max-concurrent-zips` 不再接受；严格 YAML 会把这些字段视为未知配置。
+所有信号量型配置还会拒绝超过 Tokio 最大 permit 数的值。上传时限互相矛盾、超过一年或平台单调时钟可表示范围的极端时限、零并发和零遍历上限都会阻止启动。严格 YAML 会拒绝任何未定义字段。
 
 其他配置语义：
 
@@ -187,7 +187,7 @@
 
 目录 ZIP 已从当前产品中删除。浏览器不再显示目录下载入口，服务端不再规划、压缩或临时保存目录归档；目录仍可浏览和搜索，文件仍可逐个下载，多文件选择与文件夹上传也不受影响。需要整目录导出的部署应使用共享根之外的受控备份或归档工具。
 
-为避免旧书签或脚本把 HTML 目录页误保存成 `.zip`，兼容窗口内保留一个明确的退役路由：对目录发起 `GET` 或 `HEAD` 时，只要解码后的查询参数中存在名为 `zip` 的键，无论它是空值、`zip=1` 还是其他值，都返回 `410 Gone` 和错误码 `directory_archive_unsupported`；GET 使用 `application/problem+json` 正文，HEAD 返回相同状态和类型头但没有正文。普通、不含 `zip` 参数的目录请求继续返回页面。
+目录请求始终使用普通 HTML 列表或搜索语义；未识别的查询参数不选择其他输出格式，也没有退役能力的专用兼容路由。
 
 本次删除同时移除了原 Z-01 至 Z-08 的递归归档规划、跨平台条目命名空间校验、文件身份复核、私有临时归档、压缩级别、源/输出/条目预算、生成期并发槽、任务所有权以及 ZIP 专属测试。`async-deflate-zip` 与 `unicode-normalization` 不再是直接依赖；`tempfile` 仍由状态、存储及测试代码使用。明确损失是一键下载整个目录以及通过归档保留空目录，单文件下载协议不变。
 
@@ -204,8 +204,8 @@
 | U-07 | UUID 上传身份 | 每次重新选择文件生成新 UUID；不会用文件名、大小、mtime 猜测文件身份 | 删除会重新引入不同文件错误拼接风险 | 保障 | 高 |
 | U-08 | 当前页面内安全重试 | 同一个 `File` 对象在已知可重试失败后先 HEAD 查询原 upload ID，再按 owner-scoped state 决定 PATCH 或新 ID。响应 `not-started` 只证明本次尝试在任何上传 mutation 前停止，仍必须先查询旧 ID；服务端 deadline 在原子 mutation boundary 前胜出时可明确给出 `408 not-started + retry`，而已发请求的客户端断线、提交等待超时、边界后服务端错误或明确 `unknown` 不允许盲重放 | 网络波动时不必总是从头上传，同时避免把“本次未启动”误读为“旧 ID 必定不存在”，或在结果不确定时重复覆盖 | 建议保留 | 高 |
 | U-09 | 不跨刷新恢复 | 不使用 `localStorage`；刷新后必须重新选择并新建 ID | 已是安全取舍；恢复跨刷新需要可靠内容身份方案 | 保障 | 高 |
-| U-10 | 预检与条件 PUT | 浏览器先向 `POST /__dufs__/api/upload/preflight` 提交最终绝对逻辑路径，服务按原顺序返回存在性、可替换提示和 revision。根 fd 相对路径最多 4095 个 UTF-8 字节，每个组件最多 255 字节；超过 Linux `openat2` 可寻址边界的值在任何文件系统探测前以 `400 invalid_path` 拒绝。无冲突零确认；只有已存在且可替换的文件进入覆盖/跳过/取消对话框。PUT 的 upload ID 和总长度必须各自精确出现一次；缺少 `X-Dufs-Upload-Overwrite` 或值为 `false` 使用原子 no-replace，`true` 必须携带 64 位小写十六进制 target revision。revision 绑定账号摘要、规范根内路径和完整 replacement identity，并在 rename 前复核；预检本身不提供原子锁。Missing 发布使用 `RENAME_NOREPLACE` 并在成功后核对目的名称与已打开 stage；Existing 覆盖是 identity 复核后执行普通 rename，不是对外部 writer 的目录项 CAS。目录、FIFO、Unix socket、设备等目标只返回不可替换提示或稳定拒绝，不会自动覆盖。fresh PUT 仍在创建 stage 前检查 upload/purge 路径义务；stage 在目标父目录下旧版已保留的 nil-quarantine 形状私有目录中初建为 `0600`，目录固定 `0700`，新文件发布后固定为 `0600`，覆盖 stage 则可能在发布前重放旧目标权限 | 预检减少无意义确认，no-replace 与条件复核防止当前 Dufs 的陈旧请求盲目覆盖；共享根仍须排除外部 writer | 核心 | 高 |
-| U-11 | HEAD 查询检查点与终态 | schema v5 `upload_sessions` 以 owner 摘要+UUID 为键，持久化根内相对目标/stage 路径、长度/offset、stage dev/inode、可选 target revision 与 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`；stage 位于目标父目录中的保留 `0700` 子目录，启动时分页验证目录权限/owner/设备与活跃 inode，旧同目录 stage 按 identity 迁移。对外映射为 `running/awaiting-confirmation/committed/rejected/unknown`，`not-seen/not-started` 是仅存在于响应中的词汇。SQLite 是唯一状态权威。首个 offset 按 stage fsync、父目录 fsync、DB 提交排序；活跃 stage 路径跨 owner 唯一，部分 `Running` 与 `AwaitingConfirmation` 只接受记录绑定的 stage 身份。rename 前同步 stage 再持久化 `CommitStarted`，重启恢复为 `Unknown`；revision 条件冲突会退回持久的 `AwaitingConfirmation` 而不是丢弃满 stage。discard 原位 CAS `AwaitingConfirmation→Rejected` 后按 identity 清理，已有 `Rejected` 重试不续 TTL。仅部分 `running` 可续传，满 offset `awaiting-confirmation` 可明确发布或丢弃，`rejected/not-seen` 才允许换 ID，`committed` 精确匹配才成功 | 即使删除断点续传，也需保留终态和 awaiting-confirmation 协议，才能避免网络断开后重复覆盖，并让晚到冲突不必无条件重传；删除 owner、路径、stage identity、私有目录验证或提交屏障会造成跨账号泄露、路径竞态或歧义 ID 被错误重启 | 保障 | 高 |
+| U-10 | 预检与条件 PUT | 浏览器先向 `POST /__dufs__/api/upload/preflight` 提交最终绝对逻辑路径，服务按原顺序返回存在性、可替换提示和 revision。根 fd 相对路径最多 4095 个 UTF-8 字节，每个组件最多 255 字节；超过 Linux `openat2` 可寻址边界的值在任何文件系统探测前以 `400 invalid_path` 拒绝。无冲突零确认；只有已存在且可替换的文件进入覆盖/跳过/取消对话框。PUT 的 upload ID 和总长度必须各自精确出现一次；缺少 `X-Dufs-Upload-Overwrite` 或值为 `false` 使用原子 no-replace，`true` 必须携带 64 位小写十六进制 target revision。revision 绑定账号摘要、规范根内路径和完整 replacement identity，并在 rename 前复核；预检本身不提供原子锁。Missing 发布使用 `RENAME_NOREPLACE` 并在成功后核对目的名称与已打开 stage；Existing 覆盖是 identity 复核后执行普通 rename，不是对外部 writer 的目录项 CAS。目录、FIFO、Unix socket、设备等目标只返回不可替换提示或稳定拒绝，不会自动覆盖。fresh PUT 仍在创建 stage 前检查 upload/purge 路径义务；stage 在目标父目录下当前 `.dufs-upload-stages` 私有目录中初建为 `0600`，目录固定 `0700`，新文件发布后固定为 `0600`，覆盖 stage 则可能在发布前重放旧目标权限 | 预检减少无意义确认，no-replace 与条件复核防止当前 Dufs 的陈旧请求盲目覆盖；共享根仍须排除外部 writer | 核心 | 高 |
+| U-11 | HEAD 查询检查点与终态 | schema revision 1 `upload_sessions` 以 owner 摘要+UUID 为键，持久化根内相对目标/stage 路径、长度/offset、stage dev/inode、可选 target revision 与 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`；stage 位于目标父目录中的当前 `0700` 子目录，启动时分页验证当前路径、目录权限/owner/设备与活跃 inode；非当前路径失败关闭且不移动文件或改写 SQLite。对外映射为 `running/awaiting-confirmation/committed/rejected/unknown`，`not-seen/not-started` 是仅存在于响应中的词汇。SQLite 是唯一状态权威。首个 offset 按 stage fsync、父目录 fsync、DB 提交排序；活跃 stage 路径跨 owner 唯一，部分 `Running` 与 `AwaitingConfirmation` 只接受记录绑定的 stage 身份。rename 前同步 stage 再持久化 `CommitStarted`，重启恢复为 `Unknown`；revision 条件冲突会退回持久的 `AwaitingConfirmation` 而不是丢弃满 stage。discard 原位 CAS `AwaitingConfirmation→Rejected` 后按 identity 清理，已有 `Rejected` 重试不续 TTL。仅部分 `running` 可续传，满 offset `awaiting-confirmation` 可明确发布或丢弃，`rejected/not-seen` 才允许换 ID，`committed` 精确匹配才成功 | 即使删除断点续传，也需保留终态和 awaiting-confirmation 协议，才能避免网络断开后重复覆盖，并让晚到冲突不必无条件重传；删除 owner、路径、stage identity、私有目录验证或提交屏障会造成跨账号泄露、路径竞态或歧义 ID 被错误重启 | 保障 | 高 |
 | U-12 | PATCH 续传与空正文确认 | 普通续传的总长度和 offset 必须与 owner-scoped 会话完全一致，只写剩余内容；`AwaitingConfirmation` 只接受同一 ID、原总长度、满 offset 的空正文 PATCH，并要求当前 revision。长度或 offset 不匹配时响应仍准确携带 `awaiting-confirmation` 和原绑定值，要求先查询而不会把满 stage 降格成 `running`；目标再次变化也仍返回 awaiting-confirmation。每次可信 target-change 都重新发出 `refresh-required`，不会因同一 uploader 早先已失效过列表就吞掉后续通知。若带旧目标 metadata 的 stage 遇到目标消失，服务返回 `upload_metadata_preservation_refused`，浏览器先 discard，再以新 ID 完整 create-only PUT | 删除普通续传后失败任务只能重新 PUT；删除空 PATCH 确认会让每次晚到冲突都重传完整文件，错误降格确认状态会诱导客户端向只读满 stage 继续续传；忽略 metadata 例外则会把旧对象属性错误带到新文件 | 建议保留 | 高 |
 | U-13 | 精确正文边界 | 超出声明剩余量返回 `413`；正文不足返回 `409`。确认态的剩余量固定为零，无论 `Content-Length` 已知还是以 chunked/流式正文送来首个多余字节，都会保留 `awaiting-confirmation` 与原绑定值并要求查询；传输层不会把只读满 stage 当作普通续传文件截断，也不会伪装成 `running` | 防止请求走私式额外数据和错误成功；截断或降格确认态会破坏满 stage，并诱导客户端继续重放正文 | 保障 | 高 |
 | U-14 | 分阶段上传超时 | 服务端正文空闲时限默认 60 秒，绝对总 deadline 默认 24 小时并从等待路径租约前开始覆盖整个请求；首次 mutation 与该 deadline 原子竞争，deadline 先赢为 `not-started`，mutation 先赢后的外层超时为 `unknown/query_upload`。前端正文空闲 2 分钟、传输阶段总时限 24 小时，正文发送后清除传输计时并进入最长 5 分钟的独立提交确认等待；客户端提交等待超时或断线仍显示结果未知 | 删除会让卡死连接长期占槽；混淆服务端确定未启动与客户端“已经发送但未确认”会导致不安全重放 | 保障 | 中 |
@@ -296,7 +296,6 @@
 | `405` | HTTP 方法不支持 |
 | `408` | 登录正文读取超时，或上传空闲/总 deadline 超时；上传在 mutation boundary 前超时为 `not-started + retry`，边界后不能自动视为未写入 |
 | `409` | 目标冲突、目录遍历/分页快照变化或不可用、cursor 认证标签不匹配、上传长度或 offset 冲突、operation ID 指纹冲突，或 MOVE/DELETE/fresh PUT 会切断仍有物理路径义务的控制状态 |
-| `410` | 目录请求包含已经退役的 `zip` 查询键；任意值都返回 `directory_archive_unsupported` |
 | `412` | 下载条件请求前置条件失败 |
 | `413` | 小型协议请求体、上传、直接目录快照或搜索资源上限 |
 | `415` | 登录或 browser API 的 Content-Type 不正确 |
@@ -395,7 +394,6 @@ T-14 的发布顺序还包含 RustSec 输入封存：宿主 DB 通过完整验�
 | `GET /__dufs__/api/jobs/<uuid>` | 统一查询当前账号的 mutation job；当前复用 operation registry | 是 | 只读 |
 | `GET/HEAD /目录/` | 目录页面骨架 | 是 | 只读 |
 | `GET/HEAD /目录/?q=文本` | 搜索页面骨架，结果由 list API 加载 | 是 | 只读 |
-| `GET/HEAD /目录/?zip`（任意值） | 已退役的目录归档兼容路由；查询中存在 `zip` 键即返回 `410 directory_archive_unsupported`，HEAD 无正文 | 是 | 只读 |
 | `GET/HEAD /文件` | 附件下载与 metadata；只有 GET 处理单段 Range，HEAD 忽略 Range | 是 | 只读 |
 | `HEAD /目标` + upload ID | 查询上传检查点 | 是 | 只读 |
 | `PUT /目标` | 新上传、覆盖或零字节新文件 | 是 | CSRF + 同源 + 上传协议头 |
@@ -422,7 +420,7 @@ browser API JSON 中的 `path`、`source`、`directory` 与 `name` 已经是逻�
 - 单文件共享模式；
 - 无 JavaScript 页面或 `?noscript`；
 - `?json`、`?hash`、`?simple` 等旧查询输出；
-- 目录 ZIP 或其他目录归档输出；目录查询中只要存在 `zip` 键，无论值为何，GET/HEAD 都由退役兼容路由返回 `410 directory_archive_unsupported`，不会退化成 HTML 成功响应；
+- 目录 ZIP 或其他目录归档输出；
 - 多段 Range；
 - 拖放上传和拖放目录递归；
 - 手机 Web 支持承诺；

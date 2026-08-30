@@ -2880,20 +2880,6 @@ test("刷新后不会按同名同大小同 mtime 自动续传另一份内容", a
   });
   expect(checkpoint).toEqual({ status: 409, offset: "4" });
 
-  // This legacy-shaped record is injected only to prove that current code
-  // ignores it. Production code intentionally has no cross-refresh recovery.
-  await page.evaluate(payload => {
-    localStorage.setItem("dufs-upload-sessions-v1", JSON.stringify([payload]));
-  }, {
-    target,
-    uploadId: oldUploadId,
-    totalLength: 8,
-    lastModified,
-    fileName: "resume-identity.txt",
-    relativePath: "resume-identity.txt",
-    user: "frontend-test",
-    updatedAt: Date.now(),
-  });
   await page.reload();
   await expect(
     page.getByRole("button", { name: "Upload files", exact: true }),
@@ -2946,9 +2932,7 @@ test("选择超过 128 个文件不会创建或截断浏览器续传记录", asy
   await expect(
     page.locator('.upload-status[aria-label$="upload complete"]'),
   ).toHaveCount(129, { timeout: 30_000 });
-  expect(
-    await page.evaluate(() => localStorage.getItem("dufs-upload-sessions-v1")),
-  ).toBeNull();
+  expect(await page.evaluate(() => localStorage.length)).toBe(0);
 });
 
 test("拖放被阻止，文件夹选择器保留相对目录", async ({ appPage: page }) => {

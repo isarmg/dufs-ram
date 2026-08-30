@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn hex_representation_round_trips_at_the_legacy_upload_boundary() {
+    fn hex_representation_round_trips_at_the_upload_boundary() {
         let owner = OwnerId::persistent("alice");
         assert_eq!(OwnerId::from_hex(&owner.to_hex()), Some(owner));
         assert_eq!(OwnerId::from_hex("NOT-A-DIGEST"), None);

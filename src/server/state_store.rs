@@ -290,11 +290,6 @@ enum Command {
         limit: i64,
         reply: oneshot::Sender<Result<Vec<StoredUploadSession>>>,
     },
-    ReplaceUploadStagePathBlocking {
-        expected: StoredUploadSession,
-        replacement: PathBuf,
-        reply: SyncSender<Result<bool>>,
-    },
     RejectUploadSession {
         key: UploadSessionKey,
         target_path: PathBuf,
@@ -730,27 +725,6 @@ impl StateStore {
             reply,
         })?;
         self.receive(receiver).await
-    }
-
-    /// Replace only the immutable stage path of an exact startup snapshot.
-    /// The filesystem rename is made durable first; this CAS then closes the
-    /// crash window without refreshing the session TTL or altering its state.
-    pub(super) fn replace_upload_stage_path_blocking(
-        &self,
-        expected: StoredUploadSession,
-        replacement: PathBuf,
-    ) -> Result<bool> {
-        expected.validate()?;
-        model::validate_stored_path(&replacement, "Replacement upload stage")?;
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.send(Command::ReplaceUploadStagePathBlocking {
-            expected,
-            replacement,
-            reply,
-        })?;
-        receiver
-            .recv()
-            .context("The state store thread exited while migrating an upload stage")?
     }
 
     pub(super) async fn reject_upload_session(

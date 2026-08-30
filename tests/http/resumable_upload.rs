@@ -607,19 +607,22 @@ fn patch_requires_current_upload_protocol_headers(server: TestServer) -> Result<
 }
 
 #[rstest]
-fn upload_staging_files_are_hidden_and_not_addressable(server: TestServer) -> Result<(), Error> {
+fn only_the_current_private_upload_stage_namespace_is_hidden(
+    server: TestServer,
+) -> Result<(), Error> {
     let upload_id = Uuid::new_v4();
     let target_tag = dufs::utils::encode_hex(Sha256::digest(b"target.txt"));
     let stage_name = format!(".dufs-upload-{target_tag}-{upload_id}.part");
-    let staging_names = [
+    let former_root_stage_names = [
         stage_name.clone(),
         format!("{stage_name}.state"),
         format!("{stage_name}.state-{}.tmp", Uuid::new_v4()),
-        format!(".dufs-upload-delete-{}.trash", Uuid::new_v4()),
     ];
-    for staging_name in &staging_names {
+    for staging_name in &former_root_stage_names {
         std::fs::write(server.path().join(staging_name), b"partial")?;
     }
+    let trash_name = format!(".dufs-upload-delete-{}.trash", Uuid::new_v4());
+    std::fs::write(server.path().join(&trash_name), b"trash")?;
     let private_stage_directory = server.path().join(UPLOAD_STAGE_DIRECTORY);
     std::fs::create_dir(&private_stage_directory)?;
     std::fs::write(
@@ -629,27 +632,50 @@ fn upload_staging_files_are_hidden_and_not_addressable(server: TestServer) -> Re
 
     let resp = server.get(server.url())?;
     let paths = server.paths_from_page(resp)?;
-    for staging_name in &staging_names {
-        assert!(!paths.iter().any(|path| path.contains(staging_name)));
+    for staging_name in &former_root_stage_names {
+        assert!(paths.contains(staging_name));
         let resp = server.get(format!("{}{}", server.url(), staging_name))?;
-        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes()?.as_ref(), b"partial");
     }
     assert!(
         !paths
             .iter()
             .any(|path| path.contains(UPLOAD_STAGE_DIRECTORY))
     );
+    assert!(!paths.iter().any(|path| path.contains(&trash_name)));
     assert_eq!(
         server
             .get(format!("{}{}", server.url(), UPLOAD_STAGE_DIRECTORY))?
             .status(),
         400
     );
+    assert_eq!(
+        server
+            .get(format!(
+                "{}{UPLOAD_STAGE_DIRECTORY}/{stage_name}",
+                server.url()
+            ))?
+            .status(),
+        400
+    );
+    assert_eq!(
+        server
+            .get(format!("{}{}", server.url(), trash_name))?
+            .status(),
+        400
+    );
     let search_paths =
         server.paths_from_page(server.get(format!("{}?q=.dufs-upload", server.url()))?)?;
-    for staging_name in &staging_names {
-        assert!(!search_paths.iter().any(|path| path.contains(staging_name)));
+    for staging_name in &former_root_stage_names {
+        assert!(search_paths.contains(staging_name));
     }
+    assert!(!search_paths.iter().any(|path| path.contains(&trash_name)));
+    assert!(
+        !search_paths
+            .iter()
+            .any(|path| path.contains(UPLOAD_STAGE_DIRECTORY))
+    );
 
     let ordinary_names = [
         ".dufs-upload-not-a-stage.part",

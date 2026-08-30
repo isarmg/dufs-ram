@@ -2,8 +2,8 @@ use super::{
     StatePathScanLease,
     blocking_io::blocking_io_gate,
     internal_names::{
-        InternalEntryName, classify_internal_name, delete_trash_name, quarantine_name,
-        upload_readiness_probe_name, upload_stage_directory,
+        InternalEntryName, classify_internal_name, delete_trash_name, is_upload_stage_name,
+        quarantine_name, upload_readiness_probe_name, upload_stage_directory,
     },
     state_store::StoredFileIdentity,
 };
@@ -93,14 +93,6 @@ struct CreatedAncestor {
 #[derive(Debug)]
 pub(super) struct CreatedAncestors {
     entries: Vec<CreatedAncestor>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LegacyUploadStageMigration {
-    Moved,
-    AlreadyMoved,
-    Missing,
-    IdentityMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1401,202 +1393,6 @@ impl RootedFs {
         }
     }
 
-    /// Moves one v0.48 stage into the private per-parent namespace. Filesystem
-    /// publication precedes the caller's SQLite path update. If a crash happens
-    /// in that gap, a retry recognizes the already-moved inode by its durable
-    /// identity and completes the database side without retransmitting data.
-    pub(super) fn migrate_legacy_upload_stage(
-        &self,
-        legacy_path: &Path,
-        private_path: &Path,
-        expected: Option<StoredFileIdentity>,
-    ) -> std::io::Result<LegacyUploadStageMigration> {
-        let _ancestor_creation = self
-            .inner
-            .ancestor_creation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.migrate_legacy_upload_stage_blocking(legacy_path, private_path, expected)
-    }
-
-    fn migrate_legacy_upload_stage_blocking(
-        &self,
-        legacy_path: &Path,
-        private_path: &Path,
-        expected: Option<StoredFileIdentity>,
-    ) -> std::io::Result<LegacyUploadStageMigration> {
-        let (stage_directory_path, private_name) =
-            self.validated_upload_stage_path(private_path)?;
-        self.relative_path(legacy_path)?;
-        let legacy_name = legacy_path.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "legacy upload stage has no file name",
-            )
-        })?;
-        if legacy_path.parent() != stage_directory_path.parent()
-            || legacy_name != private_name
-            || legacy_name.to_str().and_then(classify_internal_name)
-                != Some(InternalEntryName::Stage)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "legacy and private upload stage paths do not describe the same parent and name",
-            ));
-        }
-
-        let legacy_parent = match self.open_parent_blocking(legacy_path, false) {
-            Ok(parent) => parent,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(LegacyUploadStageMigration::Missing);
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(expected) = expected else {
-            let legacy_absent = match statat(
-                &legacy_parent.fd,
-                &legacy_parent.name,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) {
-                Err(Errno::NOENT) => true,
-                Ok(_) => false,
-                Err(error) => return Err(std::io::Error::from(error)),
-            };
-            let private_absent = match statat(
-                &legacy_parent.fd,
-                stage_directory_path
-                    .file_name()
-                    .expect("validated stage directory"),
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) {
-                Err(Errno::NOENT) => true,
-                Ok(_) => {
-                    let directory = open_private_upload_stage_directory_at(
-                        &legacy_parent.fd,
-                        stage_directory_path
-                            .file_name()
-                            .expect("validated stage directory"),
-                    )?;
-                    match statat(&directory, &private_name, AtFlags::SYMLINK_NOFOLLOW) {
-                        Err(Errno::NOENT) => true,
-                        Ok(_) => false,
-                        Err(error) => return Err(std::io::Error::from(error)),
-                    }
-                }
-                Err(error) => return Err(std::io::Error::from(error)),
-            };
-            if legacy_absent && private_absent {
-                return Ok(LegacyUploadStageMigration::Missing);
-            }
-            return Ok(LegacyUploadStageMigration::IdentityMismatch);
-        };
-        let existing_private_directory = match open_private_upload_stage_directory_at(
-            &legacy_parent.fd,
-            stage_directory_path
-                .file_name()
-                .expect("validated stage directory"),
-        ) {
-            Ok(directory) => Some(directory),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if let Some(stage_directory) = existing_private_directory {
-            match open_expected_upload_stage_at(
-                &stage_directory,
-                private_name.as_os_str(),
-                expected,
-            )? {
-                ExpectedUploadStage::Match(_private) => {
-                    fsync(&stage_directory).map_err(std::io::Error::from)?;
-                    fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
-                    return Ok(LegacyUploadStageMigration::AlreadyMoved);
-                }
-                ExpectedUploadStage::Mismatch => {
-                    return Ok(LegacyUploadStageMigration::IdentityMismatch);
-                }
-                ExpectedUploadStage::Missing => {}
-            }
-        }
-
-        let legacy = match open_expected_upload_stage_at(
-            &legacy_parent.fd,
-            &legacy_parent.name,
-            expected,
-        )? {
-            ExpectedUploadStage::Match(legacy) => legacy,
-            ExpectedUploadStage::Missing => return Ok(LegacyUploadStageMigration::Missing),
-            ExpectedUploadStage::Mismatch => {
-                return Ok(LegacyUploadStageMigration::IdentityMismatch);
-            }
-        };
-
-        let (stage_directory, _) = ensure_private_upload_stage_directory_at(
-            &legacy_parent.fd,
-            stage_directory_path
-                .file_name()
-                .expect("validated stage directory"),
-        )?;
-        match statat(&stage_directory, &private_name, AtFlags::SYMLINK_NOFOLLOW) {
-            Err(Errno::NOENT) => {}
-            Ok(_) => {
-                return Ok(LegacyUploadStageMigration::IdentityMismatch);
-            }
-            Err(error) => return Err(std::io::Error::from(error)),
-        }
-        verify_named_upload_stage(&legacy_parent.fd, &legacy_parent.name, &legacy, expected)?;
-
-        let rename_result = renameat_with(
-            &legacy_parent.fd,
-            &legacy_parent.name,
-            &stage_directory,
-            &private_name,
-            RenameFlags::NOREPLACE,
-        );
-        if let Err(rename_error) = rename_result {
-            let legacy_after =
-                open_expected_upload_stage_at(&legacy_parent.fd, &legacy_parent.name, expected);
-            let private_after =
-                open_expected_upload_stage_at(&stage_directory, &private_name, expected);
-            if matches!(legacy_after, Ok(ExpectedUploadStage::Missing))
-                && let Ok(ExpectedUploadStage::Match(_private)) = private_after
-            {
-                fsync(&stage_directory).map_err(std::io::Error::from)?;
-                fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
-                return Ok(LegacyUploadStageMigration::AlreadyMoved);
-            }
-            return Err(std::io::Error::new(
-                std::io::Error::from(rename_error).kind(),
-                format!(
-                    "failed to move legacy upload stage into its private directory: {rename_error}"
-                ),
-            ));
-        }
-
-        verify_named_upload_stage(&stage_directory, &private_name, &legacy, expected)?;
-        match statat(
-            &legacy_parent.fd,
-            &legacy_parent.name,
-            AtFlags::SYMLINK_NOFOLLOW,
-        ) {
-            Err(Errno::NOENT) => {}
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "legacy upload stage name still exists after rename",
-                ));
-            }
-            Err(error) => return Err(std::io::Error::from(error)),
-        }
-        fsync(&stage_directory).map_err(std::io::Error::from)?;
-        fsync(&legacy_parent.fd).map_err(std::io::Error::from)?;
-        Ok(LegacyUploadStageMigration::Moved)
-    }
-
     fn validated_upload_stage_path<'a>(
         &self,
         path: &'a Path,
@@ -1614,7 +1410,7 @@ impl RootedFs {
                 "upload stage has no file name",
             )
         })?;
-        if name.to_str().and_then(classify_internal_name) != Some(InternalEntryName::Stage) {
+        if !name.to_str().is_some_and(is_upload_stage_name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "upload stage file name is not canonical",
@@ -3004,7 +2800,7 @@ fn open_expected_upload_stage_at<F: AsFd>(
     let file = match openat(
         parent,
         name,
-        // A legacy awaiting-confirmation stage may deliberately carry the
+        // An awaiting-confirmation stage may deliberately carry the
         // destination's mode and ownership already. O_PATH pins its inode for
         // the rename checks without requiring data-read permission or
         // changing any of that preserved metadata.

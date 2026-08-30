@@ -192,14 +192,6 @@ impl StoreWorker {
                     }
                     let _ = reply.send(self.upload_sessions_page(after, limit));
                 }
-                Command::ReplaceUploadStagePathBlocking {
-                    expected,
-                    replacement,
-                    reply,
-                } => {
-                    let _ = reply
-                        .send(self.replace_upload_stage_path_if_matches(&expected, &replacement));
-                }
                 Command::RejectUploadSession {
                     key,
                     target_path,

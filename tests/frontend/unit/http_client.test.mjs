@@ -667,7 +667,7 @@ test("error payload parsing accepts only canonical Problem Details", async () =>
     "application/problem+json",
   ), empty);
   assert.deepEqual(parseErrorPayload(
-    '{"message":"Legacy message must be ignored"}',
+    '{"message":"Unrecognized message field must be ignored"}',
     "application/problem+json",
   ), empty);
 

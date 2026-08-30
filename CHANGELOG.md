@@ -14,6 +14,7 @@
 ### 不兼容变更
 
 - 项目版本提升为 `0.50.0`。state store 只初始化空库并只接受当前格式：五列 `product_metadata` 必须标识 `dufs-ram`、当前 Cargo 版本、schema revision 1 和按统一 GLOB + u64 大端字段编码算法计算的 SHA-256。内置 v2/v3/v4→v5 migration 已删除；旧版本、无标记或指纹漂移的现存库会在只读预检中拒绝且不改变数据库字节，升级必须由独立升级流程完成。
+- 删除运行时旧版兼容入口：服务只验证当前 `.dufs-upload-stages` 布局，不再搬运旧 stage 或保留旧 state sidecar 名称；目录查询不再提供退役 ZIP 的专用 `410`；CLI 不再扫描或隐藏定义旧认证参数；正式包只保留 `docs/history/code-review-report.md`，不再生成顶层报告别名。
 
 ## [0.49.7] - 2026-08-26
 

@@ -74,14 +74,6 @@ fn use_config_file(tmpdir: TempDir) -> Result<(), Error> {
 
 #[rstest]
 #[case("unexpected-setting")]
-#[case("path-prefix")]
-#[case("hidden")]
-#[case("state-db")]
-#[case("compress")]
-#[case("max-zip-entries")]
-#[case("max-zip-uncompressed-size")]
-#[case("max-zip-output-size")]
-#[case("max-concurrent-zips")]
 fn unknown_config_field_is_rejected(tmpdir: TempDir, #[case] field: &str) -> Result<(), Error> {
     let config_path = tmpdir.path().join("unknown-field.yaml");
     write_private_config(

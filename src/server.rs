@@ -407,7 +407,7 @@ impl Server {
         let state_store = operation_registry.state_store();
         let upload_records =
             UploadRecordStore::new(rooted_fs.clone(), state_store.clone(), UPLOAD_SESSION_TTL)?;
-        upload_records.reconcile_stage_layouts()?;
+        upload_records.validate_stage_layouts()?;
         Ok(Self {
             content: ContentServices {
                 args,

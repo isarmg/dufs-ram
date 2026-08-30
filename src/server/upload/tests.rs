@@ -37,6 +37,13 @@ fn stage_name(target: &str, upload_id: Uuid) -> String {
     get_file_name(&upload_temp_path(Path::new(target), upload_id).unwrap()).to_string()
 }
 
+fn stage_path(parent: &Path, target: &str, upload_id: Uuid) -> PathBuf {
+    let directory = parent.join(UPLOAD_STAGE_DIRECTORY);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory.join(stage_name(target, upload_id))
+}
+
 #[test]
 fn retained_stage_with_replayed_target_metadata_cannot_become_create_only() {
     let awaiting_overwrite = UploadCheckpoint {
@@ -827,17 +834,14 @@ async fn post_metadata_sync_failure_is_known_unpublished_and_removes_readonly_se
 #[test]
 fn maintenance_removes_expired_stages_and_trash_but_skips_active_files() {
     let temp = assert_fs::TempDir::new().unwrap();
-    let stale_stage_name = stage_name("stale.txt", Uuid::new_v4());
-    let stale = temp.path().join(&stale_stage_name);
-    let active_stage_name = stage_name("active.txt", Uuid::new_v4());
-    let active_stage = temp.path().join(&active_stage_name);
+    let stale = stage_path(temp.path(), "stale.txt", Uuid::new_v4());
+    let active_stage = stage_path(temp.path(), "active.txt", Uuid::new_v4());
     let trash = temp.path().join(format!(
         "{DELETE_TRASH_PREFIX}{}{DELETE_TRASH_SUFFIX}",
         Uuid::new_v4()
     ));
-    let invalid_session_directory = temp
-        .path()
-        .join(stage_name("invalid-directory.txt", Uuid::new_v4()));
+    let invalid_session_directory =
+        stage_path(temp.path(), "invalid-directory.txt", Uuid::new_v4());
     let ordinary = temp.path().join("ordinary.txt");
     std::fs::write(&stale, "stale").unwrap();
     std::fs::write(&active_stage, "active").unwrap();
@@ -883,7 +887,7 @@ fn maintenance_batches_resume_to_reach_deep_directories() {
         directory = directory.join(format!("directory-{depth}"));
         std::fs::create_dir(&directory).unwrap();
     }
-    let stale = directory.join(stage_name("deep.txt", Uuid::new_v4()));
+    let stale = stage_path(&directory, "deep.txt", Uuid::new_v4());
     std::fs::write(&stale, "stale").unwrap();
 
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
@@ -1006,9 +1010,7 @@ fn saturated_purge_queue_does_not_starve_other_maintenance_entries() {
     ));
     std::fs::create_dir(&trash).unwrap();
     std::fs::write(trash.join("content.txt"), "trash").unwrap();
-    let stale = temp
-        .path()
-        .join(stage_name("stale-after-trash.txt", Uuid::new_v4()));
+    let stale = stage_path(temp.path(), "stale-after-trash.txt", Uuid::new_v4());
     std::fs::write(&stale, "stale").unwrap();
 
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
@@ -1088,7 +1090,7 @@ fn maintenance_time_budget_can_pause_before_examining_entries() {
 #[test]
 fn maintenance_rechecks_the_live_lease_set_before_deleting() {
     let temp = assert_fs::TempDir::new().unwrap();
-    let stage = temp.path().join(stage_name("race.txt", Uuid::new_v4()));
+    let stage = stage_path(temp.path(), "race.txt", Uuid::new_v4());
     std::fs::write(&stage, "stale").unwrap();
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
     let stage_key = rooted_fs.entry_key_blocking(&stage).unwrap();
@@ -1130,8 +1132,8 @@ fn maintenance_recognizes_active_uploads_through_root_internal_symlink_aliases()
     std::fs::create_dir(&target).unwrap();
     symlink("target", &alias).unwrap();
 
-    let stage_name = stage_name("aliased.txt", Uuid::new_v4());
-    let aliased_stage = alias.join(&stage_name);
+    let aliased_stage = stage_path(&alias, "aliased.txt", Uuid::new_v4());
+    let stage_name = aliased_stage.file_name().unwrap().to_owned();
     std::fs::write(&aliased_stage, "active-stage").unwrap();
 
     let rooted_fs = RootedFs::new(temp.path()).unwrap();
@@ -1151,7 +1153,7 @@ fn maintenance_recognizes_active_uploads_through_root_internal_symlink_aliases()
 
     assert!(removed.is_empty());
     assert_eq!(
-        std::fs::read_to_string(target.join(&stage_name)).unwrap(),
+        std::fs::read_to_string(target.join(UPLOAD_STAGE_DIRECTORY).join(&stage_name),).unwrap(),
         "active-stage"
     );
 }
@@ -1210,12 +1212,24 @@ fn maintenance_stays_on_the_opened_root_after_path_replacement() {
     let temp = assert_fs::TempDir::new().unwrap();
     let root = temp.path().to_path_buf();
     let moved_root = root.with_extension("opened-root");
-    let stage = stage_name("stale.txt", Uuid::new_v4());
+    let stage = PathBuf::from(UPLOAD_STAGE_DIRECTORY).join(stage_name("stale.txt", Uuid::new_v4()));
+    std::fs::create_dir(root.join(UPLOAD_STAGE_DIRECTORY)).unwrap();
+    std::fs::set_permissions(
+        root.join(UPLOAD_STAGE_DIRECTORY),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     std::fs::write(root.join(&stage), "original").unwrap();
     let rooted_fs = RootedFs::new(&root).unwrap();
 
     std::fs::rename(&root, &moved_root).unwrap();
     std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(root.join(UPLOAD_STAGE_DIRECTORY)).unwrap();
+    std::fs::set_permissions(
+        root.join(UPLOAD_STAGE_DIRECTORY),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     std::fs::write(root.join(&stage), "replacement").unwrap();
 
     let result = collect_and_remove_stale_internal_files(

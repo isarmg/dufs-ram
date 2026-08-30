@@ -111,8 +111,14 @@ fn dot_directory_and_log_file_are_visible_in_listing_and_search(
 }
 
 #[rstest]
-fn unknown_directory_query_is_ignored(server: TestServer) -> Result<(), Error> {
-    let resp = server.get(format!("{}?unused=1", server.url()))?;
+#[case("unused=1")]
+#[case("zip")]
+#[case("zip=1")]
+fn unknown_directory_query_is_ignored(
+    server: TestServer,
+    #[case] query: &str,
+) -> Result<(), Error> {
+    let resp = server.get(format!("{}?{query}", server.url()))?;
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
@@ -120,49 +126,6 @@ fn unknown_directory_query_is_ignored(server: TestServer) -> Result<(), Error> {
     );
     let paths = server.paths_from_page(resp)?;
     assert!(paths.contains("index.html"));
-    Ok(())
-}
-
-#[rstest]
-#[case("", "zip")]
-#[case("", "zip=1")]
-#[case("missing-directory/", "zip")]
-fn retired_directory_archive_query_returns_a_typed_gone_problem(
-    server: TestServer,
-    #[case] path: &str,
-    #[case] query: &str,
-) -> Result<(), Error> {
-    let response = server.get(format!("{}{path}?{query}", server.url()))?;
-    assert_eq!(response.status(), 410);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "application/problem+json"
-    );
-    let problem: serde_json::Value = serde_json::from_str(&response.text()?)?;
-    assert_eq!(
-        problem["type"],
-        "urn:dufs:problem:directory_archive_unsupported"
-    );
-    assert_eq!(problem["status"], 410);
-    assert_eq!(problem["code"], "directory_archive_unsupported");
-    assert_eq!(
-        problem["detail"],
-        "Directory archive downloads are no longer supported"
-    );
-    Ok(())
-}
-
-#[rstest]
-fn retired_directory_archive_head_has_no_body(server: TestServer) -> Result<(), Error> {
-    let response = server
-        .request(reqwest::Method::HEAD, format!("{}?zip", server.url()))
-        .send()?;
-    assert_eq!(response.status(), 410);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "application/problem+json"
-    );
-    assert_eq!(response.text()?, "");
     Ok(())
 }
 

@@ -76,7 +76,6 @@ declare_error_codes! {
     DESTINATION_DIRECTORY_NOT_FOUND => "destination_directory_not_found",
     DESTINATION_NOT_DIRECTORY => "destination_not_directory",
     DIRECTORY_ACCESS_FORBIDDEN => "directory_access_forbidden",
-    DIRECTORY_ARCHIVE_UNSUPPORTED => "directory_archive_unsupported",
     DIRECTORY_CHANGED => "directory_changed",
     DIRECTORY_DEPTH_LIMIT => "directory_depth_limit",
     DIRECTORY_ENTRY_LIMIT => "directory_entry_limit",

@@ -1,7 +1,8 @@
 use super::{
     Server,
     internal_names::{
-        InternalEntryName, classify_internal_name, is_upload_temp_path, upload_stage_directory,
+        InternalEntryName, classify_internal_name, is_upload_stage_name, is_upload_temp_path,
+        upload_stage_directory,
     },
     rooted_fs::{
         DirectoryCursor, DirectoryVisitProgress, RootedEntryKey, RootedFs, TrashEntry,
@@ -774,6 +775,9 @@ where
         let directory_index = state.directories.len() - 1;
         let directory_path = state.directories[directory_index].path.clone();
         let directory_cursor = state.directories[directory_index].cursor;
+        let scanning_upload_stage_directory =
+            directory_path.file_name().and_then(|name| name.to_str())
+                == Some(super::internal_names::UPLOAD_STAGE_DIRECTORY);
         let mut descend = None;
         let mut pending_purge = None;
         let progress = rooted_fs.visit_dir_blocking_chunk(
@@ -803,28 +807,31 @@ where
                     }
                     return Ok(true);
                 };
-                let Some(internal_name) = classify_internal_name(name) else {
+                let internal_name = classify_internal_name(name);
+                let is_upload_stage =
+                    scanning_upload_stage_directory && is_upload_stage_name(name);
+                if internal_name.is_none() && !is_upload_stage {
                     if is_dir {
                         descend = Some(entry.path);
                         return Ok(false);
                     }
                     return Ok(true);
-                };
+                }
                 // Quarantine is a fail-safe terminal location for an internal
                 // trash entry whose identity could not be reconciled. It is
                 // intentionally hidden and never eligible for automatic TTL
                 // cleanup; an operator must inspect and remove it explicitly.
-                if internal_name == InternalEntryName::Quarantine {
+                if internal_name == Some(InternalEntryName::Quarantine) {
                     return Ok(true);
                 }
-                if internal_name == InternalEntryName::StageDirectory {
+                if internal_name == Some(InternalEntryName::StageDirectory) {
                     if is_dir {
                         descend = Some(entry.path);
                         return Ok(false);
                     }
                     return Ok(true);
                 }
-                let is_trash = internal_name == InternalEntryName::DeleteTrash;
+                let is_trash = internal_name == Some(InternalEntryName::DeleteTrash);
                 if is_dir && !is_trash {
                     warn!(
                         "Refusing to recursively remove an invalid upload session directory path={}",
@@ -895,12 +902,7 @@ where
                     return Ok(true);
                 }
 
-                if state.skip_untracked_upload_cleanup
-                    && matches!(
-                        internal_name,
-                        InternalEntryName::Stage | InternalEntryName::State
-                    )
-                {
+                if state.skip_untracked_upload_cleanup && is_upload_stage {
                     return Ok(true);
                 }
 

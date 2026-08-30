@@ -2,9 +2,7 @@ use super::{
     Request, Response, Server,
     disk_space::DiskSpaceReservation,
     identity::OwnerId,
-    internal_names::{
-        is_upload_temp_path, legacy_upload_temp_path, upload_stage_directory, upload_temp_path,
-    },
+    internal_names::{is_upload_temp_path, upload_stage_directory, upload_temp_path},
     maintenance::claim_changes as maintenance_claim_changes,
     path_coordinator::PathLease,
     problem::{ApiError, ErrorCode, RecoveryAdvice, UploadProblemContext, render_problem},
@@ -68,7 +66,8 @@ pub(in crate::server) use target::target_revision;
 
 #[cfg(test)]
 use super::internal_names::{
-    DELETE_TRASH_PREFIX, DELETE_TRASH_SUFFIX, UPLOAD_TEMP_PREFIX, UPLOAD_TEMP_SUFFIX,
+    DELETE_TRASH_PREFIX, DELETE_TRASH_SUFFIX, UPLOAD_STAGE_DIRECTORY, UPLOAD_TEMP_PREFIX,
+    UPLOAD_TEMP_SUFFIX,
 };
 #[cfg(test)]
 use super::maintenance::{

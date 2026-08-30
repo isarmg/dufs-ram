@@ -40,62 +40,6 @@ impl StoreWorker {
         }
     }
 
-    pub(super) fn replace_upload_stage_path_if_matches(
-        &mut self,
-        expected: &StoredUploadSession,
-        replacement: &Path,
-    ) -> Result<bool> {
-        ensure!(
-            expected.target_path != replacement,
-            "Upload target and replacement stage paths must differ"
-        );
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if load_upload_session(&transaction, expected.key)?.as_ref() != Some(expected) {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let conflicting: bool = if expected.state.is_terminal() {
-            false
-        } else {
-            transaction.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM upload_sessions
-                      WHERE stage_path = ?1
-                        AND state IN (?4, ?5, ?6)
-                        AND NOT (owner_digest = ?2 AND upload_id = ?3)
-                 )",
-                params![
-                    replacement.as_os_str().as_bytes(),
-                    expected.key.owner.as_slice(),
-                    expected.key.id.as_slice(),
-                    UPLOAD_RUNNING,
-                    UPLOAD_COMMIT_STARTED,
-                    UPLOAD_AWAITING_CONFIRMATION,
-                ],
-                |row| row.get(0),
-            )?
-        };
-        ensure!(
-            !conflicting,
-            "Replacement upload stage path is already bound to another session"
-        );
-        let updated = transaction.execute(
-            "UPDATE upload_sessions
-                SET stage_path = ?1
-              WHERE owner_digest = ?2 AND upload_id = ?3",
-            params![
-                replacement.as_os_str().as_bytes(),
-                expected.key.owner.as_slice(),
-                expected.key.id.as_slice(),
-            ],
-        )?;
-        ensure!(updated == 1, "Upload stage migration lost its locked row");
-        transaction.commit()?;
-        Ok(true)
-    }
-
     pub(super) fn save_upload_session(
         &mut self,
         proposed: &StoredUploadSession,

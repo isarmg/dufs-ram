@@ -295,7 +295,7 @@ async fn claimed_job_without_a_committed_revision_is_quarantined_and_completed()
     let temp = assert_fs::TempDir::new().unwrap();
     let (server, _state_dir) = server(temp.path());
     let target = temp.path().join("claimed-without-revision.txt");
-    std::fs::write(&target, "preserved legacy trash").unwrap();
+    std::fs::write(&target, "preserved ambiguous trash").unwrap();
     let (prepared, _) = prepared(&server, &target).await;
     let trash = server
         .content
@@ -331,10 +331,10 @@ async fn claimed_job_without_a_committed_revision_is_quarantined_and_completed()
                 name.starts_with(".dufs-quarantine-") && name.ends_with(".hold")
             })
         })
-        .expect("legacy claimed trash without a revision must be quarantined");
+        .expect("claimed trash without a revision must be quarantined");
     assert_eq!(
         std::fs::read(quarantined.path()).unwrap(),
-        b"preserved legacy trash"
+        b"preserved ambiguous trash"
     );
 }
 

@@ -1,4 +1,4 @@
-use dufs::args::{Args, build_cli, reject_cli_auth_args};
+use dufs::args::{Args, build_cli};
 use dufs::auth::{MAX_PASSWORD_BYTES, hash_password};
 use dufs::logger;
 use dufs::server::{Server, ServerRuntime};
@@ -38,7 +38,6 @@ const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> Result<()> {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
-    reject_cli_auth_args(&raw_args)?;
     run(raw_args)
 }
 

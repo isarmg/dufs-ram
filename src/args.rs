@@ -8,13 +8,12 @@ use rustix::{
 };
 use serde::{Deserialize, Deserializer};
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::net::IpAddr;
 use std::ops::Deref;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -42,7 +41,6 @@ const CONFIG_POSIX_ACL_XATTR: &str = "system.posix_acl_access";
 const MAX_BIND_ADDRESSES: usize = 128;
 const MAX_TRUSTED_PROXIES: usize = 128;
 const STATE_DATABASE_FILE_NAME: &str = "state.sqlite3";
-pub const CLI_AUTH_REJECTION_MESSAGE: &str = "`--auth`/`-a` is no longer accepted because command-line arguments can expose password hashes through process listings. Put accounts under `auth:` in a protected YAML file and start with `--config <file>`. If this command contained a real PHC, remove it from shell, service, and CI history and rotate the credential.";
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (git ",
@@ -350,15 +348,6 @@ pub fn build_cli() -> Command {
                 .value_name("port"),
         )
         .arg(
-            Arg::new("auth")
-                .short('a')
-                .long("auth")
-                .action(ArgAction::Append)
-                .num_args(0..=1)
-                .hide(true)
-                .value_name("account"),
-        )
-        .arg(
             Arg::new("log-format")
                 .long("log-format")
                 .value_name("format")
@@ -440,30 +429,6 @@ pub fn build_cli() -> Command {
                      (up to 31536000 seconds) [default: 300]",
                 ),
         )
-}
-
-/// Reject legacy command-line authentication before clap can render an
-/// offending value or startup can perform configuration and filesystem I/O.
-///
-/// The first item is treated as argv[0]. Arguments after `--` are positional
-/// values and are deliberately not interpreted as options.
-pub fn reject_cli_auth_args<I, T>(args: I) -> Result<()>
-where
-    I: IntoIterator<Item = T>,
-    T: AsRef<OsStr>,
-{
-    let mut args = args.into_iter();
-    let _program = args.next();
-    for arg in args {
-        let bytes = arg.as_ref().as_bytes();
-        if bytes == b"--" {
-            break;
-        }
-        if bytes == b"--auth" || bytes.starts_with(b"--auth=") || bytes.starts_with(b"-a") {
-            bail!(CLI_AUTH_REJECTION_MESSAGE);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -567,9 +532,6 @@ impl Args {
     /// Merge command-line arguments with the optional configuration file and
     /// validate the resulting runtime settings.
     pub fn parse(matches: ArgMatches) -> Result<Args> {
-        if matches.contains_id("auth") {
-            bail!(CLI_AUTH_REJECTION_MESSAGE);
-        }
         let mut args = Self::default();
         let config_path = matches.get_one::<PathBuf>("config").cloned();
         let mut config_identity = None;

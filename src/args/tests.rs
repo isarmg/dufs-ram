@@ -4,7 +4,6 @@ use assert_fs::prelude::*;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStringExt as _;
 
 const TEST_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 
@@ -76,27 +75,6 @@ where
     values.push("--state-dir".into());
     values.push(state_dir.as_os_str().to_os_string());
     build_cli().try_get_matches_from(values).unwrap()
-}
-
-#[test]
-fn legacy_auth_argv_scanner_handles_non_utf8_without_panicking() {
-    let unrelated = OsString::from_vec(vec![0xff, b'x']);
-    reject_cli_auth_args([OsString::from("dufs"), unrelated]).unwrap();
-
-    let attached_auth = OsString::from_vec(vec![b'-', b'a', 0xff]);
-    let error = reject_cli_auth_args([OsString::from("dufs"), attached_auth])
-        .expect_err("non-UTF-8 -a value was accepted");
-    assert_eq!(error.to_string(), CLI_AUTH_REJECTION_MESSAGE);
-}
-
-#[test]
-fn legacy_auth_argv_scanner_respects_option_boundaries() {
-    reject_cli_auth_args(["dufs", "--", "--auth"]).unwrap();
-    reject_cli_auth_args(["dufs", "--authfoo"]).unwrap();
-
-    let error = reject_cli_auth_args(["dufs", "-afoo"])
-        .expect_err("short -a with an attached value was accepted");
-    assert_eq!(error.to_string(), CLI_AUTH_REJECTION_MESSAGE);
 }
 
 #[test]

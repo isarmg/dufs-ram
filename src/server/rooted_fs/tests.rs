@@ -1,5 +1,5 @@
 use super::*;
-use crate::server::internal_names::{legacy_upload_temp_path, upload_temp_path};
+use crate::server::internal_names::upload_temp_path;
 use rustix::io::Errno;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -294,79 +294,6 @@ async fn upload_stage_creation_rejects_a_symlinked_private_directory() {
 
     assert!(rooted.create_private_upload_stage(&stage).await.is_err());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-}
-
-#[test]
-fn legacy_upload_stage_migration_is_identity_safe_and_crash_resumable() {
-    let temp = assert_fs::TempDir::new().unwrap();
-    let rooted = RootedFs::new(temp.path()).unwrap();
-    let target = temp.path().join("folder/file.bin");
-    std::fs::create_dir(target.parent().unwrap()).unwrap();
-    let upload_id = Uuid::new_v4();
-    let legacy = legacy_upload_temp_path(&target, upload_id).unwrap();
-    let private = upload_temp_path(&target, upload_id).unwrap();
-    std::fs::write(&legacy, b"legacy staged content").unwrap();
-    let opened = std::fs::File::open(&legacy).unwrap();
-    fsetxattr(
-        &opened,
-        "user.dufs-migration-metadata",
-        b"preserved",
-        XattrFlags::empty(),
-    )
-    .unwrap();
-    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o440)).unwrap();
-    let metadata = opened.metadata().unwrap();
-    let identity = StoredFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-
-    assert_eq!(
-        rooted
-            .migrate_legacy_upload_stage(&legacy, &private, Some(identity))
-            .unwrap(),
-        LegacyUploadStageMigration::Moved
-    );
-    assert!(!legacy.exists());
-    assert_eq!(std::fs::read(&private).unwrap(), b"legacy staged content");
-    let migrated = std::fs::metadata(&private).unwrap();
-    assert_eq!(migrated.permissions().mode() & 0o7777, 0o440);
-    let attributes = read_all_xattrs(std::fs::File::open(&private).unwrap()).unwrap();
-    assert!(attributes.iter().any(|(name, value)| {
-        name.as_bytes() == b"user.dufs-migration-metadata" && value == b"preserved"
-    }));
-    std::fs::write(&legacy, b"foreign legacy occupant").unwrap();
-    assert_eq!(
-        rooted
-            .migrate_legacy_upload_stage(&legacy, &private, Some(identity))
-            .unwrap(),
-        LegacyUploadStageMigration::AlreadyMoved
-    );
-    assert_eq!(std::fs::read(&legacy).unwrap(), b"foreign legacy occupant");
-}
-
-#[test]
-fn identityless_legacy_migration_only_accepts_two_missing_stage_names() {
-    let temp = assert_fs::TempDir::new().unwrap();
-    let rooted = RootedFs::new(temp.path()).unwrap();
-    let target = temp.path().join("file.bin");
-    let upload_id = Uuid::new_v4();
-    let legacy = legacy_upload_temp_path(&target, upload_id).unwrap();
-    let private = upload_temp_path(&target, upload_id).unwrap();
-
-    assert_eq!(
-        rooted
-            .migrate_legacy_upload_stage(&legacy, &private, None)
-            .unwrap(),
-        LegacyUploadStageMigration::Missing
-    );
-    std::fs::write(&legacy, b"unproven occupant").unwrap();
-    assert_eq!(
-        rooted
-            .migrate_legacy_upload_stage(&legacy, &private, None)
-            .unwrap(),
-        LegacyUploadStageMigration::IdentityMismatch
-    );
 }
 
 #[tokio::test]
