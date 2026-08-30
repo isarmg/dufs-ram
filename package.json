@@ -5,7 +5,7 @@
     "linux"
   ],
   "engines": {
-    "node": ">=18"
+    "node": "24.8.0"
   },
   "scripts": {
     "check:docs": "node scripts/check-docs.mjs",

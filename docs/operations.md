@@ -155,7 +155,7 @@ systemctl start dufs
 
 ## 6. 升级
 
-仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Node 最低版本兼容、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
+仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
 仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，并等待同一 tag/SHA 的 `read-only-ci.yml`、`dependency-audit.yml` 与 `formal-release-e2e.yml` 全部成功。只读构建 job 用固定 Rust 工具链生成 `x86_64-unknown-linux-gnu` 二进制；版本字符串必须包含完整源码 SHA，动态库必须全部可解析，发布说明只取 tagged `CHANGELOG.md` 的精确版本段。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费按 artifact ID、Action digest 和聚合摘要绑定的固定输入。它在公开前后分页核对远端资产状态、size 与摘要并实际回下载；匹配草稿可幂等续跑，普通异摘要失败关闭，只有连续稳定的同 ID `starter/0-byte` 残留可按 GitHub 契约清理。所有受校验字段匹配的已公开 Release 只做幂等验收。工作流不会创建、移动或删除 tag，也不读取生产发布私钥；SHA-256 只提供传输完整性，不构成发布者签名。tag 必须通过 GitHub Ruleset 限制为仅维护者可创建并禁止更新/删除。`v0.48.0` 已于 2026-08-22 通过该流程发布，附注 tag 精确指向提交 `c65d0251280bb8c451b6c002ccda364b4517b23d`；后续版本不要为让工作流或脚本“先通过”而提前建 tag，只有最终源码、审查和发布准备完成后才创建并独立确认其目标 commit。
 

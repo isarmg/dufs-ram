@@ -80,6 +80,58 @@ if (
   );
 }
 
+const currentNodeVersion = "24.8.0";
+const packageSource = readFileSync(resolve(projectRoot, "package.json"), "utf8");
+const packageLockSource = readFileSync(
+  resolve(projectRoot, "package-lock.json"),
+  "utf8",
+);
+const workflowDirectory = resolve(projectRoot, ".github", "workflows");
+const workflowSources = new Map(
+  readdirSync(workflowDirectory)
+    .filter(name => name.endsWith(".yml") || name.endsWith(".yaml"))
+    .map(name => [name, readFileSync(resolve(workflowDirectory, name), "utf8")]),
+);
+failures.push(
+  ...currentNodeContractFailures(
+    packageSource,
+    packageLockSource,
+    workflowSources,
+  ),
+);
+if (
+  currentNodeContractFailures(
+    packageSource.replace(
+      `"node": "${currentNodeVersion}"`,
+      '"node": ">=18"',
+    ),
+    packageLockSource,
+    workflowSources,
+  ).length === 0
+) {
+  failures.push(
+    "scripts/check-docs.mjs: old Node engine mutation fixture was accepted",
+  );
+}
+const mutatedWorkflows = new Map(workflowSources);
+mutatedWorkflows.set(
+  "read-only-ci.yml",
+  workflowSources
+    .get("read-only-ci.yml")
+    .replace("node-version: ${{ env.NODE_VERSION }}", 'node-version: "18.20.8"'),
+);
+if (
+  currentNodeContractFailures(
+    packageSource,
+    packageLockSource,
+    mutatedWorkflows,
+  ).length === 0
+) {
+  failures.push(
+    "scripts/check-docs.mjs: old Node workflow mutation fixture was accepted",
+  );
+}
+
 for (const path of markdownFiles) {
   const source = readFileSync(path, "utf8");
   const name = relative(projectRoot, path);
@@ -246,6 +298,62 @@ function v0497ReleaseFactFailures(source) {
     );
   }
   return releaseFailures;
+}
+
+function currentNodeContractFailures(
+  manifestSource,
+  lockSource,
+  checkedWorkflows,
+) {
+  const nodeFailures = [];
+  let manifest;
+  let lock;
+  try {
+    manifest = JSON.parse(manifestSource);
+    lock = JSON.parse(lockSource);
+  } catch {
+    return ["package.json and package-lock.json must be valid JSON"];
+  }
+  if (manifest.engines?.node !== currentNodeVersion) {
+    nodeFailures.push(
+      `package.json: engines.node must be exactly ${currentNodeVersion}`,
+    );
+  }
+  if (lock.packages?.[""]?.engines?.node !== currentNodeVersion) {
+    nodeFailures.push(
+      `package-lock.json: root engines.node must be exactly ${currentNodeVersion}`,
+    );
+  }
+
+  for (const [name, source] of checkedWorkflows) {
+    const versions = [
+      ...source.matchAll(/^\s+node-version:\s*(\S(?:.*\S)?)\s*$/gmu),
+    ];
+    if (versions.length === 0) continue;
+    const declarations = [
+      ...source.matchAll(
+        new RegExp(`^  NODE_VERSION: "${currentNodeVersion.replaceAll(".", "\\.")}"$`, "gmu"),
+      ),
+    ];
+    if (declarations.length !== 1) {
+      nodeFailures.push(
+        `.github/workflows/${name}: must declare exactly one current NODE_VERSION`,
+      );
+    }
+    for (const match of versions) {
+      if (match[1] !== "${{ env.NODE_VERSION }}") {
+        nodeFailures.push(
+          `.github/workflows/${name}: node-version must use the current NODE_VERSION`,
+        );
+      }
+    }
+    if (/^  compatibility:/mu.test(source) || source.includes("18.20.8")) {
+      nodeFailures.push(
+        `.github/workflows/${name}: old Node compatibility jobs are forbidden`,
+      );
+    }
+  }
+  return nodeFailures;
 }
 
 function markdownTargets(source) {

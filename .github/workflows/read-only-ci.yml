@@ -132,32 +132,6 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" clippy --locked --all-targets --all-features -- -D warnings
           cargo +"$RUST_TOOLCHAIN" test --locked --all-targets --all-features
 
-  compatibility:
-    name: Node.js minimum version
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Check out the source without credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Use the declared minimum Node.js release
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "18.20.8"
-          package-manager-cache: false
-      - name: Run source checks on the minimum Node.js release
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --version
-          npm --version
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run check:js
-          npm run check:types
-          npm run check:docs
-          npm run test:frontend:unit
-
   quality:
     name: Coverage, deployment, and release smoke
     runs-on: ubuntu-24.04
