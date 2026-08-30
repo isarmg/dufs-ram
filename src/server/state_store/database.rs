@@ -1094,16 +1094,8 @@ fn inspect_table_schema(connection: &Connection, name: String) -> Result<TableSc
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let snapshot_name = if index_name.starts_with("sqlite_autoindex_") {
-                // SQLite may retain the generated name's pre-rename table
-                // component after the v2 upload-table migration. Its origin
-                // and ordered key contract are the stable schema identity.
-                format!("sqlite_autoindex:{origin}")
-            } else {
-                index_name
-            };
             Ok(IndexSchemaSnapshot {
-                name: snapshot_name,
+                name: index_name,
                 unique,
                 origin,
                 partial,
