@@ -1356,7 +1356,7 @@ impl RootedFs {
     /// Validates an already-persisted private stage binding without creating
     /// or repairing anything. Startup uses this before opening a listener so
     /// an externally replaced or newly traversable staging directory cannot
-    /// silently weaken the confidentiality boundary recorded by schema v5.
+    /// silently weaken the confidentiality boundary recorded by the current schema.
     pub(super) fn validate_private_upload_stage(
         &self,
         path: &Path,

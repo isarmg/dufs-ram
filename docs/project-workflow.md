@@ -371,7 +371,7 @@ flowchart TD
 
 启动时只接受现有目录作为共享根。以 `__dufs__` 或当前摘要 assets 前缀开头的内部请求只接受唯一规范形式：不允许尾斜杠、重复斜杠、编码后的路径分隔符或对 unreserved 字符的多余百分号编码。原始路径只解析一次，外层 timeout/operation 分类、访问日志和实际 handler 共用同一结果；普通共享文件和目录的合法尾斜杠语义不受此约束。目录中的普通文件通过统一方法分派进入 `GET`/`HEAD` 附件下载，未知 HTTP 方法返回 `405 Method Not Allowed`；各方法受限端点同时返回与实际允许集合一致的 `Allow`，例如 health/ready 为 `GET, HEAD`、operation 状态为 `GET`。普通文件或其他非目录对象不能作为共享根启动服务。
 
-readiness 的根探针使用服务启动时长期持有的目录 fd 创建保留形状的隐藏临时项，写入固定短内容并同步文件；随后无论写入是否成功都会尝试删除，成功路径还同步根目录 fd，避免仅凭 metadata 把只读或失效挂载误报为可写。state-store 探针由现有有界 actor 顺序执行：先核对 application id 和元数据，再取得 SQLite immediate transaction、写入 `store_meta` 探针键并显式回滚，不发布业务状态。两类探针与磁盘水位检查并行；任一失败只使本次 readiness 返回 `503`，瞬时探针错误本身不等同于终止 actor。
+readiness 的根探针使用服务启动时长期持有的目录 fd 创建保留形状的隐藏临时项，写入固定短内容并同步文件；随后无论写入是否成功都会尝试删除，成功路径还同步根目录 fd，避免仅凭 metadata 把只读或失效挂载误报为可写。state-store 探针由现有有界 actor 顺序执行：先核对当前 `product_metadata` 与 schema 指纹，再取得 SQLite immediate transaction、写入 `store_meta` 探针键并显式回滚，不发布业务状态。两类探针与磁盘水位检查并行；任一失败只使本次 readiness 返回 `503`，瞬时探针错误本身不等同于终止 actor。
 
 ## 6. 目录浏览和搜索
 
@@ -559,7 +559,7 @@ flowchart LR
 
 提交任务本身持有 operation guard，并在真正调用不可逆文件系统变更前显式 `mark_commit_started`。明确的 pre-commit 业务校验失败登记 `failed`；若 future/guard 在仍为 `Reserved` 时意外丢弃，记录会被移除，状态查询变为不存在且请求可安全重试，不会泄漏虚假 `running`。只有越过 commit 边界后异常丢弃或发生无法分类的提交错误，guard 才保守登记 `unknown/outcome_uncertain`；最终父目录同步完成才登记 `succeeded`。
 
-统一 state store 当前使用 SQLite schema v5 的文件数据库，包含 `operations`、`upload_sessions` 和 `purge_jobs` 表。CLI `--state-dir <dir>` 或 YAML `state-dir: <dir>` 必须提供，固定使用 `<dir>/state.sqlite3`；目录必须已经存在、由有效服务账号所有、权限为 `0700`、不是符号链接，且与共享根不重叠；固定 DB 及 SQLite sidecar 不能与日志或配置文件重名。store 绑定共享根设备号/inode，使用 rollback journal `DELETE` 和 `synchronous=EXTRA`。所有可接受的 v2/v3/v4/v5 都要精确匹配项目表、列/约束和索引对象，不允许额外表、索引、触发器或视图。空白库直接创建并核验 v5；通过只读 application ID、精确 schema、根绑定和完整性预检的 v2 库会在写连接的单一 `BEGIN IMMEDIATE` 事务中重验后依次完成 v2→v3 上传迁移、v3→v4 purge trash revision 迁移并提升到 v5，v3 重验后完成 purge 迁移，v4 重验后只原子提升版本，提交前均再次核验目标 v5。随后启动恢复按持久 stage identity 把旧版同目录 stage 迁入私有目录，并在目录同步后精确 CAS 路径；其他版本或结构漂移仍在零修改下拒绝。
+统一 state store 当前使用 SQLite schema revision 1 的文件数据库，包含 `product_metadata`、`store_meta`、`operations`、`upload_sessions` 和 `purge_jobs` 表。CLI `--state-dir <dir>` 或 YAML `state-dir: <dir>` 必须提供，固定使用 `<dir>/state.sqlite3`；目录必须已经存在、由有效服务账号所有、权限为 `0700`、不是符号链接，且与共享根不重叠；固定 DB 及 SQLite sidecar 不能与日志或配置文件重名。store 绑定共享根设备号/inode，使用 rollback journal `DELETE` 和 `synchronous=EXTRA`。空白库直接创建当前 schema，并写入 `application='dufs-ram'`、当前 Cargo 版本、revision 1 与统一 SHA-256。已有库在任何持久修改前通过 raw snapshot 和原路径只读视图验证五列 metadata、当前版本、精确 schema、根绑定与完整性；指纹按排序后的 `sqlite_schema` 原始字段，以每字段 u64 大端长度加字节计算。旧、无标记、版本/指纹漂移或额外对象一律零修改拒绝，运行服务不执行 migration。
 
 文件型 store 恢复 operation 时先删除尚未越过文件系统提交边界的 `Reserved`，再把 operation `CommitStarted` 转为带 `outcome_uncertain` 的 `Completed/unknown`；原 `Completed` 只在尚未用完的 15 分钟 TTL 内继续按账号、ID 和指纹重放。upload session 持久化 `Running/CommitStarted/AwaitingConfirmation/Committed/Rejected/Unknown`，容量为全局 16384、每账号 4096，每次实际更新延长到 7 天 TTL；重启把 upload `CommitStarted` 转为 `Unknown`，而完整 stage 对应的 `AwaitingConfirmation` 保持可查询、可条件发布或可明确丢弃。首次 discard 将完全绑定的 `AwaitingConfirmation` 原位改为 `Rejected` 并设置终态 TTL；已有 `Rejected` 的重试不写库、不续 TTL，只继续 identity-safe cleanup。SQLite 是上传状态的唯一权威，共享根内不写入、读取或导入 JSON 上传状态文件。
 
@@ -973,7 +973,7 @@ flowchart TD
     C --> D["4. server.rs + server/{identity,path_policy,protocol,problem}.rs<br/>内容/状态/准入/生命周期组合，身份与公开协议"]
     D --> R["5. server/router.rs + router/{request,dispatch}.rs + assets.rs<br/>一次请求分类、生命周期/超时策略、端点分发与资源摘要"]
     R --> G["6. server/session.rs + login_rate_limit.rs<br/>登录限流、Cookie、注销与写请求同源防护"]
-    G --> OP["7. server/operation_registry.rs + state_store/{actor,database,model,operation,upload,purge}.rs<br/>schema v5 分域仓储、v2/v3/v4 迁移、live 探针与恢复"]
+    G --> OP["7. server/operation_registry.rs + state_store/{actor,database,model,operation,upload,purge}.rs<br/>当前 schema 分域仓储、统一 metadata/指纹、live 探针与恢复"]
     OP --> H["8. server/browser_api.rs<br/>mkdir/move/rename 与 upload preflight/discard JSON API"]
     H --> E["9. server/path_coordinator.rs<br/>同路径与祖先/后代写租约"]
     E --> F["10. server/rooted_fs.rs + rooted_fs/{purge,tests}.rs<br/>根 flock、openat2、父 fd、*at、分片递归删除及单元测试"]

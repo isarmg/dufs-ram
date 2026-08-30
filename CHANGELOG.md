@@ -11,6 +11,10 @@
 
 ## [未发布]
 
+### 不兼容变更
+
+- 项目版本提升为 `0.50.0`。state store 只初始化空库并只接受当前格式：五列 `product_metadata` 必须标识 `dufs-ram`、当前 Cargo 版本、schema revision 1 和按统一 GLOB + u64 大端字段编码算法计算的 SHA-256。内置 v2/v3/v4→v5 migration 已删除；旧版本、无标记或指纹漂移的现存库会在只读预检中拒绝且不改变数据库字节，升级必须由独立升级流程完成。
+
 ## [0.49.7] - 2026-08-26
 
 > **发布状态：** [Dufs 0.49.7 GitHub Release](https://github.com/isarmg/dufs-ram/releases/tag/v0.49.7) 已于 `2026-08-26T18:23:46Z` 公开并成为 latest，且不是草稿或预发布版本；附注标签 `v0.49.7` 精确指向提交 `a931033d5a91238a52e2a3882a1423d58ed5afc2`。同一 tag/SHA 的 [只读 CI](https://github.com/isarmg/dufs-ram/actions/runs/32997046391)、[依赖审计](https://github.com/isarmg/dufs-ram/actions/runs/32997046157)、[正式签名包 E2E](https://github.com/isarmg/dufs-ram/actions/runs/32997046548) 与 [Linux Release 无写权限验证/构建](https://github.com/isarmg/dufs-ram/actions/runs/32997048979) 四类门禁均在首次 attempt 成功；唯一持有 `contents: write` 的发布 job 只消费同一 workflow attempt 的已验证输入，并完成远端元数据、摘要、大小、资产集合与实际回下载复核。Release 正文与标签内提取结果逐字节一致，并恰好提供 `dufs-0.49.7-x86_64-unknown-linux-gnu` 二进制（`6025624` 字节，SHA-256 `4dd74e3164fbffcb3765c2c33c518ab9c24e7571bd23f5206fc6ce3802ddd66b`）和 `dufs-0.49.7-x86_64-unknown-linux-gnu.sha256` 校验和文件（`103` 字节，文件自身 SHA-256 `a282bbad570d55eabef56d41a0501b6182acac2d802ff569c90f4e014cd120b4`）；后者精确描述前者。`0.49.7` 是面向协议严格性、共享路径一致性、取消安全、资源耗尽防护、崩溃恢复和发布供应链的补丁版本，不改变 CLI、YAML、SQLite schema 或既有成功响应契约。

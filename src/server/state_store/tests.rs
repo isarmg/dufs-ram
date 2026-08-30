@@ -9,7 +9,7 @@ const CAPACITY: usize = 8;
 const PER_OWNER: usize = 4;
 const TTL: Duration = Duration::from_secs(60);
 type SchemaRow = (String, String, String);
-type DatabaseSchemaSnapshot = (i64, i64, String, Vec<SchemaRow>);
+type DatabaseSchemaSnapshot = (String, Vec<SchemaRow>);
 const HOT_ROLLBACK_FIXTURE_PATH: &str = "DUFS_TEST_HOT_ROLLBACK_FIXTURE_PATH";
 const HOT_ROLLBACK_FIXTURE_KIND: &str = "DUFS_TEST_HOT_ROLLBACK_FIXTURE_KIND";
 const HOT_ROLLBACK_ORDINARY_OPERATION: &str = "ordinary-operation";
@@ -26,51 +26,6 @@ struct FileSnapshot {
     links: u64,
     uid: u32,
     gid: u32,
-}
-
-const DOWNGRADE_UPLOAD_SCHEMA_TO_V2: &str = r#"
-DROP INDEX upload_sessions_expiry;
-ALTER TABLE upload_sessions RENAME TO upload_sessions_v3_source;
-CREATE TABLE upload_sessions (
-    owner_digest BLOB NOT NULL CHECK(length(owner_digest) = 32),
-    upload_id BLOB NOT NULL CHECK(length(upload_id) = 16),
-    target_path BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
-    stage_path BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
-    upload_length INTEGER NOT NULL CHECK(upload_length >= 0),
-    durable_offset INTEGER NOT NULL CHECK(durable_offset >= 0),
-    state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4)),
-    stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
-    stage_inode_be BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
-    updated_at_ms INTEGER NOT NULL,
-    expires_at_ms INTEGER NOT NULL,
-    PRIMARY KEY(owner_digest, upload_id),
-    CHECK(target_path != stage_path),
-    CHECK(durable_offset <= upload_length),
-    CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
-    CHECK(state != 2 OR durable_offset = upload_length),
-    CHECK(state != 1 OR durable_offset = upload_length)
-) STRICT, WITHOUT ROWID;
-INSERT INTO upload_sessions
-SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-       durable_offset, state, stage_device_be, stage_inode_be,
-       updated_at_ms, expires_at_ms
-  FROM upload_sessions_v3_source;
-DROP TABLE upload_sessions_v3_source;
-CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
-"#;
-
-fn set_fixture_schema_version(connection: &Connection, version: i32) -> Result<()> {
-    match version {
-        2 => {
-            connection.execute_batch(DOWNGRADE_UPLOAD_SCHEMA_TO_V2)?;
-            connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?;
-        }
-        3 => connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?,
-        4 | SCHEMA_VERSION => {}
-        _ => bail!("unsupported schema fixture version {version}"),
-    }
-    connection.pragma_update(None, "user_version", version)?;
-    Ok(())
 }
 
 #[test]
@@ -206,8 +161,6 @@ fn temporary_with_repository_limits(limits: RepositoryLimits) -> Result<StateSto
 
 fn database_schema_snapshot(path: &Path) -> Result<DatabaseSchemaSnapshot> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let application_id = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let journal_mode = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let mut statement = connection.prepare(
         "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
@@ -216,7 +169,7 @@ fn database_schema_snapshot(path: &Path) -> Result<DatabaseSchemaSnapshot> {
     let schema = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok((application_id, user_version, journal_mode, schema))
+    Ok((journal_mode, schema))
 }
 
 fn state_database_files_snapshot(path: &Path) -> Result<Vec<Option<FileSnapshot>>> {
@@ -1527,171 +1480,100 @@ async fn restart_makes_future_purge_retries_due_after_a_clock_rollback() -> Resu
     Ok(())
 }
 
-#[tokio::test]
-async fn v2_upload_rows_migrate_and_awaiting_confirmation_survives_restart() -> Result<()> {
+#[test]
+fn rejects_old_application_version_without_modification() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("state.sqlite3");
+    let path = directory.path().join("old-version.sqlite3");
     let identity = root(211, 223);
-    let mut session = upload(7, 9, 4);
-
     let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    assert_eq!(
-        store.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Inserted
-    );
     store.shutdown_for_test();
 
-    // Rebuild only the upload table in its exact v2 shape. All other
-    // schema objects and root binding came from the real initializer.
     let connection = Connection::open(&path)?;
-    set_fixture_schema_version(&connection, 2)?;
+    connection.execute(
+        "UPDATE product_metadata SET application_version = '0.49.7' WHERE singleton = 1",
+        [],
+    )?;
     drop(connection);
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let files_before = state_database_files_snapshot(&path)?;
 
-    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    assert_eq!(
-        migrated.upload_session(session.key).await?,
-        Some(session.clone())
+    let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
+        .err()
+        .expect("an old application version must be rejected");
+    assert!(
+        format!("{error:#}").contains("application version is not exactly current"),
+        "unexpected old-version error: {error:#}"
     );
-    assert_eq!(
-        migrated.inspect_pragmas().await?.user_version,
-        i64::from(SCHEMA_VERSION)
-    );
-
-    session.target_revision = Some([0x5a; 32]);
-    assert_eq!(
-        migrated.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Updated
-    );
-    session.durable_offset = session.upload_length;
-    session.state = StoredUploadState::CommitStarted;
-    assert_eq!(
-        migrated.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Updated
-    );
-    session.state = StoredUploadState::AwaitingConfirmation;
-    assert_eq!(
-        migrated.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Updated
-    );
-    migrated.shutdown_for_test();
-
-    let reopened = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    assert_eq!(reopened.upload_session(session.key).await?, Some(session));
-    reopened.shutdown_for_test();
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
 }
 
-#[tokio::test]
-async fn v3_purge_rows_migrate_with_an_untrusted_null_trash_revision() -> Result<()> {
+#[test]
+fn rejects_unmarked_state_database_without_modification() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("state.sqlite3");
+    let path = directory.path().join("unmarked.sqlite3");
     let identity = root(227, 229);
-    let mut job = purge(12, 13);
-
     let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    assert_eq!(
-        store.prepare_purge_job(job.clone()).await?,
-        StorePurgeJob::Inserted
-    );
-    assert!(store.mark_purge_job_ready(job.key, [0x6b; 32]).await?);
     store.shutdown_for_test();
 
     let connection = Connection::open(&path)?;
-    set_fixture_schema_version(&connection, 3)?;
+    connection.execute_batch("DROP TABLE product_metadata;")?;
     drop(connection);
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let files_before = state_database_files_snapshot(&path)?;
 
-    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    job.state = StoredPurgeState::Ready;
-    assert_eq!(migrated.purge_job(job.key).await?, Some(job));
-    assert_eq!(
-        migrated.inspect_pragmas().await?.user_version,
-        i64::from(SCHEMA_VERSION)
+    let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
+        .err()
+        .expect("an unmarked former state database must be rejected");
+    assert!(
+        format!("{error:#}").contains("does not exactly match the current DUFS schema"),
+        "unexpected unmarked-database error: {error:#}"
     );
-    migrated.shutdown_for_test();
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
 }
 
-#[tokio::test]
-async fn v4_stage_path_semantics_migrate_to_v5_before_reopen() -> Result<()> {
+#[test]
+fn rejects_raw_schema_fingerprint_drift_without_modification() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("state.sqlite3");
+    let path = directory.path().join("fingerprint-drift.sqlite3");
     let identity = root(233, 239);
-    let session = upload(13, 17, 5);
-
     let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-    assert_eq!(
-        store.save_upload_session(session.clone(), TTL).await?,
-        StoreUploadSession::Inserted
-    );
     store.shutdown_for_test();
 
     let connection = Connection::open(&path)?;
-    set_fixture_schema_version(&connection, 4)?;
-    drop(connection);
-
-    let migrated = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
+    connection.pragma_update(None, "writable_schema", true)?;
     assert_eq!(
-        migrated.inspect_pragmas().await?.user_version,
-        i64::from(SCHEMA_VERSION)
+        connection.execute(
+            "UPDATE sqlite_schema
+                SET sql = replace(sql, 'CREATE INDEX operations_expiry',
+                                   'CREATE  INDEX operations_expiry')
+              WHERE name = 'operations_expiry'",
+            [],
+        )?,
+        1
     );
-    assert_eq!(migrated.upload_session(session.key).await?, Some(session));
-    migrated.shutdown_for_test();
+    connection.pragma_update(None, "writable_schema", false)?;
+    let schema_cookie: i64 =
+        connection.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+    connection.pragma_update(None, "schema_version", schema_cookie + 1)?;
+    drop(connection);
+    fs::set_permissions(&path, Permissions::from_mode(0o640))?;
+    let files_before = state_database_files_snapshot(&path)?;
+
+    let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
+        .err()
+        .expect("raw schema SQL drift must be rejected");
+    assert!(
+        format!("{error:#}").contains("schema fingerprint does not match"),
+        "unexpected fingerprint-drift error: {error:#}"
+    );
+    assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
 }
 
 #[test]
-fn rejects_object_drift_in_every_supported_schema_without_migration() -> Result<()> {
-    let cases = [
-        (
-            2,
-            "CREATE TRIGGER unexpected_state_trigger
-             AFTER INSERT ON operations BEGIN SELECT 1; END;",
-        ),
-        (3, "DROP INDEX purge_jobs_due;"),
-        (
-            4,
-            "CREATE INDEX unexpected_state_index ON operations(updated_at_ms);",
-        ),
-        (
-            SCHEMA_VERSION,
-            "CREATE TABLE unexpected_state_table(value BLOB) STRICT;",
-        ),
-    ];
-
-    for (version, drift) in cases {
-        let directory = tempdir()?;
-        let path = directory.path().join(format!("drifted-v{version}.sqlite3"));
-        let identity = root(300 + version as u64, 400 + version as u64);
-        let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
-        store.shutdown_for_test();
-
-        let connection = Connection::open(&path)?;
-        set_fixture_schema_version(&connection, version)?;
-        connection.execute_batch(drift)?;
-        drop(connection);
-        fs::set_permissions(&path, Permissions::from_mode(0o640))?;
-
-        let bytes_before = fs::read(&path)?;
-        let schema_before = database_schema_snapshot(&path)?;
-        let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
-        let error = result
-            .err()
-            .expect("a supported version with schema-object drift must be rejected");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains(&format!("schema version {version}"))
-                && message.contains("does not exactly match"),
-            "unexpected error for v{version}: {message}"
-        );
-        assert_eq!(fs::read(&path)?, bytes_before);
-        assert_eq!(database_schema_snapshot(&path)?, schema_before);
-        assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o640);
-    }
-    Ok(())
-}
-
-#[test]
-fn rejects_tampered_v5_column_constraints_and_index_predicates() -> Result<()> {
+fn rejects_tampered_current_column_constraints_and_index_predicates() -> Result<()> {
     let cases = [
         (
             "declared type",
@@ -1735,7 +1617,7 @@ fn rejects_tampered_v5_column_constraints_and_index_predicates() -> Result<()> {
         let directory = tempdir()?;
         let path = directory
             .path()
-            .join(format!("tampered-v5-{case_index}.sqlite3"));
+            .join(format!("tampered-current-{case_index}.sqlite3"));
         let identity = root(500 + case_index as u64, 600 + case_index as u64);
         let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
         store.shutdown_for_test();
@@ -1764,10 +1646,10 @@ fn rejects_tampered_v5_column_constraints_and_index_predicates() -> Result<()> {
         let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
         let error = result
             .err()
-            .expect("a v5 database with a tampered contract must be rejected");
+            .expect("a current database with a tampered contract must be rejected");
         let message = format!("{error:#}");
         assert!(
-            message.contains("schema version 5") && message.contains("does not exactly match"),
+            message.contains("does not exactly match the current DUFS schema"),
             "unexpected {label} error: {message}"
         );
         assert_eq!(fs::read(&path)?, bytes_before);
@@ -1946,7 +1828,7 @@ fn raw_main_snapshot_copy_enforces_its_limit_before_and_during_copy() -> Result<
 }
 
 #[test]
-fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> Result<()> {
+fn raw_main_validation_rejects_a_valid_current_wal_shadow_without_modification() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("state.sqlite3");
     let identity = root(733, 739);
@@ -1955,8 +1837,6 @@ fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> R
         "CREATE TABLE foreign_records(id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
          INSERT INTO foreign_records(value) VALUES ('foreign main must survive');",
     )?;
-    connection.pragma_update(None, "application_id", 0x1122_3344_i32)?;
-    connection.pragma_update(None, "user_version", 1_i32)?;
     let mode: String =
         connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
     assert!(mode.eq_ignore_ascii_case("wal"));
@@ -1964,7 +1844,18 @@ fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> R
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch("DROP TABLE foreign_records;")?;
-    transaction.execute_batch(database::SCHEMA_V5)?;
+    transaction.execute_batch(database::CURRENT_SCHEMA)?;
+    transaction.execute(
+        "INSERT INTO product_metadata(
+             singleton, application, application_version, schema_revision, schema_sha256
+         ) VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            APPLICATION,
+            env!("CARGO_PKG_VERSION"),
+            CURRENT_SCHEMA_REVISION,
+            database::expected_schema_fingerprint()?
+        ],
+    )?;
     transaction.execute(
         "INSERT INTO store_meta(key, value) VALUES
          ('root-device-be', ?1), ('root-inode-be', ?2)",
@@ -1973,8 +1864,6 @@ fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> R
             identity.inode.to_be_bytes().as_slice()
         ],
     )?;
-    transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
 
     let wal = directory.path().join("state.sqlite3-wal");
@@ -1987,7 +1876,7 @@ fn raw_main_validation_rejects_a_valid_v5_wal_shadow_without_modification() -> R
     let result = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL);
     let error = result
         .err()
-        .expect("a DUFS v5 WAL must not be allowed to shadow a foreign main database");
+        .expect("a current DUFS WAL must not be allowed to shadow a foreign main database");
     assert!(
         format!("{error:#}").contains("raw main state database"),
         "unexpected WAL-shadow error: {error:#}"
@@ -2126,8 +2015,6 @@ fn rejects_foreign_database_without_changing_mode_bytes_schema_or_journal() -> R
             "CREATE TABLE foreign_records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO foreign_records(value) VALUES ('must remain untouched');",
         )?;
-        connection.pragma_update(None, "application_id", 0x1122_3344_i32)?;
-        connection.pragma_update(None, "user_version", 1_i32)?;
         let mode: String =
             connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
         assert!(mode.eq_ignore_ascii_case("wal"));
@@ -2139,64 +2026,15 @@ fn rejects_foreign_database_without_changing_mode_bytes_schema_or_journal() -> R
 
     let result = StateStore::open(&path, &root(1, 2), CAPACITY, PER_OWNER, TTL);
     let error = result.err().expect("a foreign database must be rejected");
-    assert!(format!("{error:#}").contains("application id"));
-
-    assert_eq!(fs::read(&path)?, bytes_before);
-    assert_eq!(fs::metadata(&path)?.mode() & 0o777, mode_before);
-    assert_eq!(database_schema_snapshot(&path)?, schema_before);
-    assert!(schema_before.2.eq_ignore_ascii_case("wal"));
-    Ok(())
-}
-
-#[test]
-fn rejects_v1_without_changing_mode_bytes_schema_or_journal() -> Result<()> {
-    let directory = tempdir()?;
-    let path = directory.path().join("legacy-v1.sqlite3");
-    {
-        let connection = Connection::open(&path)?;
-        connection.execute_batch(
-            "CREATE TABLE legacy_operations (
-                 id INTEGER PRIMARY KEY,
-                 error_message TEXT NOT NULL
-             ) STRICT;
-             INSERT INTO legacy_operations(error_message)
-             VALUES ('must remain untouched');",
-        )?;
-        connection.pragma_update(None, "application_id", APPLICATION_ID)?;
-        connection.pragma_update(None, "user_version", 1_i32)?;
-        let mode: String =
-            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        assert!(mode.eq_ignore_ascii_case("wal"));
-    }
-    fs::set_permissions(&path, Permissions::from_mode(0o644))?;
-    let bytes_before = fs::read(&path)?;
-    let mode_before = fs::metadata(&path)?.mode() & 0o777;
-    let schema_before = database_schema_snapshot(&path)?;
-    assert_eq!(schema_before.1, 1);
-
-    let result = StateStore::open(&path, &root(101, 103), CAPACITY, PER_OWNER, TTL);
-    let error = result.err().expect("a schema v1 database must be rejected");
-    let message = format!("{error:#}");
     assert!(
-        message.contains("schema version 1"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("requires schema version 5")
-            && message.contains("migration only from schema versions 2, 3, and 4"),
-        "unexpected error: {message}"
+        format!("{error:#}").contains("does not exactly match the current DUFS schema"),
+        "unexpected foreign-database error: {error:#}"
     );
 
     assert_eq!(fs::read(&path)?, bytes_before);
     assert_eq!(fs::metadata(&path)?.mode() & 0o777, mode_before);
     assert_eq!(database_schema_snapshot(&path)?, schema_before);
-    assert!(schema_before.2.eq_ignore_ascii_case("wal"));
-    assert!(
-        schema_before
-            .3
-            .iter()
-            .any(|(_, name, sql)| { name == "legacy_operations" && sql.contains("error_message") })
-    );
+    assert!(schema_before.0.eq_ignore_ascii_case("wal"));
     Ok(())
 }
 
@@ -2224,8 +2062,13 @@ async fn initializes_a_preexisting_empty_database_after_read_only_preflight() ->
 
     let store = StateStore::open(&path, &root(107, 109), CAPACITY, PER_OWNER, TTL)?;
     let pragmas = store.inspect_pragmas().await?;
-    assert_eq!(pragmas.application_id, i64::from(APPLICATION_ID));
-    assert_eq!(pragmas.user_version, i64::from(SCHEMA_VERSION));
+    assert_eq!(pragmas.application, APPLICATION);
+    assert_eq!(pragmas.application_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(pragmas.schema_revision, CURRENT_SCHEMA_REVISION);
+    assert_eq!(
+        pragmas.schema_sha256,
+        database::expected_schema_fingerprint()?
+    );
     assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
     store.shutdown_for_test();
     Ok(())
@@ -2301,8 +2144,13 @@ async fn disk_database_has_expected_identity_permissions_and_pragmas() -> Result
     assert_eq!(pragmas.foreign_keys, 1);
     assert_eq!(pragmas.trusted_schema, 0);
     assert_eq!(pragmas.mmap_size, 0);
-    assert_eq!(pragmas.application_id, i64::from(APPLICATION_ID));
-    assert_eq!(pragmas.user_version, i64::from(SCHEMA_VERSION));
+    assert_eq!(pragmas.application, APPLICATION);
+    assert_eq!(pragmas.application_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(pragmas.schema_revision, CURRENT_SCHEMA_REVISION);
+    assert_eq!(
+        pragmas.schema_sha256,
+        database::expected_schema_fingerprint()?
+    );
     assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
     store.shutdown_for_test();
 

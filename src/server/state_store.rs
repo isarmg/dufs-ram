@@ -38,8 +38,8 @@ pub(super) use model::{
     StoredTerminalState, StoredUploadSession, StoredUploadState, UploadSessionKey,
 };
 
-const APPLICATION_ID: i32 = 0x4455_4653; // "DUFS"
-const SCHEMA_VERSION: i32 = 5;
+const APPLICATION: &str = "dufs-ram";
+const CURRENT_SCHEMA_REVISION: i64 = 1;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const UPLOAD_SESSION_CAPACITY: usize = 16_384;
 const UPLOAD_SESSION_PER_OWNER_CAPACITY: usize = 4_096;
@@ -1163,12 +1163,26 @@ impl StoreWorker {
             mmap_size: self
                 .connection
                 .pragma_query_value(None, "mmap_size", |row| row.get(0))?,
-            application_id: self
-                .connection
-                .pragma_query_value(None, "application_id", |row| row.get(0))?,
-            user_version: self
-                .connection
-                .pragma_query_value(None, "user_version", |row| row.get(0))?,
+            application: self.connection.query_row(
+                "SELECT application FROM product_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?,
+            application_version: self.connection.query_row(
+                "SELECT application_version FROM product_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?,
+            schema_revision: self.connection.query_row(
+                "SELECT schema_revision FROM product_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?,
+            schema_sha256: self.connection.query_row(
+                "SELECT schema_sha256 FROM product_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?,
         })
     }
 }
@@ -1194,8 +1208,10 @@ struct PragmaSnapshot {
     foreign_keys: i64,
     trusted_schema: i64,
     mmap_size: i64,
-    application_id: i64,
-    user_version: i64,
+    application: String,
+    application_version: String,
+    schema_revision: i64,
+    schema_sha256: String,
 }
 
 #[cfg(test)]

@@ -229,7 +229,7 @@ if (error.message.includes("exists")) { /* 覆盖 */ }
 | 文件 | 职责 |
 | --- | --- |
 | [actor.rs](../../src/server/state_store/actor.rs) | 专用线程、命令循环、oneshot 响应、延迟清理和实时 SQLite readiness 写探针 |
-| [database.rs](../../src/server/state_store/database.rs) | 安全打开、加固、schema、迁移、启动恢复和 `quick_check` |
+| [database.rs](../../src/server/state_store/database.rs) | 安全打开、加固、当前 schema 身份、启动恢复和 `quick_check` |
 | [model.rs](../../src/server/state_store/model.rs) | 操作、上传、purge 的类型化记录 |
 | [operation.rs](../../src/server/state_store/operation.rs) | 普通操作 SQL 与容量/TTL |
 | [upload.rs](../../src/server/state_store/upload.rs) | 上传会话 SQL 与转换 |
@@ -274,7 +274,7 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 
 ## 5.13 数据库中保存什么
 
-固定文件是 `<state-dir>/state.sqlite3`，当前 schema v5 主要包含：
+固定文件是 `<state-dir>/state.sqlite3`，当前 schema revision 1 主要包含：
 
 | 表/概念 | 保存什么 | 不保存什么 |
 | --- | --- | --- |
@@ -297,10 +297,10 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 - busy timeout；
 - rollback journal `DELETE`；
 - `synchronous=EXTRA`；
-- application ID、schema version、精确的表/列/约束/索引对象身份与 quick check；
+- 五列 `product_metadata`、当前应用/版本/revision、统一 schema SHA-256、精确对象身份与 quick check；
 - 数据库绑定的共享根 device/inode。
 
-空白数据库直接建立 schema v5。版本号不是迁移凭据：v2/v3/v4/v5 都要逐项匹配表、列类型、空值/默认值/主键/检查约束、严格表属性、索引定义，并拒绝任何额外的项目表、索引、触发器或视图。经严格验证的 v2 会在同一个 `BEGIN IMMEDIATE` 事务内重验后依次完成 v3 上传字段、v4 purge revision 并提升到 v5；v3 重验后完成 purge revision，v4 重验后只提升版本；每条迁移都在提交前确认目标已经是精确 v5。v5 改变的是上传 stage 路径的持久语义：数据库先提升，随后启动恢复按记录的 dev/inode 把旧版同目录 stage rename 到私有 `0700` 子目录，同步两个父目录后再用全行 CAS 改写路径。这样迁移中断可以重入，旧二进制也不能在部分移动后降级打开。其他 schema 版本或结构漂移在零修改下拒绝启动。旧 purge 行迁移后没有可证明已提交的 revision，因此恢复时按后文的 quarantine/release 规则失败关闭，而不会把旧路径或 inode 当作删除授权。
+只有空白数据库会建立当前 schema revision 1。初始化事务写入精确五列 `product_metadata`：单例键、`dufs-ram` 应用名、当前 Cargo 版本、revision 和 schema SHA-256。指纹使用所有非 `sqlite_*`、非 `product_metadata` 的 `sqlite_schema` 行，按 `type/name/tbl_name` 排序，并将每个原始字段编码为 u64 大端长度加字段字节后计算 SHA-256。现存数据库先在只读 raw snapshot 与原路径视图中验证相同契约、根绑定和完整性；旧版本、无标记、版本/指纹漂移、额外对象或约束变化都在任何 chmod、journal 配置或恢复写入前拒绝，文件字节保持不变。运行服务不迁移 schema，格式转换属于停服后的独立升级流程。
 
 数据库不能随意复制给另一个共享根继续使用，因为里面的路径、对象身份和未完成动作都绑定旧根。
 
@@ -359,7 +359,7 @@ stateDiagram-v2
 
 若进程在第 7～9 步附近崩溃，重启时可能看到 `Prepared`。它只有 rename 前捕获的弱源身份，没有 live DELETE 在 rename 和父目录同步后提交的 trash revision；当前 target 名或 trash occupant 都不能证明哪个对象经历了原 checked rename。
 
-因此 `Prepared` 恢复规则刻意简单而保守：永远不触碰 target；trash 路径若存在任何 occupant，就原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`；随后释放 intent，绝不把它补写为 `Ready`。v2/v3 的结构迁移和 v4→v5 的版本迁移都不会改写旧 purge 行的原状态：旧 `Prepared` 走上述 reconciler；旧 `Claimed` 启动时先恢复为 `Ready`，再与旧 `Ready` 一样由 worker 因 NULL revision 失败关闭，quarantine 当前 trash occupant 并释放 job。只有 live 提交写入的完整 revision 才能授权 `Ready/Claimed` 自动回收。
+因此 `Prepared` 恢复规则刻意简单而保守：永远不触碰 target；trash 路径若存在任何 occupant，就原子改名为隐藏的 `.dufs-quarantine-<uuid>.hold`；随后释放 intent，绝不把它补写为 `Ready`。启动会把本版本遗留的 `Claimed` 恢复为 `Ready`，但只有 live 提交写入的完整 revision 才能授权 `Ready/Claimed` 自动回收；缺失 revision 会失败关闭并 quarantine 当前 trash occupant。
 
 worker 还持有 trash 根的 `O_PATH` 锚点，并在每个最终 unlink/rmdir 前把候选移入随机 quarantine/disposal 名，再比较名称与 fd 的完整 identity。缺失 revision、身份不一致、最终 `ENOTEMPTY/EXIST` 或其他 `InvalidData` 都会使整棵 trash 根进入永久 quarantine 并释放 job，不从 cursor 0 重扫；普通瞬时 I/O 才保留 job 并退避。未记账 orphan 在兜底通道满、取消或普通 I/O 失败时保持隐藏，等待以后 maintenance 重新发现；若 purge 返回 `InvalidData`，整棵根立即永久 quarantine，不再进入扫描。quarantine 永不自动清理，运维人员必须先停止 Dufs，结合日志和状态库检查对象后再手工移除。
 

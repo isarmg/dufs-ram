@@ -373,14 +373,8 @@ impl StoreWorker {
     }
 
     fn probe_readiness(&mut self) -> Result<()> {
-        let application_id: i32 = self
-            .connection
-            .pragma_query_value(None, "application_id", |row| row.get(0))
-            .context("Failed to read the state database identity")?;
-        ensure!(
-            application_id == APPLICATION_ID,
-            "The state database application id changed"
-        );
+        database::validate_product_metadata(&self.connection)
+            .context("The state database product identity changed")?;
 
         // BEGIN IMMEDIATE plus a rolled-back row mutation checks both reads
         // and the actual rollback-journal write path without publishing probe

@@ -1,5 +1,6 @@
 use super::*;
 use rusqlite::{OpenFlags, config::DbConfig};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions, Permissions},
     io::{self, ErrorKind, Read, Seek, SeekFrom},
@@ -13,7 +14,15 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RAW_DATABASE_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub(super) const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-pub(super) const SCHEMA_V5: &str = r#"
+pub(super) const CURRENT_SCHEMA: &str = r#"
+CREATE TABLE product_metadata (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    application TEXT NOT NULL,
+    application_version TEXT NOT NULL,
+    schema_revision INTEGER NOT NULL,
+    schema_sha256 TEXT NOT NULL
+);
+
 CREATE TABLE store_meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -109,78 +118,6 @@ WHERE state = 1;
 CREATE INDEX purge_jobs_prepared
 ON purge_jobs(created_at_ms)
 WHERE state = 0;
-"#;
-
-const MIGRATE_V2_UPLOADS_TO_V3: &str = r#"
-CREATE TABLE upload_sessions_v3 (
-    owner_digest    BLOB NOT NULL CHECK(length(owner_digest) = 32),
-    upload_id       BLOB NOT NULL CHECK(length(upload_id) = 16),
-    target_path     BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
-    stage_path      BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
-    upload_length   INTEGER NOT NULL CHECK(upload_length >= 0),
-    durable_offset  INTEGER NOT NULL CHECK(durable_offset >= 0),
-    state           INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4, 5)),
-    stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
-    stage_inode_be  BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
-    target_revision BLOB CHECK(target_revision IS NULL OR length(target_revision) = 32),
-    updated_at_ms   INTEGER NOT NULL,
-    expires_at_ms   INTEGER NOT NULL,
-    PRIMARY KEY(owner_digest, upload_id),
-    CHECK(target_path != stage_path),
-    CHECK(durable_offset <= upload_length),
-    CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
-    CHECK(state != 2 OR durable_offset = upload_length),
-    CHECK(state != 1 OR durable_offset = upload_length),
-    CHECK(state != 5 OR durable_offset = upload_length)
-) STRICT, WITHOUT ROWID;
-
-INSERT INTO upload_sessions_v3(
-    owner_digest, upload_id, target_path, stage_path, upload_length,
-    durable_offset, state, stage_device_be, stage_inode_be,
-    target_revision, updated_at_ms, expires_at_ms
-)
-SELECT owner_digest, upload_id, target_path, stage_path, upload_length,
-       durable_offset, state, stage_device_be, stage_inode_be,
-       NULL, updated_at_ms, expires_at_ms
-  FROM upload_sessions;
-
-DROP TABLE upload_sessions;
-ALTER TABLE upload_sessions_v3 RENAME TO upload_sessions;
-CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
-"#;
-
-const MIGRATE_V3_PURGES_TO_V4: &str = r#"
-ALTER TABLE purge_jobs ADD COLUMN trash_revision BLOB
-    CHECK(trash_revision IS NULL OR length(trash_revision) = 32);
-"#;
-
-// Build the one historical shape that cannot be obtained from v5 with a
-// column drop. This is used only to construct the trusted schema snapshot for
-// a v2 migration input; production data is migrated by the statements above.
-const BUILD_EXPECTED_V2_FROM_V5: &str = r#"
-DROP INDEX upload_sessions_expiry;
-DROP TABLE upload_sessions;
-CREATE TABLE upload_sessions (
-    owner_digest    BLOB NOT NULL CHECK(length(owner_digest) = 32),
-    upload_id       BLOB NOT NULL CHECK(length(upload_id) = 16),
-    target_path     BLOB NOT NULL CHECK(length(target_path) BETWEEN 1 AND 65536),
-    stage_path      BLOB NOT NULL CHECK(length(stage_path) BETWEEN 1 AND 65536),
-    upload_length   INTEGER NOT NULL CHECK(upload_length >= 0),
-    durable_offset  INTEGER NOT NULL CHECK(durable_offset >= 0),
-    state           INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4)),
-    stage_device_be BLOB CHECK(stage_device_be IS NULL OR length(stage_device_be) = 8),
-    stage_inode_be  BLOB CHECK(stage_inode_be IS NULL OR length(stage_inode_be) = 8),
-    updated_at_ms   INTEGER NOT NULL,
-    expires_at_ms   INTEGER NOT NULL,
-    PRIMARY KEY(owner_digest, upload_id),
-    CHECK(target_path != stage_path),
-    CHECK(durable_offset <= upload_length),
-    CHECK((stage_device_be IS NULL) = (stage_inode_be IS NULL)),
-    CHECK(state != 2 OR durable_offset = upload_length),
-    CHECK(state != 1 OR durable_offset = upload_length)
-) STRICT, WITHOUT ROWID;
-CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at_ms);
-ALTER TABLE purge_jobs DROP COLUMN trash_revision;
 "#;
 
 #[derive(Eq, PartialEq)]
@@ -783,9 +720,9 @@ fn validate_raw_main_database(
     let connection = Connection::open_with_flags(&snapshot_path, flags)
         .context("Failed to open the raw state database validation snapshot")?;
     harden_connection(&connection)?;
-    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let object_count = persistent_object_count(&connection)?;
     ensure!(
-        version != 0 || !sidecars.has_present_sidecar(),
+        object_count != 0 || !sidecars.has_present_sidecar(),
         "Refusing to initialize an empty main state database from SQLite sidecar contents"
     );
     validate_database_before_mutation(&connection, root)
@@ -1029,28 +966,19 @@ fn preflight_existing_database(path: &Path, root: RootIdentity) -> Result<()> {
     })
 }
 
-fn validate_exact_schema(connection: &Connection, version: i32) -> Result<()> {
-    let actual = inspect_schema(connection)
-        .with_context(|| format!("Failed to inspect state database schema version {version}"))?;
-    let expected = expected_schema(version).with_context(|| {
-        format!("Failed to construct the trusted schema version {version} definition")
-    })?;
+fn validate_exact_schema(connection: &Connection) -> Result<()> {
+    let actual = inspect_schema(connection).context("Failed to inspect state database schema")?;
+    let expected = expected_schema().context("Failed to construct the current state schema")?;
     ensure!(
         actual == expected,
-        "State database schema version {version} does not exactly match the supported DUFS schema (tables, columns, constraints, indexes, triggers, or views differ)"
+        "State database does not exactly match the current DUFS schema (tables, columns, constraints, indexes, triggers, or views differ)"
     );
     Ok(())
 }
 
-fn expected_schema(version: i32) -> Result<SchemaSnapshot> {
+fn expected_schema() -> Result<SchemaSnapshot> {
     let connection = Connection::open_in_memory()?;
-    connection.execute_batch(SCHEMA_V5)?;
-    match version {
-        2 => connection.execute_batch(BUILD_EXPECTED_V2_FROM_V5)?,
-        3 => connection.execute_batch("ALTER TABLE purge_jobs DROP COLUMN trash_revision;")?,
-        4 | SCHEMA_VERSION => {}
-        _ => bail!("Schema version {version} has no trusted definition"),
-    }
+    connection.execute_batch(CURRENT_SCHEMA)?;
     inspect_schema(&connection)
 }
 
@@ -1357,47 +1285,28 @@ fn canonical_create_table_sql(compact: String) -> Result<String> {
 }
 
 fn validate_database_before_mutation(connection: &Connection, root: RootIdentity) -> Result<()> {
-    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let application_id: i32 =
-        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-
-    match version {
-        0 => {
-            ensure!(
-                application_id == 0,
-                "State database schema version 0 is unsupported; this release requires schema version {SCHEMA_VERSION}"
-            );
-            let object_count: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema \
-                 WHERE type IN ('table', 'index', 'trigger', 'view') \
-                   AND name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            ensure!(
-                object_count == 0,
-                "Refusing to initialize a non-empty database without a DUFS schema version"
-            );
-        }
-        2 | 3 | 4 | SCHEMA_VERSION => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The state database application id is invalid"
-            );
-            validate_exact_schema(connection, version)?;
-            verify_root_identity(connection, root)?;
-        }
-        version => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The configured database application id belongs to another application"
-            );
-            bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2, 3, and 4"
-            );
-        }
+    if persistent_object_count(connection)? == 0 {
+        return validate_integrity(connection);
     }
 
+    validate_product_metadata(connection)?;
+    verify_root_identity(connection, root)?;
+    validate_integrity(connection)
+}
+
+fn persistent_object_count(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type IN ('table', 'index', 'trigger', 'view') \
+               AND name NOT GLOB 'sqlite_*'",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count state database schema objects")
+}
+
+fn validate_integrity(connection: &Connection) -> Result<()> {
     let quick_check: String = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .context("Failed to check state database integrity")?;
@@ -1409,100 +1318,135 @@ fn validate_database_before_mutation(connection: &Connection, root: RootIdentity
 }
 
 fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<()> {
-    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let application_id: i32 =
-        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-
-    match version {
-        0 => {
-            ensure!(
-                application_id == 0,
-                "State database schema version 0 is unsupported; this release requires schema version {SCHEMA_VERSION}"
-            );
-            let object_count: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema \
-                 WHERE type IN ('table', 'index', 'trigger', 'view') \
-                   AND name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            ensure!(
-                object_count == 0,
-                "Refusing to initialize a non-empty database without a DUFS schema version"
-            );
-
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(SCHEMA_V5)?;
-            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            insert_root_identity(&transaction, root)?;
-            validate_exact_schema(&transaction, SCHEMA_VERSION)?;
-            transaction.commit()?;
-        }
-        2 => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The state database application id is invalid"
-            );
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_exact_schema(&transaction, 2)?;
-            transaction.execute_batch(MIGRATE_V2_UPLOADS_TO_V3)?;
-            transaction.execute_batch(MIGRATE_V3_PURGES_TO_V4)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            validate_exact_schema(&transaction, SCHEMA_VERSION)?;
-            transaction.commit()?;
-        }
-        3 => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The state database application id is invalid"
-            );
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_exact_schema(&transaction, 3)?;
-            transaction.execute_batch(MIGRATE_V3_PURGES_TO_V4)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            validate_exact_schema(&transaction, SCHEMA_VERSION)?;
-            transaction.commit()?;
-        }
-        4 => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The state database application id is invalid"
-            );
-            // Schema v5 changes the durable meaning of upload stage paths:
-            // the listener-start reconciliation moves v4 stages into their
-            // private directory. Bump first so an older binary can never open
-            // a database after any part of that filesystem migration.
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_exact_schema(&transaction, 4)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            validate_exact_schema(&transaction, SCHEMA_VERSION)?;
-            transaction.commit()?;
-        }
-        SCHEMA_VERSION => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The state database application id is invalid"
-            );
-            validate_exact_schema(connection, SCHEMA_VERSION)?;
-        }
-        version => {
-            ensure!(
-                application_id == APPLICATION_ID,
-                "The configured database application id belongs to another application"
-            );
-            bail!(
-                "State database schema version {version} is unsupported; this release requires schema version {SCHEMA_VERSION} and supports migration only from schema versions 2, 3, and 4"
-            );
-        }
+    if persistent_object_count(connection)? != 0 {
+        validate_product_metadata(connection)?;
+        verify_root_identity(connection, root)?;
+        return Ok(());
     }
 
-    verify_root_identity(connection, root)?;
+    let expected_fingerprint = expected_schema_fingerprint()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(CURRENT_SCHEMA)?;
+    let actual_fingerprint = schema_fingerprint(&transaction)?;
+    ensure!(
+        actual_fingerprint == expected_fingerprint,
+        "The compiled state schema fingerprint is inconsistent"
+    );
+    transaction.execute(
+        "INSERT INTO product_metadata(
+             singleton, application, application_version, schema_revision, schema_sha256
+         ) VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            APPLICATION,
+            env!("CARGO_PKG_VERSION"),
+            CURRENT_SCHEMA_REVISION,
+            expected_fingerprint
+        ],
+    )?;
+    insert_root_identity(&transaction, root)?;
+    validate_product_metadata(&transaction)?;
+    verify_root_identity(&transaction, root)?;
+    transaction.commit()?;
     Ok(())
+}
+
+pub(super) fn validate_product_metadata(connection: &Connection) -> Result<()> {
+    validate_exact_schema(connection)?;
+    let row_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM product_metadata", [], |row| {
+            row.get(0)
+        })?;
+    ensure!(
+        row_count == 1,
+        "State database product_metadata must contain exactly one row"
+    );
+    let (singleton, application, application_version, schema_revision, schema_sha256): (
+        i64,
+        String,
+        String,
+        i64,
+        String,
+    ) = connection.query_row(
+        "SELECT singleton, application, application_version, schema_revision, schema_sha256
+           FROM product_metadata",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    ensure!(
+        singleton == 1,
+        "State database metadata singleton is invalid"
+    );
+    ensure!(
+        application == APPLICATION,
+        "State database belongs to a different application"
+    );
+    ensure!(
+        application_version == env!("CARGO_PKG_VERSION"),
+        "State database application version is not exactly current"
+    );
+    ensure!(
+        schema_revision == CURRENT_SCHEMA_REVISION,
+        "State database schema revision is not exactly current"
+    );
+
+    let expected_fingerprint = expected_schema_fingerprint()?;
+    ensure!(
+        schema_sha256 == expected_fingerprint,
+        "State database schema fingerprint metadata is not exactly current"
+    );
+    let actual_fingerprint = schema_fingerprint(connection)?;
+    ensure!(
+        actual_fingerprint == expected_fingerprint,
+        "State database schema fingerprint does not match the current schema"
+    );
+    Ok(())
+}
+
+pub(super) fn expected_schema_fingerprint() -> Result<String> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(CURRENT_SCHEMA)?;
+    schema_fingerprint(&connection)
+}
+
+fn schema_fingerprint(connection: &Connection) -> Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '')
+           FROM sqlite_schema
+          WHERE name NOT GLOB 'sqlite_*' AND name <> 'product_metadata'
+          ORDER BY type, name, tbl_name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok([
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ])
+    })?;
+    let mut digest = Sha256::new();
+    for row in rows {
+        for field in row? {
+            let bytes = field.as_bytes();
+            let length = u64::try_from(bytes.len()).context("SQLite schema field is too large")?;
+            digest.update(length.to_be_bytes());
+            digest.update(bytes);
+        }
+    }
+    let digest = digest.finalize();
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(output)
 }
 
 fn insert_root_identity(transaction: &Transaction<'_>, root: RootIdentity) -> Result<()> {

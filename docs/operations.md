@@ -68,7 +68,7 @@ operation 容量为全局 4096、每账号 1024，终态 TTL 为 15 分钟。启
 
 认证客户端应通过 `GET /__dufs__/api/jobs/<UUID>` 查询当前账号的 mutation job。响应使用 `job_id` 字段及 `running/succeeded/failed/unknown` 状态。
 
-状态库固定使用 SQLite rollback journal `DELETE` 模式和 `synchronous=EXTRA`，由单独状态线程串行访问。数据库文件以 `0600` 使用，必须位于共享根之外；已有数据库还必须是非符号链接、单硬链接普通文件，并绑定创建时共享根的设备号和 inode。任何 SQLite 连接打开前，固定 `-journal/-wal/-shm` 都要经 `lstat`、`O_NOFOLLOW|O_NONBLOCK` 打开、`fstat` 和打开前后身份复核，拒绝符号链接、特殊文件、多硬链接、出现/消失或替换；主库不存在时不接受任何孤立 sidecar。现存主库从 no-follow fd 复制到进程私有临时目录形成不叠加 sidecar 的 raw baseline，先验证 application ID、精确 schema、根绑定和完整性，再由原路径连接验证合并视图；因此合法外形的 WAL 也不能把空白、外来或不受支持的旧主库伪装为 DUFS v5。失败发生在 chmod、journal mode、恢复或迁移写入之前，主库及全部 sidecar 保持原字节、mode 和身份。schema v5 可直接恢复写入，合法 schema v2、v3 和 v4 是允许升级的旧版本。每个受支持版本都必须精确匹配 DUFS 定义的表、列契约、表约束和索引，且不允许额外表、索引、触发器或视图；这会拒绝仅伪造 `user_version`、删改列约束、改变部分索引谓词或夹带持久触发器的数据库。v2 在一个 `BEGIN IMMEDIATE` 事务内重新核验源 schema，再依次增加上传 target revision/确认状态、purge trash revision 并提升到 v5；v3 重验后增加 purge revision，v4 重验后只提升版本，三条路径都在提交前再次精确核验所得 v5；空白库也在创建事务提交前核验 v5。v4→v5 的含义变化由随后启动恢复完成：旧版同目录 stage 必须匹配持久 dev/inode，文件 rename 和源/目标目录同步完成后才精确 CAS 数据库路径；版本先提升，因此旧二进制不能在部分迁移后降级打开。其他版本、结构漂移的 DUFS 数据库、其他应用数据库、错误共享根或非 SQLite 文件都会在零修改下拒绝；应改用新的私有状态目录。迁移后的旧 purge 行没有已提交 trash revision，恢复会 quarantine 当前 trash occupant、保留目标并释放 intent，而不是猜测删除。不要绕过这些失败，也不要把同一文件复制给另一共享根复用。
+状态库固定使用 SQLite rollback journal `DELETE` 模式和 `synchronous=EXTRA`，由单独状态线程串行访问。数据库文件以 `0600` 使用，必须位于共享根之外；已有数据库还必须是非符号链接、单硬链接普通文件，并绑定创建时共享根的设备号和 inode。任何 SQLite 连接打开前，固定 `-journal/-wal/-shm` 都要经 `lstat`、`O_NOFOLLOW|O_NONBLOCK` 打开、`fstat` 和打开前后身份复核，拒绝符号链接、特殊文件、多硬链接、出现/消失或替换；主库不存在时不接受任何孤立 sidecar。现存主库从 no-follow fd 复制到进程私有临时目录形成不叠加 sidecar 的 raw baseline，先验证精确的五列 `product_metadata`、`dufs-ram` 应用名、当前 Cargo 版本、schema revision 1、统一 SHA-256 指纹、根绑定和完整性，再由原路径连接验证合并视图。指纹对排除 `sqlite_*` 与 `product_metadata` 后按 `type/name/tbl_name/sql` 排序的原始字段逐个编码 u64 大端长度和字段字节。只有空库会创建当前 schema；任何旧版本、无标记库、版本/指纹/对象漂移、其他应用数据库、错误共享根或非 SQLite 文件都会在 chmod、journal mode 和恢复写入前拒绝，主库及全部 sidecar 保持原字节、mode 和身份。运行服务不提供 schema migration；应先停服并使用独立升级流程，不要绕过失败或把同一文件复制给另一共享根复用。
 
 SQLite 提交与共享根中的 mkdir、rename、文件同步和目录 `fsync` 不属于一个共同事务。operation/upload 崩溃恢复中的 `unknown` 是保守结果，不是回滚记录。DELETE 先持久化含根内相对目标/trash 路径和源 dev/inode/类型的 `Prepared` outbox，再做 checked rename 与父目录 `fsync`；成功后才把覆盖 dev/inode、类型、链接数、大小、uid/gid、完整 mode 和纳秒级 mtime/ctime 的 32 字节 trash revision 与 `Ready` 原子写入。worker 把到期 job 原子 claim 为 `Claimed`，并用 revision 与持续 fd 锚点共同复核；普通 I/O 失败持久化回 `Ready` 并从 100 ms 指数退避到最长 30 秒。若 state-store 的 defer/complete 命令瞬时失败，worker 会有界保留本地 claim，并在回读确认数据库仍为 `Claimed` 后重试；重启也会把遗留 `Claimed` 恢复为 `Ready`。`Prepared` 没有已提交 revision，reconciler 始终保留目标，把 trash 路径上的任何 occupant 移入 `.dufs-quarantine-<uuid>.hold` 后释放 intent，绝不再依据弱源 inode 推断 rename 结果。`Ready/Claimed` 缺失 revision、身份不匹配或最终删除出现 `InvalidData` 时同样 quarantine 整棵 trash 根并释放 job。每个最终 unlink/rmdir 候选先移入随机隔离名，再用既有 fd 复核；`ENOTEMPTY/EXIST` 等异常不从 cursor 0 重扫。DFS 最多保留 2048 层目录 frame，每次 push 都用 `try_reserve`；超深树返回 `InvalidData` 并把剩余 trash 根永久隔离，内存预留失败则保留游标供以后重试。未记账 orphan 在兜底通道满、取消或普通 I/O 失败时保持隐藏，等待以后 maintenance 重新发现；若 purge 判定为 `InvalidData`，整棵根立即进入永久 quarantine。quarantine 永不由 maintenance 自动清理；发现后应停止 Dufs，核对内容、owner、来源日志和状态库再手工移除。递归清理不会进入 trash 下的嵌套/bind mount，普通 mount 边界 I/O 故障保留 job 并退避，卸载后继续。能用 inotify 竞争随机隔离名的恶意同 UID writer 仍不在支持边界内。
 
@@ -208,7 +208,7 @@ install -d -m 0700 ./dist
 ```sh
 set -eu
 
-bundle=/secure/releases/dufs-0.49.7-x86_64-unknown-linux-gnu-0123456789ab.release
+bundle=/secure/releases/dufs-0.50.0-x86_64-unknown-linux-gnu-0123456789ab.release
 pinned_public_key=/secure/trust/dufs-release-public.pem
 test -d "$bundle"
 test ! -L "$bundle"
@@ -233,7 +233,7 @@ test ! -L "$release_dir"
 (cd "$release_dir" && sha256sum --check SHA256SUMS)
 
 # 从独立可信的发布记录填写完整值，不从同一下载目录自行推断。
-expected_version=0.49.7
+expected_version=0.50.0
 expected_sha=0123456789abcdef0123456789abcdef01234567
 expected_target=x86_64-unknown-linux-gnu
 test "$("$release_dir/dufs" --version)" = \

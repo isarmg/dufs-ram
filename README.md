@@ -193,7 +193,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 - 若进程在嵌套候选已经移入随机隔离名、尚未完成 unlink 时中断，后续 orphan maintenance 会把 trash 树中的该隔离名视为 `InvalidData`，将整棵根永久 quarantine，而不是把它当普通子项继续自动删除；
 - 内部删除暂存项不是回收站，不提供恢复或撤销功能。
 
-统一 state store 当前使用文件型 SQLite schema v5，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。任何 SQLite 打开前，现存 `-journal/-wal/-shm` 都必须以 no-follow fd 证明是身份稳定的单硬链接普通文件；主库不存在时任何 sidecar 都会阻止初始化。现存主库还会先从持有的 no-follow fd 建立不叠加 sidecar 的私有 raw snapshot，验证其自身 DUFS application id、受支持的精确 schema、共享根绑定和完整性；随后原路径的普通只读/读写连接必须再次验证合并视图，通过后才允许 chmod、journal 配置或恢复写入。这阻止 WAL 把空白、外来或不受支持的旧主库伪装成 v5，失败不会恢复或改写主库及 sidecar。受支持的 v2/v3/v4/v5 必须精确匹配项目定义的表、列类型、`NOT NULL`/默认值/主键/`CHECK`、`STRICT`/`WITHOUT ROWID`、索引键/唯一性/来源/部分谓词，并且不能夹带额外表、索引、触发器或视图；迁移事务取得 `BEGIN IMMEDIATE` 后会重验源 schema，并在提交前核验所得 v5。空白新库会直接建立并核验 v5。经严格检查的 v2 会在一个事务内依次完成上传 target revision/确认状态、purge trash revision 和 v5 版本迁移，v3 会依次完成 purge 与 v5 迁移，v4 则先原子提升到 v5，再由启动恢复把旧版同目录 stage 按持久 inode 身份迁入私有 `0700` 子目录。先提升数据库版本可阻止旧二进制在部分文件系统迁移后重新打开；每个 stage 都先完成 rename 与目录同步，再精确 CAS 更新其数据库路径。其他版本或结构漂移在零修改下明确拒绝。迁移得到的旧 purge job 没有已提交 revision，恢复时会按上述 quarantine/release 规则失败关闭。误指向其他数据库或非 SQLite 文件同样会零修改拒绝；部署时也不能通过 bind mount 等别名让数据库实际落回共享根。
+统一 state store 当前使用文件型 SQLite schema revision 1，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。任何 SQLite 打开前，现存 `-journal/-wal/-shm` 都必须以 no-follow fd 证明是身份稳定的单硬链接普通文件；主库不存在时任何 sidecar 都会阻止初始化。现存主库还会先从持有的 no-follow fd 建立不叠加 sidecar 的私有 raw snapshot，验证五列 `product_metadata` 契约、`application='dufs-ram'`、与当前二进制完全一致的 Cargo 版本、schema revision、统一 schema SHA-256、共享根绑定和完整性；随后原路径连接再次验证合并视图，通过后才允许 chmod、journal 配置或恢复写入。schema 指纹按 `sqlite_schema` 的 `type/name/tbl_name/sql` 排序，排除 `sqlite_*` 与 `product_metadata`，并对每个原始字段写入 u64 大端长度和字段字节后计算 SHA-256。只有不存在或不含持久对象的空数据库会初始化当前 schema；旧版本、无 `product_metadata`、版本或指纹漂移、额外对象及其他应用数据库全部在任何持久修改前拒绝，主库与 sidecar 字节、mode 和身份保持不变。版本/格式转换由独立升级流程负责，运行服务不执行 schema migration。
 
 文件型状态库启动恢复会删除 operation 中尚未进入文件系统提交边界的 `Reserved`，把 operation `CommitStarted` 转换为 `Completed/unknown`，把 upload `CommitStarted` 转换为 `Unknown` 并从恢复时刻重新给予完整的 upload session TTL，并把 purge `Claimed` 重置为可立即重试的 `Ready`。operation 终态 TTL 为 15 分钟；upload session TTL 为 7 天，容量为全局 16384、每账号 4096；purge job 没有固定失败次数或 TTL 逃生口，容量为全局 4096、每账号 1024。普通 I/O 故障保留 job 并退避；缺少已提交 revision、身份歧义或最终删除异常则 quarantine 当前对象并释放 job。SQLite 使用 rollback journal `DELETE` 模式和 `synchronous=EXTRA`。SQLite 事务与文件系统 mkdir、rename、文件/目录 `fsync` 不是一个共同事务：operation/upload 在跨域缝隙中恢复为 `unknown`；purge 只有 live DELETE 在 rename 与父目录同步后原子写入的完整 trash revision 才授权后续回收，`Prepared` 恢复从不以数据库意图猜测文件系统结果。
 
@@ -578,7 +578,7 @@ git status --short
 │       │   ├── dispatch.rs         # 认证后端点与文件请求分发
 │       │   └── request.rs          # 单次解析的请求分类与 mutation 进度
 │       ├── session.rs              # 登录、注销与写请求校验
-│       ├── state_store.rs           # schema v5 文件 SQLite 统一控制面 API
+│       ├── state_store.rs           # 当前 revision 1 文件 SQLite 统一控制面 API
 │       ├── state_store/
 │       │   ├── actor.rs             # 有界命令 actor 与 live readiness 探针
 │       │   ├── database.rs          # 数据库打开、schema 与恢复

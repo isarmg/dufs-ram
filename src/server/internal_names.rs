@@ -9,7 +9,7 @@ pub(super) const UPLOAD_TEMP_PREFIX: &str = ".dufs-upload-";
 pub(super) const UPLOAD_TEMP_SUFFIX: &str = ".part";
 // Keep the private directory inside a quarantine-name shape understood by
 // v0.48 and earlier. Those releases therefore hide it and never recurse into
-// it even if an operator rolls the binary back; schema v5 independently
+// it even if an operator rolls the binary back; the current schema independently
 // prevents such a downgrade from opening the state database. Production
 // quarantine names use UUID v4, so the nil UUID cannot collide with one.
 pub(super) const UPLOAD_STAGE_DIRECTORY: &str =
