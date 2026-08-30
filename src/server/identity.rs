@@ -8,17 +8,12 @@ use sha2::{Digest, Sha256};
 ///
 /// This is an unkeyed SHA-256 digest, not a secrecy boundary: low-entropy
 /// account names can be recovered by dictionary enumeration.
-///
-/// `persistent` deliberately keeps the historical unscoped SHA-256 wire
-/// representation: operation, upload, and purge rows written by older
-/// versions must remain addressable after an upgrade. Ephemeral consumers can
-/// opt into a domain-separated digest instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OwnerId([u8; 32]);
 
 impl OwnerId {
     pub(super) fn persistent(owner: &str) -> Self {
-        Self(Sha256::digest(owner.as_bytes()).into())
+        Self::domain_separated(b"dufs-durable-owner-v1\0", owner)
     }
 
     pub(super) fn listing_snapshot(owner: &str) -> Self {
@@ -62,10 +57,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persistent_owner_id_preserves_the_existing_digest() {
+    fn persistent_owner_id_uses_the_current_durable_domain() {
         assert_eq!(
             OwnerId::persistent("alice").to_hex(),
-            "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+            "35ad2994ff78c7cbd371449a5f087bd5bd23f766c5cd46825ca6be1a2addb5e4"
         );
     }
 
