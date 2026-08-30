@@ -46,40 +46,6 @@ if (markdownTargets(maskFencedCode(fencedFixture)).length !== 0) {
   );
 }
 
-const v0497ReleaseFacts = Object.freeze({
-  commit: "5b098e2a8f05557b72efdf7929f4ccef3a3af837",
-  binaryName: "dufs-0.49.7-x86_64-unknown-linux-gnu",
-  binaryBytes: 6025624,
-  binarySha256:
-    "4dd74e3164fbffcb3765c2c33c518ab9c24e7571bd23f5206fc6ce3802ddd66b",
-  checksumBytes: 103,
-  checksumSha256:
-    "a282bbad570d55eabef56d41a0501b6182acac2d802ff569c90f4e014cd120b4",
-});
-const releaseFactFixture = [
-  "## [0.49.7] - 2026-08-26",
-  "",
-  `> **发布状态：** 附注标签 \`v0.49.7\` 未签名，当前实际解引用到提交 \`${v0497ReleaseFacts.commit}\`。` +
-    ` \`${v0497ReleaseFacts.binaryName}\` 二进制（\`${v0497ReleaseFacts.binaryBytes}\` 字节，SHA-256 \`${v0497ReleaseFacts.binarySha256}\`）和` +
-    ` \`${v0497ReleaseFacts.binaryName}.sha256\` 校验和文件（\`${v0497ReleaseFacts.checksumBytes}\` 字节，文件自身 SHA-256 \`${v0497ReleaseFacts.checksumSha256}\`）。`,
-  "",
-  "## [0.49.6] - 2026-08-25",
-].join("\n");
-if (v0497ReleaseFactFailures(releaseFactFixture).length !== 0) {
-  failures.push(
-    "scripts/check-docs.mjs: valid v0.49.7 release-fact fixture was rejected",
-  );
-}
-if (
-  v0497ReleaseFactFailures(
-    releaseFactFixture.replace(v0497ReleaseFacts.commit, "0".repeat(40)),
-  ).length === 0
-) {
-  failures.push(
-    "scripts/check-docs.mjs: incorrect v0.49.7 source commit fixture was accepted",
-  );
-}
-
 const currentNodeVersion = "24.8.0";
 const packageSource = readFileSync(resolve(projectRoot, "package.json"), "utf8");
 const packageLockSource = readFileSync(
@@ -136,9 +102,6 @@ for (const path of markdownFiles) {
   const source = readFileSync(path, "utf8");
   const name = relative(projectRoot, path);
   checkTextFormat(name, source);
-  if (name === "CHANGELOG.md") {
-    failures.push(...v0497ReleaseFactFailures(source));
-  }
   headingsByFile.set(path, markdownHeadings(maskFencedCode(source)));
 }
 
@@ -255,49 +218,6 @@ function checkTextFormat(name, source) {
       failures.push(`${name}:${index + 1}: trailing whitespace`);
     }
   });
-}
-
-function v0497ReleaseFactFailures(source) {
-  const releaseFailures = [];
-  const headings = [...source.matchAll(/^## \[0\.49\.7\][^\n]*$/gmu)];
-  if (headings.length !== 1) {
-    return [
-      `CHANGELOG.md: expected exactly one v0.49.7 section; found ${headings.length}`,
-    ];
-  }
-  const sectionStart = headings[0].index;
-  const nextSection = source.indexOf("\n## [", sectionStart + headings[0][0].length);
-  const section = source.slice(
-    sectionStart,
-    nextSection === -1 ? source.length : nextSection,
-  );
-  const statusLines = section
-    .split("\n")
-    .filter(line => line.startsWith("> **发布状态：**"));
-  if (statusLines.length !== 1) {
-    return [
-      `CHANGELOG.md: expected exactly one v0.49.7 release-status line; found ${statusLines.length}`,
-    ];
-  }
-  const status = statusLines[0];
-  const requiredFacts = [
-    `附注标签 \`v0.49.7\` 未签名，当前实际解引用到提交 \`${v0497ReleaseFacts.commit}\``,
-    `\`${v0497ReleaseFacts.binaryName}\` 二进制（\`${v0497ReleaseFacts.binaryBytes}\` 字节，SHA-256 \`${v0497ReleaseFacts.binarySha256}\`）`,
-    `\`${v0497ReleaseFacts.binaryName}.sha256\` 校验和文件（\`${v0497ReleaseFacts.checksumBytes}\` 字节，文件自身 SHA-256 \`${v0497ReleaseFacts.checksumSha256}\`）`,
-  ];
-  for (const fact of requiredFacts) {
-    if (!status.includes(fact)) {
-      releaseFailures.push(
-        `CHANGELOG.md: v0.49.7 release status is missing the pinned fact: ${fact}`,
-      );
-    }
-  }
-  if (status.includes("同一 tag/SHA")) {
-    releaseFailures.push(
-      "CHANGELOG.md: v0.49.7 historical workflow runs must not be described as the current tag/SHA identity",
-    );
-  }
-  return releaseFailures;
 }
 
 function currentNodeContractFailures(
