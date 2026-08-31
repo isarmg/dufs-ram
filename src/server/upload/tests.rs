@@ -879,6 +879,9 @@ fn maintenance_removes_expired_stages_and_trash_but_skips_active_files() {
 fn maintenance_batches_resume_to_reach_deep_directories() {
     const DEPTH: usize = 12;
     const ENTRY_BUDGET: usize = 2;
+    // The continuation contains the shared root, every ordinary nested
+    // directory, and the private upload-stage directory at the leaf.
+    const MAX_CONTINUATION_DEPTH: usize = DEPTH + 2;
 
     let temp = assert_fs::TempDir::new().unwrap();
     let mut directory = temp.path().to_path_buf();
@@ -917,7 +920,7 @@ fn maintenance_batches_resume_to_reach_deep_directories() {
         );
         assert!(examined <= ENTRY_BUDGET);
         assert!(
-            next.directories.len() <= DEPTH + 1,
+            next.directories.len() <= MAX_CONTINUATION_DEPTH,
             "the DFS continuation stack must remain depth-bounded"
         );
         state = next;
