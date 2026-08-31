@@ -2,6 +2,8 @@ import { createActionDialogs } from "./operations/dialogs.js";
 import { createFileOperations } from "./operations/file_operations.js";
 import { createDirectoryListing } from "./listing/controller.js";
 import { createElement, createIcon, errorMessage } from "./shared/dom.js";
+// Dufs is the suite's explicit React/Vite migration exception: this client
+// remains a browser-native ES-module application with no framework bootstrap.
 import { parseIndexData } from "./shared/index_data.js";
 import { currentPageUrl } from "./shared/path.js";
 import { createUploadManager } from "./upload/manager.js";
@@ -206,7 +208,7 @@ function setupFileDropGuard() {
 
 function setupAuth() {
   const logout = requiredElement(".logout-btn", HTMLButtonElement);
-  requiredElement(".user-name", HTMLElement).textContent = data.user;
+  requiredElement(".user-name", HTMLElement).textContent = data.session.username;
   logout.classList.remove("hidden");
   logout.addEventListener("click", () => {
     void fileOperations.logout();

@@ -51,8 +51,13 @@ const ERROR_CODE_STATUS = Object.freeze({
  * @typedef {{
  *   href: string,
  *   dir_exists: boolean,
- *   user: string,
- *   csrf_token: string,
+ *   session: {
+ *     authenticated: true,
+ *     user_id: string,
+ *     username: string,
+ *     role: "admin",
+ *     csrf_token: string,
+ *   },
  * }} IndexData
  */
 
@@ -111,7 +116,7 @@ export function createFileOperations(options) {
         () => requestNoContent(childUrl(file.name), {
           method: "DELETE",
           headers: {
-            [CSRF_HEADER]: data.csrf_token,
+            [CSRF_HEADER]: data.session.csrf_token,
             [OPERATION_ID_HEADER]: operationId,
             "If-Match": `"${file.revision}"`,
           },
@@ -337,10 +342,10 @@ export function createFileOperations(options) {
     const returnFocus = document.querySelector(".logout-btn");
     if (!begin("logout", returnFocus, "Signing out…")) return;
     try {
-      const response = await requestNoContent("/__dufs__/logout", {
+      const response = await requestNoContent("/api/v2/auth/logout", {
         method: "POST",
         headers: {
-          [CSRF_HEADER]: data.csrf_token,
+          [CSRF_HEADER]: data.session.csrf_token,
         },
       }, {
         outcomeUnknown: true,
@@ -407,7 +412,7 @@ export function createFileOperations(options) {
           const response = await requestNoContent(targetUrl, {
             method: "PUT",
             headers: {
-              [CSRF_HEADER]: data.csrf_token,
+              [CSRF_HEADER]: data.session.csrf_token,
               [UPLOAD_ID_HEADER]: uploadId,
               [UPLOAD_LENGTH_HEADER]: "0",
               [UPLOAD_OVERWRITE_HEADER]: "false",
@@ -483,7 +488,7 @@ export function createFileOperations(options) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            [CSRF_HEADER]: data.csrf_token,
+            [CSRF_HEADER]: data.session.csrf_token,
           },
           body: JSON.stringify({ paths: [path] }),
         },
@@ -529,7 +534,7 @@ export function createFileOperations(options) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            [CSRF_HEADER]: data.csrf_token,
+            [CSRF_HEADER]: data.session.csrf_token,
           },
           body: JSON.stringify({
             path: logicalPath(name),
@@ -624,7 +629,7 @@ export function createFileOperations(options) {
   function postBrowserApi(action, body) {
     return postJson(
       `/__dufs__/api/${action}`,
-      data.csrf_token,
+      data.session.csrf_token,
       body,
     );
   }

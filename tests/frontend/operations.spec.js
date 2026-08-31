@@ -8,6 +8,7 @@ const {
   pageData,
   rotateSession,
   rowByName,
+  sameOriginRequestHeaders,
   selectFiles,
   submitActionDialog,
   test,
@@ -80,6 +81,18 @@ function inlineNameInput(page) {
   return page.locator(".inline-name-input");
 }
 
+async function fetchSameOriginRoute(route) {
+  return route.fetch({
+    headers: {
+      ...(await route.request().allHeaders()),
+      // route.fetch() is an APIRequestContext request, so Playwright does not
+      // synthesize the Fetch Metadata header that the intercepted browser
+      // request would have sent to the server.
+      "Sec-Fetch-Site": "same-origin",
+    },
+  });
+}
+
 async function expectSelection(input, start, end) {
   expect(await input.evaluate(element => ({
     start: element.selectionStart,
@@ -94,8 +107,9 @@ async function seedFolder(page, name) {
     new URL("/__dufs__/api/mkdir", page.url()).href,
     {
       headers: {
+        ...sameOriginRequestHeaders(page),
         "Content-Type": "application/json",
-        "X-Dufs-CSRF-Token": data.csrf_token,
+        "X-CSRF-Token": data.session.csrf_token,
         "X-Dufs-Operation-Id": randomUUID(),
       },
       data: { path: `${root}/${name}` },
@@ -108,7 +122,8 @@ async function seedEmptyFile(page, name) {
   const data = await pageData(page);
   const response = await page.context().request.put(currentUrl(page, name), {
     headers: {
-      "X-Dufs-CSRF-Token": data.csrf_token,
+      ...sameOriginRequestHeaders(page),
+      "X-CSRF-Token": data.session.csrf_token,
       "X-Dufs-Upload-Id": randomUUID(),
       "X-Dufs-Upload-Length": "0",
       "X-Dufs-Upload-Overwrite": "false",
@@ -1617,7 +1632,7 @@ test("重命名目标存在时只有确认后才显式覆盖", async ({
       request.name === "overwrite-target.txt" &&
       request.overwrite === false
     ) {
-      const response = await route.fetch();
+      const response = await fetchSameOriginRoute(route);
       targetRevision = response.headers()["x-dufs-target-revision"] || "";
       await route.fulfill({ response });
       return;
@@ -2167,7 +2182,7 @@ test("状态查询确认成功后安全更新页面", async ({ appPage: page }) 
       return;
     }
     operationId = route.request().headers()["x-dufs-operation-id"];
-    const response = await route.fetch();
+    const response = await fetchSameOriginRoute(route);
     backendDeleteStatus = response.status();
     await requestGate;
     try {

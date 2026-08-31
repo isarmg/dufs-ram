@@ -35,8 +35,13 @@ function isRefreshableDirectoryChange(error) {
  * @typedef {{
  *   href: string,
  *   dir_exists: boolean,
- *   user: string,
- *   csrf_token: string,
+ *   session: {
+ *     authenticated: true,
+ *     user_id: string,
+ *     username: string,
+ *     role: "admin",
+ *     csrf_token: string,
+ *   },
  * }} IndexData
  */
 

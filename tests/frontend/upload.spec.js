@@ -2863,7 +2863,7 @@ test("刷新后不会按同名同大小同 mtime 自动续传另一份内容", a
     const response = await fetch(payload.target, {
       method: "PUT",
       headers: {
-        "X-Dufs-CSRF-Token": payload.csrf,
+        "X-CSRF-Token": payload.csrf,
         "X-Dufs-Upload-Id": payload.uploadId,
         "X-Dufs-Upload-Length": "8",
       },
@@ -2875,7 +2875,7 @@ test("刷新后不会按同名同大小同 mtime 自动续传另一份内容", a
     };
   }, {
     target,
-    csrf: data.csrf_token,
+    csrf: data.session.csrf_token,
     uploadId: oldUploadId,
   });
   expect(checkpoint).toEqual({ status: 409, offset: "4" });

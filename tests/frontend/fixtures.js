@@ -46,14 +46,20 @@ async function submitKnownLogin(page, username) {
     await page.getByLabel("Username").fill(username);
     await page.getByLabel("Password").fill(TEST_PASSWORD);
     const [response] = await Promise.all([
-      page.waitForNavigation({ waitUntil: "load" }),
+      page.waitForResponse(candidate =>
+        candidate.request().method() === "POST" &&
+        new URL(candidate.url()).pathname === "/api/v2/auth/login"
+      ),
       page.getByRole("button", { name: "Sign in" }).click(),
     ]);
-    if (new URL(page.url()).pathname === "/") return;
+    if (response.status() === 200) {
+      await page.waitForURL(url => url.pathname === "/", { waitUntil: "load" });
+      return;
+    }
 
     const message = (await page.getByRole("alert").textContent())?.trim() || "";
-    if (response?.status() !== 429 || message !== RATE_LIMIT_LOGIN_ERROR) {
-      throw new Error(`Test sign-in failed: ${message || `HTTP ${response?.status() || 0}`}`);
+    if (response.status() !== 429 || message !== RATE_LIMIT_LOGIN_ERROR) {
+      throw new Error(`Test sign-in failed: ${message || `HTTP ${response.status()}`}`);
     }
     if (attempt === MAX_LOGIN_ATTEMPTS) {
       throw new Error(
@@ -103,7 +109,7 @@ const test = base.extend({
 });
 
 async function rotateSession(page) {
-  const username = (await pageData(page)).user;
+  const username = (await pageData(page)).session.username;
   const relogin = await page.context().newPage();
   await relogin.goto("/__dufs__/login");
   await submitKnownLogin(relogin, username);
@@ -114,6 +120,7 @@ async function seedWorkspace(page, root) {
   const data = await pageData(page);
   const request = page.context().request;
   const apiUrl = new URL("/__dufs__/api/mkdir", page.url()).href;
+  const sourceHeaders = sameOriginRequestHeaders(page);
   for (const path of [root, ...SEED_DIRECTORIES.map(name => `${root}/${name}`)]) {
     const operationId = randomUUID();
     const response = await request.post(apiUrl, {
@@ -122,8 +129,9 @@ async function seedWorkspace(page, root) {
       // the server committed the mkdir operation.
       maxRetries: 1,
       headers: {
+        ...sourceHeaders,
         "Content-Type": "application/json",
-        "X-Dufs-CSRF-Token": data.csrf_token,
+        "X-CSRF-Token": data.session.csrf_token,
         "X-Dufs-Operation-Id": operationId,
       },
       data: { path },
@@ -138,7 +146,8 @@ async function seedWorkspace(page, root) {
     const body = Buffer.from(contents);
     const response = await request.put(logicalPathUrl(page, `${root}/${name}`), {
       headers: {
-        "X-Dufs-CSRF-Token": data.csrf_token,
+        ...sourceHeaders,
+        "X-CSRF-Token": data.session.csrf_token,
         "X-Dufs-Upload-Id": randomUUID(),
         "X-Dufs-Upload-Length": String(body.length),
       },
@@ -150,6 +159,15 @@ async function seedWorkspace(page, root) {
       );
     }
   }
+}
+
+function sameOriginRequestHeaders(page) {
+  return {
+    // APIRequestContext shares browser cookies but does not synthesize Fetch
+    // Metadata. Supply the exact browser proof required by the CSRF boundary.
+    Origin: new URL(page.url()).origin,
+    "Sec-Fetch-Site": "same-origin",
+  };
 }
 
 function rowByName(page, name) {
@@ -252,6 +270,7 @@ module.exports = {
   pageData,
   rotateSession,
   rowByName,
+  sameOriginRequestHeaders,
   selectFiles,
   submitActionDialog,
   test,

@@ -10,7 +10,7 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
   // 30-second UI-test budget on constrained builders even when every individual
   // request remains within its protocol deadline.
   test.slow();
-  const usernameValue = (await pageData(page)).user;
+  const usernameValue = (await pageData(page)).session.username;
   const anonymous = await browser.newContext({ ignoreHTTPSErrors: true });
   const loginPage = await anonymous.newPage();
   await loginPage.goto(testInfo.project.use.baseURL);
@@ -25,7 +25,7 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
   loginPage.on("request", request => {
     if (
       request.method() === "POST" &&
-      new URL(request.url()).pathname === "/__dufs__/login"
+      new URL(request.url()).pathname === "/api/v2/auth/login"
     ) {
       emptyLoginPosts++;
     }
@@ -38,7 +38,12 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
 
   await username.fill(usernameValue);
   await password.fill("wrong-password");
+  const rejectedLogin = loginPage.waitForResponse(response =>
+    response.request().method() === "POST" &&
+    new URL(response.url()).pathname === "/api/v2/auth/login"
+  );
   await submit.click();
+  expect((await rejectedLogin).status()).toBe(401);
   await expect(alert).toHaveText("Invalid username or password.");
   expect(
     (await anonymous.cookies()).find(
@@ -60,7 +65,7 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
   const logoutResponse = page.waitForResponse(
     response =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname.endsWith("/__dufs__/logout"),
+      new URL(response.url()).pathname === "/api/v2/auth/logout",
   );
   await Promise.all([
     page.waitForURL(/\/__dufs__\/login$/),
@@ -137,8 +142,12 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
   expect(response.headers()["content-security-policy"]).toContain(
     "script-src 'sha256-",
   );
+  expect(response.headers()["content-security-policy"]).toContain(
+    "connect-src 'self'",
+  );
 
   const password = page.getByLabel("Password");
+  await expect(password).toHaveAttribute("data-min-bytes", "12");
   await expect(password).toHaveAttribute("data-max-bytes", "1024");
   expect(await password.getAttribute("maxlength")).toBeNull();
 
@@ -156,7 +165,7 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
   page.on("request", request => {
     if (
       request.method() === "POST" &&
-      new URL(request.url()).pathname === "/__dufs__/login"
+      new URL(request.url()).pathname === "/api/v2/auth/login"
     ) {
       loginPosts += 1;
     }
@@ -169,7 +178,7 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
     })),
   ).toEqual({
     bytes: 1025,
-    message: "Password must not exceed 1024 UTF-8 bytes.",
+    message: "Password must contain 12 to 1024 UTF-8 bytes and no control characters.",
   });
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(/\/__dufs__\/login$/);

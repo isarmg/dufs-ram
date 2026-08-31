@@ -5,26 +5,29 @@ import {
   parseIndexData,
 } from "../../../clients/web/modules/shared/index_data.js";
 
+const VALID_SESSION = Object.freeze({
+  authenticated: true,
+  user_id: `dufs:${"a".repeat(64)}`,
+  username: "admin",
+  role: "admin",
+  csrf_token: "A".repeat(43),
+});
 const VALID_INDEX_DATA = Object.freeze({
   href: "/folder/文件 & name",
   dir_exists: true,
-  user: "browser-user",
-  csrf_token: "0123456789abcdef".repeat(4),
+  session: VALID_SESSION,
 });
 
-test("embedded index data returns only a fresh frozen validated record", () => {
-  const input = { ...VALID_INDEX_DATA };
+test("embedded index data returns only a fresh deeply frozen validated record", () => {
+  const input = { ...VALID_INDEX_DATA, session: { ...VALID_SESSION } };
   const parsed = parseIndexData(input);
 
   assert.deepEqual(parsed, VALID_INDEX_DATA);
   assert.notEqual(parsed, input);
+  assert.notEqual(parsed.session, input.session);
   assert.equal(Object.isFrozen(parsed), true);
-  assert.deepEqual(Object.keys(parsed), [
-    "href",
-    "dir_exists",
-    "user",
-    "csrf_token",
-  ]);
+  assert.equal(Object.isFrozen(parsed.session), true);
+  assert.deepEqual(Object.keys(parsed), ["href", "dir_exists", "session"]);
 
   const nullPrototype = Object.assign(
     Object.create(null),
@@ -54,26 +57,24 @@ test("embedded index data rejects non-records and non-plain objects", () => {
   }
 });
 
-test("embedded index data requires exactly four own data properties", () => {
+test("embedded index data requires exactly three own data properties", () => {
   for (const key of Object.keys(VALID_INDEX_DATA)) {
     const missing = { ...VALID_INDEX_DATA };
     delete missing[key];
     assert.throws(
       () => parseIndexData(missing),
-      /expected exactly href, dir_exists, user, and csrf_token/,
+      /expected exactly href, dir_exists, and session/,
     );
   }
-  assert.throws(
-    () => parseIndexData({ ...VALID_INDEX_DATA, extra: true }),
-    /expected exactly href, dir_exists, user, and csrf_token/,
-  );
-  assert.throws(
-    () => parseIndexData({
-      ...VALID_INDEX_DATA,
-      [Symbol("extra")]: true,
-    }),
-    /expected exactly href, dir_exists, user, and csrf_token/,
-  );
+  for (const extra of [
+    { extra: true },
+    { [Symbol("extra")]: true },
+  ]) {
+    assert.throws(
+      () => parseIndexData({ ...VALID_INDEX_DATA, ...extra }),
+      /expected exactly href, dir_exists, and session/,
+    );
+  }
 
   let hrefReads = 0;
   const accessor = { ...VALID_INDEX_DATA };
@@ -84,10 +85,7 @@ test("embedded index data requires exactly four own data properties", () => {
       return "/";
     },
   });
-  assert.throws(
-    () => parseIndexData(accessor),
-    /href must be a data property/,
-  );
+  assert.throws(() => parseIndexData(accessor), /href must be a data property/);
   assert.equal(hrefReads, 0);
 });
 
@@ -129,7 +127,7 @@ test("embedded index data accepts only canonical absolute logical paths", () => 
   }
 });
 
-test("embedded index data enforces boolean and UTF-8 user fields", () => {
+test("embedded index data enforces boolean and exact administrator session fields", () => {
   assert.equal(
     parseIndexData({ ...VALID_INDEX_DATA, dir_exists: false }).dir_exists,
     false,
@@ -141,46 +139,72 @@ test("embedded index data enforces boolean and UTF-8 user fields", () => {
     );
   }
 
-  const exactAscii = "a".repeat(128);
-  const exactUnicode = `${"界".repeat(42)}ab`;
-  assert.equal(
-    parseIndexData({ ...VALID_INDEX_DATA, user: exactAscii }).user,
-    exactAscii,
+  for (const key of Object.keys(VALID_SESSION)) {
+    const session = { ...VALID_SESSION };
+    delete session[key];
+    assert.throws(
+      () => parseIndexData({ ...VALID_INDEX_DATA, session }),
+      /session must contain exactly authenticated, user_id, username, role, and csrf_token/,
+    );
+  }
+  assert.throws(
+    () => parseIndexData({
+      ...VALID_INDEX_DATA,
+      session: { ...VALID_SESSION, extra: true },
+    }),
+    /session must contain exactly authenticated, user_id, username, role, and csrf_token/,
   );
-  assert.equal(
-    parseIndexData({ ...VALID_INDEX_DATA, user: exactUnicode }).user,
-    exactUnicode,
-  );
-  assert.equal(parseIndexData({ ...VALID_INDEX_DATA, user: "" }).user, "");
+});
 
-  for (const user of [
-    "a".repeat(129),
-    "界".repeat(43),
-    null,
-    42,
+test("embedded session admits only the current administrator identity contract", () => {
+  for (const username of ["adm", "admin..ops", "a_b-c.d", "a".repeat(64)]) {
+    assert.equal(
+      parseIndexData({
+        ...VALID_INDEX_DATA,
+        session: { ...VALID_SESSION, username },
+      }).session.username,
+      username,
+    );
+  }
+  for (const [field, value, message] of [
+    ["authenticated", false, /session.authenticated must be true/],
+    ["user_id", "space is invalid", /session.user_id must be a Foundation identifier/],
+    ["username", "ad", /session.username must be a canonical administrator username/],
+    ["username", "Admin", /session.username must be a canonical administrator username/],
+    ["username", "admin@name", /session.username must be a canonical administrator username/],
+    ["username", "-admin", /session.username must be a canonical administrator username/],
+    ["username", "admin-", /session.username must be a canonical administrator username/],
+    ["username", "a".repeat(65), /session.username must be a canonical administrator username/],
+    ["role", "viewer", /session.role must be admin/],
   ]) {
     assert.throws(
-      () => parseIndexData({ ...VALID_INDEX_DATA, user }),
-      /user must be a string no longer than 128 UTF-8 bytes/,
+      () => parseIndexData({
+        ...VALID_INDEX_DATA,
+        session: { ...VALID_SESSION, [field]: value },
+      }),
+      message,
     );
   }
 });
 
-test("embedded index data accepts only canonical CSRF tokens", () => {
+test("embedded session accepts only Foundation URL-safe CSRF tokens", () => {
   for (const csrf_token of [
     "",
-    "a".repeat(63),
-    "a".repeat(65),
-    "A".repeat(64),
-    "g".repeat(64),
-    "-".repeat(64),
+    "A".repeat(42),
+    "A".repeat(44),
+    "B".repeat(43),
+    "+".repeat(43),
+    "/".repeat(43),
     0,
     true,
     null,
   ]) {
     assert.throws(
-      () => parseIndexData({ ...VALID_INDEX_DATA, csrf_token }),
-      /csrf_token must be 64 lowercase hexadecimal characters/,
+      () => parseIndexData({
+        ...VALID_INDEX_DATA,
+        session: { ...VALID_SESSION, csrf_token },
+      }),
+      /session.csrf_token must be a Foundation URL-safe token/,
     );
   }
 });

@@ -1,17 +1,31 @@
 const INDEX_DATA_KEYS = Object.freeze([
   "href",
   "dir_exists",
-  "user",
+  "session",
+]);
+const SESSION_KEYS = Object.freeze([
+  "authenticated",
+  "user_id",
+  "username",
+  "role",
   "csrf_token",
 ]);
-const USER_UTF8_BYTES_LIMIT = 128;
+const CANONICAL_ADMINISTRATOR_USERNAME_PATTERN =
+  /^(?=.{3,64}$)[a-z0-9][a-z0-9._-]*[a-z0-9]$/u;
+const AUTHENTICATION_TOKEN_PATTERN =
+  /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 
 /**
  * @typedef {Readonly<{
  *   href: string,
  *   dir_exists: boolean,
- *   user: string,
- *   csrf_token: string,
+ *   session: Readonly<{
+ *     authenticated: true,
+ *     user_id: string,
+ *     username: string,
+ *     role: "admin",
+ *     csrf_token: string,
+ *   }>,
  * }>} IndexData
  */
 
@@ -34,13 +48,12 @@ export function parseIndexData(value) {
       typeof key === "string" && INDEX_DATA_KEYS.includes(key)
     )
   ) {
-    invalidIndexData("expected exactly href, dir_exists, user, and csrf_token");
+    invalidIndexData("expected exactly href, dir_exists, and session");
   }
 
   const href = ownDataValue(value, "href");
   const dirExists = ownDataValue(value, "dir_exists");
-  const user = ownDataValue(value, "user");
-  const csrfToken = ownDataValue(value, "csrf_token");
+  const session = parseAdministratorSession(ownDataValue(value, "session"));
 
   if (!isCanonicalAbsoluteLogicalPath(href)) {
     invalidIndexData("href must be a canonical absolute logical path");
@@ -48,27 +61,68 @@ export function parseIndexData(value) {
   if (typeof dirExists !== "boolean") {
     invalidIndexData("dir_exists must be a boolean");
   }
-  if (
-    typeof user !== "string" ||
-    new TextEncoder().encode(user).byteLength > USER_UTF8_BYTES_LIMIT
-  ) {
-    invalidIndexData(
-      `user must be a string no longer than ${USER_UTF8_BYTES_LIMIT} UTF-8 bytes`,
-    );
-  }
-  if (
-    typeof csrfToken !== "string" ||
-    !/^[0-9a-f]{64}$/u.test(csrfToken)
-  ) {
-    invalidIndexData("csrf_token must be 64 lowercase hexadecimal characters");
-  }
-
   return Object.freeze({
     href,
     dir_exists: dirExists,
-    user,
+    session,
+  });
+}
+
+/**
+ * Enforce the one current Foundation administrator-session contract before
+ * any product module receives authentication data. Dufs also enforces the
+ * Foundation 256-bit URL-safe token representation at this trust boundary.
+ *
+ * @param {unknown} value
+ * @returns {IndexData["session"]}
+ */
+function parseAdministratorSession(value) {
+  if (!isPlainRecord(value)) {
+    invalidIndexData("session must be a plain object");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== SESSION_KEYS.length ||
+    !keys.every(key => typeof key === "string" && SESSION_KEYS.includes(key))
+  ) {
+    invalidIndexData(
+      "session must contain exactly authenticated, user_id, username, role, and csrf_token",
+    );
+  }
+
+  const authenticated = ownDataValue(value, "authenticated");
+  const userId = ownDataValue(value, "user_id");
+  const username = ownDataValue(value, "username");
+  const role = ownDataValue(value, "role");
+  const csrfToken = ownDataValue(value, "csrf_token");
+  if (authenticated !== true) {
+    invalidIndexData("session.authenticated must be true");
+  }
+  if (typeof userId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(userId)) {
+    invalidIndexData("session.user_id must be a Foundation identifier");
+  }
+  if (!isCanonicalAdministratorUsername(username)) {
+    invalidIndexData("session.username must be a canonical administrator username");
+  }
+  if (role !== "admin") {
+    invalidIndexData("session.role must be admin");
+  }
+  if (typeof csrfToken !== "string" || !AUTHENTICATION_TOKEN_PATTERN.test(csrfToken)) {
+    invalidIndexData("session.csrf_token must be a Foundation URL-safe token");
+  }
+  return Object.freeze({
+    authenticated: true,
+    user_id: userId,
+    username,
+    role: "admin",
     csrf_token: csrfToken,
   });
+}
+
+/** @param {unknown} value @returns {value is string} */
+function isCanonicalAdministratorUsername(value) {
+  return typeof value === "string" &&
+    CANONICAL_ADMINISTRATOR_USERNAME_PATTERN.test(value);
 }
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */

@@ -15,7 +15,7 @@ export {
   SUCCESS_RESPONSE_BODY_LIMIT,
 } from "./response_buffer.js";
 
-export const CSRF_HEADER = "X-Dufs-CSRF-Token";
+export const CSRF_HEADER = "X-CSRF-Token";
 export const AUTH_ERROR_HEADER = "X-Dufs-Auth-Error";
 export const AUTH_REQUIRED_MESSAGE =
   "Your session is no longer valid. Returning to the sign-in page.";

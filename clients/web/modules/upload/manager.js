@@ -80,8 +80,13 @@ const UNKNOWN_UPLOAD_RESULT_MESSAGE =
  * @typedef {{
  *   href: string,
  *   dir_exists: boolean,
- *   user: string,
- *   csrf_token: string,
+ *   session: {
+ *     authenticated: true,
+ *     user_id: string,
+ *     username: string,
+ *     role: "admin",
+ *     csrf_token: string,
+ *   },
  *   max_concurrent_uploads?: number,
  * }} IndexData
  */
@@ -492,7 +497,7 @@ export function createUploadManager(options) {
         const resuming = forceResume || this.uploadOffset > 0;
         this.uploadRequestPhase = resuming ? "resume" : "fresh";
         const commonHeaders = {
-          [CSRF_HEADER]: data.csrf_token,
+          [CSRF_HEADER]: data.session.csrf_token,
           [UPLOAD_ID_HEADER]: this.uploadId,
           [UPLOAD_LENGTH_HEADER]: String(this.file.size),
           [UPLOAD_OVERWRITE_HEADER]: String(this.targetRevision !== null),
@@ -727,7 +732,7 @@ export function createUploadManager(options) {
           method: "PATCH",
           url: this.url,
           headers: {
-            [CSRF_HEADER]: data.csrf_token,
+            [CSRF_HEADER]: data.session.csrf_token,
             [UPLOAD_ID_HEADER]: this.uploadId,
             [UPLOAD_LENGTH_HEADER]: String(this.file.size),
             [UPLOAD_OFFSET_HEADER]: String(this.file.size),
@@ -761,7 +766,7 @@ export function createUploadManager(options) {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              [CSRF_HEADER]: data.csrf_token,
+              [CSRF_HEADER]: data.session.csrf_token,
             },
             body: JSON.stringify({
               path: this.logicalPath,
@@ -1389,7 +1394,7 @@ export function createUploadManager(options) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          [CSRF_HEADER]: data.csrf_token,
+          [CSRF_HEADER]: data.session.csrf_token,
         },
         body: JSON.stringify({ paths }),
       },
