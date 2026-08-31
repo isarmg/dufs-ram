@@ -155,11 +155,13 @@ toolchain="$(
   printf 'Unable to determine the pinned Rust toolchain.\n' >&2
   exit 1
 }
-host_target="$(
+detected_host_target="$(
   env RUSTUP_TOOLCHAIN="$toolchain" rustc -vV | sed -n 's/^host: //p'
 )"
-[[ -n "$host_target" && "$host_target" != *$'\n'* ]] || {
-  printf 'Unable to determine the release host target.\n' >&2
+host_target="x86_64-unknown-linux-gnu"
+[[ "$detected_host_target" == "$host_target" ]] || {
+  printf 'Formal DUFS release E2E requires Rust host %s; found %s.\n' \
+    "$host_target" "$detected_host_target" >&2
   exit 1
 }
 

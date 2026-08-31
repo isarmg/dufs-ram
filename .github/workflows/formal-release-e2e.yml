@@ -17,7 +17,8 @@ concurrency:
 
 env:
   NODE_VERSION: "24.8.0"
-  RUST_TOOLCHAIN: "1.97.1"
+  RUST_TOOLCHAIN: "1.98.0"
+  SERVER_TARGET: "x86_64-unknown-linux-gnu"
   SHELLCHECK_VERSION: "0.11.0"
   SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
   CARGO_LLVM_COV_VERSION: "0.8.6"
@@ -114,6 +115,8 @@ jobs:
 
           rustc +"$RUST_TOOLCHAIN" --version --verbose
           cargo +"$RUST_TOOLCHAIN" --version --verbose
+          test "$(rustc +"$RUST_TOOLCHAIN" -vV | sed -n 's/^host: //p')" = \
+            "$SERVER_TARGET"
           test "$(cargo audit --version)" = \
             "cargo-audit-audit $CARGO_AUDIT_VERSION"
           test "$(cargo cyclonedx --version)" = \

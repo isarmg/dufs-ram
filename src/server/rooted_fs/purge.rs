@@ -76,13 +76,16 @@ pub(in crate::server) enum TrashPurgeProgress {
 }
 
 pub(in crate::server) struct TrashPurgeError {
-    entry: TrashEntry,
+    // The entry contains the resumable DFS stack and open directory anchors.
+    // Box it so the error path retains that evidence without inflating every
+    // successful Result returned by a purge slice.
+    entry: Box<TrashEntry>,
     source: std::io::Error,
 }
 
 impl TrashPurgeError {
     pub(in crate::server) fn into_parts(self) -> (TrashEntry, std::io::Error) {
-        (self.entry, self.source)
+        (*self.entry, self.source)
     }
 }
 
@@ -182,9 +185,12 @@ impl TrashEntry {
         match result {
             Ok(Ok(true)) => Ok(TrashPurgeProgress::Complete),
             Ok(Ok(false)) => Ok(TrashPurgeProgress::Pending(entry)),
-            Ok(Err(source)) => Err(TrashPurgeError { entry, source }),
+            Ok(Err(source)) => Err(TrashPurgeError {
+                entry: Box::new(entry),
+                source,
+            }),
             Err(error) => Err(TrashPurgeError {
-                entry,
+                entry: Box::new(entry),
                 source: error,
             }),
         }

@@ -12,9 +12,9 @@
     "check:js": "node scripts/check-js.mjs",
     "check:types": "tsc -p clients/web/tsconfig.json",
     "test:frontend:unit": "node --test tests/frontend/unit/*.test.mjs",
-    "test:frontend": "cargo build --locked --quiet && node tests/frontend/run.mjs",
-    "test:frontend:headed": "cargo build --locked --quiet && node tests/frontend/run.mjs --headed",
-    "test:frontend:edge": "cargo build --locked --quiet && node tests/frontend/run.mjs --edge --project=edge",
+    "test:frontend": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs",
+    "test:frontend:headed": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --headed",
+    "test:frontend:edge": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --edge --project=edge",
     "test:frontend:install": "playwright install chromium firefox"
   },
   "devDependencies": {

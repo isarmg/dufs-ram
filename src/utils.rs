@@ -50,7 +50,7 @@ pub(crate) fn decode_hex_to_slice(input: &str, output: &mut [u8]) -> bool {
     if input.len() != output.len().saturating_mul(2) {
         return false;
     }
-    for (pair, slot) in input.as_bytes().chunks_exact(2).zip(output) {
+    for (pair, slot) in input.as_bytes().as_chunks::<2>().0.iter().zip(output) {
         let Some(high) = hex_nibble(pair[0]) else {
             return false;
         };

@@ -56,14 +56,16 @@ pub(in crate::server) struct PurgeWork {
 
 #[derive(Debug)]
 struct ClaimedPurgeFailure {
-    job: StoredPurgeJob,
+    // Keep the retry evidence intact without making every Result carrying
+    // this error reserve space for the full durable job record.
+    job: Box<StoredPurgeJob>,
     source: anyhow::Error,
 }
 
 impl ClaimedPurgeFailure {
     fn new(job: StoredPurgeJob, source: impl Into<anyhow::Error>) -> Self {
         Self {
-            job,
+            job: Box::new(job),
             source: source.into(),
         }
     }
@@ -71,7 +73,7 @@ impl ClaimedPurgeFailure {
 
 enum PurgeWorkResult {
     Complete,
-    Pending(PurgeWork),
+    Pending(Box<PurgeWork>),
     Retry(ClaimedPurgeFailure),
 }
 
@@ -246,7 +248,7 @@ impl Server {
                     PurgeTask::Durable(work) => match self.process_purge_work(work).await {
                         PurgeWorkResult::Complete => {}
                         PurgeWorkResult::Pending(work) => {
-                            pending.push_back(PurgeTask::Durable(work));
+                            pending.push_back(PurgeTask::Durable(*work));
                         }
                         PurgeWorkResult::Retry(failure) => {
                             schedule_claimed_purge_retry(&mut claimed_retries, failure, 1);
@@ -420,7 +422,7 @@ impl Server {
             }
             Ok(TrashPurgeProgress::Pending(entry)) => {
                 work.entry = entry;
-                PurgeWorkResult::Pending(work)
+                PurgeWorkResult::Pending(Box::new(work))
             }
             Err(error) => {
                 let (entry, source) = error.into_parts();
@@ -597,7 +599,7 @@ fn schedule_claimed_purge_retry(
     );
     let retry = ClaimedPurgeRetry {
         due: Instant::now() + delay,
-        job: failure.job,
+        job: *failure.job,
         local_failures,
     };
     let position = retries

@@ -104,8 +104,8 @@ else
 fi
 
 run cargo fmt --all --check
-run cargo clippy --locked --all-targets --all-features -- -D warnings
-run cargo test --locked --all-targets --all-features
+run cargo clippy --locked --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
+run cargo test --locked --target x86_64-unknown-linux-gnu --all-targets --all-features
 run ./scripts/check-coverage.sh
 
 run npm ci --ignore-scripts --no-audit --no-fund

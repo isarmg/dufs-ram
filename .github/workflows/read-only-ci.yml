@@ -14,7 +14,8 @@ concurrency:
 
 env:
   NODE_VERSION: "24.8.0"
-  RUST_TOOLCHAIN: "1.97.1"
+  RUST_TOOLCHAIN: "1.98.0"
+  SERVER_TARGET: "x86_64-unknown-linux-gnu"
   SHELLCHECK_VERSION: "0.11.0"
   SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
   CARGO_LLVM_COV_VERSION: "0.8.6"
@@ -123,13 +124,15 @@ jobs:
           uname -a
           rustc +"$RUST_TOOLCHAIN" --version --verbose
           cargo +"$RUST_TOOLCHAIN" --version --verbose
+          test "$(rustc +"$RUST_TOOLCHAIN" -vV | sed -n 's/^host: //p')" = \
+            "$SERVER_TARGET"
       - name: Run Rust gates
         shell: bash
         run: |
           set -euo pipefail
           cargo +"$RUST_TOOLCHAIN" fmt --all --check
-          cargo +"$RUST_TOOLCHAIN" clippy --locked --all-targets --all-features -- -D warnings
-          cargo +"$RUST_TOOLCHAIN" test --locked --all-targets --all-features
+          cargo +"$RUST_TOOLCHAIN" clippy --locked --target "$SERVER_TARGET" --all-targets --all-features -- -D warnings
+          cargo +"$RUST_TOOLCHAIN" test --locked --target "$SERVER_TARGET" --all-targets --all-features
 
   quality:
     name: Coverage, deployment, and release smoke
@@ -215,8 +218,8 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
         run: |
           set -euo pipefail
-          cargo build --locked --release
-          ./target/release/dufs --version | grep -F "dufs "
+          cargo build --locked --release --target "$SERVER_TARGET"
+          "./target/$SERVER_TARGET/release/dufs" --version | grep -F "dufs "
 
   browser:
     name: Browser (${{ matrix.browser }})
@@ -264,7 +267,7 @@ jobs:
           ./node_modules/.bin/playwright --version
           ./node_modules/.bin/playwright install --with-deps "$BROWSER"
       - name: Build the test server
-        run: cargo +"$RUST_TOOLCHAIN" build --locked --quiet
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --quiet --target "$SERVER_TARGET"
       - name: Run the isolated browser project
         env:
           BROWSER: ${{ matrix.browser }}

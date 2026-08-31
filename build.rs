@@ -1,15 +1,16 @@
 use std::{path::Path, process::Command};
 
 fn main() {
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let pointer_width = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default();
     assert!(
-        target_os == "linux",
-        "dufs supports Linux targets only (requested target OS: {target_os})"
-    );
-    assert!(
-        pointer_width == "64",
-        "dufs supports 64-bit Linux targets only (requested pointer width: {pointer_width})"
+        target_arch == "x86_64"
+            && target_env == "gnu"
+            && target_os == "linux"
+            && pointer_width == "64",
+        "dufs server supports only x86_64-unknown-linux-gnu (requested arch={target_arch}, os={target_os}, env={target_env}, pointer_width={pointer_width})"
     );
 
     println!("cargo:rerun-if-env-changed=DUFS_BUILD_GIT_SHA");

@@ -865,6 +865,6 @@ rate_recovery_status="$(
 }
 stop_nginx
 
-cargo test --locked --test config deployment_yaml_example_parses -- --exact
+cargo test --locked --target x86_64-unknown-linux-gnu --test config deployment_yaml_example_parses -- --exact
 
 printf 'systemd, active nginx boundary, and Dufs YAML examples are valid\n'

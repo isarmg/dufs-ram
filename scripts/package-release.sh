@@ -1526,9 +1526,9 @@ expected_rust_library_notice_sha256() {
   local toolchain="$1"
 
   case "$toolchain" in
-    1.97.1)
+    1.98.0)
       printf '%s\n' \
-        '0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed'
+        '68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6'
       ;;
     *)
       printf \
@@ -2275,9 +2275,9 @@ EOF
     0123456789abcdef0123456789abcdef01234567 \
     0.0.0-test \
     1234567890 \
-    test-target \
-    'rustc 1.97.1 (test)' \
-    'cargo 1.97.1 (test)' \
+    x86_64-unknown-linux-gnu \
+    'rustc 1.98.0 (test)' \
+    'cargo 1.98.0 (test)' \
     'cargo-cyclonedx-cyclonedx 0.5.9' \
     'cargo-audit-audit 0.22.2' \
     0123456789abcdef0123456789abcdef01234567 \
@@ -2292,7 +2292,7 @@ EOF
     "$build_environment_manifest"
   grep -Fxq 'source_version=0.0.0-test' "$build_environment_manifest"
   grep -Fxq 'source_date_epoch=1234567890' "$build_environment_manifest"
-  grep -Fxq 'target=test-target' "$build_environment_manifest"
+  grep -Fxq 'target=x86_64-unknown-linux-gnu' "$build_environment_manifest"
   local manifest_key
   for manifest_key in \
     bash \
@@ -3156,8 +3156,8 @@ EOF
     printf 'release self-test accepted a symbolic-link notice\n' >&2
     return 1
   fi
-  [[ "$(expected_rust_library_notice_sha256 1.97.1)" == \
-    '0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed' ]] || {
+  [[ "$(expected_rust_library_notice_sha256 1.98.0)" == \
+    '68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6' ]] || {
     printf 'release self-test found the wrong pinned Rust notice digest\n' >&2
     return 1
   }
@@ -3408,16 +3408,18 @@ expected_cargo_cyclonedx_version="cargo-cyclonedx-cyclonedx $required_cargo_cycl
   exit 1
 }
 
-host_target="$(
+detected_host_target="$(
   env RUSTUP_TOOLCHAIN="$required_rust_version" \
     "$rustc_command" -vV |
     sed -n 's/^host: //p'
 )"
+host_target="x86_64-unknown-linux-gnu"
 release_epoch="${SOURCE_DATE_EPOCH:-$(
   run_source_git "$project_dir" show -s --format=%ct "$source_sha"
 )}"
-[[ -n "$host_target" && "$host_target" != *$'\n'* ]] || {
-  printf 'Unable to determine the Rust host target.\n' >&2
+[[ "$detected_host_target" == "$host_target" ]] || {
+  printf 'Formal DUFS releases require Rust host %s; found %s.\n' \
+    "$host_target" "$detected_host_target" >&2
   exit 1
 }
 [[ "$release_epoch" =~ ^[0-9]+$ ]] || {

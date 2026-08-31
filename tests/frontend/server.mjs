@@ -46,7 +46,12 @@ const cargoTargetDir = resolve(
   projectRoot,
   process.env.CARGO_TARGET_DIR || "target",
 );
-const binary = join(cargoTargetDir, "debug", "dufs");
+const binary = join(
+  cargoTargetDir,
+  "x86_64-unknown-linux-gnu",
+  "debug",
+  "dufs",
+);
 const testPasswordHash =
   "$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 const testAccounts = [`frontend-test-0:${testPasswordHash}`];

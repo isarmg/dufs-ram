@@ -21,6 +21,7 @@ actual_version="$(cargo llvm-cov --version 2>/dev/null)" || {
 
 cargo llvm-cov \
   --locked \
+  --target x86_64-unknown-linux-gnu \
   --all-targets \
   --all-features \
   --summary-only \

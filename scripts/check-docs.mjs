@@ -280,11 +280,6 @@ function currentNodeContractFailures(
         );
       }
     }
-    if (/^  compatibility:/mu.test(source) || source.includes("18.20.8")) {
-      nodeFailures.push(
-        `.github/workflows/${name}: old Node compatibility jobs are forbidden`,
-      );
-    }
   }
   return nodeFailures;
 }

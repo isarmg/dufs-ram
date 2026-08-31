@@ -13,7 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: "1.97.1"
+  RUST_TOOLCHAIN: "1.98.0"
+  SERVER_TARGET: "x86_64-unknown-linux-gnu"
   CARGO_TERM_COLOR: always
   DUFS_BENCHMARK_MAX_MILLIS: "30000"
 
@@ -44,6 +45,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +"$RUST_TOOLCHAIN" test --locked --release \
+          cargo +"$RUST_TOOLCHAIN" test --locked --release --target "$SERVER_TARGET" \
             --test pagination benchmark_one_hundred_thousand_entries \
             -- --ignored --exact --nocapture
