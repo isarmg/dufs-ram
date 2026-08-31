@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 import { parse } from "acorn";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const webRoot = join(projectRoot, "clients", "web");
 const sourceFiles = [
-  ...walk(join(projectRoot, "assets")),
+  ...walk(webRoot),
   ...walk(join(projectRoot, "tests", "frontend")),
   join(projectRoot, "playwright.config.js"),
   fileURLToPath(import.meta.url),
@@ -35,92 +36,92 @@ const STATIC_STRING_LENGTH_LIMIT = 512;
 
 const detectionFixtures = [
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const request = fetch; request('/');\n",
     "fetch",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const Transport = XMLHttpRequest; new Transport();\n",
     "XMLHttpRequest",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "document.createRange().createContextualFragment('<p>unsafe</p>');\n",
     "createContextualFragment",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "element['inner' /* split */ + 'HTML'] = userControlled;\n",
     "innerHTML",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "element[`inner${'HTML'}`] = userControlled;\n",
     "innerHTML",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = ['inner', 'HTML'].join(''); element[key] = value;\n",
     "innerHTML",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const prefix = 'inner'; const key = `${prefix}HTML`; element[key] = value;\n",
     "innerHTML",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "globalThis['ev\\u0061l'](userControlled);\n",
     "eval",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const show = globalThis.alert; show(userControlled);\n",
     "alert",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "window['con' + 'firm'](userControlled);\n",
     "confirm",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "Reflect.get(window, 'prompt')(userControlled);\n",
     "prompt",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const root = globalThis; const key = ['fe', 'tch'].join(''); root[key]('/');\n",
     "fetch",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); globalThis[key]('/');\n",
     "dynamic global property access",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); element[key] = userControlled;\n",
     "dynamic computed property write",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); const {[key]: fn} = globalThis; fn(input);\n",
     "dynamic global destructuring property",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); function f({[key]: fn} = globalThis) { fn(input); } f();\n",
     "dynamic global destructuring property",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); const root = globalThis; function f({nested: {[key]: fn}} = root) { fn(input); } f();\n",
     "dynamic global destructuring property",
   ],
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     "const key = getName(); function f({[key]: fn}) { fn(input); } f(globalThis);\n",
     "dynamic computed destructuring property",
   ],
@@ -137,7 +138,7 @@ for (const [name, source, expected] of detectionFixtures) {
 
 const safeFixtures = [
   [
-    "assets/modules/listing/controller.js",
+    "clients/web/modules/listing/controller.js",
     [
       "// innerHTML, eval, fetch and XMLHttpRequest are inert comments.",
       "const label = 'innerHTML and eval and fetch';",
@@ -148,11 +149,11 @@ const safeFixtures = [
     ].join("\n"),
   ],
   [
-    "assets/modules/http/client.js",
+    "clients/web/modules/http/client.js",
     "const request = fetch; request('/');\n",
   ],
   [
-    "assets/modules/upload/transport.js",
+    "clients/web/modules/upload/transport.js",
     "const Transport = XMLHttpRequest; new Transport();\n",
   ],
 ];
@@ -215,11 +216,11 @@ function walk(root) {
 }
 
 function checkEmbeddedModules() {
-  const modulesRoot = join(projectRoot, "assets", "modules");
+  const modulesRoot = join(webRoot, "modules");
   const moduleNames = new Set(
     walk(modulesRoot)
       .filter(path => path.endsWith(".js"))
-      .map(path => relative(join(projectRoot, "assets"), path)
+      .map(path => relative(webRoot, path)
         .split(sep).join("/")),
   );
   const registryPath = join(projectRoot, "src", "server", "assets.rs");
@@ -272,7 +273,7 @@ function checkProductionSafety(name, source) {
 }
 
 function productionSafetyIssues(name, source) {
-  if (!name.startsWith("assets/") || !name.endsWith(".js")) return [];
+  if (!name.startsWith("clients/web/") || !name.endsWith(".js")) return [];
 
   let ast;
   try {
@@ -319,15 +320,15 @@ function productionSafetyIssues(name, source) {
     }
     if (
       propertyName === "fetch" &&
-      name.startsWith("assets/modules/") &&
-      name !== "assets/modules/http/client.js"
+      name.startsWith("clients/web/modules/") &&
+      name !== "clients/web/modules/http/client.js"
     ) {
       addIssue(node, "fetch must go through modules/http/client.js");
     }
     if (
       propertyName === "XMLHttpRequest" &&
-      name.startsWith("assets/modules/") &&
-      name !== "assets/modules/upload/transport.js"
+      name.startsWith("clients/web/modules/") &&
+      name !== "clients/web/modules/upload/transport.js"
     ) {
       addIssue(
         node,

@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   createBoundedHistory,
   createUploadQueue,
-} from "../../../assets/modules/upload/queue.js";
+} from "../../../clients/web/modules/upload/queue.js";
 
 test("upload queue dequeues and cancels in constant-time order", () => {
   const queue = createUploadQueue();

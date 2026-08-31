@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   parseIndexData,
-} from "../../../assets/modules/shared/index_data.js";
+} from "../../../clients/web/modules/shared/index_data.js";
 
 const VALID_INDEX_DATA = Object.freeze({
   href: "/folder/文件 & name",

@@ -10,7 +10,7 @@
   "scripts": {
     "check:docs": "node scripts/check-docs.mjs",
     "check:js": "node scripts/check-js.mjs",
-    "check:types": "tsc -p assets/tsconfig.json",
+    "check:types": "tsc -p clients/web/tsconfig.json",
     "test:frontend:unit": "node --test tests/frontend/unit/*.test.mjs",
     "test:frontend": "cargo build --locked --quiet && node tests/frontend/run.mjs",
     "test:frontend:headed": "cargo build --locked --quiet && node tests/frontend/run.mjs --headed",

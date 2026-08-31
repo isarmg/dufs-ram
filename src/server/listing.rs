@@ -53,7 +53,7 @@ pub(super) use walk::{
     CollectionByteBudget, DirectoryWalk, collect_dir_items, spawn_directory_blocking,
 };
 
-const INDEX_HTML: &str = include_str!("../../assets/index.html");
+const INDEX_HTML: &str = include_str!("../../clients/web/index.html");
 const UNSUPPORTED_FILENAME_MESSAGE: &str =
     "The folder contains an unsupported non-UTF-8 name. Rename it on Linux.";
 pub(super) const DIRECTORY_CHANGED_DURING_WALK_MESSAGE: &str =

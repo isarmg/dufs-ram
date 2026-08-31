@@ -5,10 +5,10 @@ import {
   classifyUploadResponse,
   parseTargetReplaceable,
   parseTargetRevision,
-} from "../../../assets/modules/upload/protocol.js";
+} from "../../../clients/web/modules/upload/protocol.js";
 import {
   parseUploadPreflight,
-} from "../../../assets/modules/upload/preflight.js";
+} from "../../../clients/web/modules/upload/preflight.js";
 
 const uploadId = "00000000-0000-4000-8000-000000000001";
 

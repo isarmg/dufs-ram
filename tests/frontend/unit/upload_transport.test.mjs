@@ -56,7 +56,7 @@ test("upload transport settles authentication at response headers", async () => 
   globalThis.XMLHttpRequest = FakeXMLHttpRequest;
   try {
     const { createUploadRequest } = await import(
-      "../../../assets/modules/upload/transport.js"
+      "../../../clients/web/modules/upload/transport.js"
     );
     const responseLimit = 16 * 1024;
     const cases = [

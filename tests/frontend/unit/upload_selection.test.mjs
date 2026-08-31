@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   prepareUploadSelection,
-} from "../../../assets/modules/upload/selection.js";
+} from "../../../clients/web/modules/upload/selection.js";
 
 test("upload selection enforces file-count and UTF-8 path budgets", () => {
   const OriginalFile = globalThis.File;

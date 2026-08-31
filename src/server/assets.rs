@@ -16,115 +16,118 @@ struct EmbeddedAsset {
     content_type: &'static str,
 }
 
+// 浏览器客户端的源码统一位于 clients/web，并在编译期完整嵌入二进制；
+// 运行时 URL 仍由下面的资源名和内容摘要生成，与仓库目录名解耦。
 const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
     EmbeddedAsset {
         name: "index.js",
-        contents: include_str!("../../assets/index.js").as_bytes(),
+        contents: include_str!("../../clients/web/index.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "index.css",
-        contents: include_str!("../../assets/index.css").as_bytes(),
+        contents: include_str!("../../clients/web/index.css").as_bytes(),
         content_type: "text/css; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "login.css",
-        contents: include_str!("../../assets/login.css").as_bytes(),
+        contents: include_str!("../../clients/web/login.css").as_bytes(),
         content_type: "text/css; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "favicon.ico",
-        contents: include_bytes!("../../assets/favicon.ico"),
+        contents: include_bytes!("../../clients/web/favicon.ico"),
         content_type: "image/x-icon",
     },
     EmbeddedAsset {
         name: "modules/app.js",
-        contents: include_str!("../../assets/modules/app.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/app.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/http/client.js",
-        contents: include_str!("../../assets/modules/http/client.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/http/client.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/http/headers.js",
-        contents: include_str!("../../assets/modules/http/headers.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/http/headers.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/http/response_buffer.js",
-        contents: include_str!("../../assets/modules/http/response_buffer.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/http/response_buffer.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/listing/controller.js",
-        contents: include_str!("../../assets/modules/listing/controller.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/listing/controller.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/operations/dialogs.js",
-        contents: include_str!("../../assets/modules/operations/dialogs.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/operations/dialogs.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/operations/file_operations.js",
-        contents: include_str!("../../assets/modules/operations/file_operations.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/operations/file_operations.js")
+            .as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/shared/dom.js",
-        contents: include_str!("../../assets/modules/shared/dom.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/shared/dom.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/shared/index_data.js",
-        contents: include_str!("../../assets/modules/shared/index_data.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/shared/index_data.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/shared/mutation_effect.js",
-        contents: include_str!("../../assets/modules/shared/mutation_effect.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/shared/mutation_effect.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/shared/path.js",
-        contents: include_str!("../../assets/modules/shared/path.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/shared/path.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/manager.js",
-        contents: include_str!("../../assets/modules/upload/manager.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/manager.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/preflight.js",
-        contents: include_str!("../../assets/modules/upload/preflight.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/preflight.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/protocol.js",
-        contents: include_str!("../../assets/modules/upload/protocol.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/protocol.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/queue.js",
-        contents: include_str!("../../assets/modules/upload/queue.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/queue.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/selection.js",
-        contents: include_str!("../../assets/modules/upload/selection.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/selection.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/transport.js",
-        contents: include_str!("../../assets/modules/upload/transport.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/transport.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {
         name: "modules/upload/view.js",
-        contents: include_str!("../../assets/modules/upload/view.js").as_bytes(),
+        contents: include_str!("../../clients/web/modules/upload/view.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
     },
 ];

@@ -33,8 +33,8 @@ pub(super) const LOGOUT_PATH: &str = "__dufs__/logout";
 pub(super) const CSRF_HEADER: &str = "x-dufs-csrf-token";
 pub(super) const LOGIN_ERROR_QUERY: &str = "login_error";
 
-const LOGIN_HTML: &str = include_str!("../../assets/login.html");
-const LOGIN_JS: &str = include_str!("../../assets/login.js");
+const LOGIN_HTML: &str = include_str!("../../clients/web/login.html");
+const LOGIN_JS: &str = include_str!("../../clients/web/login.js");
 const LOGIN_URI: &str = "/__dufs__/login";
 const LOGIN_BODY_LIMIT: usize = 4 * 1024;
 const LOGIN_BODY_TIMEOUT: Duration = Duration::from_secs(10);

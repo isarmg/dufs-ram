@@ -1136,10 +1136,11 @@ install_release_support_tree() {
   local package_root="$2"
   local entry
   local -a entries=(
-    assets
     build.rs
     Cargo.lock
     Cargo.toml
+    clients
+    config
     deploy
     docs
     LICENSE-APACHE
@@ -1149,7 +1150,6 @@ install_release_support_tree() {
     README.md
     rust-toolchain.toml
     scripts
-    SECURITY.md
     src
     tests
   )
@@ -1203,7 +1203,9 @@ verify_release_documentation_layout() {
   for required_path in \
     docs/README.md \
     docs/beginner-guide/README.md \
-    docs/history/code-review-report.md
+    docs/project-workflow.md \
+    docs/feature-inventory-and-tradeoffs.md \
+    docs/operations.md
   do
     [[ -f "$package_root/$required_path" && \
       ! -L "$package_root/$required_path" ]] || {

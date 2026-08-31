@@ -150,7 +150,7 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     const PLACEHOLDER: &str = "admin:$argon2id$REPLACE_WITH_A_REAL_HASH";
     const STATE_DIR: &str = "/var/lib/dufs";
 
-    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/dufs.yaml.example");
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/dufs.yaml.example");
     let template = std::fs::read_to_string(example)?;
     assert_eq!(
         template.matches(PLACEHOLDER).count(),
