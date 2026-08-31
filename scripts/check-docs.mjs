@@ -17,7 +17,8 @@ import {
 import { fileURLToPath } from "node:url";
 
 const defaultProjectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const projectRoot = realpathSync(parseProjectRoot(process.argv.slice(2)));
+const invocation = parseInvocation(process.argv.slice(2));
+const projectRoot = realpathSync(invocation.projectRoot);
 const ignoredGeneratedDirectories = new Set([
   ".dufs-data",
   ".git",
@@ -53,11 +54,13 @@ const packageLockSource = readFileSync(
   "utf8",
 );
 const workflowDirectory = resolve(projectRoot, ".github", "workflows");
-const workflowSources = new Map(
-  readdirSync(workflowDirectory)
-    .filter(name => name.endsWith(".yml") || name.endsWith(".yaml"))
-    .map(name => [name, readFileSync(resolve(workflowDirectory, name), "utf8")]),
-);
+const workflowSources = invocation.checkWorkflowContracts
+  ? new Map(
+      readdirSync(workflowDirectory)
+        .filter(name => name.endsWith(".yml") || name.endsWith(".yaml"))
+        .map(name => [name, readFileSync(resolve(workflowDirectory, name), "utf8")]),
+    )
+  : new Map();
 failures.push(
   ...currentNodeContractFailures(
     packageSource,
@@ -79,23 +82,25 @@ if (
     "scripts/check-docs.mjs: old Node engine mutation fixture was accepted",
   );
 }
-const mutatedWorkflows = new Map(workflowSources);
-mutatedWorkflows.set(
-  "read-only-ci.yml",
-  workflowSources
-    .get("read-only-ci.yml")
-    .replace("node-version: ${{ env.NODE_VERSION }}", 'node-version: "18.20.8"'),
-);
-if (
-  currentNodeContractFailures(
-    packageSource,
-    packageLockSource,
-    mutatedWorkflows,
-  ).length === 0
-) {
-  failures.push(
-    "scripts/check-docs.mjs: old Node workflow mutation fixture was accepted",
+if (invocation.checkWorkflowContracts) {
+  const mutatedWorkflows = new Map(workflowSources);
+  mutatedWorkflows.set(
+    "read-only-ci.yml",
+    workflowSources
+      .get("read-only-ci.yml")
+      .replace("node-version: ${{ env.NODE_VERSION }}", 'node-version: "18.20.8"'),
   );
+  if (
+    currentNodeContractFailures(
+      packageSource,
+      packageLockSource,
+      mutatedWorkflows,
+    ).length === 0
+  ) {
+    failures.push(
+      "scripts/check-docs.mjs: old Node workflow mutation fixture was accepted",
+    );
+  }
 }
 
 for (const path of markdownFiles) {
@@ -174,12 +179,20 @@ for (const path of markdownFiles) {
   }
 }
 
-function parseProjectRoot(args) {
-  if (args.length === 0) return defaultProjectRoot;
-  if (args.length === 2 && args[0] === "--root") {
-    return resolve(args[1]);
+function parseInvocation(args) {
+  if (args.length === 0) {
+    return {
+      projectRoot: defaultProjectRoot,
+      checkWorkflowContracts: true,
+    };
   }
-  throw new Error("Usage: check-docs.mjs [--root <directory>]");
+  if (args.length === 2 && args[0] === "--artifact-root") {
+    return {
+      projectRoot: resolve(args[1]),
+      checkWorkflowContracts: false,
+    };
+  }
+  throw new Error("Usage: check-docs.mjs [--artifact-root <directory>]");
 }
 
 if (failures.length > 0) {

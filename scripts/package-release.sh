@@ -1229,7 +1229,7 @@ verify_release_documentation_layout() {
 
   run_node_entrypoint "$node_command" \
     "$package_root/scripts/check-docs.mjs" \
-    --root "$package_root"
+    --artifact-root "$package_root"
 }
 
 write_release_package_checksums() {
