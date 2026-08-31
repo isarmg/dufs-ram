@@ -6,6 +6,8 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use reqwest::{IntoUrl, Method, Url};
 use rstest::fixture;
+use sarmg_admin_auth::normalize_administrator_username;
+use sarmg_contracts::{AdministratorRole, AdministratorSession};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -22,9 +24,9 @@ pub type Error = Box<dyn std::error::Error>;
 
 #[allow(dead_code)]
 pub const BIN_FILE: &str = "😀.bin";
-pub const TEST_USER: &str = "test-user";
+pub const TEST_USER: &str = "test-admin";
 pub const TEST_PASSWORD: &str = "test-password";
-pub const TEST_ACCOUNT: &str = "test-user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
+pub const TEST_ACCOUNT: &str = "test-admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 #[allow(dead_code)]
 pub const UPLOAD_STAGE_DIRECTORY: &str = ".dufs-upload-stages";
 #[allow(dead_code)]
@@ -32,7 +34,7 @@ pub const USER_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+y
 #[allow(dead_code)]
 pub const ADMIN_ACCOUNT: &str = "admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
-const CSRF_HEADER: &str = "x-dufs-csrf-token";
+const CSRF_HEADER: &str = "x-csrf-token";
 
 #[allow(dead_code)]
 pub struct TestAuthConfig {
@@ -493,7 +495,10 @@ impl TestServer {
             .request(method, url)
             .header(COOKIE, &session.cookie);
         if is_unsafe {
-            request = request.header(CSRF_HEADER, &session.csrf_token);
+            request = request
+                .header("origin", self.url().origin().ascii_serialization())
+                .header("sec-fetch-site", "same-origin")
+                .header(CSRF_HEADER, &session.csrf_token);
         }
         if is_delete {
             request = request.header("X-Dufs-Operation-Id", Uuid::new_v4().to_string());
@@ -619,17 +624,22 @@ impl TestServer {
         let login_client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let login_url = self.url().join("__dufs__/login")?;
-        let form = form_urlencoded::Serializer::new(String::new())
-            .append_pair("username", username)
-            .append_pair("password", password)
-            .finish();
+        let login_url = self.url().join("api/v2/auth/login")?;
         let response = login_client
             .post(login_url)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(form)
+            .header("origin", self.url().origin().ascii_serialization())
+            .header("sec-fetch-site", "same-origin")
+            // A fixture may configure max-connections=1. Closing this setup
+            // request before returning keeps that sole permit from racing the
+            // test's first deliberately held connection.
+            .header("connection", "close")
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&serde_json::json!({
+                "username": username,
+                "password": password,
+            }))?)
             .send()?;
-        if !response.status().is_success() && !response.status().is_redirection() {
+        if response.status() != reqwest::StatusCode::OK {
             return Err(format!("Login failed with status {}", response.status()).into());
         }
         let cookie = response
@@ -641,17 +651,13 @@ impl TestServer {
             .find(|value| value.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
             .ok_or("Login response is missing the session cookie")?
             .to_string();
-
-        let page_url = self.url();
-        let page = self
-            .client
-            .get(page_url)
-            .header(COOKIE, &cookie)
-            .header("connection", "close")
-            .send()?
-            .error_for_status()?;
-        let csrf_token = extract_csrf_token(&page.text()?)
-            .ok_or("Authenticated page is missing the CSRF token")?;
+        let session: AdministratorSession = serde_json::from_str(&response.text()?)?;
+        session.validate()?;
+        let canonical_username = normalize_administrator_username(username)?;
+        if session.username != canonical_username || session.role != AdministratorRole::Admin {
+            return Err("Login response contains the wrong administrator identity".into());
+        }
+        let csrf_token = session.csrf_token;
 
         Ok(TestSession { cookie, csrf_token })
     }
@@ -741,13 +747,6 @@ impl TestServer {
         self.default_session = Some(self.login(TEST_USER, TEST_PASSWORD)?);
         Ok(())
     }
-}
-
-fn extract_csrf_token(content: &str) -> Option<String> {
-    extract_index_data(content)?
-        .get("csrf_token")?
-        .as_str()
-        .map(ToOwned::to_owned)
 }
 
 fn extract_index_data(content: &str) -> Option<Value> {

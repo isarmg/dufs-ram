@@ -21,7 +21,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const CSRF_HEADER: &str = "x-dufs-csrf-token";
+const CSRF_HEADER: &str = "x-csrf-token";
 const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
 
 struct BrowserContext<'a> {
@@ -36,6 +36,8 @@ impl BrowserContext<'_> {
         self.server
             .raw_request(method, url)
             .header(COOKIE, &self.cookie)
+            .header("origin", self.server.url().origin().ascii_serialization())
+            .header("sec-fetch-site", "same-origin")
     }
 }
 
@@ -62,7 +64,7 @@ fn browser_context<'a>(
     assert!(directives.contains(&"private"));
     assert!(directives.contains(&"no-store"));
     let data = utils::retrieve_json(&response.text()?).ok_or("Missing index data")?;
-    let csrf_token = data["csrf_token"]
+    let csrf_token = data["session"]["csrf_token"]
         .as_str()
         .ok_or("Missing CSRF token")?
         .to_string();

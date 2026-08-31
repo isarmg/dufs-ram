@@ -1453,9 +1453,9 @@ async fn restart_makes_future_purge_retries_due_after_a_clock_rollback() -> Resu
 }
 
 #[test]
-fn rejects_old_application_version_without_modification() -> Result<()> {
+fn rejects_noncurrent_application_version_without_modification() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("old-version.sqlite3");
+    let path = directory.path().join("noncurrent-version.sqlite3");
     let identity = root(211, 223);
     let store = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)?;
     store.shutdown_for_test();
@@ -1471,10 +1471,12 @@ fn rejects_old_application_version_without_modification() -> Result<()> {
 
     let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
         .err()
-        .expect("an old application version must be rejected");
+        .expect("a noncurrent application version must be rejected");
+    let message = format!("{error:#}");
     assert!(
-        format!("{error:#}").contains("application version is not exactly current"),
-        "unexpected old-version error: {error:#}"
+        message.contains("metadata or schema fingerprint is not exactly current")
+            && message.contains("schema identity application_version drifted"),
+        "unexpected noncurrent-version error: {error:#}"
     );
     assert_eq!(state_database_files_snapshot(&path)?, files_before);
     Ok(())
@@ -1536,8 +1538,11 @@ fn rejects_raw_schema_fingerprint_drift_without_modification() -> Result<()> {
     let error = StateStore::open(&path, &identity, CAPACITY, PER_OWNER, TTL)
         .err()
         .expect("raw schema SQL drift must be rejected");
+    let message = format!("{error:#}");
     assert!(
-        format!("{error:#}").contains("schema fingerprint does not match"),
+        message.contains("metadata or schema fingerprint is not exactly current")
+            && message.contains("declared schema fingerprint")
+            && message.contains("does not match actual fingerprint"),
         "unexpected fingerprint-drift error: {error:#}"
     );
     assert_eq!(state_database_files_snapshot(&path)?, files_before);

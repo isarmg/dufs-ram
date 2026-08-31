@@ -1,8 +1,5 @@
 #[path = "support/fixtures.rs"]
 mod fixtures;
-#[path = "support/utils.rs"]
-mod utils;
-
 use fixtures::{
     Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, USER_ACCOUNT, dufs_command, read_bound_url,
     tmpdir,
@@ -13,6 +10,7 @@ use assert_fs::fixture::TempDir;
 use reqwest::blocking::Client;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use rstest::rstest;
+use sarmg_contracts::AdministratorSession;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -22,7 +20,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const CSRF_HEADER: &str = "x-dufs-csrf-token";
+const CSRF_HEADER: &str = "x-csrf-token";
 static HTTP_LOGGER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Session {
@@ -47,7 +45,6 @@ fn verified_session_user_is_written_to_access_log(tmpdir: TempDir) -> Result<(),
     assert_eq!(response.status(), 200);
 
     let output = stop_and_read(&mut child)?;
-    assert!(output.lines().any(|line| line == "ACCESS 303 user"));
     assert!(output.lines().any(|line| line == "ACCESS 200 user"));
     Ok(())
 }
@@ -64,8 +61,8 @@ fn empty_log_format_disables_access_log(tmpdir: TempDir) -> Result<(), Error> {
     assert_eq!(response.status(), 200);
 
     let output = stop_and_read(&mut child)?;
-    assert!(!output.contains("test-user"));
-    assert!(!output.contains("POST /__dufs__/login"));
+    assert!(!output.contains("test-admin"));
+    assert!(!output.contains("POST /api/v2/auth/login"));
     Ok(())
 }
 
@@ -95,14 +92,16 @@ fn authenticated_logout_keeps_verified_user_in_access_log(tmpdir: TempDir) -> Re
         spawn_logged_server(&tmpdir, &["--log-format", "ACCESS $status $remote_user"])?;
     let session = login(port, TEST_USER, TEST_PASSWORD)?;
     let response = Client::new()
-        .post(format!("http://localhost:{port}/__dufs__/logout"))
+        .post(format!("http://localhost:{port}/api/v2/auth/logout"))
         .header(COOKIE, &session.cookie)
+        .header("origin", format!("http://localhost:{port}"))
+        .header("sec-fetch-site", "same-origin")
         .header(CSRF_HEADER, &session.csrf_token)
         .send()?;
     assert_eq!(response.status(), 204);
 
     let output = stop_and_read(&mut child)?;
-    assert!(output.lines().any(|line| line == "ACCESS 204 test-user"));
+    assert!(output.lines().any(|line| line == "ACCESS 204 test-admin"));
     Ok(())
 }
 
@@ -113,7 +112,7 @@ fn sensitive_request_headers_are_redacted(tmpdir: TempDir) -> Result<(), Error> 
         &tmpdir,
         &[
             "--log-format",
-            "SECRETS $http_cookie $http_x_dufs_csrf_token $http_authorization \
+            "SECRETS $http_cookie $http_x_csrf_token $http_authorization \
              $http_proxy_authorization",
         ],
         &[USER_ACCOUNT],
@@ -123,8 +122,8 @@ fn sensitive_request_headers_are_redacted(tmpdir: TempDir) -> Result<(), Error> 
         .get(format!("http://localhost:{port}"))
         .header(COOKIE, &session.cookie)
         .header(CSRF_HEADER, &session.csrf_token)
-        .header("authorization", "obsolete-secret")
-        .header("proxy-authorization", "proxy-obsolete-secret")
+        .header("authorization", "sensitive-secret")
+        .header("proxy-authorization", "proxy-sensitive-secret")
         .send()?;
     assert_eq!(response.status(), 200);
 
@@ -136,8 +135,8 @@ fn sensitive_request_headers_are_redacted(tmpdir: TempDir) -> Result<(), Error> 
     );
     assert!(!output.contains(&session.cookie));
     assert!(!output.contains(&session.csrf_token));
-    assert!(!output.contains("obsolete-secret"));
-    assert!(!output.contains("proxy-obsolete-secret"));
+    assert!(!output.contains("sensitive-secret"));
+    assert!(!output.contains("proxy-sensitive-secret"));
     Ok(())
 }
 
@@ -153,7 +152,7 @@ fn sensitive_request_header_variable_suffixes_are_case_insensitive(
             "CASE_SECRETS $http_AUTHORIZATION $http_AuThOrIzAtIoN \
              $http_PROXY_AUTHORIZATION $http_PrOxY_AuThOrIzAtIoN \
              $http_COOKIE $http_CoOkIe \
-             $http_X_DUFS_CSRF_TOKEN $http_X_DuFs_CsRf_ToKeN",
+             $http_X_CSRF_TOKEN $http_X_CsRf_ToKeN",
         ],
         &[USER_ACCOUNT],
     )?;
@@ -319,6 +318,8 @@ fn authenticated_operation_id_is_available_to_access_logs(tmpdir: TempDir) -> Re
     let response = Client::new()
         .post(format!("http://localhost:{port}/__dufs__/api/mkdir"))
         .header(COOKIE, &session.cookie)
+        .header("origin", format!("http://localhost:{port}"))
+        .header("sec-fetch-site", "same-origin")
         .header(CSRF_HEADER, &session.csrf_token)
         .header(CONTENT_TYPE, "application/json")
         .header("X-Dufs-Operation-Id", &operation_id)
@@ -390,6 +391,8 @@ fn only_successful_embedded_asset_gets_are_omitted_from_access_log(
     let response = client
         .post(format!("http://localhost:{port}{api_path}"))
         .header(COOKIE, &session.cookie)
+        .header("origin", format!("http://localhost:{port}"))
+        .header("sec-fetch-site", "same-origin")
         .header(CSRF_HEADER, &session.csrf_token)
         .header(CONTENT_TYPE, "application/json")
         .header("X-Dufs-Operation-Id", operation_id)
@@ -462,9 +465,9 @@ fn only_successful_embedded_asset_gets_are_omitted_from_access_log(
         "anonymous successful embedded asset was logged: {unexpected}\n{output}"
     );
 
-    let login_path = "/__dufs__/login";
+    let login_path = "/api/v2/auth/login";
     for expected in [
-        format!("P006 POST {login_path} 303"),
+        format!("P006 POST {login_path} 200"),
         format!("P006 GET {page_path} 200"),
         format!("P006 GET {download_path} 200"),
         format!("P006 POST {api_path} 201"),
@@ -602,16 +605,17 @@ fn login(port: u16, username: &str, password: &str) -> Result<Session, Error> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let form = form_urlencoded::Serializer::new(String::new())
-        .append_pair("username", username)
-        .append_pair("password", password)
-        .finish();
     let response = client
-        .post(format!("http://localhost:{port}/__dufs__/login"))
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(form)
+        .post(format!("http://localhost:{port}/api/v2/auth/login"))
+        .header("origin", format!("http://localhost:{port}"))
+        .header("sec-fetch-site", "same-origin")
+        .header(CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&serde_json::json!({
+            "username": username,
+            "password": password,
+        }))?)
         .send()?;
-    assert_eq!(response.status(), 303);
+    assert_eq!(response.status(), 200);
     let cookie = response
         .headers()
         .get(SET_COOKIE)
@@ -621,15 +625,9 @@ fn login(port: u16, username: &str, password: &str) -> Result<Session, Error> {
         .next()
         .ok_or("Invalid session cookie")?
         .to_string();
-    let page = Client::new()
-        .get(format!("http://localhost:{port}/"))
-        .header(COOKIE, &cookie)
-        .send()?
-        .error_for_status()?
-        .text()?;
-    let csrf_token = utils::retrieve_json(&page)
-        .and_then(|value| value["csrf_token"].as_str().map(str::to_owned))
-        .ok_or("Missing CSRF token")?;
+    let session: AdministratorSession = serde_json::from_str(&response.text()?)?;
+    session.validate()?;
+    let csrf_token = session.csrf_token;
     Ok(Session { cookie, csrf_token })
 }
 

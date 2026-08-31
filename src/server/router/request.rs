@@ -3,7 +3,7 @@ use super::super::{
     browser_api::{BROWSER_API_PREFIX, is_tracked_browser_mutation},
     listing::LIST_API_PATH,
     operation_registry::{JOB_STATUS_PREFIX, parse_operation_id},
-    session::LOGOUT_PATH,
+    session::{ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH, ADMIN_SESSION_PATH},
     upload::{parse_upload_id, parse_upload_length, parse_upload_offset},
 };
 
@@ -30,6 +30,7 @@ pub(super) struct RequestProfile {
     omit_success_log: bool,
     upload: bool,
     internal_api: bool,
+    administrator_auth_api: bool,
     upload_context: Option<UploadRequestContext>,
     operation_id: Option<Uuid>,
     mutation: MutationProgress,
@@ -43,15 +44,18 @@ impl RequestProfile {
             method == Method::HEAD && req.headers().contains_key("x-dufs-upload-id");
         let tracked_operation = method == Method::DELETE
             || (method == Method::POST && relative_path.is_some_and(is_tracked_browser_mutation));
+        let request_path = req.uri().path();
+        let administrator_auth_api = request_path == ADMIN_LOGIN_PATH
+            || request_path == ADMIN_SESSION_PATH
+            || request_path == ADMIN_LOGOUT_PATH;
         let internal_api = relative_path.is_some_and(|path| {
             path == LIST_API_PATH
                 || path.starts_with(BROWSER_API_PREFIX)
                 || path.starts_with(JOB_STATUS_PREFIX)
-                || (path == LOGOUT_PATH && method == Method::POST)
                 || upload
                 || upload_status
                 || method == Method::DELETE
-        });
+        }) || administrator_auth_api;
         let upload_context = upload
             .then(|| {
                 match (
@@ -75,6 +79,7 @@ impl RequestProfile {
             omit_success_log: method == Method::GET && public_asset,
             upload,
             internal_api,
+            administrator_auth_api,
             upload_context,
             operation_id,
             mutation: MutationProgress::default(),
@@ -95,6 +100,10 @@ impl RequestProfile {
 
     pub(super) const fn is_internal_api(&self) -> bool {
         self.internal_api
+    }
+
+    pub(super) const fn is_administrator_auth_api(&self) -> bool {
+        self.administrator_auth_api
     }
 
     pub(super) const fn upload_context(&self) -> Option<UploadRequestContext> {

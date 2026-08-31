@@ -1,6 +1,6 @@
 use super::{MutationProgress, render_upload_problem};
 use crate::{
-    auth::{SessionInfo, session_token_from_cookie},
+    auth::{SessionInfo, session_token_from_headers},
     request_context::RequestContext,
     server::{
         HEALTH_CHECK_PATH, READINESS_CHECK_PATH, Request, Response, Server,
@@ -24,7 +24,7 @@ use crate::{
         problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
         protocol::{OperationPublicState, UploadPublicState},
         render_path_wait_limit,
-        session::{LOGIN_ERROR_QUERY, LOGIN_PATH, LOGOUT_PATH},
+        session::{ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH, ADMIN_SESSION_PATH, LOGIN_PATH},
         status_bad_request, status_csrf_forbid, status_method_not_allowed, status_not_found,
         upload::{
             TargetRevision, UploadErrorContext, UploadMode, UploadOptions,
@@ -36,10 +36,7 @@ use crate::{
 };
 
 use anyhow::Result;
-use hyper::{
-    HeaderMap, Method, StatusCode, Uri,
-    header::{COOKIE, IF_MATCH},
-};
+use hyper::{HeaderMap, Method, StatusCode, Uri, header::IF_MATCH};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, timeout_at};
@@ -176,6 +173,21 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch(mut self) -> Result<Response> {
+        if self.is_administrator_auth_request()
+            && !self
+                .server
+                .administrator_auth_headers_are_unambiguous(&self.headers, &self.uri)
+        {
+            self.server.render_administrator_auth_error(
+                &mut self.response,
+                StatusCode::BAD_REQUEST,
+                "invalid_security_header",
+                "Administrator authentication headers are invalid or ambiguous",
+                false,
+                None,
+            )?;
+            return Ok(self.response);
+        }
         if self.dispatch_public_routes().await? == Phase::Complete {
             return Ok(self.response);
         }
@@ -204,28 +216,39 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Complete);
         }
 
+        if self.request_path == ADMIN_LOGIN_PATH {
+            if self.method == Method::POST {
+                let peer_ip = self.context.peer().ip();
+                let request = self.take_request();
+                if let Some(username) = self
+                    .server
+                    .handle_login(request, peer_ip, &mut self.response)
+                    .await?
+                {
+                    self.server
+                        .content
+                        .args
+                        .http_logger
+                        .set_authenticated_user(self.context.access_log_mut(), &username);
+                }
+            } else {
+                status_method_not_allowed(&mut self.response, "POST");
+                self.server.render_administrator_auth_error(
+                    &mut self.response,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "Method not allowed for this administrator auth endpoint",
+                    false,
+                    None,
+                )?;
+            }
+            return Ok(Phase::Complete);
+        }
+
         if self.route_path.as_str() == LOGIN_PATH {
             match self.method {
-                Method::GET => self.server.send_login_page_for_get(
-                    self.query_params.get(LOGIN_ERROR_QUERY).map(String::as_str),
-                    &mut self.response,
-                )?,
-                Method::POST => {
-                    let peer_ip = self.context.peer().ip();
-                    let request = self.take_request();
-                    if let Some(user) = self
-                        .server
-                        .handle_login(request, peer_ip, &mut self.response)
-                        .await?
-                    {
-                        self.server
-                            .content
-                            .args
-                            .http_logger
-                            .set_authenticated_user(self.context.access_log_mut(), &user);
-                    }
-                }
-                _ => status_method_not_allowed(&mut self.response, "GET, POST"),
+                Method::GET => self.server.send_login_page_for_get(&mut self.response)?,
+                _ => status_method_not_allowed(&mut self.response, "GET"),
             }
             return Ok(Phase::Complete);
         }
@@ -244,10 +267,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     fn authenticate(&mut self) -> Result<Option<AuthenticatedRequest>> {
-        let token = self
-            .headers
-            .get(COOKIE)
-            .and_then(session_token_from_cookie)
+        let token = session_token_from_headers(&self.headers)
+            .ok()
+            .flatten()
             .map(str::to_owned);
         let authenticated = token.and_then(|token| {
             self.server
@@ -257,10 +279,12 @@ impl<'a> RequestDispatcher<'a> {
                 .map(|session| AuthenticatedRequest { token, session })
         });
         let Some(authenticated) = authenticated else {
+            let administrator_auth_api = self.is_administrator_auth_request();
             self.server.reject_unauthenticated(
                 &self.method,
                 &self.headers,
                 self.internal_api_request,
+                administrator_auth_api,
                 &mut self.response,
             )?;
             return Ok(None);
@@ -287,8 +311,19 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Continue);
         }
 
-        status_csrf_forbid(&mut self.response);
-        if self.internal_api_request {
+        if self.is_administrator_auth_request() {
+            self.server.render_administrator_auth_error(
+                &mut self.response,
+                StatusCode::FORBIDDEN,
+                "csrf_failed",
+                "CSRF validation failed",
+                false,
+                None,
+            )?;
+        } else {
+            status_csrf_forbid(&mut self.response);
+        }
+        if self.internal_api_request && !self.is_administrator_auth_request() {
             render_problem(
                 &mut self.response,
                 &ApiError::new(
@@ -306,9 +341,38 @@ impl<'a> RequestDispatcher<'a> {
         authenticated: &AuthenticatedRequest,
     ) -> Result<Phase> {
         let relative_path = self.route_path.as_str().to_owned();
-        if self.method == Method::POST && relative_path == LOGOUT_PATH {
-            self.server
-                .handle_logout(&authenticated.token, &mut self.response);
+        if self.request_path == ADMIN_SESSION_PATH {
+            if self.method == Method::GET {
+                self.server
+                    .send_administrator_session(&authenticated.session, &mut self.response)?;
+            } else {
+                status_method_not_allowed(&mut self.response, "GET");
+                self.server.render_administrator_auth_error(
+                    &mut self.response,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "Method not allowed for this administrator auth endpoint",
+                    false,
+                    None,
+                )?;
+            }
+            return Ok(Phase::Complete);
+        }
+        if self.request_path == ADMIN_LOGOUT_PATH {
+            if self.method == Method::POST {
+                self.server
+                    .handle_logout(&authenticated.token, &mut self.response);
+            } else {
+                status_method_not_allowed(&mut self.response, "POST");
+                self.server.render_administrator_auth_error(
+                    &mut self.response,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "Method not allowed for this administrator auth endpoint",
+                    false,
+                    None,
+                )?;
+            }
             return Ok(Phase::Complete);
         }
         if relative_path == READINESS_CHECK_PATH {
@@ -346,6 +410,12 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Complete);
         }
         Ok(Phase::Continue)
+    }
+
+    fn is_administrator_auth_request(&self) -> bool {
+        self.request_path == ADMIN_LOGIN_PATH
+            || self.request_path == ADMIN_SESSION_PATH
+            || self.request_path == ADMIN_LOGOUT_PATH
     }
 
     async fn dispatch_job_status(&mut self, id: &str, owner: &str) -> Result<()> {
@@ -1639,7 +1709,7 @@ mod tests {
             response: Response::default(),
         };
         let session = SessionInfo {
-            user: "user".to_owned(),
+            user: "admin".to_owned(),
             csrf_token: String::new(),
         };
 

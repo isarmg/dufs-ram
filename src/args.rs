@@ -298,7 +298,8 @@ pub fn build_cli() -> Command {
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .subcommand(
-            Command::new("hash-password").about("Interactively generate an Argon2id password hash"),
+            Command::new("hash-password")
+                .about("Interactively generate a current administrator password hash"),
         )
         .arg(
             Arg::new("serve-path")
@@ -741,7 +742,7 @@ impl Args {
 
         if !self.auth.has_users() {
             bail!(
-                "At least one account is required; generate a hash with `dufs hash-password`, \
+                "At least one administrator username account is required; generate a hash with `dufs hash-password`, \
                  add it under `auth:` in a protected YAML file, then start with `--config <file>`"
             );
         }

@@ -1,15 +1,15 @@
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
+use anyhow::Context as _;
 use assert_fs::TempDir;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
     blocking::Client,
-    header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
+    header::{CONTENT_TYPE, SET_COOKIE},
 };
 use rstest::rstest;
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use sarmg_contracts::AdministratorSession;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     error::Error,
@@ -72,10 +72,14 @@ fn signal_drains_an_active_download_and_stops_accepting(
     let _test_guard = SHUTDOWN_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temp = TempDir::new()?;
-    let state_dir = TempDir::new()?;
-    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))?;
-    std::fs::File::create(temp.path().join("large.bin"))?.set_len(FILE_SIZE as u64)?;
+    let temp = TempDir::new().context("create the download fixture directory")?;
+    let state_dir = TempDir::new().context("create the download state directory")?;
+    std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+        .context("secure the download state directory")?;
+    std::fs::File::create(temp.path().join("large.bin"))
+        .context("create the large download fixture")?
+        .set_len(FILE_SIZE as u64)
+        .context("size the large download fixture")?;
     let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
     let mut child = command
         .arg(temp.path())
@@ -85,7 +89,8 @@ fn signal_drains_an_active_download_and_stops_accepting(
         .arg(state_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+        .context("spawn the server for the graceful download test")?;
     let port = read_bound_url(&mut child)?
         .port()
         .ok_or("Printed URL has no port")?;
@@ -108,20 +113,28 @@ fn signal_drains_an_active_download_and_stops_accepting(
 
     let signal_status = Command::new("kill")
         .args([format!("-{signal}"), child.id().to_string()])
-        .status()?;
+        .status()
+        .context("send the graceful shutdown signal")?;
     assert!(signal_status.success());
 
     // With a deliberately tiny receive buffer, the response cannot have been
     // buffered in full. The process must remain alive while it drains this
     // connection, but its listening socket must disappear promptly.
     sleep(Duration::from_millis(150));
-    assert!(child.try_wait()?.is_none());
+    assert!(
+        child
+            .try_wait()
+            .context("inspect the server during graceful shutdown")?
+            .is_none()
+    );
     wait_until_not_accepting(port)?;
 
     let mut remaining = 0usize;
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let count = download.read(&mut buffer)?;
+        let count = download
+            .read(&mut buffer)
+            .context("drain the active download after signalling the server")?;
         if count == 0 {
             break;
         }
@@ -184,7 +197,7 @@ fn shutdown_deadline_checkpoints_a_stalled_upload_before_exit() -> Result<(), Bo
          Origin: http://127.0.0.1:{port}\r\n\
          Sec-Fetch-Site: same-origin\r\n\
          Cookie: {}\r\n\
-         X-Dufs-Csrf-Token: {}\r\n\
+         X-CSRF-Token: {}\r\n\
          X-Dufs-Upload-Id: {upload_id}\r\n\
          X-Dufs-Upload-Length: {DECLARED_SIZE}\r\n\
          Content-Length: {DECLARED_SIZE}\r\n\
@@ -229,16 +242,17 @@ fn login(port: u16) -> Result<BrowserSession, Box<dyn Error>> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let form = form_urlencoded::Serializer::new(String::new())
-        .append_pair("username", TEST_USER)
-        .append_pair("password", TEST_PASSWORD)
-        .finish();
     let response = client
-        .post(format!("http://127.0.0.1:{port}/__dufs__/login"))
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(form)
+        .post(format!("http://127.0.0.1:{port}/api/v2/auth/login"))
+        .header("origin", format!("http://127.0.0.1:{port}"))
+        .header("sec-fetch-site", "same-origin")
+        .header(CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&serde_json::json!({
+            "username": TEST_USER,
+            "password": TEST_PASSWORD,
+        }))?)
         .send()?;
-    assert!(response.status().is_redirection());
+    assert_eq!(response.status(), 200);
     let cookie = response
         .headers()
         .get(SET_COOKIE)
@@ -248,23 +262,9 @@ fn login(port: u16) -> Result<BrowserSession, Box<dyn Error>> {
         .next()
         .ok_or("empty set-cookie header")?
         .to_string();
-    let page = client
-        .get(format!("http://127.0.0.1:{port}/"))
-        .header(COOKIE, &cookie)
-        .send()?
-        .error_for_status()?
-        .text()?;
-    let marker = "<template id=\"index-data\">";
-    let start = page.find(marker).ok_or("page has no index data")? + marker.len();
-    let end = start
-        + page[start..]
-            .find("</template>")
-            .ok_or("invalid index data")?;
-    let data: Value = serde_json::from_slice(&STANDARD.decode(&page[start..end])?)?;
-    let csrf_token = data["csrf_token"]
-        .as_str()
-        .ok_or("page has no CSRF token")?
-        .to_string();
+    let session: AdministratorSession = serde_json::from_str(&response.text()?)?;
+    session.validate()?;
+    let csrf_token = session.csrf_token;
     Ok(BrowserSession { cookie, csrf_token })
 }
 

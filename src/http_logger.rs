@@ -428,7 +428,7 @@ impl FromStr for HttpLogger {
 fn is_sensitive_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "x-dufs-csrf-token"
+        "authorization" | "proxy-authorization" | "cookie" | "x-csrf-token"
     )
 }
 
@@ -569,9 +569,9 @@ mod tests {
                 "$http_Proxy_Authorization",
             ],
             [
-                "$http_x_dufs_csrf_token",
-                "$http_X_DUFS_CSRF_TOKEN",
-                "$http_X_DuFs_CsRf_ToKeN",
+                "$http_x_csrf_token",
+                "$http_X_CSRF_TOKEN",
+                "$http_X_CsRf_ToKeN",
             ],
             [
                 "$http_x_request_id",

@@ -727,34 +727,50 @@ then
 fi
 
 head -c 5000 /dev/zero > "$validation_dir/large-login-body"
-for login_path in \
-  '/__dufs__/login' \
-  '/__dufs__/login/' \
-  '/__dufs__/%6cogin' \
-  '/__dufs__//login'
-do
-  login_status="$(
-    bounded_curl "$curl_default_max_time_seconds" \
-      --http1.1 \
-      --insecure \
-      --noproxy '*' \
-      --path-as-is \
-      --silent \
-      --show-error \
-      --unix-socket "$socket_dir/https.sock" \
-      --request POST \
-      --data-binary "@$validation_dir/large-login-body" \
-      --output /dev/null \
-      --write-out '%{http_code}' \
-      "https://files.example.com${login_path}"
-  )"
-  [[ "$login_status" == "413" ]] || {
-    printf 'Login route variant escaped the 4 KiB body limit: %s (%s)\n' \
-      "$login_path" \
-      "$login_status" >&2
-    exit 1
-  }
-done
+login_status="$(
+  bounded_curl "$curl_default_max_time_seconds" \
+    --http1.1 \
+    --insecure \
+    --noproxy '*' \
+    --path-as-is \
+    --silent \
+    --show-error \
+    --unix-socket "$socket_dir/https.sock" \
+    --request POST \
+    --data-binary "@$validation_dir/large-login-body" \
+    --output /dev/null \
+    --write-out '%{http_code}' \
+    'https://files.example.com/api/v2/auth/login'
+)"
+[[ "$login_status" == "413" ]] || {
+  printf 'Current administrator login API escaped the 4 KiB body limit: %s\n' \
+    "$login_status" >&2
+  exit 1
+}
+
+# The removed HTML form POST path must not retain a second Nginx admission
+# policy. The mock upstream returns 200 here, proving this request used the
+# ordinary location instead of the exact current administrator API location.
+legacy_login_status="$(
+  bounded_curl "$curl_default_max_time_seconds" \
+    --http1.1 \
+    --insecure \
+    --noproxy '*' \
+    --path-as-is \
+    --silent \
+    --show-error \
+    --unix-socket "$socket_dir/https.sock" \
+    --request POST \
+    --data-binary "@$validation_dir/large-login-body" \
+    --output /dev/null \
+    --write-out '%{http_code}' \
+    'https://files.example.com/__dufs__/login'
+)"
+[[ "$legacy_login_status" == "200" ]] || {
+  printf 'Removed HTML login POST path retained special handling: %s\n' \
+    "$legacy_login_status" >&2
+  exit 1
+}
 ordinary_status="$(
   bounded_curl "$curl_default_max_time_seconds" \
     --http1.1 \
@@ -785,7 +801,7 @@ for index in {1..5}; do
     --request POST \
     --output /dev/null \
     --write-out '%{http_code}\n' \
-    "https://files.example.com/__dufs__/login/hold?request=${index}" \
+    "https://files.example.com/api/v2/auth/login?probe=/hold&request=${index}" \
     > "$validation_dir/connection-${index}.status" &
   connection_pids+=("$!")
 done
@@ -812,7 +828,7 @@ connection_recovery_status="$(
     --request POST \
     --output /dev/null \
     --write-out '%{http_code}' \
-    'https://files.example.com/__dufs__/login?connection-recovery=1'
+    'https://files.example.com/api/v2/auth/login?connection-recovery=1'
 )"
 [[ "$connection_recovery_status" == "200" ]] || {
   printf 'Nginx login limits did not recover after connections closed: %s\n' \
@@ -833,7 +849,7 @@ for index in {1..7}; do
     --request POST \
     --output /dev/null \
     --write-out '%{http_code}\n' \
-    "https://files.example.com/__dufs__/login?request=${index}" \
+    "https://files.example.com/api/v2/auth/login?request=${index}" \
     > "$validation_dir/rate-${index}.status"
 done
 grep -qx '429' "$validation_dir"/rate-*.status || {
@@ -856,7 +872,7 @@ rate_recovery_status="$(
     --request POST \
     --output /dev/null \
     --write-out '%{http_code}' \
-    'https://files.example.com/__dufs__/login?rate-recovery=1'
+    'https://files.example.com/api/v2/auth/login?rate-recovery=1'
 )"
 [[ "$rate_recovery_status" == "200" ]] || {
   printf 'Nginx login token bucket did not recover after a 429: %s\n' \

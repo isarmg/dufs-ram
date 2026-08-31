@@ -1,6 +1,10 @@
 use super::*;
 use rusqlite::{OpenFlags, config::DbConfig};
-use sha2::{Digest, Sha256};
+use sarmg_schema_identity::{
+    ProductMetadataRow, SQLITE_SCHEMA_ROWS_QUERY, SchemaIdentity, SchemaRow,
+    schema_fingerprint as foundation_schema_fingerprint, validate_product_metadata_ddl,
+    verify_current_schema,
+};
 use std::{
     fs::{self, File, OpenOptions, Permissions},
     io::{self, ErrorKind, Read, Seek, SeekFrom},
@@ -1344,61 +1348,33 @@ fn initialize_schema(connection: &mut Connection, root: RootIdentity) -> Result<
 
 pub(super) fn validate_product_metadata(connection: &Connection) -> Result<()> {
     validate_exact_schema(connection)?;
-    let row_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM product_metadata", [], |row| {
-            row.get(0)
-        })?;
-    ensure!(
-        row_count == 1,
-        "State database product_metadata must contain exactly one row"
-    );
-    let (singleton, application, application_version, schema_revision, schema_sha256): (
-        i64,
-        String,
-        String,
-        i64,
-        String,
-    ) = connection.query_row(
-        "SELECT singleton, application, application_version, schema_revision, schema_sha256
-           FROM product_metadata",
+    let metadata_ddl: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'product_metadata'",
         [],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
+        |row| row.get(0),
     )?;
-    ensure!(
-        singleton == 1,
-        "State database metadata singleton is invalid"
-    );
-    ensure!(
-        application == APPLICATION,
-        "State database belongs to a different application"
-    );
-    ensure!(
-        application_version == env!("CARGO_PKG_VERSION"),
-        "State database application version is not exactly current"
-    );
-    ensure!(
-        schema_revision == CURRENT_SCHEMA_REVISION,
-        "State database schema revision is not exactly current"
-    );
+    validate_product_metadata_ddl(&metadata_ddl)
+        .context("State database product_metadata DDL violates the Foundation contract")?;
 
-    let expected_fingerprint = expected_schema_fingerprint()?;
-    ensure!(
-        schema_sha256 == expected_fingerprint,
-        "State database schema fingerprint metadata is not exactly current"
-    );
-    let actual_fingerprint = schema_fingerprint(connection)?;
-    ensure!(
-        actual_fingerprint == expected_fingerprint,
-        "State database schema fingerprint does not match the current schema"
-    );
+    let mut metadata_statement = connection.prepare(
+        "SELECT singleton, application, application_version, schema_revision, schema_sha256
+           FROM product_metadata ORDER BY singleton",
+    )?;
+    let metadata_rows = metadata_statement
+        .query_map([], |row| {
+            Ok(ProductMetadataRow {
+                singleton: row.get(0)?,
+                application: row.get(1)?,
+                application_version: row.get(2)?,
+                schema_revision: row.get(3)?,
+                schema_sha256: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let schema_rows = foundation_schema_rows(connection)?;
+    let expected = expected_schema_identity()?;
+    verify_current_schema(&metadata_rows, &schema_rows, &expected)
+        .context("State database metadata or schema fingerprint is not exactly current")?;
     Ok(())
 }
 
@@ -1409,36 +1385,35 @@ pub(super) fn expected_schema_fingerprint() -> Result<String> {
 }
 
 fn schema_fingerprint(connection: &Connection) -> Result<String> {
-    let mut statement = connection.prepare(
-        "SELECT type, name, tbl_name, COALESCE(sql, '')
-           FROM sqlite_schema
-          WHERE name NOT GLOB 'sqlite_*' AND name <> 'product_metadata'
-          ORDER BY type, name, tbl_name",
-    )?;
+    foundation_schema_fingerprint(&foundation_schema_rows(connection)?)
+        .context("Foundation schema fingerprint rejected the SQLite schema rows")
+}
+
+fn foundation_schema_rows(connection: &Connection) -> Result<Vec<SchemaRow>> {
+    let mut statement = connection.prepare(SQLITE_SCHEMA_ROWS_QUERY)?;
     let rows = statement.query_map([], |row| {
-        Ok([
+        Ok(SchemaRow::new(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-        ])
+        ))
     })?;
-    let mut digest = Sha256::new();
-    for row in rows {
-        for field in row? {
-            let bytes = field.as_bytes();
-            let length = u64::try_from(bytes.len()).context("SQLite schema field is too large")?;
-            digest.update(length.to_be_bytes());
-            digest.update(bytes);
-        }
-    }
-    let digest = digest.finalize();
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(output)
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("Failed to collect canonical SQLite schema rows")?;
+    Ok(rows)
+}
+
+fn expected_schema_identity() -> Result<SchemaIdentity> {
+    SchemaIdentity::new(
+        APPLICATION,
+        env!("CARGO_PKG_VERSION"),
+        u64::try_from(CURRENT_SCHEMA_REVISION)
+            .context("Current schema revision cannot be represented as u64")?,
+        expected_schema_fingerprint()?,
+    )
+    .context("Compiled DUFS schema identity violates the Foundation contract")
 }
 
 fn insert_root_identity(transaction: &Transaction<'_>, root: RootIdentity) -> Result<()> {

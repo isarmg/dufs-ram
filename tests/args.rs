@@ -20,7 +20,7 @@ fn runtime_environment_cannot_supply_required_account(tmpdir: TempDir) -> Result
         .env("DUFS_AUTH", "environment-user:environment-password")
         .assert()
         .stderr(predicates::str::contains(
-            "At least one account is required",
+            "At least one administrator username account is required",
         ))
         .failure();
     Ok(())

@@ -276,7 +276,10 @@ fn test_args_from_empty_config_file_requires_auth() {
         .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
         .unwrap();
     let err = Args::parse(matches).unwrap_err();
-    assert!(err.to_string().contains("At least one account is required"));
+    assert!(
+        err.to_string()
+            .contains("At least one administrator username account is required")
+    );
 }
 
 #[test]

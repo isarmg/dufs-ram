@@ -33,7 +33,9 @@ fn account_is_required_to_start() -> Result<(), Error> {
     Command::new(assert_cmd::cargo::cargo_bin!())
         .assert()
         .failure()
-        .stderr(contains("At least one account is required"));
+        .stderr(contains(
+            "At least one administrator username account is required",
+        ));
 
     Ok(())
 }

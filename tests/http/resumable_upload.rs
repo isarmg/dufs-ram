@@ -50,8 +50,10 @@ fn chunked_excess_resume_body_preserves_the_durable_checkpoint(
             concat!(
                 "PATCH /chunked-excess-resume.bin HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "X-Dufs-Upload-Offset: 3\r\n",
@@ -61,6 +63,7 @@ fn chunked_excess_resume_body_preserves_the_durable_checkpoint(
                 "4\r\n1234\r\n",
                 "0\r\n\r\n"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),
@@ -134,8 +137,10 @@ fn full_running_checkpoint_can_reenter_commit_with_empty_patch(
             concat!(
                 "PUT /full-checkpoint.bin HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: {}\r\n",
                 "Transfer-Encoding: chunked\r\n",
@@ -143,6 +148,7 @@ fn full_running_checkpoint_can_reenter_commit_with_empty_patch(
                 "\r\n",
                 "{:x}\r\n"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),
@@ -240,8 +246,10 @@ fn resumed_small_checkpoint_survives_a_later_idle_timeout(
             concat!(
                 "PATCH /small-resume.bin HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 10\r\n",
                 "X-Dufs-Upload-Offset: 3\r\n",
@@ -251,6 +259,7 @@ fn resumed_small_checkpoint_survives_a_later_idle_timeout(
                 "2\r\n",
                 "de\r\n"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),

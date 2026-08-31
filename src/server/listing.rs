@@ -810,8 +810,7 @@ impl Server {
         let data = IndexData {
             href,
             dir_exists: options.exist,
-            user: options.session.user,
-            csrf_token: options.session.csrf_token,
+            session: options.session.administrator_session()?,
         };
         let index_data = STANDARD.encode(serde_json::to_string(&data)?);
         let output = INDEX_HTML
@@ -1294,8 +1293,7 @@ struct IndexOptions {
 struct IndexData {
     href: String,
     dir_exists: bool,
-    user: String,
-    csrf_token: String,
+    session: sarmg_contracts::AdministratorSession,
 }
 
 #[derive(Debug, Serialize)]

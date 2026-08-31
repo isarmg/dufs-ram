@@ -29,7 +29,6 @@ socket2 = "0.6"
 form_urlencoded = "1.2"
 alphanumeric-sort = "1.4"
 anyhow = "1.0"
-argon2 = "0.5"
 rustix = { version = "1.1", features = ["event", "fs", "process", "time"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 base64 = "0.22"
@@ -43,6 +42,10 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 sha2 = "0.11.0"
 subtle = "2.6"
 tempfile = "3"
+sarmg-admin-auth = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-contracts = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-schema-identity = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-server-target = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
 
 [dev-dependencies]
 assert_cmd = "2"

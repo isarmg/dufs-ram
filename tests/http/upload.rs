@@ -221,8 +221,10 @@ fn upload_concurrency_and_idle_time_are_bounded(
             concat!(
                 "PUT /bounded-first.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "Content-Length: 6\r\n",
@@ -230,6 +232,7 @@ fn upload_concurrency_and_idle_time_are_bounded(
                 "\r\n",
                 "abc"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),
@@ -325,8 +328,10 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
             concat!(
                 "PUT /changed-during-upload.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "Content-Length: 6\r\n",
@@ -334,6 +339,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
                 "\r\n",
                 "abc"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),
@@ -713,8 +719,10 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
             concat!(
                 "PATCH /changed-during-upload.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "X-Dufs-Upload-Offset: 6\r\n",
@@ -723,6 +731,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
                 "Connection: close\r\n",
                 "\r\n"
             ),
+            server.port(),
             server.port(),
             chunked_session.cookie(),
             chunked_session.csrf_token(),
@@ -767,8 +776,10 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
             concat!(
                 "PATCH /changed-during-upload.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "X-Dufs-Upload-Offset: 6\r\n",
@@ -779,6 +790,7 @@ fn late_upload_conflict_keeps_the_stage_and_confirmation_reuses_it(
                 "1\r\nx\r\n",
                 "0\r\n\r\n"
             ),
+            server.port(),
             server.port(),
             chunked_session.cookie(),
             chunked_session.csrf_token(),
@@ -894,8 +906,10 @@ fn staged_existing_target_metadata_cannot_be_reused_as_a_create(
             concat!(
                 "PUT /metadata-stage.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "X-Dufs-Upload-Overwrite: true\r\n",
@@ -905,6 +919,7 @@ fn staged_existing_target_metadata_cannot_be_reused_as_a_create(
                 "\r\n",
                 "abc"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),

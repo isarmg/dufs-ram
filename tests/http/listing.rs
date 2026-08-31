@@ -64,7 +64,16 @@ fn method_not_allowed_responses_advertise_supported_methods(
         .raw_request(reqwest::Method::PUT, server.url().join("__dufs__/login")?)
         .send()?;
     assert_eq!(login.status(), 405);
-    assert_eq!(login.headers().get("allow").unwrap(), "GET, POST");
+    assert_eq!(login.headers().get("allow").unwrap(), "GET");
+
+    let login_api = server
+        .raw_request(
+            reqwest::Method::GET,
+            server.url().join("api/v2/auth/login")?,
+        )
+        .send()?;
+    assert_eq!(login_api.status(), 405);
+    assert_eq!(login_api.headers().get("allow").unwrap(), "POST");
     Ok(())
 }
 

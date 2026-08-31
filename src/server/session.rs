@@ -5,45 +5,48 @@ use super::{
 };
 use crate::{
     args::TrustedProxy,
-    auth::{MAX_PASSWORD_BYTES, MAX_USERNAME_BYTES, session_token_from_cookie},
+    auth::{MAX_PASSWORD_BYTES, SessionInfo, session_token_from_headers},
     http_utils::{body_full, request_content_type_is},
-    utils::{decode_hex_to_slice, encode_hex},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use headers::{ContentLength, ContentType, HeaderMapExt};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::{
     Method, StatusCode, Uri,
     header::{
-        ACCEPT, CACHE_CONTROL, CONTENT_SECURITY_POLICY, HOST, HeaderMap, HeaderValue, LOCATION,
-        REFERRER_POLICY, SET_COOKIE,
+        ACCEPT, CACHE_CONTROL, CONTENT_SECURITY_POLICY, HeaderMap, HeaderValue, LOCATION,
+        REFERRER_POLICY, RETRY_AFTER, SET_COOKIE,
     },
+};
+pub(super) use sarmg_admin_auth::CSRF_HEADER;
+use sarmg_admin_auth::{
+    AdministratorOriginMode, HOST_HEADER, ORIGIN_HEADER, PASSWORD_MIN_BYTES, SEC_FETCH_SITE_HEADER,
+    normalize_administrator_username, require_administrator_same_origin,
+    require_single_security_header_value, validate_password,
+};
+pub(super) use sarmg_contracts::{ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH, ADMIN_SESSION_PATH};
+use sarmg_contracts::{
+    AdministratorLoginRequest, AdministratorSession, ErrorCode as FoundationErrorCode,
+    ErrorEnvelope,
 };
 use std::{
     collections::{HashMap, hash_map::Entry},
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
 pub(super) const LOGIN_PATH: &str = "__dufs__/login";
-pub(super) const LOGOUT_PATH: &str = "__dufs__/logout";
-pub(super) const CSRF_HEADER: &str = "x-dufs-csrf-token";
-pub(super) const LOGIN_ERROR_QUERY: &str = "login_error";
-
 const LOGIN_HTML: &str = include_str!("../../clients/web/login.html");
 const LOGIN_JS: &str = include_str!("../../clients/web/login.js");
 const LOGIN_URI: &str = "/__dufs__/login";
-const LOGIN_BODY_LIMIT: usize = 4 * 1024;
+const LOGIN_BODY_LIMIT: usize = 16 * 1024;
 const LOGIN_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_BODY_GLOBAL_LIMIT: usize = 32;
 const LOGIN_BODY_PER_IP_LIMIT: usize = 4;
-const LOGIN_CSP: &str = "default-src 'none'; script-src 'sha256-C2dkZ9O8X30GXdSF3n4Y6gTZ7GA3ZZJzRs2D2Qdabqc='; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
-const LOGIN_ERROR_CAPACITY: usize = 1024;
-const LOGIN_ERROR_TOKEN_BYTES: usize = 32;
-const LOGIN_ERROR_TTL: Duration = Duration::from_secs(60);
+const LOGIN_CSP: &str = "default-src 'none'; script-src 'sha256-8JkQKyZlvHgF9rVyTqmp4acwrwzHlcBJfZeOlicr02c='; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 #[derive(Debug, Default)]
 struct LoginBodyAdmissionState {
@@ -118,7 +121,6 @@ impl Drop for LoginBodyPermit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginError {
-    MissingFields,
     InvalidCredentials,
     TooManyRequests { retry_after_seconds: u64 },
 }
@@ -126,7 +128,6 @@ enum LoginError {
 impl LoginError {
     const fn message(self) -> &'static str {
         match self {
-            Self::MissingFields => "Enter username and password.",
             Self::InvalidCredentials => "Invalid username or password.",
             Self::TooManyRequests { .. } => "Too many sign-in requests. Please try again later.",
         }
@@ -135,69 +136,8 @@ impl LoginError {
     const fn status(self) -> StatusCode {
         match self {
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::MissingFields | Self::InvalidCredentials => StatusCode::OK,
+            Self::InvalidCredentials => StatusCode::UNAUTHORIZED,
         }
-    }
-
-    const fn retry_after_seconds(self) -> Option<u64> {
-        match self {
-            Self::TooManyRequests {
-                retry_after_seconds,
-            } => Some(retry_after_seconds),
-            Self::MissingFields | Self::InvalidCredentials => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct LoginErrorRecord {
-    error: LoginError,
-    created_at: Instant,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct LoginErrorStore {
-    entries: HashMap<[u8; LOGIN_ERROR_TOKEN_BYTES], LoginErrorRecord>,
-}
-
-impl LoginErrorStore {
-    fn insert(&mut self, error: LoginError) -> Result<String> {
-        let now = Instant::now();
-        self.purge_expired(now);
-        if self.entries.len() >= LOGIN_ERROR_CAPACITY
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, record)| record.created_at)
-                .map(|(token, _)| *token)
-        {
-            self.entries.remove(&oldest);
-        }
-
-        for _ in 0..4 {
-            let mut token = [0u8; LOGIN_ERROR_TOKEN_BYTES];
-            getrandom::fill(&mut token)
-                .map_err(|err| anyhow!("Failed to generate login error token: {err}"))?;
-            if let Entry::Vacant(entry) = self.entries.entry(token) {
-                entry.insert(LoginErrorRecord {
-                    error,
-                    created_at: now,
-                });
-                return Ok(encode_hex(token));
-            }
-        }
-        Err(anyhow!("Failed to generate a unique login error token"))
-    }
-
-    fn consume(&mut self, encoded_token: &str) -> Option<LoginError> {
-        let token = decode_login_error_token(encoded_token)?;
-        self.purge_expired(Instant::now());
-        self.entries.remove(&token).map(|record| record.error)
-    }
-
-    fn purge_expired(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, record| now.saturating_duration_since(record.created_at) < LOGIN_ERROR_TTL);
     }
 }
 
@@ -214,14 +154,20 @@ impl Server {
             peer_ip,
             &self.content.args.trusted_proxies,
         ) {
-            status_error(res, StatusCode::FORBIDDEN, "Forbidden");
-            self.add_private_security_headers(res);
+            self.render_login_problem(
+                res,
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Login requests must be same-origin",
+                false,
+                None,
+            )?;
             return Ok(None);
         }
 
         let client_ip = login_client_ip(req.headers(), peer_ip, &self.content.args.trusted_proxies);
         if let Err(delay) = self.admission.login_rate_limiter.check_request(client_ip) {
-            self.redirect_login_error(
+            self.render_login_error(
                 res,
                 LoginError::TooManyRequests {
                     retry_after_seconds: retry_after_seconds(delay),
@@ -230,20 +176,21 @@ impl Server {
             return Ok(None);
         }
 
-        let content_type_ok =
-            request_content_type_is(req.headers(), "application/x-www-form-urlencoded");
+        let content_type_ok = request_content_type_is(req.headers(), "application/json");
         if !content_type_ok {
-            status_error(
+            self.render_login_problem(
                 res,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Content-Type must be application/x-www-form-urlencoded",
-            );
-            self.add_private_security_headers(res);
+                "unsupported_media_type",
+                "Content-Type must be application/json",
+                false,
+                None,
+            )?;
             return Ok(None);
         }
 
         let Some(body_permit) = self.admission.login_body_admission.try_acquire(client_ip) else {
-            self.redirect_login_error(
+            self.render_login_error(
                 res,
                 LoginError::TooManyRequests {
                     retry_after_seconds: 1,
@@ -251,11 +198,20 @@ impl Server {
             )?;
             return Ok(None);
         };
-        let previous_token = req
-            .headers()
-            .get(hyper::header::COOKIE)
-            .and_then(session_token_from_cookie)
-            .map(str::to_owned);
+        let previous_token = match session_token_from_headers(req.headers()) {
+            Ok(token) => token.map(str::to_owned),
+            Err(()) => {
+                self.render_login_problem(
+                    res,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cookie_header",
+                    "Session Cookie header is invalid or ambiguous",
+                    false,
+                    None,
+                )?;
+                return Ok(None);
+            }
+        };
         let body = match tokio::time::timeout(
             LOGIN_BODY_TIMEOUT,
             Limited::new(req.into_body(), LOGIN_BODY_LIMIT).collect(),
@@ -265,40 +221,87 @@ impl Server {
             Ok(Ok(body)) => body.to_bytes(),
             Ok(Err(err)) => {
                 if err.downcast_ref::<LengthLimitError>().is_some() {
-                    status_error(res, StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
+                    self.render_login_problem(
+                        res,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_body_too_large",
+                        "Login request body is too large",
+                        false,
+                        None,
+                    )?;
                 } else {
-                    status_error(res, StatusCode::BAD_REQUEST, "Invalid request body");
+                    self.render_login_problem(
+                        res,
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_body",
+                        "Login request body is invalid",
+                        false,
+                        None,
+                    )?;
                 }
-                self.add_private_security_headers(res);
                 return Ok(None);
             }
             Err(_) => {
-                status_error(
+                self.render_login_problem(
                     res,
                     StatusCode::REQUEST_TIMEOUT,
+                    "request_timeout",
                     "Login request body timed out",
-                );
-                self.add_private_security_headers(res);
+                    true,
+                    None,
+                )?;
                 return Ok(None);
             }
         };
         drop(body_permit);
 
-        let Some((username, password)) = parse_login_form(&body) else {
-            self.redirect_login_error(res, LoginError::InvalidCredentials)?;
+        let Ok(credentials) = serde_json::from_slice::<AdministratorLoginRequest>(&body) else {
+            self.render_login_problem(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_body",
+                "Login request must contain exactly non-empty username and password fields",
+                false,
+                None,
+            )?;
             return Ok(None);
         };
-        if username.is_empty() || password.is_empty() {
-            self.redirect_login_error(res, LoginError::MissingFields)?;
+        if validate_password(&credentials.password).is_err() {
+            self.render_login_problem(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_body",
+                "Password does not satisfy the current administrator policy",
+                false,
+                None,
+            )?;
             return Ok(None);
         }
+        let AdministratorLoginRequest {
+            username: untrusted_username,
+            password,
+        } = credentials;
+        let username = match normalize_administrator_username(&untrusted_username) {
+            Ok(username) => username,
+            Err(_) => {
+                self.render_login_problem(
+                    res,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_body",
+                    "Username is not a valid administrator identity",
+                    false,
+                    None,
+                )?;
+                return Ok(None);
+            }
+        };
 
         if let Err(delay) = self
             .admission
             .login_rate_limiter
             .check_account_backoff(client_ip, &username)
         {
-            self.redirect_login_error(
+            self.render_login_error(
                 res,
                 LoginError::TooManyRequests {
                     retry_after_seconds: retry_after_seconds(delay),
@@ -308,7 +311,7 @@ impl Server {
         }
 
         let Ok(permit) = self.admission.login_slots.clone().try_acquire_owned() else {
-            self.redirect_login_error(
+            self.render_login_error(
                 res,
                 LoginError::TooManyRequests {
                     retry_after_seconds: 1,
@@ -318,9 +321,9 @@ impl Server {
         };
 
         let auth = self.content.auth.clone();
-        let login_user = username.clone();
+        let login_username = username.clone();
         let verified_user = run_with_login_slot(permit, move || {
-            auth.verify_credentials(&login_user, &password)
+            auth.verify_credentials(&login_username, &password)
         })
         .await?;
 
@@ -328,7 +331,7 @@ impl Server {
             self.admission
                 .login_rate_limiter
                 .record_failure(client_ip, &username);
-            self.redirect_login_error(res, LoginError::InvalidCredentials)?;
+            self.render_login_error(res, LoginError::InvalidCredentials)?;
             return Ok(None);
         };
         self.admission
@@ -343,74 +346,101 @@ impl Server {
             SET_COOKIE,
             self.content.auth.session_cookie(&created.token)?,
         );
-        res.headers_mut()
-            .insert(LOCATION, HeaderValue::from_static("/"));
-        *res.status_mut() = StatusCode::SEE_OTHER;
-        self.add_private_security_headers(res);
+        self.send_administrator_session(&created.session, res)?;
         Ok(Some(created.session.user))
     }
 
-    pub(super) fn send_login_page_for_get(
-        &self,
-        login_error_token: Option<&str>,
-        res: &mut Response,
-    ) -> Result<()> {
-        let error = login_error_token.and_then(|token| {
-            self.admission
-                .login_errors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .consume(token)
-        });
-        let status = error.map_or(StatusCode::OK, LoginError::status);
-        self.send_login_page(res, status, error.map(LoginError::message))?;
-        if let Some(retry_after_seconds) = error.and_then(LoginError::retry_after_seconds) {
-            res.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after_seconds.to_string())?,
-            );
-        }
-        Ok(())
-    }
-
-    fn send_login_page(
-        &self,
-        res: &mut Response,
-        status: StatusCode,
-        error: Option<&str>,
-    ) -> Result<()> {
+    pub(super) fn send_login_page_for_get(&self, res: &mut Response) -> Result<()> {
         let max_password_bytes = MAX_PASSWORD_BYTES.to_string();
+        let min_password_bytes = PASSWORD_MIN_BYTES.to_string();
         let output = LOGIN_HTML
-            .replace("__LOGIN_ACTION__", LOGIN_URI)
             .replace("__ASSETS_PREFIX__", &self.content.assets_prefix)
             .replace("__LOGIN_SCRIPT__", LOGIN_JS)
-            .replace("__MAX_PASSWORD_BYTES__", &max_password_bytes)
-            .replace(
-                "__ERROR_CLASS__",
-                if error.is_some() { "" } else { "hidden" },
-            )
-            .replace("__ERROR_MESSAGE__", error.unwrap_or_default());
+            .replace("__MIN_PASSWORD_BYTES__", &min_password_bytes)
+            .replace("__MAX_PASSWORD_BYTES__", &max_password_bytes);
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
-        *res.status_mut() = status;
+        *res.status_mut() = StatusCode::OK;
         *res.body_mut() = body_full(output);
         self.add_private_security_headers(res);
         Ok(())
     }
 
-    fn redirect_login_error(&self, res: &mut Response, error: LoginError) -> Result<()> {
-        let token = self
-            .admission
-            .login_errors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(error)?;
-        let location = format!("{LOGIN_URI}?{LOGIN_ERROR_QUERY}={token}");
+    pub(super) fn send_administrator_session(
+        &self,
+        session: &SessionInfo,
+        res: &mut Response,
+    ) -> Result<()> {
+        let contract: AdministratorSession = session.administrator_session()?;
+        let output = serde_json::to_vec(&contract)?;
         res.headers_mut()
-            .insert(LOCATION, HeaderValue::from_str(&location)?);
-        *res.status_mut() = StatusCode::SEE_OTHER;
+            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        *res.status_mut() = StatusCode::OK;
+        *res.body_mut() = body_full(output);
+        self.add_private_security_headers(res);
+        Ok(())
+    }
+
+    fn render_login_error(&self, res: &mut Response, error: LoginError) -> Result<()> {
+        let (code, retryable, retry_after) = match error {
+            LoginError::InvalidCredentials => ("invalid_credentials", false, None),
+            LoginError::TooManyRequests {
+                retry_after_seconds,
+            } => ("login_rate_limited", true, Some(retry_after_seconds)),
+        };
+        self.render_login_problem(
+            res,
+            error.status(),
+            code,
+            error.message(),
+            retryable,
+            retry_after,
+        )
+    }
+
+    fn render_login_problem(
+        &self,
+        res: &mut Response,
+        status: StatusCode,
+        code: &'static str,
+        detail: &'static str,
+        retryable: bool,
+        retry_after: Option<u64>,
+    ) -> Result<()> {
+        self.render_administrator_auth_error(res, status, code, detail, retryable, retry_after)?;
+        Ok(())
+    }
+
+    pub(super) fn render_administrator_auth_error(
+        &self,
+        res: &mut Response,
+        status: StatusCode,
+        code: &'static str,
+        message: &str,
+        retryable: bool,
+        retry_after: Option<u64>,
+    ) -> Result<()> {
+        let code = FoundationErrorCode::new(code)
+            .expect("administrator auth error codes are compile-time constants");
+        let mut envelope = ErrorEnvelope::with_code(code, message).retryable(retryable);
+        if let Some(seconds) = retry_after {
+            envelope = envelope.with_detail("retry_after", seconds);
+            res.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_str(&seconds.to_string())?);
+        } else {
+            res.headers_mut().remove(RETRY_AFTER);
+        }
+        let output = serde_json::to_vec(&envelope)?;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        *res.status_mut() = status;
+        *res.body_mut() = body_full(output);
         self.add_private_security_headers(res);
         Ok(())
     }
@@ -420,11 +450,24 @@ impl Server {
         method: &Method,
         headers: &HeaderMap,
         api_request: bool,
+        administrator_auth_api: bool,
         res: &mut Response,
     ) -> Result<()> {
         res.headers_mut()
             .insert(SET_COOKIE, self.content.auth.clear_session_cookie());
-        if !api_request && matches!(*method, Method::GET | Method::HEAD) && accepts_html(headers) {
+        if administrator_auth_api {
+            self.render_administrator_auth_error(
+                res,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Administrator authentication is required",
+                false,
+                None,
+            )?;
+        } else if !api_request
+            && matches!(*method, Method::GET | Method::HEAD)
+            && accepts_html(headers)
+        {
             res.headers_mut()
                 .insert(LOCATION, HeaderValue::from_static(LOGIN_URI));
             *res.status_mut() = StatusCode::SEE_OTHER;
@@ -440,7 +483,9 @@ impl Server {
         } else {
             status_error(res, StatusCode::UNAUTHORIZED, "Authentication required");
         }
-        self.add_private_security_headers(res);
+        if !administrator_auth_api {
+            self.add_private_security_headers(res);
+        }
         Ok(())
     }
 
@@ -468,13 +513,26 @@ impl Server {
         ) {
             return false;
         }
-        headers
-            .get(CSRF_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|candidate| {
-                self.content
-                    .auth
-                    .verify_csrf(session_token, expected_csrf, candidate)
+        let candidates = raw_header_values(headers, CSRF_HEADER);
+        self.content
+            .auth
+            .verify_csrf_header_values(session_token, expected_csrf, &candidates)
+    }
+
+    pub(super) fn administrator_auth_headers_are_unambiguous(
+        &self,
+        headers: &HeaderMap,
+        request_uri: &Uri,
+    ) -> bool {
+        let host_values = effective_host_values(headers, request_uri);
+        if require_single_security_header_value(HOST_HEADER, &host_values).is_err() {
+            return false;
+        }
+        [ORIGIN_HEADER, SEC_FETCH_SITE_HEADER, CSRF_HEADER]
+            .into_iter()
+            .all(|name| {
+                let values = raw_header_values(headers, name);
+                values.is_empty() || require_single_security_header_value(name, &values).is_ok()
             })
     }
 
@@ -571,42 +629,11 @@ where
     .await?)
 }
 
-fn decode_login_error_token(encoded_token: &str) -> Option<[u8; LOGIN_ERROR_TOKEN_BYTES]> {
-    if encoded_token.len() != LOGIN_ERROR_TOKEN_BYTES * 2 {
-        return None;
-    }
-    let mut token = [0u8; LOGIN_ERROR_TOKEN_BYTES];
-    decode_hex_to_slice(encoded_token, &mut token).then_some(())?;
-    Some(token)
-}
-
 fn retry_after_seconds(delay: Duration) -> u64 {
     delay
         .as_secs()
         .saturating_add(u64::from(delay.subsec_nanos() != 0))
         .max(1)
-}
-
-fn parse_login_form(body: &[u8]) -> Option<(String, String)> {
-    let mut values: HashMap<String, String> = HashMap::new();
-    for (key, value) in form_urlencoded::parse(body) {
-        if !matches!(key.as_ref(), "username" | "password")
-            || values
-                .insert(key.into_owned(), value.into_owned())
-                .is_some()
-        {
-            return None;
-        }
-    }
-    let username = values.remove("username")?;
-    let password = values.remove("password")?;
-    if username.len() > MAX_USERNAME_BYTES
-        || password.len() > MAX_PASSWORD_BYTES
-        || !values.is_empty()
-    {
-        return None;
-    }
-    Some((username, password))
 }
 
 fn accepts_html(headers: &HeaderMap) -> bool {
@@ -658,32 +685,6 @@ fn request_source_is_same_origin(
     peer_ip: IpAddr,
     trusted_proxies: &[TrustedProxy],
 ) -> bool {
-    let fetch_site = headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok());
-    if fetch_site.is_some_and(|value| value.eq_ignore_ascii_case("cross-site")) {
-        return false;
-    }
-
-    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
-        return true;
-    };
-    let request_authority = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| request_uri.authority().map(|authority| authority.as_str()));
-    let Some(request_authority) = request_authority else {
-        return false;
-    };
-    if origin.eq_ignore_ascii_case("null") {
-        return fetch_site.is_some_and(|value| value.eq_ignore_ascii_case("same-origin"));
-    }
-    let Ok(origin) = origin.parse::<Uri>() else {
-        return false;
-    };
-    let Some(origin_scheme) = origin.scheme_str() else {
-        return false;
-    };
     let request_scheme =
         match trusted_forwarded_value(headers, "x-forwarded-proto", peer_ip, trusted_proxies) {
             Ok(Some(value)) => {
@@ -699,10 +700,38 @@ fn request_source_is_same_origin(
                 // must preserve the external scheme in X-Forwarded-Proto.
                 .unwrap_or("http"),
         };
-    origin_scheme.eq_ignore_ascii_case(request_scheme)
-        && origin
-            .authority()
-            .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(request_authority))
+    let mode = if request_scheme.eq_ignore_ascii_case("https") {
+        AdministratorOriginMode::ProductionHttps
+    } else if request_scheme.eq_ignore_ascii_case("http") {
+        AdministratorOriginMode::LoopbackDevelopmentHttp
+    } else {
+        return false;
+    };
+    let origin_values = raw_header_values(headers, ORIGIN_HEADER);
+    let host_values = effective_host_values(headers, request_uri);
+    let site_values = raw_header_values(headers, SEC_FETCH_SITE_HEADER);
+    require_administrator_same_origin(mode, &origin_values, &host_values, &site_values).is_ok()
+}
+
+/// Preserve every raw field-line value for Foundation's singleton-header
+/// policy. This adapter deliberately performs no selection or normalization.
+fn raw_header_values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a [u8]> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect()
+}
+
+/// Treat HTTP/2 `:authority` (represented by `Uri::authority`) and every Host
+/// field line as the same singleton input. Supplying both is ambiguous and is
+/// intentionally rejected by Foundation as a duplicate.
+fn effective_host_values<'a>(headers: &'a HeaderMap, request_uri: &'a Uri) -> Vec<&'a [u8]> {
+    let mut values = raw_header_values(headers, HOST_HEADER);
+    if let Some(authority) = request_uri.authority() {
+        values.push(authority.as_str().as_bytes());
+    }
+    values
 }
 
 #[cfg(test)]

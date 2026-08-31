@@ -79,6 +79,16 @@ impl Server {
                     RecoveryAdvice::RetryAfterSeconds(1),
                 )
                 .expect("serializing a fixed upload problem cannot fail");
+            } else if profile.is_administrator_auth_api() {
+                self.render_administrator_auth_error(
+                    &mut res,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "Server is shutting down",
+                    true,
+                    Some(1),
+                )
+                .expect("serializing a fixed administrator auth error cannot fail");
             } else if profile.is_internal_api() {
                 render_problem(
                     &mut res,
@@ -129,6 +139,16 @@ impl Server {
                     if let Some(operation_id) = profile.operation_id() {
                         apply_operation_timeout(&mut res, operation_id, &mutation)
                             .expect("serializing a fixed operation response cannot fail");
+                    } else if profile.is_administrator_auth_api() {
+                        self.render_administrator_auth_error(
+                            &mut res,
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "request_timeout",
+                            "Request timed out",
+                            true,
+                            None,
+                        )
+                        .expect("serializing a fixed administrator auth error cannot fail");
                     } else if profile.is_internal_api() {
                         render_problem(
                             &mut res,
@@ -241,6 +261,27 @@ impl Server {
                         state,
                     )
                     .expect("serializing a validated upload problem cannot fail");
+                } else if profile.is_administrator_auth_api() {
+                    let (status, code, message, retryable) =
+                        if error.status() == StatusCode::GATEWAY_TIMEOUT {
+                            (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "request_timeout",
+                                "Request timed out",
+                                true,
+                            )
+                        } else {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal_error",
+                                "Administrator authentication request failed",
+                                false,
+                            )
+                        };
+                    self.render_administrator_auth_error(
+                        &mut res, status, code, message, retryable, None,
+                    )
+                    .expect("serializing a fixed administrator auth error cannot fail");
                 } else if profile.is_internal_api() {
                     render_problem(&mut res, &api_error_from_app_error(&error))
                         .expect("serializing a validated API problem cannot fail");

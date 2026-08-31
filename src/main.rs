@@ -1,5 +1,5 @@
 use dufs::args::{Args, build_cli};
-use dufs::auth::{MAX_PASSWORD_BYTES, hash_password};
+use dufs::auth::hash_password;
 use dufs::logger;
 use dufs::server::{Server, ServerRuntime};
 
@@ -105,13 +105,8 @@ async fn run_server(args: Args) -> Result<()> {
 }
 
 fn validate_cli_password(password: &str) -> Result<()> {
-    if password.is_empty() {
-        anyhow::bail!("Password must not be empty");
-    }
-    if password.len() > MAX_PASSWORD_BYTES {
-        anyhow::bail!("Password exceeds the {MAX_PASSWORD_BYTES}-byte limit");
-    }
-    Ok(())
+    sarmg_admin_auth::validate_password(password)
+        .context("Password violates the current administrator policy")
 }
 
 struct Serving {
@@ -899,17 +894,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_password_validation_uses_the_login_byte_limit() {
+    fn cli_password_validation_uses_the_foundation_administrator_policy() {
         assert!(validate_cli_password("").is_err());
         for password in [
-            "p".repeat(MAX_PASSWORD_BYTES),
-            "é".repeat(MAX_PASSWORD_BYTES / "é".len()),
+            "p".repeat(sarmg_admin_auth::PASSWORD_MIN_BYTES),
+            "p".repeat(sarmg_admin_auth::PASSWORD_MAX_BYTES),
+            "é".repeat(sarmg_admin_auth::PASSWORD_MAX_BYTES / "é".len()),
         ] {
             assert!(validate_cli_password(&password).is_ok());
         }
         for password in [
-            "p".repeat(MAX_PASSWORD_BYTES + 1),
-            format!("a{}", "é".repeat(MAX_PASSWORD_BYTES / "é".len())),
+            "p".repeat(sarmg_admin_auth::PASSWORD_MIN_BYTES - 1),
+            "valid-password\n".to_string(),
+            "p".repeat(sarmg_admin_auth::PASSWORD_MAX_BYTES + 1),
+            format!(
+                "a{}",
+                "é".repeat(sarmg_admin_auth::PASSWORD_MAX_BYTES / "é".len())
+            ),
         ] {
             assert!(validate_cli_password(&password).is_err());
         }

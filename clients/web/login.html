@@ -10,8 +10,7 @@
 
 <body>
   <main class="login-screen">
-    <form class="content-card login-card" method="post" action="__LOGIN_ACTION__" aria-label="Sign in to Dufs"
-      novalidate>
+    <form class="content-card login-card" aria-label="Sign in to Dufs" novalidate>
       <div class="card-inner">
         <div class="card-row">
           <label class="card-row-label" for="username">
@@ -27,8 +26,9 @@
         </div>
         <div class="card-row input-row">
           <div class="card-row-content">
-            <input class="login-input" id="username" name="username" type="text" maxlength="128" data-max-bytes="128"
-              autocomplete="username" aria-label="Username" required autofocus>
+            <input class="login-input" id="username" name="username" type="text" maxlength="64"
+              autocomplete="username" autocapitalize="none" spellcheck="false" aria-label="Username"
+              required autofocus>
           </div>
         </div>
         <div class="card-row">
@@ -46,13 +46,13 @@
         <div class="card-row input-row">
           <div class="card-row-content">
             <input class="login-input" id="password" name="password" type="password"
-              data-max-bytes="__MAX_PASSWORD_BYTES__"
+              data-min-bytes="__MIN_PASSWORD_BYTES__" data-max-bytes="__MAX_PASSWORD_BYTES__"
               autocomplete="current-password" aria-label="Password" required>
           </div>
         </div>
-        <div class="card-row error-row __ERROR_CLASS__" role="alert">
+        <div class="card-row error-row hidden" role="alert">
           <div class="card-row-content">
-            <span class="login-error">__ERROR_MESSAGE__</span>
+            <span class="login-error"></span>
           </div>
         </div>
         <div class="card-row">

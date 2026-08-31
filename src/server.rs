@@ -37,7 +37,7 @@ use self::{
     protocol::UploadPublicState,
     purge::{PurgeQueue, PurgeSignal},
     rooted_fs::{RootedEntryKey, RootedFs},
-    session::{LoginBodyAdmission, LoginErrorStore},
+    session::LoginBodyAdmission,
     state_store::StateStore,
     storage::DurableStorage,
     upload::{UploadOptions, UploadRecordStore},
@@ -328,7 +328,6 @@ struct AdmissionControl {
     path_wait_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
     disk_space: DiskSpaceTracker,
-    login_errors: Mutex<LoginErrorStore>,
     #[cfg(test)]
     upload_preflight_probe_hook: UploadPreflightProbeHook,
     #[cfg(test)]
@@ -441,7 +440,6 @@ impl Server {
                 path_wait_slots: Arc::new(Semaphore::new(path_wait_capacity)),
                 search_slots: Arc::new(Semaphore::new(max_concurrent_searches)),
                 disk_space: DiskSpaceTracker::new(),
-                login_errors: Mutex::new(LoginErrorStore::default()),
                 #[cfg(test)]
                 upload_preflight_probe_hook: Mutex::new(None),
                 #[cfg(test)]

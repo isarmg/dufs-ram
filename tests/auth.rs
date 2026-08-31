@@ -12,10 +12,11 @@ use reqwest::header::{
 };
 use reqwest::{Method, StatusCode, Url};
 use rstest::rstest;
-use serde_json::json;
+use sarmg_contracts::{AdministratorRole, AdministratorSession, ErrorEnvelope};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
-const CSRF_HEADER: &str = "x-dufs-csrf-token";
+const CSRF_HEADER: &str = "x-csrf-token";
 const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
 
 fn client_without_redirects() -> Result<Client, Error> {
@@ -24,42 +25,30 @@ fn client_without_redirects() -> Result<Client, Error> {
         .build()?)
 }
 
-fn login_form_response(
-    server: &TestServer,
-    username: &str,
-    password: &str,
-) -> Result<Response, Error> {
-    login_form_response_from(server, username, password, None)
+fn login_response(server: &TestServer, username: &str, password: &str) -> Result<Response, Error> {
+    login_response_from(server, username, password, None)
 }
 
-fn login_form_response_from(
+fn login_response_from(
     server: &TestServer,
     username: &str,
     password: &str,
     client_ip: Option<&str>,
 ) -> Result<Response, Error> {
-    let form = form_urlencoded::Serializer::new(String::new())
-        .append_pair("username", username)
-        .append_pair("password", password)
-        .finish();
     let request = client_without_redirects()?
-        .post(server.url().join("__dufs__/login")?)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(form);
+        .post(server.url().join("api/v2/auth/login")?)
+        .header("origin", server.url().origin().ascii_serialization())
+        .header("sec-fetch-site", "same-origin")
+        .header(CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&json!({
+            "username": username,
+            "password": password,
+        }))?);
     let request = match client_ip {
         Some(client_ip) => request.header("x-forwarded-for", client_ip),
         None => request,
     };
     Ok(request.send()?)
-}
-
-fn login_error_url(server: &TestServer, response: &Response) -> Result<Url, Error> {
-    let location = response
-        .headers()
-        .get(LOCATION)
-        .ok_or("Rejected login is missing its redirect")?
-        .to_str()?;
-    Ok(server.url().join(location)?)
 }
 
 fn request_with_csrf(
@@ -71,7 +60,9 @@ fn request_with_csrf(
 ) -> RequestBuilder {
     let request = server
         .raw_request(method, url)
-        .header(COOKIE, session.cookie());
+        .header(COOKIE, session.cookie())
+        .header("origin", server.url().origin().ascii_serialization())
+        .header("sec-fetch-site", "same-origin");
     match csrf {
         Some(csrf) => request.header(CSRF_HEADER, csrf),
         None => request,
@@ -112,7 +103,9 @@ fn unauthenticated_html_navigation_redirects_to_login(
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| {
-                value.contains("style-src 'self'") && !value.contains("'unsafe-inline'")
+                value.contains("style-src 'self'")
+                    && value.contains("connect-src 'self'")
+                    && !value.contains("'unsafe-inline'")
             })
     );
     let body = login_page.text()?;
@@ -147,7 +140,10 @@ fn unauthenticated_html_navigation_redirects_to_login(
     assert_eq!(body.matches(" required").count(), 2);
     assert!(body.contains("name=\"username\""));
     assert!(body.contains("name=\"password\""));
+    assert!(body.contains("maxlength=\"64\""));
+    assert!(body.contains("data-min-bytes=\"12\""));
     assert!(body.contains("data-max-bytes=\"1024\""));
+    assert!(!body.contains("__MIN_PASSWORD_BYTES__"));
     assert!(!body.contains("__MAX_PASSWORD_BYTES__"));
     Ok(())
 }
@@ -166,8 +162,11 @@ fn noncanonical_login_paths_are_rejected(
         assert_eq!(url.path(), raw_path);
         let response = client
             .post(url)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(format!("username=user&password={TEST_PASSWORD}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&json!({
+                "username": "user",
+                "password": TEST_PASSWORD,
+            }))?)
             .send()?;
         assert_eq!(
             response.status(),
@@ -233,53 +232,59 @@ fn unauthenticated_writes_return_401_before_touching_disk(
 }
 
 #[rstest]
-fn login_form_uses_one_time_prg_errors_and_sets_cookie_only_on_success(
+fn administrator_login_uses_exact_foundation_json_and_sets_cookie_only_on_success(
     #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
-    let client = client_without_redirects()?;
-    let mut locations = Vec::new();
-    for (username, password, message) in [
-        ("", "", "Enter username and password."),
-        ("user", "", "Enter username and password."),
-        ("", TEST_PASSWORD, "Enter username and password."),
-        ("user", "wrong", "Invalid username or password."),
+    for (username, password, expected_status, expected_code) in [
+        ("", "", StatusCode::BAD_REQUEST, "invalid_request_body"),
+        (
+            "user",
+            "short",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_body",
+        ),
+        (
+            "invalid@username",
+            TEST_PASSWORD,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_body",
+        ),
+        (
+            "user",
+            "wrong-password",
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+        ),
     ] {
-        let rejected = login_form_response(&server, username, password)?;
-        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        let rejected = login_response(&server, username, password)?;
+        assert_eq!(rejected.status(), expected_status);
         assert!(!rejected.headers().contains_key(SET_COOKIE));
         assert!(!rejected.headers().contains_key(RETRY_AFTER));
-        let location = rejected
-            .headers()
-            .get(LOCATION)
-            .ok_or("Rejected login is missing its redirect")?
-            .to_str()?
-            .to_string();
-        assert!(location.starts_with("/__dufs__/login?login_error="));
-        assert_eq!(
-            location
-                .split_once("login_error=")
-                .map(|(_, token)| token.len()),
-            Some(64)
-        );
-        assert!(!locations.contains(&location));
-        locations.push(location.clone());
-
-        let error_url = server.url().join(&location)?;
-        let first_get = client.get(error_url.clone()).send()?;
-        assert_eq!(first_get.status(), StatusCode::OK);
-        assert!(!first_get.headers().contains_key(RETRY_AFTER));
-        assert!(first_get.text()?.contains(message));
-
-        let refreshed = client.get(error_url).send()?;
-        assert_eq!(refreshed.status(), StatusCode::OK);
-        assert!(!refreshed.headers().contains_key(RETRY_AFTER));
-        let refreshed_body = refreshed.text()?;
-        assert!(!refreshed_body.contains("Enter username and password."));
-        assert!(!refreshed_body.contains("Invalid username or password."));
+        let envelope: ErrorEnvelope = serde_json::from_str(&rejected.text()?)?;
+        assert_eq!(envelope.code.as_str(), expected_code);
+        assert!(!envelope.retryable);
+        assert!(envelope.details.is_empty());
     }
 
-    let accepted = login_form_response(&server, "user", TEST_PASSWORD)?;
-    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+    for invalid_shape in [
+        json!({ "password": TEST_PASSWORD }),
+        json!({ "username": "user", "password": TEST_PASSWORD, "extra": true }),
+    ] {
+        let rejected = client_without_redirects()?
+            .post(server.url().join("api/v2/auth/login")?)
+            .header("origin", server.url().origin().ascii_serialization())
+            .header("sec-fetch-site", "same-origin")
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&invalid_shape)?)
+            .send()?;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(!rejected.headers().contains_key(SET_COOKIE));
+        let envelope: ErrorEnvelope = serde_json::from_str(&rejected.text()?)?;
+        assert_eq!(envelope.code.as_str(), "invalid_request_body");
+    }
+
+    let accepted = login_response(&server, " User ", TEST_PASSWORD)?;
+    assert_eq!(accepted.status(), StatusCode::OK);
     let cookie = accepted
         .headers()
         .get(SET_COOKIE)
@@ -291,6 +296,111 @@ fn login_form_uses_one_time_prg_errors_and_sets_cookie_only_on_success(
         assert!(cookie_lower.contains(attribute), "cookie={cookie}");
     }
     assert!(!cookie_lower.contains("domain="));
+    let body = accepted.text()?;
+    let raw: Value = serde_json::from_str(&body)?;
+    let keys = raw
+        .as_object()
+        .ok_or("Login response is not an object")?
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        ["authenticated", "csrf_token", "role", "user_id", "username"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let session: AdministratorSession = serde_json::from_str(&body)?;
+    assert_eq!(session.username, "user");
+    assert_eq!(session.role, AdministratorRole::Admin);
+    assert_eq!(session.csrf_token.len(), 43);
+    assert!(
+        session
+            .csrf_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    );
+
+    let removed_form_endpoint = client_without_redirects()?
+        .post(server.url().join("__dufs__/login")?)
+        .header(CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&json!({
+            "username": "user",
+            "password": TEST_PASSWORD,
+        }))?)
+        .send()?;
+    assert_eq!(
+        removed_form_endpoint.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert!(!removed_form_endpoint.headers().contains_key(SET_COOKIE));
+    Ok(())
+}
+
+#[rstest]
+fn administrator_session_and_auth_failures_use_the_foundation_contract(
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
+) -> Result<(), Error> {
+    let session = server.login("user", TEST_PASSWORD)?;
+    let restored = server
+        .raw_request(Method::GET, server.url().join("api/v2/auth/session")?)
+        .header(COOKIE, session.cookie())
+        .send()?;
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored: AdministratorSession = serde_json::from_str(&restored.text()?)?;
+    assert_eq!(restored.username, "user");
+    assert_eq!(restored.role, AdministratorRole::Admin);
+    assert_eq!(restored.csrf_token, session.csrf_token());
+
+    let unauthenticated = server
+        .raw_request(Method::GET, server.url().join("api/v2/auth/session")?)
+        .send()?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unauthenticated: ErrorEnvelope = serde_json::from_str(&unauthenticated.text()?)?;
+    assert_eq!(unauthenticated.code.as_str(), "unauthorized");
+    assert!(!unauthenticated.retryable);
+    assert!(unauthenticated.details.is_empty());
+
+    let missing_csrf = server
+        .raw_request(Method::POST, server.url().join("api/v2/auth/logout")?)
+        .header(COOKIE, session.cookie())
+        .header("origin", server.url().origin().ascii_serialization())
+        .header("sec-fetch-site", "same-origin")
+        .send()?;
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    let missing_csrf: ErrorEnvelope = serde_json::from_str(&missing_csrf.text()?)?;
+    assert_eq!(missing_csrf.code.as_str(), "csrf_failed");
+    assert!(!missing_csrf.retryable);
+    assert!(missing_csrf.details.is_empty());
+    Ok(())
+}
+
+#[rstest]
+fn administrator_login_rejects_ambiguous_session_cookie_without_rotation(
+    #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
+) -> Result<(), Error> {
+    let token = "A".repeat(43);
+    let response = client_without_redirects()?
+        .post(server.url().join("api/v2/auth/login")?)
+        .header("origin", server.url().origin().ascii_serialization())
+        .header("sec-fetch-site", "same-origin")
+        .header(CONTENT_TYPE, "application/json")
+        .header(
+            COOKIE,
+            format!("{SESSION_COOKIE_NAME}={token}; {SESSION_COOKIE_NAME}={token}"),
+        )
+        .body(serde_json::to_vec(&json!({
+            "username": "user",
+            "password": TEST_PASSWORD,
+        }))?)
+        .send()?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.headers().contains_key(SET_COOKIE));
+    let envelope: ErrorEnvelope = serde_json::from_str(&response.text()?)?;
+    assert_eq!(envelope.code.as_str(), "invalid_cookie_header");
+    assert!(!envelope.retryable);
+    assert!(envelope.details.is_empty());
     Ok(())
 }
 
@@ -302,63 +412,45 @@ fn login_backoff_is_scoped_to_the_source_and_account_pair(
     ], &[USER_ACCOUNT])]
     server: TestServer,
 ) -> Result<(), Error> {
-    let client = client_without_redirects()?;
     let first_ip = "192.0.2.10";
     let second_ip = "192.0.2.11";
 
     for _ in 0..5 {
-        let rejected = login_form_response_from(&server, "user", "wrong", Some(first_ip))?;
-        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        let rejected = login_response_from(&server, "user", "wrong-password", Some(first_ip))?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
         assert!(!rejected.headers().contains_key(RETRY_AFTER));
         assert!(!rejected.headers().contains_key(SET_COOKIE));
     }
 
-    let blocked = login_form_response_from(&server, "user", TEST_PASSWORD, Some(first_ip))?;
-    assert_eq!(blocked.status(), StatusCode::SEE_OTHER);
-    assert!(!blocked.headers().contains_key(RETRY_AFTER));
+    let blocked = login_response_from(&server, "user", TEST_PASSWORD, Some(first_ip))?;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(!blocked.headers().contains_key(SET_COOKIE));
-    let blocked_error_url = login_error_url(&server, &blocked)?;
-    let blocked_page = client.get(blocked_error_url.clone()).send()?;
-    assert_eq!(blocked_page.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        blocked_page
+        blocked
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
-    assert!(
-        blocked_page
-            .text()?
-            .contains("Too many sign-in requests. Please try again later.")
-    );
-    let blocked_refresh = client.get(blocked_error_url).send()?;
-    assert_eq!(blocked_refresh.status(), StatusCode::OK);
-    assert!(!blocked_refresh.headers().contains_key(RETRY_AFTER));
-    assert!(
-        !blocked_refresh
-            .text()?
-            .contains("Too many sign-in requests. Please try again later.")
-    );
+    let blocked_envelope: ErrorEnvelope = serde_json::from_str(&blocked.text()?)?;
+    assert_eq!(blocked_envelope.code.as_str(), "login_rate_limited");
+    assert!(blocked_envelope.retryable);
+    assert_eq!(blocked_envelope.details["retry_after"], 1);
 
-    let other_source = login_form_response_from(&server, "user", TEST_PASSWORD, Some(second_ip))?;
-    assert_eq!(other_source.status(), StatusCode::SEE_OTHER);
+    let other_source = login_response_from(&server, "user", TEST_PASSWORD, Some(second_ip))?;
+    assert_eq!(other_source.status(), StatusCode::OK);
     assert!(other_source.headers().contains_key(SET_COOKIE));
     assert!(!other_source.headers().contains_key(RETRY_AFTER));
 
     std::thread::sleep(std::time::Duration::from_millis(1_050));
-    let next_failure = login_form_response_from(&server, "user", "wrong", Some(first_ip))?;
-    assert_eq!(next_failure.status(), StatusCode::SEE_OTHER);
+    let next_failure = login_response_from(&server, "user", "wrong-password", Some(first_ip))?;
+    assert_eq!(next_failure.status(), StatusCode::UNAUTHORIZED);
     assert!(!next_failure.headers().contains_key(RETRY_AFTER));
 
-    let longer_backoff = login_form_response_from(&server, "user", TEST_PASSWORD, Some(first_ip))?;
-    assert_eq!(longer_backoff.status(), StatusCode::SEE_OTHER);
-    assert!(!longer_backoff.headers().contains_key(RETRY_AFTER));
-    let longer_backoff_url = login_error_url(&server, &longer_backoff)?;
-    let longer_backoff_page = client.get(longer_backoff_url).send()?;
-    assert_eq!(longer_backoff_page.status(), StatusCode::TOO_MANY_REQUESTS);
+    let longer_backoff = login_response_from(&server, "user", TEST_PASSWORD, Some(first_ip))?;
+    assert_eq!(longer_backoff.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        longer_backoff_page
+        longer_backoff
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
@@ -378,21 +470,22 @@ fn successful_login_clears_the_pair_failure_history(
 ) -> Result<(), Error> {
     let client_ip = "192.0.2.20";
     for _ in 0..4 {
-        let rejected = login_form_response_from(&server, "user", "wrong", Some(client_ip))?;
-        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        let rejected = login_response_from(&server, "user", "wrong-password", Some(client_ip))?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
         assert!(!rejected.headers().contains_key(RETRY_AFTER));
     }
 
-    let first_success = login_form_response_from(&server, "user", TEST_PASSWORD, Some(client_ip))?;
+    let first_success = login_response_from(&server, "user", TEST_PASSWORD, Some(client_ip))?;
+    assert_eq!(first_success.status(), StatusCode::OK);
     assert!(first_success.headers().contains_key(SET_COOKIE));
 
     let failure_after_success =
-        login_form_response_from(&server, "user", "wrong", Some(client_ip))?;
-    assert_eq!(failure_after_success.status(), StatusCode::SEE_OTHER);
+        login_response_from(&server, "user", "wrong-password", Some(client_ip))?;
+    assert_eq!(failure_after_success.status(), StatusCode::UNAUTHORIZED);
     assert!(!failure_after_success.headers().contains_key(RETRY_AFTER));
 
-    let second_success = login_form_response_from(&server, "user", TEST_PASSWORD, Some(client_ip))?;
-    assert_eq!(second_success.status(), StatusCode::SEE_OTHER);
+    let second_success = login_response_from(&server, "user", TEST_PASSWORD, Some(client_ip))?;
+    assert_eq!(second_success.status(), StatusCode::OK);
     assert!(second_success.headers().contains_key(SET_COOKIE));
     assert!(!second_success.headers().contains_key(RETRY_AFTER));
     Ok(())
@@ -403,18 +496,15 @@ fn untrusted_forwarded_addresses_do_not_split_login_backoff(
     #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     for _ in 0..5 {
-        let rejected = login_form_response_from(&server, "user", "wrong", Some("192.0.2.30"))?;
-        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        let rejected = login_response_from(&server, "user", "wrong-password", Some("192.0.2.30"))?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
         assert!(!rejected.headers().contains_key(SET_COOKIE));
     }
 
-    let blocked = login_form_response_from(&server, "user", TEST_PASSWORD, Some("192.0.2.31"))?;
-    assert_eq!(blocked.status(), StatusCode::SEE_OTHER);
+    let blocked = login_response_from(&server, "user", TEST_PASSWORD, Some("192.0.2.31"))?;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(!blocked.headers().contains_key(SET_COOKIE));
-    let page = client_without_redirects()?
-        .get(login_error_url(&server, &blocked)?)
-        .send()?;
-    assert_eq!(page.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().contains_key(RETRY_AFTER));
     Ok(())
 }
 
@@ -422,16 +512,15 @@ fn untrusted_forwarded_addresses_do_not_split_login_backoff(
 fn cross_site_login_and_write_requests_are_rejected(
     #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
-    let form = form_urlencoded::Serializer::new(String::new())
-        .append_pair("username", "user")
-        .append_pair("password", TEST_PASSWORD)
-        .finish();
     let login = client_without_redirects()?
-        .post(server.url().join("__dufs__/login")?)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .post(server.url().join("api/v2/auth/login")?)
+        .header(CONTENT_TYPE, "application/json")
         .header("origin", "https://evil.example")
         .header("sec-fetch-site", "cross-site")
-        .body(form)
+        .body(serde_json::to_vec(&json!({
+            "username": "user",
+            "password": TEST_PASSWORD,
+        }))?)
         .send()?;
     assert_eq!(login.status(), StatusCode::FORBIDDEN);
     assert!(!login.headers().contains_key(SET_COOKIE));
@@ -565,7 +654,7 @@ fn every_write_method_rejects_missing_forged_and_cross_session_csrf(
     let other_session = server.login("user", TEST_PASSWORD)?;
     let csrf_cases = [
         ("missing", None),
-        ("forged", Some("00".repeat(32))),
+        ("forged", Some("A".repeat(43))),
         (
             "cross-session",
             Some(other_session.csrf_token().to_string()),
@@ -704,11 +793,27 @@ fn logout_clears_cookie_and_immediately_revokes_the_session(
     #[with(&[] as &[&str], &[USER_ACCOUNT])] server: TestServer,
 ) -> Result<(), Error> {
     let session = server.login("user", TEST_PASSWORD)?;
-    let logout = server
+    let removed_logout = server
         .request_with(
             &session,
             Method::POST,
             server.url().join("__dufs__/logout")?,
+        )
+        .send()?;
+    // Retired auth routes are ordinary unknown paths. Keeping a method-aware
+    // response would itself preserve a compatibility alias.
+    assert_eq!(removed_logout.status(), StatusCode::NOT_FOUND);
+    let still_authenticated = server
+        .raw_request(Method::GET, server.url().join("api/v2/auth/session")?)
+        .header(COOKIE, session.cookie())
+        .send()?;
+    assert_eq!(still_authenticated.status(), StatusCode::OK);
+
+    let logout = server
+        .request_with(
+            &session,
+            Method::POST,
+            server.url().join("api/v2/auth/logout")?,
         )
         .send()?;
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);

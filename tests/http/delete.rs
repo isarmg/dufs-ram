@@ -118,8 +118,10 @@ fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
             concat!(
                 "PUT /locked/file.txt HTTP/1.1\r\n",
                 "Host: localhost:{}\r\n",
+                "Origin: http://localhost:{}\r\n",
+                "Sec-Fetch-Site: same-origin\r\n",
                 "Cookie: {}\r\n",
-                "X-Dufs-CSRF-Token: {}\r\n",
+                "X-CSRF-Token: {}\r\n",
                 "X-Dufs-Upload-Id: {}\r\n",
                 "X-Dufs-Upload-Length: 6\r\n",
                 "Content-Length: 6\r\n",
@@ -127,6 +129,7 @@ fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
                 "\r\n",
                 "abc"
             ),
+            server.port(),
             server.port(),
             session.cookie(),
             session.csrf_token(),
@@ -157,6 +160,7 @@ fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
         .ok_or("active upload ancestor has no revision")?;
 
     let delete_url = format!("{}locked/", server.url());
+    let delete_origin = server.url().origin().ascii_serialization();
     let cookie = session.cookie().to_owned();
     let csrf = session.csrf_token().to_owned();
     let (delete_tx, delete_rx) = mpsc::channel();
@@ -164,7 +168,9 @@ fn delete_ancestor_waits_for_active_upload_then_rejects_its_stale_revision(
         let result = reqwest::blocking::Client::new()
             .delete(delete_url)
             .header("cookie", cookie)
-            .header("x-dufs-csrf-token", csrf)
+            .header("origin", delete_origin)
+            .header("sec-fetch-site", "same-origin")
+            .header("x-csrf-token", csrf)
             .header("x-dufs-operation-id", Uuid::new_v4().to_string())
             .header("if-match", format!("\"{delete_revision}\""))
             .send()

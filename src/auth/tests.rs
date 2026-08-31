@@ -1,12 +1,16 @@
 use super::*;
 
+const TEST_USERNAME: &str = "admin";
+const TEST_PASSWORD: &str = "test-password";
+const TEST_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
 fn test_access_control() -> AccessControl {
     test_access_control_with_clock(SessionClock::boottime())
 }
 
 fn test_access_control_with_clock(clock: SessionClock) -> AccessControl {
-    let hash = hash_password("pass").unwrap();
-    let account = format!("user:{hash}");
+    let hash = hash_password(TEST_PASSWORD).unwrap();
+    let account = format!("{TEST_USERNAME}:{hash}");
     AccessControl::with_clock(AuthConfig::new(&[&account]).unwrap(), clock)
 }
 
@@ -51,105 +55,81 @@ fn password_hashes_are_argon2id_and_salted() {
     assert!(second.starts_with("$argon2id$v=19$"));
     assert_ne!(first, second);
 
-    let parsed = PasswordHash::new(&first).unwrap();
-    assert!(
-        Argon2::default()
-            .verify_password(b"correct horse battery staple", &parsed)
-            .is_ok()
-    );
-    assert!(
-        Argon2::default()
-            .verify_password(b"wrong", &parsed)
-            .is_err()
-    );
+    assert!(foundation_verify_password(
+        "correct horse battery staple",
+        &first
+    ));
+    assert!(!foundation_verify_password("wrong-password", &first));
 }
 
 #[test]
 fn password_hashing_enforces_the_login_byte_limit() {
-    let empty_error = hash_password("")
-        .expect_err("an empty password was accepted")
-        .to_string();
-    assert!(
-        empty_error.contains("must not be empty"),
-        "unexpected error: {empty_error}"
-    );
     for password in [
+        "p".repeat(sarmg_admin_auth::PASSWORD_MIN_BYTES),
         "p".repeat(MAX_PASSWORD_BYTES),
         "é".repeat(MAX_PASSWORD_BYTES / "é".len()),
     ] {
         assert!(hash_password(&password).is_ok());
     }
     for password in [
+        String::new(),
+        "p".repeat(sarmg_admin_auth::PASSWORD_MIN_BYTES - 1),
+        "valid-password\n".to_string(),
         "p".repeat(MAX_PASSWORD_BYTES + 1),
         format!("a{}", "é".repeat(MAX_PASSWORD_BYTES / "é".len())),
     ] {
-        let error = hash_password(&password)
-            .expect_err("an oversized password was accepted")
-            .to_string();
         assert!(
-            error.contains("1024-byte limit"),
-            "unexpected error: {error}"
+            hash_password(&password).is_err(),
+            "an out-of-policy password was accepted"
         );
     }
 }
 
 #[test]
 fn configured_argon2id_phc_is_accepted() {
-    let hash = hash_password("secret").unwrap();
-    let account = format!("user:{hash}");
+    let hash = hash_password(TEST_PASSWORD).unwrap();
+    let account = format!("{TEST_USERNAME}:{hash}");
     let auth = AccessControl::from_config(AuthConfig::new(&[&account]).unwrap());
-    assert!(auth.login("user", "secret", None).unwrap().is_some());
-    assert_eq!(auth.config.users.get("user"), Some(&hash));
+    assert!(
+        auth.login(TEST_USERNAME, TEST_PASSWORD, None)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(auth.config.users.get(TEST_USERNAME), Some(&hash));
 }
 
 #[test]
 fn auth_config_debug_never_exposes_password_hashes() {
-    let hash = hash_password("debug-secret").unwrap();
-    let account = format!("visible-user:{hash}");
+    let hash = hash_password("debug-secret-password").unwrap();
+    let account = format!("visible-admin:{hash}");
     let config = AuthConfig::new(&[&account]).unwrap();
 
     let output = format!("{config:?}");
-    assert!(output.contains("visible-user"));
+    assert!(output.contains("visible-admin"));
     assert!(!output.contains("argon2id"));
     assert!(!output.contains(&hash));
 }
 
 #[test]
 fn access_controls_from_cloned_config_have_isolated_sessions() {
-    let hash = hash_password("pass").unwrap();
-    let account = format!("user:{hash}");
+    let hash = hash_password(TEST_PASSWORD).unwrap();
+    let account = format!("{TEST_USERNAME}:{hash}");
     let config = AuthConfig::new(&[&account]).unwrap();
     let first = AccessControl::from_config(config.clone());
     let second = AccessControl::from_config(config);
 
-    let created = first.login("user", "pass", None).unwrap().unwrap();
+    let created = first
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
     assert!(first.authenticate(&created.token).is_some());
     assert!(second.authenticate(&created.token).is_none());
 }
 
 #[test]
 fn configured_hash_must_match_the_current_argon2id_policy_exactly() {
-    let valid = hash_password("secret").unwrap();
-    validate_argon2id_hash(&valid).unwrap();
-
-    let salt = SaltString::encode_b64(&[0x5a; SALT_BYTES]).unwrap();
-    let short_output_params = Params::new(
-        ARGON2_MEMORY_KIB,
-        ARGON2_ITERATIONS,
-        ARGON2_PARALLELISM,
-        Some(16),
-    )
-    .unwrap();
-    let short_output = Argon2::new(Algorithm::Argon2id, Version::V0x13, short_output_params)
-        .hash_password(b"secret", &salt)
-        .unwrap()
-        .to_string();
-
-    let short_salt = SaltString::encode_b64(&[0x5a; 8]).unwrap();
-    let short_salt = current_argon2()
-        .hash_password(b"secret", &short_salt)
-        .unwrap()
-        .to_string();
+    let valid = hash_password(TEST_PASSWORD).unwrap();
+    sarmg_admin_auth::require_current_password_hash(&valid).unwrap();
 
     for invalid in [
         valid.replacen("v=19", "v=16", 1),
@@ -158,11 +138,11 @@ fn configured_hash_must_match_the_current_argon2id_policy_exactly() {
         valid.replacen("t=2", "t=3", 1),
         valid.replacen("p=1", "p=2", 1),
         valid.replacen(",p=1", "", 1),
-        short_output,
-        short_salt,
+        format!("{valid}$trailing"),
+        "not-a-phc-string".to_string(),
     ] {
-        let error =
-            validate_argon2id_hash(&invalid).expect_err("non-current Argon2id policy was accepted");
+        let error = sarmg_admin_auth::require_current_password_hash(&invalid)
+            .expect_err("non-current Argon2id policy was accepted");
         assert!(
             !error.to_string().contains(&invalid),
             "password hash was echoed in the validation error"
@@ -174,8 +154,8 @@ fn configured_hash_must_match_the_current_argon2id_policy_exactly() {
 fn invalid_password_configurations_are_rejected_without_echoing_secrets() {
     for account in [
         "missing-separator-secret",
-        "user:not-a-valid-phc-secret",
-        "user:$argon2id$malformed-secret",
+        "admin:not-a-valid-phc-secret",
+        "admin:$argon2id$malformed-secret",
     ] {
         let err = AuthConfig::new(&[account]).unwrap_err().to_string();
         assert!(err.contains("auth account #1"), "unexpected error: {err}");
@@ -186,17 +166,24 @@ fn invalid_password_configurations_are_rejected_without_echoing_secrets() {
 
 #[test]
 fn invalid_accounts_are_rejected() {
-    let hash = hash_password("secret").unwrap();
-    let first = format!("user:{hash}");
-    let second = format!("user:{hash}");
+    let hash = hash_password(TEST_PASSWORD).unwrap();
+    let first = format!("{TEST_USERNAME}:{hash}");
+    let second = format!("{TEST_USERNAME}:{hash}");
     assert!(
         AuthConfig::new(&[&first, &second])
             .unwrap_err()
             .to_string()
-            .contains("duplicate username")
+            .contains("duplicate administrator username")
     );
     assert!(
-        AuthConfig::new(&["user:"])
+        AuthConfig::new(&["admin:"])
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty")
+    );
+    let empty_username = format!(":{hash}");
+    assert!(
+        AuthConfig::new(&[&empty_username])
             .unwrap_err()
             .to_string()
             .contains("must not be empty")
@@ -212,51 +199,64 @@ fn oversized_account_lists_are_rejected_before_parsing_entries() {
 }
 
 #[test]
-fn configured_username_uses_the_browser_login_byte_limit_without_echoing_it() {
-    let hash = hash_password("secret").unwrap();
-    let maximum_username = "u".repeat(MAX_USERNAME_BYTES);
+fn configured_identity_requires_a_canonical_foundation_username_without_echoing_it() {
+    let hash = hash_password(TEST_PASSWORD).unwrap();
+    let maximum_username = "a".repeat(sarmg_admin_auth::ADMINISTRATOR_USERNAME_MAX_BYTES);
+    assert_eq!(
+        maximum_username.len(),
+        sarmg_admin_auth::ADMINISTRATOR_USERNAME_MAX_BYTES
+    );
     let maximum_account = format!("{maximum_username}:{hash}");
     assert!(AuthConfig::new(&[&maximum_account]).is_ok());
+    let adjacent_separators = format!("admin..ops:{hash}");
+    assert!(AuthConfig::new(&[&adjacent_separators]).is_ok());
 
-    let oversized_username = "private-user".repeat(MAX_USERNAME_BYTES);
-    let oversized_account = format!("{oversized_username}:{hash}");
-    let error = AuthConfig::new(&[&oversized_account])
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("auth account #1"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        error.contains("128-byte limit"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !error.contains(&oversized_username),
-        "error echoed the configured username"
-    );
+    for invalid_username in [
+        "ab".to_string(),
+        "Admin".to_string(),
+        "admin@name".to_string(),
+        "-admin".to_string(),
+        "admin-".to_string(),
+        "a".repeat(sarmg_admin_auth::ADMINISTRATOR_USERNAME_MAX_BYTES + 1),
+    ] {
+        let invalid_account = format!("{invalid_username}:{hash}");
+        let error = AuthConfig::new(&[&invalid_account])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("auth account #1"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains(&invalid_username),
+            "error echoed the configured administrator username"
+        );
+    }
 }
 
 #[test]
 fn login_creates_an_opaque_digest_stored_session_and_rotates() {
     let auth = test_access_control();
-    let first = auth.login("user", "pass", None).unwrap().unwrap();
-    assert_eq!(first.session.user, "user");
-    assert_eq!(first.token.len(), ENCODED_SECRET_LEN);
-    assert_eq!(first.session.csrf_token.len(), ENCODED_SECRET_LEN);
+    let first = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.session.user, TEST_USERNAME);
+    assert!(is_token_shape(&first.token));
+    assert!(is_token_shape(&first.session.csrf_token));
 
-    let digest = session_digest(&first.token);
+    let digest = token_hash(&first.token);
     let sessions = auth.lock_sessions();
     assert!(sessions.entries.contains_key(&digest));
     assert_eq!(sessions.entries.len(), 1);
     drop(sessions);
 
     let info = auth.authenticate(&first.token).unwrap();
-    assert_eq!(info.user, "user");
+    assert_eq!(info.user, TEST_USERNAME);
     assert_eq!(info.csrf_token, first.session.csrf_token);
 
     let second = auth
-        .login("user", "pass", Some(&first.token))
+        .login(TEST_USERNAME, TEST_PASSWORD, Some(&first.token))
         .unwrap()
         .unwrap();
     assert_ne!(first.token, second.token);
@@ -273,7 +273,7 @@ fn rotating_a_full_session_store_does_not_evict_an_unrelated_session() {
     let first = auth
         .create_session(
             VerifiedUser {
-                user: "user".to_string(),
+                user: TEST_USERNAME.to_string(),
             },
             None,
         )
@@ -293,7 +293,7 @@ fn rotating_a_full_session_store_does_not_evict_an_unrelated_session() {
                     digest,
                     SessionRecord {
                         user: format!("other-{index}"),
-                        csrf_token: [0; SECRET_BYTES],
+                        csrf_token: TEST_TOKEN.to_string(),
                         created_at: now,
                         last_seen: now,
                     },
@@ -305,27 +305,26 @@ fn rotating_a_full_session_store_does_not_evict_an_unrelated_session() {
     let second = auth
         .create_session(
             VerifiedUser {
-                user: "user".to_string(),
+                user: TEST_USERNAME.to_string(),
             },
             Some(&first.token),
         )
         .unwrap();
     let sessions = auth.lock_sessions();
     assert_eq!(sessions.entries.len(), SESSION_CAPACITY);
-    assert!(!sessions.entries.contains_key(&session_digest(&first.token)));
-    assert!(
-        sessions
-            .entries
-            .contains_key(&session_digest(&second.token))
-    );
+    assert!(!sessions.entries.contains_key(&token_hash(&first.token)));
+    assert!(sessions.entries.contains_key(&token_hash(&second.token)));
 }
 
 #[test]
 fn failed_login_does_not_revoke_an_existing_session() {
     let auth = test_access_control();
-    let session = auth.login("user", "pass", None).unwrap().unwrap();
+    let session = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
     assert!(
-        auth.login("user", "wrong", Some(&session.token))
+        auth.login(TEST_USERNAME, "wrong-password", Some(&session.token))
             .unwrap()
             .is_none()
     );
@@ -335,7 +334,10 @@ fn failed_login_does_not_revoke_an_existing_session() {
 #[test]
 fn logout_revokes_the_session() {
     let auth = test_access_control();
-    let session = auth.login("user", "pass", None).unwrap().unwrap();
+    let session = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
     assert!(auth.logout(&session.token));
     assert!(!auth.logout(&session.token));
     assert!(auth.authenticate(&session.token).is_none());
@@ -344,8 +346,14 @@ fn logout_revokes_the_session() {
 #[test]
 fn csrf_is_random_session_bound_and_compared_by_value() {
     let auth = test_access_control();
-    let first = auth.login("user", "pass", None).unwrap().unwrap();
-    let second = auth.login("user", "pass", None).unwrap().unwrap();
+    let first = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
+    let second = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
     assert_ne!(first.session.csrf_token, second.session.csrf_token);
     assert!(auth.verify_csrf(
         &first.token,
@@ -360,7 +368,7 @@ fn csrf_is_random_session_bound_and_compared_by_value() {
     assert!(!auth.verify_csrf(&first.token, &first.session.csrf_token, "invalid"));
 
     let mut tampered = first.session.csrf_token.clone().into_bytes();
-    tampered[0] = if tampered[0] == b'0' { b'1' } else { b'0' };
+    tampered[0] = if tampered[0] == b'A' { b'B' } else { b'A' };
     assert!(!auth.verify_csrf(
         &first.token,
         &first.session.csrf_token,
@@ -373,9 +381,18 @@ fn injected_clock_enforces_idle_csrf_and_absolute_expiration_boundaries() {
     let start = session_test_time();
     let clock = ManualSessionClock::new(start);
     let auth = test_access_control_with_clock(clock.session_clock());
-    let idle = auth.login("user", "pass", None).unwrap().unwrap();
-    let csrf = auth.login("user", "pass", None).unwrap().unwrap();
-    let absolute = auth.login("user", "pass", None).unwrap().unwrap();
+    let idle = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
+    let csrf = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
+    let absolute = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
 
     // Advancing the injected clock without executing application code models
     // elapsed CLOCK_BOOTTIME while the machine is suspended.
@@ -389,7 +406,7 @@ fn injected_clock_enforces_idle_csrf_and_absolute_expiration_boundaries() {
     assert_eq!(
         auth.lock_sessions()
             .entries
-            .get(&session_digest(&absolute.token))
+            .get(&token_hash(&absolute.token))
             .unwrap()
             .last_seen,
         start + (SESSION_IDLE_TIMEOUT - Duration::from_nanos(1))
@@ -420,7 +437,7 @@ fn injected_clock_enforces_idle_csrf_and_absolute_expiration_boundaries() {
         !auth
             .lock_sessions()
             .entries
-            .contains_key(&session_digest(&absolute.token))
+            .contains_key(&token_hash(&absolute.token))
     );
 }
 
@@ -429,12 +446,15 @@ fn injected_clock_regression_does_not_underflow_or_move_idle_time_backwards() {
     let start = session_test_time();
     let clock = ManualSessionClock::new(start);
     let auth = test_access_control_with_clock(clock.session_clock());
-    let session = auth.login("user", "pass", None).unwrap().unwrap();
+    let session = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
 
     clock.set(SessionInstant(start.0 - Duration::from_secs(1)));
     assert!(auth.authenticate(&session.token).is_some());
     let stored = auth.lock_sessions();
-    let record = stored.entries.get(&session_digest(&session.token)).unwrap();
+    let record = stored.entries.get(&token_hash(&session.token)).unwrap();
     assert_eq!(record.created_at, start);
     assert_eq!(record.last_seen, start);
 }
@@ -443,14 +463,14 @@ fn injected_clock_regression_does_not_underflow_or_move_idle_time_backwards() {
 fn session_store_is_bounded_and_evicts_the_least_recent_session() {
     let mut store = SessionStore::default();
     let now = session_test_time();
-    let oldest_digest = session_digest("oldest");
+    let oldest_digest = token_hash("oldest");
 
     store
         .insert(
             oldest_digest,
             SessionRecord {
-                user: "user".to_string(),
-                csrf_token: [0; SECRET_BYTES],
+                user: TEST_USERNAME.to_string(),
+                csrf_token: TEST_TOKEN.to_string(),
                 created_at: now,
                 last_seen: now,
             },
@@ -463,8 +483,8 @@ fn session_store_is_bounded_and_evicts_the_least_recent_session() {
             .insert(
                 digest,
                 SessionRecord {
-                    user: format!("user-{index}"),
-                    csrf_token: [0; SECRET_BYTES],
+                    user: format!("admin-{index}"),
+                    csrf_token: TEST_TOKEN.to_string(),
                     created_at: now,
                     last_seen: now + Duration::from_nanos(index as u64),
                 },
@@ -480,14 +500,14 @@ fn session_store_is_bounded_and_evicts_the_least_recent_session() {
 fn session_store_enforces_the_per_user_capacity_before_global_capacity() {
     let mut store = SessionStore::default();
     let now = session_test_time();
-    let oldest = session_digest("same-user-0");
+    let oldest = token_hash("same-user-0");
     for index in 0..=SESSION_PER_USER_CAPACITY {
         store
             .insert(
-                session_digest(&format!("same-user-{index}")),
+                token_hash(&format!("same-user-{index}")),
                 SessionRecord {
-                    user: "same-user".to_string(),
-                    csrf_token: [0; SECRET_BYTES],
+                    user: TEST_USERNAME.to_string(),
+                    csrf_token: TEST_TOKEN.to_string(),
                     created_at: now,
                     last_seen: now + Duration::from_nanos(index as u64),
                 },
@@ -503,27 +523,27 @@ fn session_store_enforces_the_per_user_capacity_before_global_capacity() {
 fn repeated_logins_evict_the_same_users_oldest_session_first() {
     let mut store = SessionStore::default();
     let now = session_test_time();
-    let protected_digest = session_digest("protected-oldest");
+    let protected_digest = token_hash("protected-oldest");
     store
         .insert(
             protected_digest,
             SessionRecord {
                 user: "protected".to_string(),
-                csrf_token: [0; SECRET_BYTES],
+                csrf_token: TEST_TOKEN.to_string(),
                 created_at: now,
                 last_seen: now,
             },
         )
         .unwrap();
 
-    let attacker_oldest = session_digest("attacker-0");
+    let attacker_oldest = token_hash("attacker-0");
     for index in 0..SESSION_PER_USER_CAPACITY {
         store
             .insert(
-                session_digest(&format!("attacker-{index}")),
+                token_hash(&format!("attacker-{index}")),
                 SessionRecord {
                     user: "attacker".to_string(),
-                    csrf_token: [0; SECRET_BYTES],
+                    csrf_token: TEST_TOKEN.to_string(),
                     created_at: now + Duration::from_secs(1),
                     last_seen: now + Duration::from_secs(index as u64 + 1),
                 },
@@ -535,10 +555,10 @@ fn repeated_logins_evict_the_same_users_oldest_session_first() {
     while store.entries.len() < SESSION_CAPACITY {
         store
             .insert(
-                session_digest(&format!("filler-{filler}")),
+                token_hash(&format!("filler-{filler}")),
                 SessionRecord {
                     user: format!("filler-{filler}"),
-                    csrf_token: [0; SECRET_BYTES],
+                    csrf_token: TEST_TOKEN.to_string(),
                     created_at: now + Duration::from_secs(100),
                     last_seen: now + Duration::from_secs(100),
                 },
@@ -547,13 +567,13 @@ fn repeated_logins_evict_the_same_users_oldest_session_first() {
         filler += 1;
     }
 
-    let newest = session_digest("attacker-newest");
+    let newest = token_hash("attacker-newest");
     store
         .insert(
             newest,
             SessionRecord {
                 user: "attacker".to_string(),
-                csrf_token: [0; SECRET_BYTES],
+                csrf_token: TEST_TOKEN.to_string(),
                 created_at: now + Duration::from_secs(200),
                 last_seen: now + Duration::from_secs(200),
             },
@@ -579,7 +599,7 @@ fn repeated_logins_evict_the_same_users_oldest_session_first() {
 
 #[test]
 fn cookie_helpers_use_host_only_secure_attributes() {
-    let token = "ab".repeat(SECRET_BYTES);
+    let token = TEST_TOKEN.to_string();
     let cookie = session_cookie(&token).unwrap();
     assert_eq!(
         cookie.to_str().unwrap(),
@@ -594,6 +614,34 @@ fn cookie_helpers_use_host_only_secure_attributes() {
     assert_eq!(
         session_token_from_cookie(&request_cookie),
         Some(token.as_str())
+    );
+    let duplicate_cookie = HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE_NAME}={token}; {SESSION_COOKIE_NAME}={token}"
+    ))
+    .unwrap();
+    assert_eq!(session_token_from_cookie(&duplicate_cookie), None);
+
+    let mut duplicate_headers = HeaderMap::new();
+    duplicate_headers.append(COOKIE, HeaderValue::from_static("first=value"));
+    duplicate_headers.append(
+        COOKIE,
+        HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={token}")).unwrap(),
+    );
+    assert!(session_token_from_headers(&duplicate_headers).is_err());
+
+    let mut ambiguous_value = HeaderMap::new();
+    ambiguous_value.insert(COOKIE, duplicate_cookie);
+    assert!(session_token_from_headers(&ambiguous_value).is_err());
+
+    let mut unrelated_cookie = HeaderMap::new();
+    unrelated_cookie.insert(COOKIE, HeaderValue::from_static("theme=dark"));
+    assert_eq!(session_token_from_headers(&unrelated_cookie), Ok(None));
+
+    let mut valid_headers = HeaderMap::new();
+    valid_headers.insert(COOKIE, request_cookie);
+    assert_eq!(
+        session_token_from_headers(&valid_headers),
+        Ok(Some(token.as_str()))
     );
 
     let clear_cookie = clear_session_cookie();
@@ -616,7 +664,10 @@ fn cookie_helpers_use_host_only_secure_attributes() {
 fn cloned_access_control_shares_session_state() {
     let auth = test_access_control();
     let clone = auth.clone();
-    let session = auth.login("user", "pass", None).unwrap().unwrap();
+    let session = auth
+        .login(TEST_USERNAME, TEST_PASSWORD, None)
+        .unwrap()
+        .unwrap();
     assert!(clone.authenticate(&session.token).is_some());
     assert!(clone.logout(&session.token));
     assert!(auth.authenticate(&session.token).is_none());

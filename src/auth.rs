@@ -1,11 +1,15 @@
-use crate::utils::{decode_hex_to_slice, encode_hex};
+use crate::utils::encode_hex;
 use anyhow::{Context, Result, anyhow, bail};
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-};
 use headers::HeaderValue;
+use hyper::{HeaderMap, header::COOKIE};
 use rustix::time::{ClockId, clock_gettime};
+use sarmg_admin_auth::{
+    hash_password as foundation_hash_password, is_token_shape,
+    parse_cookie_value as parse_foundation_cookie_value, random_token,
+    require_canonical_administrator_username, require_csrf_token_matches_hash, token_hash,
+    token_matches_hash, verify_password as foundation_verify_password,
+};
+use sarmg_contracts::AdministratorSession;
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,31 +18,36 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
-use subtle::ConstantTimeEq;
 
 pub const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const SESSION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
-pub const MAX_PASSWORD_BYTES: usize = 1024;
-pub(crate) const MAX_USERNAME_BYTES: usize = 128;
+pub use sarmg_admin_auth::PASSWORD_MAX_BYTES as MAX_PASSWORD_BYTES;
 
 const SESSION_CAPACITY: usize = 1024;
 const SESSION_PER_USER_CAPACITY: usize = 32;
 const MAX_ACCOUNTS: usize = 1024;
 const SECRET_BYTES: usize = 32;
-const SALT_BYTES: usize = 16;
-const ARGON2_VERSION: u32 = 19;
-const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
-const ARGON2_ITERATIONS: u32 = 2;
-const ARGON2_PARALLELISM: u32 = 1;
-const ARGON2_OUTPUT_BYTES: usize = 32;
-const ENCODED_SECRET_LEN: usize = SECRET_BYTES * 2;
 const COOKIE_ATTRIBUTES: &str = "Path=/; HttpOnly; Secure; SameSite=Strict";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
+    /// Configured administrator username. It also remains the product-local owner
+    /// key for durable file operations.
     pub user: String,
     pub csrf_token: String,
+}
+
+impl SessionInfo {
+    /// Materialize the one current Foundation browser-session contract.
+    pub fn administrator_session(&self) -> Result<AdministratorSession> {
+        AdministratorSession::new(
+            stable_administrator_id(&self.user),
+            self.user.clone(),
+            self.csrf_token.clone(),
+        )
+        .context("Configured administrator cannot be represented by the current auth contract")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +58,9 @@ pub struct CreatedSession {
 
 /// Proof that [`AccessControl`] has verified an account password.
 ///
-/// The username is intentionally private and this type is not cloneable, so a
-/// session can only be created from a successful verification result.
+/// The administrator username is intentionally private and this type is not
+/// cloneable, so a session can only be created from a successful verification
+/// result.
 pub(crate) struct VerifiedUser {
     user: String,
 }
@@ -109,7 +119,7 @@ impl SessionClock {
 #[derive(Debug)]
 struct SessionRecord {
     user: String,
-    csrf_token: [u8; SECRET_BYTES],
+    csrf_token: String,
     created_at: SessionInstant,
     last_seen: SessionInstant,
 }
@@ -123,7 +133,7 @@ impl SessionRecord {
     fn info(&self) -> SessionInfo {
         SessionInfo {
             user: self.user.clone(),
-            csrf_token: encode_hex(self.csrf_token),
+            csrf_token: self.csrf_token.clone(),
         }
     }
 }
@@ -179,8 +189,8 @@ impl SessionStore {
 /// Immutable account configuration loaded at startup.
 ///
 /// Password hashes stay private and custom `Debug` output only exposes the
-/// configured usernames. Cloning this value never clones or shares runtime
-/// sessions; each server constructs its own [`AccessControl`].
+/// configured administrator usernames. Cloning this value never clones or
+/// shares runtime sessions; each server constructs its own [`AccessControl`].
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct AuthConfig {
     users: HashMap<String, String>,
@@ -196,23 +206,23 @@ impl AuthConfig {
         for (index, account) in raw_accounts.iter().enumerate() {
             let account_number = index + 1;
             let (user, password) = account.split_once(':').ok_or_else(|| {
-                anyhow!("Invalid auth account #{account_number}: expected `user:<argon2id PHC>`")
+                anyhow!(
+                    "Invalid auth account #{account_number}: expected `username:<argon2id PHC>`"
+                )
             })?;
             if user.is_empty() || password.is_empty() {
                 bail!(
-                    "Invalid auth account #{account_number}: username and Argon2id PHC must not be empty"
+                    "Invalid auth account #{account_number}: administrator username and Argon2id PHC must not be empty"
                 );
             }
-            if user.len() > MAX_USERNAME_BYTES {
-                bail!(
-                    "Invalid auth account #{account_number}: username exceeds the {MAX_USERNAME_BYTES}-byte limit"
-                );
-            }
+            require_canonical_administrator_username(user).with_context(|| {
+                format!("Invalid administrator username in auth account #{account_number}")
+            })?;
             if users.contains_key(user) {
-                bail!("Invalid auth account #{account_number}: duplicate username");
+                bail!("Invalid auth account #{account_number}: duplicate administrator username");
             }
 
-            validate_argon2id_hash(password).with_context(|| {
+            sarmg_admin_auth::require_current_password_hash(password).with_context(|| {
                 format!("Invalid Argon2id PHC in auth account #{account_number}")
             })?;
 
@@ -314,9 +324,9 @@ impl AccessControl {
         previous_token: Option<&str>,
     ) -> Result<CreatedSession> {
         let user = verified_user.user;
-        let token = random_secret()?;
-        let token_digest = session_digest(&token);
-        let csrf_token = random_bytes()?;
+        let token = random_token().context("Failed to generate a session token")?;
+        let token_digest = token_hash(&token);
+        let csrf_token = random_token().context("Failed to generate a CSRF token")?;
         let now = self.clock.now();
 
         let mut sessions = self.lock_sessions();
@@ -325,17 +335,19 @@ impl AccessControl {
             bail!("Generated a duplicate session token");
         }
         // Check the new digest before removing the previous session, then
-        // replace under the same lock. This preserves the old session on a
+        // replace under the same lock. This preserves the previous session on a
         // random-token collision and avoids evicting an unrelated session
         // when a full store rotates one of its existing entries.
-        if let Some(previous_token) = previous_token {
-            sessions.entries.remove(&session_digest(previous_token));
+        if let Some(previous_token) = previous_token
+            && is_token_shape(previous_token)
+        {
+            sessions.entries.remove(&token_hash(previous_token));
         }
         sessions.insert(
             token_digest,
             SessionRecord {
                 user: user.clone(),
-                csrf_token,
+                csrf_token: csrf_token.clone(),
                 created_at: now,
                 last_seen: now,
             },
@@ -343,10 +355,7 @@ impl AccessControl {
 
         Ok(CreatedSession {
             token,
-            session: SessionInfo {
-                user,
-                csrf_token: encode_hex(csrf_token),
-            },
+            session: SessionInfo { user, csrf_token },
         })
     }
 
@@ -375,26 +384,34 @@ impl AccessControl {
 
     /// Remove a session. Returns whether an active or expired record existed.
     pub fn logout(&self, token: &str) -> bool {
-        if !is_encoded_secret(token) {
+        if !is_token_shape(token) {
             return false;
         }
         self.lock_sessions()
             .entries
-            .remove(&session_digest(token))
+            .remove(&token_hash(token))
             .is_some()
     }
 
     /// Check the CSRF value belonging to an unexpired session.
     ///
-    /// The comparison always covers all 256 bits for a syntactically valid
-    /// or invalid candidate of the expected length.
-    pub fn verify_csrf(&self, token: &str, expected: &str, candidate: &str) -> bool {
-        if !is_encoded_secret(token) {
+    /// Both supplied values must use the one current Foundation token shape,
+    /// and both are compared against the session-bound 256-bit token hash.
+    pub fn verify_csrf_header_values<Value>(
+        &self,
+        token: &str,
+        expected: &str,
+        candidate_values: &[Value],
+    ) -> bool
+    where
+        Value: AsRef<[u8]>,
+    {
+        if !is_token_shape(token) {
             return false;
         }
 
         let now = self.clock.now();
-        let digest = session_digest(token);
+        let digest = token_hash(token);
         let mut sessions = self.lock_sessions();
         let Some(session) = sessions.entries.get(&digest) else {
             return false;
@@ -404,11 +421,15 @@ impl AccessControl {
             return false;
         }
 
-        let (expected, expected_valid) = decode_secret_for_comparison(expected);
-        let (candidate, candidate_valid) = decode_secret_for_comparison(candidate);
-        let expected_equal = session.csrf_token.ct_eq(&expected);
-        let candidate_equal = session.csrf_token.ct_eq(&candidate);
-        bool::from(expected_equal & candidate_equal) && expected_valid && candidate_valid
+        let csrf_digest = token_hash(&session.csrf_token);
+        is_token_shape(expected)
+            && token_matches_hash(expected, &csrf_digest)
+            && require_csrf_token_matches_hash(candidate_values, &csrf_digest).is_ok()
+    }
+
+    #[cfg(test)]
+    fn verify_csrf(&self, token: &str, expected: &str, candidate: &str) -> bool {
+        self.verify_csrf_header_values(token, expected, &[candidate.as_bytes()])
     }
 
     fn verify_password(&self, user: &str, password: &str) -> bool {
@@ -422,20 +443,16 @@ impl AccessControl {
             return false;
         };
 
-        let verified = PasswordHash::new(password_hash).ok().is_some_and(|hash| {
-            current_argon2()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok()
-        });
+        let verified = foundation_verify_password(password, password_hash);
         known_user && verified
     }
 
     fn authenticate_at(&self, token: &str, now: SessionInstant) -> Option<SessionInfo> {
-        if !is_encoded_secret(token) {
+        if !is_token_shape(token) {
             return None;
         }
 
-        let digest = session_digest(token);
+        let digest = token_hash(token);
         let mut sessions = self.lock_sessions();
         let expired = sessions
             .entries
@@ -472,26 +489,13 @@ impl From<AuthConfig> for AccessControl {
     }
 }
 
-/// Hash a password with Argon2id v19 and the crate's standard parameters.
+/// Hash a password with Foundation's one current administrator policy.
 pub fn hash_password(password: &str) -> Result<String> {
-    if password.is_empty() {
-        bail!("Password must not be empty");
-    }
-    if password.len() > MAX_PASSWORD_BYTES {
-        bail!("Password exceeds the {MAX_PASSWORD_BYTES}-byte limit");
-    }
-    let mut salt = [0u8; SALT_BYTES];
-    getrandom::fill(&mut salt).map_err(|err| anyhow!("Failed to generate password salt: {err}"))?;
-    let salt = SaltString::encode_b64(&salt)
-        .map_err(|err| anyhow!("Failed to encode password salt: {err}"))?;
-    current_argon2()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|err| anyhow!("Failed to hash password: {err}"))
+    foundation_hash_password(password).context("Failed to hash administrator password")
 }
 
 pub fn session_cookie(token: &str) -> Result<HeaderValue> {
-    if !is_encoded_secret(token) {
+    if !is_token_shape(token) {
         bail!("Invalid session token");
     }
     HeaderValue::from_str(&format!(
@@ -507,104 +511,47 @@ pub fn clear_session_cookie() -> HeaderValue {
 }
 
 pub fn session_token_from_cookie(cookie: &HeaderValue) -> Option<&str> {
-    cookie
-        .to_str()
-        .ok()?
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(name, value)| {
-            (name == SESSION_COOKIE_NAME && is_encoded_secret(value)).then_some(value)
-        })
+    let raw = cookie.to_str().ok()?;
+    let value = parse_foundation_cookie_value(raw, SESSION_COOKIE_NAME)?;
+    is_token_shape(value).then_some(value)
 }
 
-fn validate_argon2id_hash(password_hash: &str) -> Result<()> {
-    let parsed =
-        PasswordHash::new(password_hash).map_err(|err| anyhow!("Invalid PHC string: {err}"))?;
-    if parsed.algorithm.as_str() != "argon2id" {
-        bail!("Expected the argon2id algorithm");
-    }
-    if parsed.version != Some(ARGON2_VERSION) {
-        bail!("Expected Argon2id version 19");
-    }
-    let Some(salt) = parsed.salt else {
-        bail!("Argon2id PHC string must include a salt and output");
+/// Extract the current session cookie only when the request has exactly one
+/// unambiguous raw Cookie header line. Multiple header lines, duplicate
+/// session-cookie names, empty values, malformed UTF-8 and non-current token
+/// shapes are explicit errors so a login request cannot silently treat an
+/// attacker-controlled cookie as absent.
+pub(crate) fn session_token_from_headers(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<&str>, ()> {
+    let mut values = headers.get_all(COOKIE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
     };
-    let Some(output) = parsed.hash else {
-        bail!("Argon2id PHC string must include a salt and output");
-    };
-
-    let mut decoded_salt = [0u8; 64];
-    let decoded_salt = salt
-        .decode_b64(&mut decoded_salt)
-        .map_err(|err| anyhow!("Invalid Argon2id salt: {err}"))?;
-    if decoded_salt.len() != SALT_BYTES {
-        bail!("Argon2id salt must be exactly {SALT_BYTES} bytes");
+    if values.next().is_some() {
+        return Err(());
     }
-    if output.len() != ARGON2_OUTPUT_BYTES {
-        bail!("Argon2id output must be exactly {ARGON2_OUTPUT_BYTES} bytes");
+    let raw = value.to_str().map_err(|_| ())?;
+    if let Some(token) = parse_foundation_cookie_value(raw, SESSION_COOKIE_NAME) {
+        return is_token_shape(token).then_some(token).ok_or(()).map(Some);
     }
 
-    if parsed.params.iter().count() != 3
-        || parsed.params.get_decimal("m") != Some(ARGON2_MEMORY_KIB)
-        || parsed.params.get_decimal("t") != Some(ARGON2_ITERATIONS)
-        || parsed.params.get_decimal("p") != Some(ARGON2_PARALLELISM)
-    {
-        bail!(
-            "Argon2id parameters must be exactly m={},t={},p={}",
-            ARGON2_MEMORY_KIB,
-            ARGON2_ITERATIONS,
-            ARGON2_PARALLELISM
-        );
+    let contains_session_cookie = raw.split(';').any(|part| {
+        let part = part.trim();
+        part == SESSION_COOKIE_NAME
+            || part
+                .split_once('=')
+                .is_some_and(|(name, _)| name == SESSION_COOKIE_NAME)
+    });
+    if contains_session_cookie {
+        Err(())
+    } else {
+        Ok(None)
     }
-
-    let params =
-        Params::try_from(&parsed).map_err(|err| anyhow!("Invalid Argon2id parameters: {err}"))?;
-    if params.m_cost() != ARGON2_MEMORY_KIB
-        || params.t_cost() != ARGON2_ITERATIONS
-        || params.p_cost() != ARGON2_PARALLELISM
-        || params.output_len() != Some(ARGON2_OUTPUT_BYTES)
-        || !params.keyid().is_empty()
-        || !params.data().is_empty()
-    {
-        bail!("Argon2id PHC string does not match the current password policy");
-    }
-    Ok(())
 }
 
-fn current_argon2() -> Argon2<'static> {
-    let params = Params::new(
-        ARGON2_MEMORY_KIB,
-        ARGON2_ITERATIONS,
-        ARGON2_PARALLELISM,
-        Some(ARGON2_OUTPUT_BYTES),
-    )
-    .expect("the fixed Argon2id password policy is valid");
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-}
-
-fn random_bytes() -> Result<[u8; SECRET_BYTES]> {
-    let mut bytes = [0u8; SECRET_BYTES];
-    getrandom::fill(&mut bytes)
-        .map_err(|err| anyhow!("Failed to generate random secret: {err}"))?;
-    Ok(bytes)
-}
-
-fn random_secret() -> Result<String> {
-    Ok(encode_hex(random_bytes()?))
-}
-
-fn session_digest(token: &str) -> [u8; SECRET_BYTES] {
-    Sha256::digest(token.as_bytes()).into()
-}
-
-fn is_encoded_secret(value: &str) -> bool {
-    value.len() == ENCODED_SECRET_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn decode_secret_for_comparison(value: &str) -> ([u8; SECRET_BYTES], bool) {
-    let mut decoded = [0u8; SECRET_BYTES];
-    let valid = value.len() == ENCODED_SECRET_LEN && decode_hex_to_slice(value, &mut decoded);
-    (decoded, valid)
+fn stable_administrator_id(username: &str) -> String {
+    format!("dufs:{}", encode_hex(Sha256::digest(username.as_bytes())))
 }
 
 #[cfg(test)]

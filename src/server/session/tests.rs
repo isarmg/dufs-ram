@@ -1,62 +1,13 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hyper::header::HOST;
+use sarmg_admin_auth::require_single_csrf_token;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, oneshot};
 
 fn trusted_proxies(values: &[&str]) -> Vec<TrustedProxy> {
     values.iter().map(|value| value.parse().unwrap()).collect()
-}
-
-#[test]
-fn login_form_requires_exact_fields() {
-    assert_eq!(
-        parse_login_form(b"username=user&password=pa%3Ass"),
-        Some(("user".to_string(), "pa:ss".to_string()))
-    );
-    assert!(parse_login_form(b"username=user").is_none());
-    assert_eq!(
-        parse_login_form(b"username=&password=pass"),
-        Some(("".to_string(), "pass".to_string()))
-    );
-    assert_eq!(
-        parse_login_form(b"username=user&password="),
-        Some(("user".to_string(), "".to_string()))
-    );
-    assert!(parse_login_form(b"username=a&username=b&password=p").is_none());
-    assert!(parse_login_form(b"username=user&password=pass&extra=1").is_none());
-    let maximum_username = "u".repeat(MAX_USERNAME_BYTES);
-    let maximum_form = format!("username={maximum_username}&password=p");
-    assert_eq!(
-        parse_login_form(maximum_form.as_bytes()),
-        Some((maximum_username, "p".to_string()))
-    );
-    let oversized_form = format!("username={}&password=p", "u".repeat(MAX_USERNAME_BYTES + 1));
-    assert!(parse_login_form(oversized_form.as_bytes()).is_none());
-
-    for password in [
-        "p".repeat(MAX_PASSWORD_BYTES),
-        "é".repeat(MAX_PASSWORD_BYTES / "é".len()),
-    ] {
-        let form = form_urlencoded::Serializer::new(String::new())
-            .append_pair("username", "user")
-            .append_pair("password", &password)
-            .finish();
-        assert_eq!(
-            parse_login_form(form.as_bytes()),
-            Some(("user".to_string(), password))
-        );
-    }
-    for password in [
-        "p".repeat(MAX_PASSWORD_BYTES + 1),
-        format!("a{}", "é".repeat(MAX_PASSWORD_BYTES / "é".len())),
-    ] {
-        let form = form_urlencoded::Serializer::new(String::new())
-            .append_pair("username", "user")
-            .append_pair("password", &password)
-            .finish();
-        assert!(parse_login_form(form.as_bytes()).is_none());
-    }
 }
 
 #[test]
@@ -69,6 +20,7 @@ fn login_script_and_csp_enforce_the_shared_password_byte_limit() {
     assert!(LOGIN_HTML.contains(r#"href="/__ASSETS_PREFIX__login.css""#));
     assert!(!LOGIN_HTML.contains("<style>"));
     assert!(LOGIN_CSP.contains("style-src 'self'"));
+    assert!(LOGIN_CSP.contains("connect-src 'self'"));
     assert!(!LOGIN_CSP.contains("'unsafe-inline'"));
 
     let digest = Sha256::digest(LOGIN_JS.as_bytes());
@@ -130,10 +82,11 @@ fn html_acceptance_requires_an_exact_positive_media_range() {
 
 #[test]
 fn same_origin_requires_matching_external_scheme_and_authority() {
-    let request_uri = "/__dufs__/login".parse::<Uri>().unwrap();
+    let request_uri = ADMIN_LOGIN_PATH.parse::<Uri>().unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(HOST, HeaderValue::from_static("files.example"));
     headers.insert("origin", HeaderValue::from_static("https://files.example"));
+    headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
 
     assert!(!request_source_is_same_origin(
         &headers,
@@ -265,52 +218,6 @@ fn login_body_admission_enforces_global_and_per_ip_limits() {
     assert!(state.per_ip.is_empty());
 }
 
-#[test]
-fn login_error_tokens_are_random_and_consumed_once() -> Result<()> {
-    let mut store = LoginErrorStore::default();
-    let missing = store.insert(LoginError::MissingFields)?;
-    let invalid = store.insert(LoginError::InvalidCredentials)?;
-    let rate_limited = store.insert(LoginError::TooManyRequests {
-        retry_after_seconds: 7,
-    })?;
-    assert_eq!(missing.len(), LOGIN_ERROR_TOKEN_BYTES * 2);
-    assert_ne!(missing, invalid);
-    assert_ne!(missing, rate_limited);
-    assert_eq!(store.consume(&missing), Some(LoginError::MissingFields));
-    assert_eq!(store.consume(&missing), None);
-    assert_eq!(
-        store.consume(&invalid),
-        Some(LoginError::InvalidCredentials)
-    );
-    assert_eq!(
-        store.consume(&rate_limited),
-        Some(LoginError::TooManyRequests {
-            retry_after_seconds: 7,
-        })
-    );
-    assert_eq!(store.consume("untrusted-text"), None);
-
-    let expired_token = [0xA5; LOGIN_ERROR_TOKEN_BYTES];
-    store.entries.insert(
-        expired_token,
-        LoginErrorRecord {
-            error: LoginError::TooManyRequests {
-                retry_after_seconds: 9,
-            },
-            created_at: Instant::now()
-                .checked_sub(LOGIN_ERROR_TTL)
-                .ok_or_else(|| anyhow!("Could not construct expired test instant"))?,
-        },
-    );
-    assert_eq!(store.consume(&encode_hex(expired_token)), None);
-
-    for _ in 0..=LOGIN_ERROR_CAPACITY {
-        store.insert(LoginError::MissingFields)?;
-    }
-    assert_eq!(store.entries.len(), LOGIN_ERROR_CAPACITY);
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_login_waiter_keeps_slot_until_blocking_task_finishes() -> Result<()> {
     let slots = Arc::new(Semaphore::new(1));
@@ -361,6 +268,7 @@ fn origin_must_match_host_when_present() {
         "origin",
         HeaderValue::from_static("https://files.example.test"),
     );
+    headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     let loopback_proxy = trusted_proxies(&["127.0.0.1/32"]);
     assert!(request_source_is_same_origin(
@@ -382,12 +290,55 @@ fn origin_must_match_host_when_present() {
 }
 
 #[test]
-fn opaque_origin_requires_browser_same_origin_metadata() {
+fn security_sensitive_origin_headers_reject_duplicate_lines() {
+    let peer = "127.0.0.1".parse().unwrap();
+    let proxies = trusted_proxies(&["127.0.0.1/32"]);
+    for name in [HOST.as_str(), "origin", "sec-fetch-site"] {
+        let mut headers = HeaderMap::new();
+        headers.append(HOST, HeaderValue::from_static("files.example.test"));
+        headers.append(
+            "origin",
+            HeaderValue::from_static("https://files.example.test"),
+        );
+        headers.append("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        let duplicate = headers
+            .get(name)
+            .expect("baseline header is present")
+            .clone();
+        headers.append(name, duplicate);
+        assert!(!request_source_is_same_origin(
+            &headers,
+            &Uri::from_static("/api/v2/auth/login"),
+            peer,
+            &proxies,
+        ));
+    }
+}
+
+#[test]
+fn csrf_rejects_duplicate_header_lines_before_token_verification() {
+    let token = HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     let mut headers = HeaderMap::new();
+    headers.append(CSRF_HEADER, token.clone());
+    let values = raw_header_values(&headers, CSRF_HEADER);
+    assert_eq!(
+        require_single_csrf_token(&values).unwrap(),
+        token.to_str().unwrap()
+    );
+    headers.append(CSRF_HEADER, token);
+    let values = raw_header_values(&headers, CSRF_HEADER);
+    assert!(require_single_csrf_token(&values).is_err());
+}
+
+#[test]
+fn opaque_origin_is_never_a_current_administrator_origin() {
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("localhost:5000"));
     headers.insert("origin", HeaderValue::from_static("null"));
     headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-    let uri = Uri::from_static("https://localhost:5000/__dufs__/login");
-    assert!(request_source_is_same_origin(
+    let uri = Uri::from_static("http://localhost:5000/api/v2/auth/login");
+    assert!(!request_source_is_same_origin(
         &headers,
         &uri,
         "127.0.0.1".parse().unwrap(),
@@ -398,6 +349,45 @@ fn opaque_origin_requires_browser_same_origin_metadata() {
     assert!(!request_source_is_same_origin(
         &headers,
         &uri,
+        "127.0.0.1".parse().unwrap(),
+        &[],
+    ));
+}
+
+#[test]
+fn direct_http_is_limited_to_complete_loopback_browser_headers() {
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("127.0.0.1:5000"));
+    headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:5000"));
+    headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+    assert!(request_source_is_same_origin(
+        &headers,
+        &Uri::from_static("/api/v2/auth/login"),
+        "127.0.0.1".parse().unwrap(),
+        &[],
+    ));
+
+    headers.remove(HOST);
+    let authority_uri = Uri::from_static("http://127.0.0.1:5000/api/v2/auth/login");
+    assert!(request_source_is_same_origin(
+        &headers,
+        &authority_uri,
+        "127.0.0.1".parse().unwrap(),
+        &[],
+    ));
+    headers.insert(HOST, HeaderValue::from_static("127.0.0.1:5000"));
+    assert!(!request_source_is_same_origin(
+        &headers,
+        &authority_uri,
+        "127.0.0.1".parse().unwrap(),
+        &[],
+    ));
+
+    headers.remove(HOST);
+    headers.remove("sec-fetch-site");
+    assert!(!request_source_is_same_origin(
+        &headers,
+        &authority_uri,
         "127.0.0.1".parse().unwrap(),
         &[],
     ));
