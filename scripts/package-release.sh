@@ -1203,7 +1203,6 @@ verify_release_documentation_layout() {
   for required_path in \
     docs/README.md \
     docs/beginner-guide/README.md \
-    docs/history/browser-only-optimization-review.md \
     docs/history/code-review-report.md
   do
     [[ -f "$package_root/$required_path" && \
@@ -1213,11 +1212,6 @@ verify_release_documentation_layout() {
       return 1
     }
   done
-  [[ ! -e "$package_root/docs/browser-only-optimization-review.md" && \
-    ! -L "$package_root/docs/browser-only-optimization-review.md" ]] || {
-    printf 'Release documentation retained the obsolete flattened history path.\n' >&2
-    return 1
-  }
   [[ "$(stat -Lc '%a' -- "$package_root/docs")" == "755" && \
     "$(stat -Lc '%a' -- "$package_root/docs/README.md")" == "644" && \
     "$(stat -Lc '%a' -- "$package_root/scripts/package-release.sh")" == "755" ]] || {

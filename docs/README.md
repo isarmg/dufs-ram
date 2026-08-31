@@ -19,6 +19,5 @@
 ## 历史记录
 
 - [全面代码审查与整改报告](history/code-review-report.md)：历次审查、问题证据和整改验收记录。
-- [十项优化 TODO 与完成记录](history/browser-only-optimization-review.md)：浏览器化质量优化的实施历史。
 
 历史文档可能保留旧问题名称、旧文件规模或旧实现描述。它们用于追溯决策，不表示相关能力仍然存在。

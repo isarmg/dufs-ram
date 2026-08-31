@@ -1,6 +1,6 @@
 # Dufs 浏览器文件管理器工作流程与流程树
 
-本文以当前代码为准，说明 Dufs 作为现代桌面浏览器文件管理器时的启动、认证、页面生成和文件操作流程。目标客户端是当前版本的 Chromium、Edge、Firefox 等桌面浏览器；前端自动化通过测试 HTTPS 网关分别验证桌面 Chromium 和 Firefox，并可选验证本机安装的正式 Edge。十项质量优化的实现与验证记录见[十项优化 TODO](history/browser-only-optimization-review.md)。
+本文以当前代码为准，说明 Dufs 作为现代桌面浏览器文件管理器时的启动、认证、页面生成和文件操作流程。目标客户端是当前版本的 Chromium、Edge、Firefox 等桌面浏览器；前端自动化通过测试 HTTPS 网关分别验证桌面 Chromium 和 Firefox，并可选验证本机安装的正式 Edge。
 
 当前产品边界如下：
 

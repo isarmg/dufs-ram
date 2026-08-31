@@ -125,7 +125,6 @@ rg "符号名|协议字段|错误代码" src assets tests
 
 - [项目工作流程](../project-workflow.md)是更紧凑的全流程参考；
 - [功能与取舍清单](../feature-inventory-and-tradeoffs.md)用于判断功能依赖和删除成本；
-- [浏览器化优化审查](../history/browser-only-optimization-review.md)记录质量问题与改造结果；
 - [生产运维手册](../operations.md)是部署、备份、升级和回滚的权威操作说明；
 - [根目录 README](../../README.md)给出产品范围、CLI 和协议的完整公开说明。
 

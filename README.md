@@ -24,7 +24,6 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - [从零读懂 Dufs：新手教学手册](docs/beginner-guide/README.md)：按十章课程从运行环境、Rust/HTTP 基础一路讲到前后端、上传状态机、测试和生产运维；
 - [项目工作流程与流程树](docs/project-workflow.md)：说明当前代码的启动、认证、浏览、上传、下载、持久化和停机流程；
 - [文档导航](docs/README.md)：区分当前规范、教学资料与历史审查记录；
-- [十项优化 TODO 与完成记录](docs/history/browser-only-optimization-review.md)：记录历次质量优化及其与当前实现的同步结果；
 - [完整功能与取舍清单](docs/feature-inventory-and-tradeoffs.md)：逐项列出当前功能、依赖、删除影响和可精简候选；
 - [生产部署、备份、升级与回滚](docs/operations.md)：给出经过语法验证的 systemd/nginx 基线、健康检查、备份恢复演练和制品验证流程；
 - [安全策略](SECURITY.md)：说明支持边界、私密报告要求和事件响应信息；
@@ -536,8 +535,7 @@ git status --short
 │   ├── feature-inventory-and-tradeoffs.md   # 完整功能、边界与精简决策清单
 │   ├── operations.md                        # 部署、备份、升级与回滚
 │   ├── history/                             # 历史审查与整改记录
-│   │   ├── code-review-report.md
-│   │   └── browser-only-optimization-review.md
+│   │   └── code-review-report.md
 │   └── beginner-guide/                      # 从零理解项目的十章教程
 ├── deploy/                        # 经语法验证的 systemd、nginx 和 YAML 示例
 ├── scripts/                       # 质量门禁、部署校验和签名发布脚本
