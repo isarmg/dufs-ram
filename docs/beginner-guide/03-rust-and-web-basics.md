@@ -227,7 +227,7 @@ POST /__dufs__/api/rename HTTP/1.1
 Host: files.example.com
 Cookie: __Host-dufs-session=...
 Content-Type: application/json
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Operation-Id: 123e4567-e89b-42d3-a456-426614174000
 
 {"source":"/old.txt","name":"new.txt","overwrite":false}
@@ -264,7 +264,7 @@ HTTP 方法只是协议意图，安全性仍取决于后端校验。例如 `HEAD
 | `200` | 成功且有表示 | 表示结构和协议头是否也有效？ |
 | `202` | 已接受或仍在运行 | 是否需要按 ID 查询？ |
 | `204` | 成功但无正文 | 操作终态头是否匹配？ |
-| `303` | 应用另一个 GET 地址 | 登录 PRG 流程跳到哪里？ |
+| `303` | 应用另一个 GET 地址 | 未认证的 HTML 导航应跳到登录页面吗？ |
 | `400` | 输入或协议格式错误 | 哪个字段没有通过验证？ |
 | `401` | 未认证或会话失效 | 页面是否应回到登录？ |
 | `403` | 已识别但禁止 | CSRF、来源或路径策略失败？ |
@@ -280,7 +280,7 @@ HTTP 方法只是协议意图，安全性仍取决于后端校验。例如 `HEAD
 
 ### Header
 
-Header 是请求或响应的元数据。Dufs 会对 Operation ID、上传协议头和受信代理头等关键协议字段显式拒绝重复值，并要求规范格式，因为代理和服务端可能对重复头产生不同解释。不要把它外推成所有头都统一执行单值校验：Cookie、CSRF、Origin、Host、Content-Type 等若干路径仍通过 `HeaderMap::get()` 读取首个值，审查新协议时必须逐项确认重复头策略。
+Header 是请求或响应的元数据。Dufs 会对 Operation ID、上传协议头、Cookie、Foundation CSRF/Origin/Host/Fetch Metadata 和受信代理头等安全相关字段拒绝重复、逗号拼接或非规范值，因为代理和服务端可能对歧义字段产生不同解释。普通展示型 header 是否允许重复仍需逐项确认；不能从某一路由的策略外推全部协议。
 
 ### Cookie
 
@@ -288,13 +288,13 @@ Header 是请求或响应的元数据。Dufs 会对 Operation ID、上传协议�
 
 ### CSRF token
 
-Cookie 会被浏览器自动附带，因此恶意站点可能诱导用户浏览器发出写请求。CSRF token 是当前页面从服务端取得、再显式放入写请求头的随机值；服务端验证请求持有当前会话绑定的 token，并结合 `Origin`/`Sec-Fetch-Site` 等来源检查进行防护。缺少 `Origin` 时来源函数可以兼容放行，因此 token 本身证明的是“持有会话 token”，不能单独证明请求必然来自某个受信页面上下文。
+Cookie 会被浏览器自动附带，因此恶意站点可能诱导用户浏览器发出写请求。CSRF token 是当前页面从服务端取得、再显式放入 `X-CSRF-Token` 的随机值；服务端以常量时间验证它，并与 Foundation 的严格同源检查共同防护。`Origin`、effective Host（含 URI authority）和 `Sec-Fetch-Site: same-origin` 都必须存在、唯一、规范且互相一致；缺失或歧义不会被兼容放行。
 
 认证回答“你是谁”，CSRF token 与来源检查共同回答“这个写请求是否具备当前会话页面应持有的证明”；两者不可互相替代。
 
 ### Body
 
-JSON 控制请求、登录表单和大文件正文有不同大小及时间限制。服务端必须在分配内存前限制正文，前端也对响应正文做有界读取，防止异常对端用巨大错误页耗尽内存。
+JSON browser API、Foundation 登录 JSON 和大文件正文有不同大小及时间限制。服务端必须在分配内存前限制正文，前端也对响应正文做有界读取，防止异常对端用巨大错误页耗尽内存。
 
 ## 3.13 URL 路径不等于磁盘路径
 

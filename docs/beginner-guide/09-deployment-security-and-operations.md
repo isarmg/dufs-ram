@@ -110,7 +110,7 @@ request-timeout: 300
 
 ### YAML 为什么严格拒绝未知字段
 
-如果升级后某个安全参数已删除，而 YAML 静默忽略它，操作者可能误以为限制仍生效。当前解析会对拼错或废弃字段启动失败，使配置漂移在上线前暴露。
+如果新版本删除了某个安全参数，而 YAML 静默忽略它，操作者可能误以为限制仍生效。当前解析会对拼错或废弃字段启动失败，使配置漂移在上线前暴露；这不是旧字段兼容机制。
 
 ## 9.5 密码和会话
 
@@ -271,7 +271,7 @@ curl --noproxy '*' --connect-timeout 2 --max-time 10 --fail \
 
 负载均衡器若无法安全维护登录会话 Cookie，应只请求公开 health；另建受控的认证冒烟任务检查 ready。不要把账号密码塞进所有基础网络探针。
 
-下面是一次交互式生产冒烟的 Bash 示例。用户名和密码写入 mode `0600` 的临时文件，curl 的进程参数只暴露文件路径，不暴露凭据内容；域名必须替换为真实站点，并正常校验证书：
+下面是一次交互式生产冒烟的 Bash 示例。它额外需要 `jq`，把管理员 username 和密码写入 mode `0600` 的临时文件并生成严格 JSON；curl 的进程参数只暴露文件路径，不暴露凭据内容。域名必须替换为真实站点，并正常校验证书：
 
 ```bash
 (
@@ -285,21 +285,26 @@ curl --noproxy '*' --connect-timeout 2 --max-time 10 --fail \
   cleanup_probe() { rm -rf -- "$probe_dir"; }
   trap cleanup_probe EXIT
 
-  IFS= read -r -p 'Dufs username: ' probe_user
+  command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
+  IFS= read -r -p 'Dufs administrator username: ' probe_username
   IFS= read -r -s -p 'Dufs password: ' probe_password
   printf '\n'
-  printf '%s' "$probe_user" > "$probe_dir/username"
+  printf '%s' "$probe_username" > "$probe_dir/username"
   printf '%s' "$probe_password" > "$probe_dir/password"
-  unset probe_user probe_password
+  unset probe_username probe_password
+  jq -n --rawfile username "$probe_dir/username" --rawfile password "$probe_dir/password" \
+    '{username:$username,password:$password}' > "$probe_dir/login.json"
 
   curl --fail --silent --show-error \
     --connect-timeout 5 --max-time 30 \
     --cookie-jar "$probe_dir/cookies" \
-    --header 'Content-Type: application/x-www-form-urlencoded' \
-    --data-urlencode "username@$probe_dir/username" \
-    --data-urlencode "password@$probe_dir/password" \
-    --output /dev/null \
-    https://files.example.com/__dufs__/login
+    --header 'Accept: application/json' \
+    --header 'Content-Type: application/json' \
+    --header 'Origin: https://files.example.com' \
+    --header 'Sec-Fetch-Site: same-origin' \
+    --data-binary "@$probe_dir/login.json" \
+    --output "$probe_dir/session.json" \
+    https://files.example.com/api/v2/auth/login
   curl --fail --silent --show-error \
     --connect-timeout 5 --max-time 30 \
     --cookie "$probe_dir/cookies" \
@@ -308,7 +313,7 @@ curl --noproxy '*' --connect-timeout 2 --max-time 10 --fail \
 )
 ```
 
-预期第二条命令输出 `{"status":"ready"}`。自动探针应从只有探针进程可读的受控凭据源建立或更新会话，并控制登录频率，避免触发 Argon2 和登录限流预算。当前 Dufs 没有 readiness-only 或只读账号，任何探针账号都拥有共享根完整权限，因此必须把这项凭据风险纳入设计；无法安全保存时就不要把它塞进通用负载均衡器。独立 ready 任务还必须接入告警或明确的摘流自动化，只记录一次 503 不会自动停止流量。
+第一条命令的 `session.json` 应为 Foundation 五字段 `AdministratorSession` 且 `role` 只能是 `admin`，第二条命令预期输出 `{"status":"ready"}`。自动探针应从只有探针进程可读的受控凭据源建立或更新会话，并控制登录频率，避免触发 Argon2 和登录限流预算。当前 Dufs 没有 readiness-only 或只读角色，任何管理员凭据都拥有共享根完整权限，因此必须把这项风险纳入设计；无法安全保存时就不要把它塞进通用负载均衡器。独立 ready 任务还必须接入告警或明确的摘流自动化，只记录一次 503 不会自动停止流量。
 
 ## 9.11 日志与 Operation ID
 
@@ -407,37 +412,35 @@ rollback journal 模式下，不要在活跃事务中只复制 `state.sqlite3` �
 
 新恢复根通常有不同 device/inode，不能强改旧数据库根绑定继续用。使用新 state-dir 意味着旧 Operation ID、上传检查点和 purge 控制状态丢失，应明确接受并人工处理遗留内部项。
 
-## 9.15 升级前检查
+## 9.15 新版本切换前检查
 
-升级不是只替换二进制。先检查：
+Dufs 每个版本都是一套新的 current-only 合同；运行服务不识别旧配置、旧 wire schema 或旧状态库，也不内置迁移。切换前先检查：
 
-- CHANGELOG 中是否删除功能或配置项；
-- YAML 是否包含新版本拒绝的旧字段；
-- schema 是否支持从当前版本迁移；
-- 浏览器行为和 API 是否改变；
-- nginx/systemd 样例是否变化；
-- 最小 Rust/Linux/Node 要求是否变化；
-- 备份和恢复演练是否最新；
-- 新制品版本、Git SHA、checksum 和签名是否可验证。
+- 新版本当前 YAML、API、Foundation 管理员认证与页面合同；
+- 新版本 nginx/systemd 样例、精确 AMD64 GNU target 及 Rust 1.98/Node 24.8 构建要求；
+- 原状态是否需要转换；未来稳定版本如需要，必须交给 `sarmg-upgrade` 中已公开支持的精确迁移边并在停服副本上执行；
+- 备份、恢复与转换失败后的回到原快照演练是否最新；
+- 新制品版本、Git SHA、checksum、签名和 SBOM 是否可验证。
 
-YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝；升级前应清理不属于当前契约的调用方和配置。
+YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝。不要为了让旧调用方继续工作而在 Dufs 中增加 alias、fallback、自动探测或双写。
 
-## 9.16 安全升级顺序
+## 9.16 安全版本切换顺序
 
 一个保守流程：
 
 1. 在隔离环境用生产近似配置跑完整测试；
 2. 校验签名制品和源码身份；
-3. 记录旧二进制、配置、数据库 schema 和回滚条件；
+3. 记录原制品、配置、数据库 identity 和整组恢复条件；
 4. 创建一致备份或快照；
 5. 进入维护窗口，正常停止 Dufs；
-6. 替换制品和经过审查的配置；
-7. 启动，检查 journal；
-8. 验证 health 和 authenticated ready；
-9. 经 HTTPS 完成关键业务冒烟；
-10. 观察 5xx、unknown、空间与 purge 指标。
+6. 若 `sarmg-upgrade` 有明确支持且精确绑定 source/target 的转换边，则在副本验证后转换；否则只能从新版本当前格式初始化；
+7. 原子切换制品和经过审查的当前配置；
+8. 启动，检查 journal；
+9. 验证 health 和 authenticated ready；
+10. 经 HTTPS 完成关键业务冒烟；
+11. 观察 5xx、unknown、空间与 purge 指标。
 
-若新版本已经迁移数据库或改变磁盘状态，不能只把旧二进制放回去就宣称回滚。回滚方案必须与 schema 和共享根状态一起演练。
+若 `sarmg-upgrade` 的精确转换边或新版本已经改变数据库或共享根，不能只把原二进制放回去就宣称恢复。恢复必须还原同一一致点的制品、配置、状态库和共享根；任何转换都不由 Dufs 运行服务承担。
 
 ## 9.17 优雅停机的运维意义
 
@@ -451,7 +454,7 @@ YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝；升�
 - 发送正常 SIGTERM；
 - 观察停机日志；只有 30 秒正常宽限耗尽或强制截止时，告警才会报告 `active_tasks`/`active_mutations`，正常排空期间没有持续任务计数日志；
 - 等待退出；
-- 只有在明确卡死并已保全现场时才升级到强制终止。
+- 只有在明确卡死并已保全现场时才改用强制终止。
 
 ## 9.18 事件响应原则
 
@@ -515,6 +518,6 @@ YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝；升�
 - [ ] 共享根与 state-dir 有一致备份方案；
 - [ ] 制品 checksum/签名和可信公钥可用；
 - [ ] 已在隔离环境完成恢复演练；
-- [ ] 已记录升级和回滚条件。
+- [ ] 已记录版本切换、整体恢复和制品回退条件。
 
 下一章提供完整源码阅读计划、术语表和常见问题，帮助把前九章串成长期维护能力。

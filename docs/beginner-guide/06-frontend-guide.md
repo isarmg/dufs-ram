@@ -8,9 +8,9 @@
 
 读完后，你应当能够回答：
 
-1. 为什么项目不用 React、Vue 和生产前端打包器，页面仍然能拆成多个模块？
+1. 为什么 Dufs 是项目组唯一不使用 React/Vite 的明确例外，页面仍然能拆成多个模块？
 2. 修改 `clients/web/index.css` 后，为什么只刷新浏览器可能看不到变化？
-3. Rust 如何把当前目录、用户名和 CSRF token 交给 JavaScript？
+3. Rust 如何把当前目录与完整 Foundation 管理员 session 交给 JavaScript？
 4. `listing/controller.js` 为什么同时维护数据项、cursor、revision 和 DOM 窗口？
 5. 文件夹没有下载按钮时，为什么删除和重命名按钮仍不会向左移动？
 6. 为什么点击“新建文件夹”后先创建 `newfolder`，再在原位置编辑？
@@ -20,7 +20,7 @@
 
 ## 6.2 先建立正确的前端心智模型
 
-当前前端采用原生 Web 技术：
+当前前端采用原生 Web 技术。Dufs 是项目组唯一明确不迁移到 React/Vite 的客户端；这项例外只覆盖界面实现和打包方式，认证 wire contract 仍严格使用 Foundation：
 
 - HTML 提供页面骨架；
 - CSS 提供布局、主题、响应式和高对比度样式；
@@ -121,7 +121,7 @@ body
 │   │   └── 新建空文件按钮
 │   ├── .searchbar
 │   └── .toolbox-right
-│       └── 注销按钮和用户名
+│       └── 注销按钮和管理员 username
 ├── .main
 │   └── .index-page
 │       ├── 操作状态
@@ -145,8 +145,13 @@ body
 {
   href: "/photos",
   dir_exists: true,
-  user: "admin",
-  csrf_token: "..."
+  session: {
+    authenticated: true,
+    user_id: "dufs:...",
+    username: "admin",
+    role: "admin",
+    csrf_token: "..."
+  }
 }
 ```
 
@@ -156,8 +161,11 @@ body
 | --- | --- |
 | `href` | 当前共享根内的逻辑目录，以 `/` 开头 |
 | `dir_exists` | 当前目录是否已经存在 |
-| `user` | 当前会话的用户名 |
-| `csrf_token` | 当前页面写请求必须携带的防跨站 token |
+| `session.authenticated` | 只能为 `true`，证明页面由已认证分支生成 |
+| `session.user_id` | Foundation 稳定管理员标识，1～128 个允许字符 |
+| `session.username` | Foundation canonical 管理员 username：3～64 lowercase ASCII bytes、首尾 alnum、字符仅 `[a-z0-9._-]` |
+| `session.role` | 唯一允许值 `admin`；不存在普通用户或其他角色 |
+| `session.csrf_token` | 当前页面写请求必须携带的 32-byte、43 字符规范 base64url token |
 
 服务端先把 JSON 序列化，再编码为 Base64，最后替换 `__INDEX_DATA__` 占位符。JavaScript 从 `<template id="index-data">` 读取并解码；`JSON.parse()` 的结果仍是 `unknown`，必须通过 `shared/index_data.js` 的 `parseIndexData()` 严格校验后才能使用。
 
@@ -316,26 +324,24 @@ element.setAttribute(name, value);
 
 ## 6.7 登录页和注销
 
-登录页与文件页是两套页面，见 [clients/web/login.html](../../clients/web/login.html) 和 [clients/web/login.css](../../clients/web/login.css)。登录流程不是 JavaScript Fetch：
+登录页与文件页是两套页面，见 [clients/web/login.html](../../clients/web/login.html) 和 [clients/web/login.css](../../clients/web/login.css)。登录采用 Foundation 当前 JSON 协议：
 
-1. 浏览器 GET 登录页；
-2. 用户填写用户名和密码；
-3. 标准 HTML form POST 到 `/__dufs__/login`；
-4. 服务端验证密码并设置 Secure 会话 Cookie；
-5. 成功时以 303 跳转到 `/`；
-6. 失败时也使用 PRG：POST 以 303 跳到 `/__dufs__/login?login_error=<不透明 token>`；
-7. 随后的 GET 单次消费这个短寿命、服务端保存的错误 token，再生成带安全错误信息的登录页。
+1. 浏览器 `GET /__dufs__/login` 取得页面；
+2. 用户填写管理员 username candidate 和密码；candidate 必须是 1～64 bytes 且每字节 `0x20`～`0x7e`，允许外层 ASCII space 和大写字母；
+3. `login.js` 阻止默认 form navigation，以 Fetch 向 `POST /api/v2/auth/login` 发送恰好 `username/password` 的 JSON；
+4. 浏览器自动附带同源安全上下文，服务端还要求唯一且一致的 Origin、effective Host 与 `Sec-Fetch-Site: same-origin`；
+5. 服务端验证 Foundation 当前 Argon2id PHC，设置 `__Host-dufs-session` Secure Cookie，并返回恰好五字段的 `AdministratorSession`；
+6. 客户端严格验证 session 的字段集合、canonical 管理员 username、`role=admin` 与 token 规范，成功才 `location.replace("/")`；
+7. `400/401/429` 等错误直接解析 Foundation `ErrorEnvelope` 并在原页面安全显示，不使用 PRG、查询字符串 token 或旧表单 alias。
 
-这样刷新失败页不会重复提交密码表单，错误详情也不会直接塞进可复制的查询字符串。错误 token 有容量和约 60 秒寿命，且取出后即删除。
+登录脚本严格复制 Foundation 当前 username 形状，并使用 `TextEncoder.encodeInto()` 按 UTF-8 字节检查密码：
 
-登录脚本使用 `TextEncoder.encodeInto()` 按 UTF-8 字节检查输入：
-
-- 用户名最多 128 字节；
-- 密码最多 1024 字节。
+- username candidate 必须为 1～64 bytes 且每字节 `0x20`～`0x7e`；客户端和服务端均执行 ASCII trim/lowercase，结果必须为 3～64 字节、首尾 alnum、字符仅 `[a-z0-9._-]` 的 canonical username；`@`、Unicode、控制字符和首尾分隔符拒绝，相邻分隔符允许；
+- 密码必须为 12～1024 个 UTF-8 字节且没有 ASCII 控制字符。
 
 “字符数”和“UTF-8 字节数”不同。英文字母通常占 1 字节，常见汉字通常占 3 字节，因此不能只依赖 `value.length`。
 
-文件页的注销按钮向 `/__dufs__/logout` 发送 POST，并带当前页面的 CSRF token。成功后不手工伪造登录界面，而是刷新页面，让服务端根据会话事实决定下一页。
+文件页的注销按钮向 `/api/v2/auth/logout` 发送 POST，并带当前 session 的 `X-CSRF-Token`。成功后不手工伪造登录界面，而是刷新页面，让服务端根据会话事实决定下一页。
 
 当 API 返回 401，或返回带明确 CSRF 标记的 403 时，`redirectToLogin()` 同样只执行一次页面刷新，避免多个并发失败反复触发导航。
 
@@ -659,7 +665,7 @@ Rename 和 Move 不再共用一个“完整目标路径”输入框。这样能�
 ```http
 POST /__dufs__/api/rename
 Content-Type: application/json
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Operation-Id: UUID
 
 {
@@ -921,7 +927,7 @@ const item = payload;
 因此外部边界仍然需要运行时解析器：
 
 - `validateListingPage()` 校验目录页；
-- `parseIndexData()` 校验服务端注入的四字段启动对象；
+- `parseIndexData()` 校验服务端注入的三字段启动对象及嵌套五字段 Foundation session；
 - `parseUploadPreflight()` 校验预检顺序和 revision；
 - `classifyUploadResponse()` 校验上传状态矩阵；
 - `parseErrorPayload()` 只从 `application/problem+json` 中容错读取有界、规范命名的顶层字段；
@@ -929,7 +935,7 @@ const item = payload;
 
 `parseErrorPayload()` 也不是完整 Problem Details schema validator：只要 media type 正确，它会尝试读取受支持的有界字段，缺失或非法字段会回落为空值/默认值；只有调用方需要的 HTTP status、协议头和业务组合另行做权威校验。
 
-`parseIndexData()` 只接受普通对象和恰好 `href/dir_exists/user/csrf_token` 四个 own data property，不接受 accessor 或额外字段；`href` 必须是规范绝对逻辑路径，`dir_exists` 必须是 boolean，`user` 必须为 UTF-8 最多 128 字节的字符串，CSRF 必须恰为 64 位小写十六进制。它复制并冻结结果，调用方不会继续持有未经验证的解析对象。修改这个 schema 时仍必须同步 Rust 生成端、解析器、嵌入资源和正反测试。
+`parseIndexData()` 只接受普通对象和恰好 `href/dir_exists/session` 三个 own data property，不接受 accessor 或额外字段；`href` 必须是规范绝对逻辑路径，`dir_exists` 必须是 boolean。嵌套 session 又必须恰好包含 `authenticated/user_id/username/role/csrf_token`：authenticated 只能为 true，user_id 匹配 Foundation 标识字符集，username 是 3～64 字节的 canonical 管理员 username，role 只能是 admin，CSRF 是 32-byte 无填充规范 base64url token。解析器复制并冻结外层和 session，调用方不会继续持有未经验证的对象。修改这个 current-only schema 时必须同步 Rust 生成端、解析器、嵌入资源和正反测试，不增加旧字段兼容分支。
 
 一个实用原则是：
 
@@ -1065,7 +1071,7 @@ discard 不复用普通 operation 的 `succeeded` 解析。`http/client.js` 的 
 - 第一行显示图标、名称、四操作槽；
 - 第二行显示修改时间和大小；
 - 搜索框占整行；
-- 用户名空间不足时可截断并显示省略号；
+- 管理员 username 空间不足时可截断并显示省略号；
 - 上传状态允许换行。
 
 注释把 320 CSS 像素视为 1280px 桌面在 400% 缩放下的宽度。因此这项设计首先是桌面缩放无障碍保证，不等于项目承诺完整的移动端产品体验。

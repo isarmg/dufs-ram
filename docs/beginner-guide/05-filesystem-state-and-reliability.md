@@ -300,7 +300,7 @@ actor 循环必须在**每条命令内部**处理 `Result`，把错误只回复�
 - 五列 `product_metadata`、当前应用/版本/revision、统一 schema SHA-256、精确对象身份与 quick check；
 - 数据库绑定的共享根 device/inode。
 
-只有空白数据库会建立当前 schema revision 1。初始化事务写入精确五列 `product_metadata`：单例键、`dufs-ram` 应用名、当前 Cargo 版本、revision 和 schema SHA-256。指纹使用所有非 `sqlite_*`、非 `product_metadata` 的 `sqlite_schema` 行，按 `type/name/tbl_name` 排序，并将每个原始字段编码为 u64 大端长度加字段字节后计算 SHA-256。现存数据库先在只读 raw snapshot 与原路径视图中验证相同契约、根绑定和完整性；旧版本、无标记、版本/指纹漂移、额外对象或约束变化都在任何 chmod、journal 配置或恢复写入前拒绝，文件字节保持不变。运行服务不迁移 schema，格式转换属于停服后的独立升级流程。
+只有空白数据库会建立当前 schema revision 1。初始化事务写入精确五列 `product_metadata`：单例键、`dufs-ram` 应用名、当前 Cargo 版本、revision 和 schema SHA-256。指纹使用所有非 `sqlite_*`、非 `product_metadata` 的 `sqlite_schema` 行，按 `type/name/tbl_name` 排序，并将每个原始字段编码为 u64 大端长度加字段字节后计算 SHA-256。现存数据库先在只读 raw snapshot 与原路径视图中验证相同契约、根绑定和完整性；任何非当前 identity、无标记、版本/指纹漂移、额外对象或约束变化都在任何 chmod、journal 配置或恢复写入前拒绝，文件字节保持不变。运行服务不迁移 schema；未来稳定版本如确有跨版本转换需求，只能由 `sarmg-upgrade` 中精确绑定 source/target 的独立 adapter、fixture 与 CLI 在停服副本上负责。
 
 数据库不能随意复制给另一个共享根继续使用，因为里面的路径、对象身份和未完成动作都绑定旧根。
 
@@ -430,7 +430,7 @@ PathCoordinator 无法控制外部进程。目标应不存在时，Upload/Move/R
 5. 不要在提交后取消路径里删除状态证据。
 6. 不要让一条 SQLite 命令的 `?` 逃出 actor 主循环。
 7. 新增 mkdir、move、rename、delete 一类普通 tracked mutation 时，必须接入 Operation ID、mutation progress、列表失效和测试；上传使用独立 Upload ID，preflight/discard 也不走普通 Operation Registry。
-8. 修改 schema 时要同时考虑迁移、启动恢复、损坏校验和旧记录的不可信字段。
+8. 修改 schema 时要同步更新唯一当前 identity、启动恢复、损坏校验和测试；Dufs 内不增加旧 schema 解析、迁移或双读分支。
 9. 修改内部文件名形状时，要同步路径策略、列表隐藏、orphan 扫描和测试。
 10. 所有“成功”都要写清它证明了可见性、持久性还是仅已受理。
 

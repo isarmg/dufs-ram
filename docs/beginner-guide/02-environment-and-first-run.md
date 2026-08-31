@@ -6,16 +6,16 @@
 
 构建源码需要：
 
-- 目标平台是 64 位 Linux；仓库自动验证的基线是 `x86_64-unknown-linux-gnu`，aarch64 等目标在补齐等价 CI/部署矩阵前不属于正式验证范围；
-- Rust、rustc、Cargo 1.97.1；
+- 唯一目标平台是 Linux AMD64 GNU，即 `x86_64-unknown-linux-gnu`；aarch64、ARM64、musl、Windows 和 macOS 均在编译期拒绝；
+- Rust、rustc、Cargo 1.98.0；
 - 源码使用 Rust 2024 edition；
 - 与目标 ABI 匹配的 C 编译器、链接器和 binutils；项目通过 `rusqlite` 的 bundled feature 编译 SQLite C 源码。
 
 运行已经构建好的二进制不需要 Rust 工具链，但制品必须匹配目标机器的 CPU 架构和 libc/动态加载器 ABI，内核还必须提供可用的 `openat2`。因此不能把某个 GNU libc 的 x86-64 制品笼统视为“所有 64 位 Linux 都能运行”。
 
-[build.rs](../../build.rs) 会在编译期拒绝非 Linux 或非 64 位目标。启动时还会探测 `openat2`；仅仅“能编译”不代表当前内核能运行。
+[build.rs](../../build.rs) 会在编译期拒绝任何非 `x86_64-unknown-linux-gnu` 目标。启动时还会探测 `openat2`；精确 target 能编译仍不代表当前内核具备运行所需系统调用。
 
-Node.js 18 或更高版本用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
+Node.js 精确版本 24.8.0 用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本；正式质量门会拒绝其他 Node 版本。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
 
 ## 2.2 先检查工具
 
@@ -74,6 +74,10 @@ target/release/dufs
 ```
 
 `--locked` 要求 Cargo 严格使用 [Cargo.lock](../../Cargo.lock)，避免一次普通构建意外改变依赖解析结果。
+其中 Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target`
+都必须是 `=0.3.0`，Git rev 都必须是 `1fe326081cfd896f05ff502e80f99504797c14c6`。即使只是开发联调，也不能
+改成相邻工作区、Cargo path dependency、可变 branch 或本地复制代码；那会让同一 Dufs 提交产生不同的认证、
+Schema 或正式 target 合同。
 
 ## 2.4 准备隔离目录
 
@@ -113,7 +117,7 @@ target/debug/dufs hash-password
 $argon2id$v=19$m=...$...$...
 ```
 
-这是 PHC 格式的 Argon2id 密码哈希，不是原始密码。原始密码必须非空，并且最多 1024 个 UTF-8 字节。
+这是 PHC 格式的 Argon2id 密码哈希，不是原始密码。原始密码必须为 12～1024 个 UTF-8 字节，且不能包含 ASCII 控制字符。
 
 把完整账号值写入 YAML 时建议使用单引号：
 
@@ -121,7 +125,7 @@ $argon2id$v=19$m=...$...$...
 'admin:$argon2id$v=19$...'
 ```
 
-不要把真实密码、会话 Cookie、CSRF token 或完整生产 PHC 放进 Git、截图或公开日志。
+冒号左侧是 canonical 管理员 username：3～64 个 lowercase ASCII 字节，首尾为字母数字，中间只允许字母、数字、`.`、`_`、`-`；不能包含 `@`。不要把真实密码、会话 Cookie、CSRF token 或完整生产 PHC 放进 Git、截图或公开日志。
 
 ## 2.6 启动最小实例
 
@@ -228,10 +232,12 @@ password: test-password
   curl -k --noproxy '*' --connect-timeout 2 --max-time 30 \
     --silent --show-error \
     --cookie-jar "$cookie_dir/cookies" \
-    --header 'Content-Type: application/x-www-form-urlencoded' \
-    --data 'username=frontend-test-0&password=test-password' \
+    --header 'Content-Type: application/json' \
+    --header 'Origin: https://127.0.0.1:9443' \
+    --header 'Sec-Fetch-Site: same-origin' \
+    --data '{"username":"frontend-test-0","password":"test-password"}' \
     --output /dev/null \
-    https://127.0.0.1:9443/__dufs__/login
+    https://127.0.0.1:9443/api/v2/auth/login
   curl -k --noproxy '*' --connect-timeout 2 --max-time 30 \
     --fail --silent --show-error \
     --cookie "$cookie_dir/cookies" \
@@ -275,7 +281,7 @@ min-free-space: 0
 target/debug/dufs --config "$tutorial_root/dufs.yaml"
 ```
 
-YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项会直接失败，不会静默忽略。这样升级时更吵，但能防止操作者误以为某个安全限制仍然生效。
+YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项会直接失败，不会静默忽略。这样在 current-only 版本切换时会明确暴露不匹配，并能防止操作者误以为某个安全限制仍然生效。
 
 配置优先级是“内置默认值 → YAML → 命令行中明确给出的非认证参数”。因此命令行中的 `--bind` 和 `--trusted-proxy` 会分别整体替换 YAML 中的对应列表，而不是追加合并。账号只能来自受保护 YAML 的 `auth`；CLI 不定义账号参数，未声明选项由 clap 统一拒绝。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
 
@@ -348,7 +354,7 @@ ss -ltnp | rg ':5000\b'
 
 ### 账号参数解析失败
 
-常见原因是 PHC 没有用单引号包裹、用户名重复，或哈希不是 Argon2id。
+常见原因是 PHC 没有用单引号包裹、管理员 username 不是 canonical 形式或发生重复，或者哈希不符合 Foundation 当前 Argon2id 参数。配置 username 必须是 3～64 个 lowercase ASCII 字节，首尾 alnum、字符仅 `[a-z0-9._-]`；不能写 `@`、空白、Unicode 或首尾分隔符。
 
 ### 状态目录权限或位置错误
 

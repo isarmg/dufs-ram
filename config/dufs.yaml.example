@@ -9,8 +9,9 @@ trusted-proxies:
   - 127.0.0.1/32
 port: 5000
 auth:
-  # Replace this entire value with `admin:` followed by the output of
-  # `/opt/dufs/bin/dufs hash-password`. Keep the YAML string quoted.
+  # Replace the username and hash with one canonical lowercase administrator
+  # username followed by the output of `/opt/dufs/bin/dufs hash-password`.
+  # Keep the complete `username:hash` value quoted.
   - 'admin:$argon2id$REPLACE_WITH_A_REAL_HASH'
 log-format: '$time_iso8601 $log_level $remote_addr $remote_user "$request" $status operation_id=$operation_id operation_state=$operation_state'
 max-upload-size: 107374182400

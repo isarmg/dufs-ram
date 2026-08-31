@@ -65,7 +65,7 @@
 
 回答：
 
-- 登录为何用标准表单和 `303`，不是前端 fetch？
+- 登录为何使用 Foundation JSON Fetch，而不使用表单提交或 PRG？
 - Cookie 认证与 CSRF 各解决什么？
 - 为什么修改 `login.js` 可能还要更新 CSP 哈希？
 - 应用和 nginx 的登录限流如何叠加？
@@ -138,7 +138,7 @@ URI → RoutePath → RootedPath → 根 FD 相对打开 → fstat identity
 
 回答：
 
-- Move 和 Rename 为什么是两个 API，却共用底层迁移引擎？
+- Move 和 Rename 为什么是两个 API，却共用底层安全移动实现？
 - Operation ID 如何绑定请求内容？
 - 哪个时刻以后超时只能 unknown？
 - committed、outcome-unknown、refresh-required、not-committed 如何影响列表？
@@ -270,10 +270,10 @@ rg "X-Dufs-Upload-Offset" src assets tests
 
 1. 修改 Rust response struct；
 2. 在前端以 `unknown` 接收并验证；
-3. 决定旧服务/旧页面兼容策略；
+3. 同步修改当前服务、当前页面与严格解析器，不保留旧 wire schema 分支；
 4. 更新 Rust API、前端单元和浏览器测试。
 
-学习点：wire schema、运行时校验和渐进兼容。
+学习点：wire schema、运行时校验和 current-only 原子切换。
 
 ### 练习 C：增加稳定错误 code
 
@@ -477,7 +477,7 @@ Rust 中表示将来可能完成的异步计算。丢弃 Future 不会撤销已�
 先持久记录待执行副作用，再由 worker 可靠消费的模式。删除 purge job 是文件系统与 SQLite 之间的 durable outbox。
 
 **owner digest**
-按具体用途从账号生成的假名化 `OwnerId`。operation/upload/purge 的持久记录使用兼容历史格式的 `OwnerId::persistent`；列表快照和登录限流使用各自 domain-separated 摘要。它们避免在这些边界直接保存或比较用户名，但都只是未加密盐的 SHA-256；低熵账号名可被字典枚举，不能视为匿名化或保密边界，也不能混成一个全局通用摘要。
+按具体用途从 Foundation 管理员身份生成的假名化 `OwnerId`。operation/upload/purge 的持久记录使用当前 `OwnerId::persistent` 合同；列表快照和登录限流使用各自 domain-separated 摘要。它们避免在这些边界直接保存或比较管理员 username，但都只是未加密盐的 SHA-256；低熵 username 可被字典枚举，不能视为匿名化或保密边界，也不能混成一个全局通用摘要。源码里的 data-plane `user`/owner 命名描述文件操作归属，不表示另有普通用户角色。
 
 ### P
 
@@ -531,7 +531,7 @@ SQLite 的事务日志模式之一。活跃事务期间只复制主 DB 文件不
 一次列表扫描形成的不可变结果集。后续 cursor 对它分页，目录变化会使其失效。
 
 **stage**
-上传正文先写入目标父目录下 `0700` 私有保留子目录中的隐藏暂存文件，完整同步并通过最终检查后在同一文件系统内原子发布；该目录使用旧版本已经保留的 nil-quarantine 名称形状。
+上传正文先写入目标父目录下 `0700` 私有保留子目录中的隐藏暂存文件，完整同步并通过最终检查后在同一文件系统内原子发布；目录名称和布局只属于当前实现，不承担任何旧版本格式兼容义务。
 
 **StateStore**
 管理 operations、upload sessions 和 purge jobs 的持久状态 façade/actor，不保存用户文件正文。
@@ -567,9 +567,9 @@ Extended Attribute，Linux 文件扩展属性。覆盖重放时必须限制特�
 
 运行中的旧二进制仍包含旧资源。重新 Cargo 构建、重启服务并重新取得页面。若修改的是 `EMBEDDED_ASSETS` 白名单中的 CSS、ES module、图标或其 MIME 声明，再确认页面请求了新的资源摘要 URL；`index.html`、`login.html` 和内联 `login.js` 不参与该摘要，修改它们时摘要前缀可以不变。
 
-### 为什么不用 React/Vue？
+### 为什么 Dufs 不使用其他项目统一的 React/Vite？
 
-当前页面规模和功能边界适合原生 ES modules。减少生产构建链的同时，也要求项目自己严格管理状态、DOM 和运行时数据校验。
+这是项目组唯一明确批准的前端例外：当前页面规模、Rust 编译期资源登记和单二进制交付合同适合原生 ES modules。减少生产构建链的同时，也要求项目自己严格管理状态、DOM 和运行时数据校验；例外不扩展到认证线协议，管理员身份仍完全采用 Foundation current 合同。
 
 ### SQLite 是文件索引数据库吗？
 

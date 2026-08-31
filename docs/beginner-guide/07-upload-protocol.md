@@ -99,7 +99,7 @@ stage 的 device/inode 与 SQLite 记录绑定。仅仅猜中隐藏文件名或 
 
 | 头部 | 方向 | 含义 |
 | --- | --- | --- |
-| `X-Dufs-CSRF-Token` | 请求 | 当前登录页面的写请求证明 |
+| `X-CSRF-Token` | 请求 | Foundation 当前会话的写请求证明 |
 | `X-Dufs-Upload-Id` | 双向 | 上传会话 UUID |
 | `X-Dufs-Upload-Length` | 双向 | 文件完整字节长度 |
 | `X-Dufs-Upload-Offset` | 双向 | 本次续写起点或服务端可靠检查点 |
@@ -170,7 +170,7 @@ stateDiagram-v2
 ```http
 POST /__dufs__/api/upload/preflight
 Content-Type: application/json
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 
 {"paths":["/docs/report.pdf"]}
 ```
@@ -231,7 +231,7 @@ revision 绑定 owner、规范路径和完整目标身份，不能拿 `/a.txt` �
 
 ```http
 PUT /docs/report.pdf
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Upload-Id: 规范UUID
 X-Dufs-Upload-Length: 123456
 X-Dufs-Upload-Overwrite: false
@@ -264,7 +264,7 @@ X-Dufs-Target-Revision: 64个小写十六进制字符
 6. 检查目标/stage identity、revision、metadata 和空间准入；
 7. 在首次文件系统或上传状态 mutation 前，与总 deadline 原子竞争 mutation boundary；
 8. task 赢得边界后，原子补建必要祖先；
-9. 在目标父目录下建立或验证服务账号所有、旧版本也会隐藏并保留的 nil-quarantine 形状私有目录（`0700`）；
+9. 在目标父目录下建立或验证服务账号所有、仅供当前实现使用的私有上传暂存目录（`0700`）；该名称和布局不是历史格式兼容合同；
 10. 在该目录内以独占方式创建隐藏 stage，并设置 mode `0600`；
 11. 同步 stage 及其目录，并在 SQLite 写 `Running(offset=0)`。
 
@@ -422,7 +422,7 @@ file.slice(offset)
 
 ```http
 PATCH /docs/report.pdf
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Upload-Id: 原UUID
 X-Dufs-Upload-Length: 123456
 X-Dufs-Upload-Offset: 服务器返回的精确offset
@@ -463,7 +463,7 @@ T5 最终 no-replace 提交发现冲突
 
 ```http
 PATCH /docs/report.pdf
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Upload-Id: 原UUID
 X-Dufs-Upload-Length: 123456
 X-Dufs-Upload-Offset: 123456
@@ -486,7 +486,7 @@ Content-Length: 0
 ```http
 POST /__dufs__/api/upload/discard
 Content-Type: application/json
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 
 {"path":"/docs/report.pdf","upload_id":"原UUID"}
 ```

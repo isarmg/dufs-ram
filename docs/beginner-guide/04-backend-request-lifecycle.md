@@ -255,20 +255,21 @@ CSRF
 
 其他方法会返回 `405 Method Not Allowed`。
 
-### 登录
+### 登录页面与 Foundation 登录 API
 
-- `GET /__dufs__/login` 返回嵌入二进制的登录 HTML；
-- `POST /__dufs__/login` 读取表单、验证密码、创建会话并 `303` 跳转到 `/`。
+- `GET /__dufs__/login` 只返回嵌入二进制的登录 HTML，其他方法返回 `405`；
+- `POST /api/v2/auth/login` 只接受 Foundation `AdministratorLoginRequest` JSON，即恰好 `username/password` 两个字段；username candidate 限 1～64 bytes 且每字节 `0x20`～`0x7e`，Foundation 执行 ASCII trim/lowercase 并要求 canonical；成功设置 Cookie 并返回 `AdministratorSession` JSON，页面脚本再以 `location.replace("/")` 导航；
+- 不存在 `POST /__dufs__/login` alias、表单协议、PRG 或一次性错误 token。
 
 登录处理本身也有保护：
 
-- 显式 `Sec-Fetch-Site: cross-site` 会被拒绝；若带 `Origin`，其外部 scheme/authority 必须与请求匹配；没有 `Origin` 的兼容客户端不会仅因此被拒绝；
-- 只接受 `application/x-www-form-urlencoded`；
-- 正文上限 4 KiB；
-- 正文读取超时 10 秒；
-- 有全局和单 IP 正文接纳上限；
-- 有登录速率限制和账号退避；
-- 密码哈希验证放入阻塞任务，并限制并发数量。
+- `Origin`、effective Host（合并所有 Host field line 与 URI authority）和 `Sec-Fetch-Site: same-origin` 必须存在、唯一、规范且互相一致；生产只接受 HTTPS，环回开发才允许 HTTP；
+- 只接受严格 JSON，未知、重复、缺失或错类型字段均拒绝；
+- 应用正文上限 16 KiB，官方 nginx 仅对 exact `/api/v2/auth/login` 进一步限制为 4 KiB；
+- 正文读取总 deadline 为 10 秒；
+- 有全局 32、每来源 IP 4 个正文接纳许可，以及全局/IP token bucket；
+- 有“来源 IP + canonical 管理员 username 摘要”的失败退避；未知 username 仍执行当前成本的 Argon2id 校验；
+- 密码验证占用最多两个 Argon2id 计算槽，满载用 Foundation `429` 和 `Retry-After` 直接返回，不经重定向。
 
 这些限制不是普通业务 Router 总超时的替代品，而是登录这个高成本入口自己的更窄边界。
 
@@ -278,7 +279,7 @@ CSRF
 
 普通目录页面、列表 API 和 readiness 都不属于公共路由。
 
-登录 POST 是公共路由阶段的特殊写请求：它发生在会话认证和全局 CSRF 阶段之前，因此没有“已登录会话 + CSRF header”；它依靠上述来源判断、严格表单、登录限流以及成功后创建的新会话。不要把后文“已认证 POST 都要 CSRF”错误套到登录表单上。
+Foundation 登录 POST 是公共路由阶段的特殊写请求：它发生在会话认证和全局 CSRF 阶段之前，因此没有“已登录会话 + CSRF header”；它依靠严格同源、严格 JSON、登录限流以及成功后创建的新会话。不要把后文“已认证 POST 都要 CSRF”错误套到登录请求上。
 
 ## 4.9 阶段二：验证会话 Cookie
 
@@ -289,7 +290,7 @@ CSRF
 - `Secure`，浏览器只在安全上下文发送；
 - `SameSite=Strict`，降低跨站携带风险。
 
-Dispatcher 从请求的 `Cookie` 头提取 token，再交给认证存储查找会话。认证成功后，把用户名写入访问日志上下文，并把会话信息交给后续路由。
+Dispatcher 从请求的 `Cookie` 头提取唯一规范 token，再交给内存认证存储查找会话。认证成功后，把 canonical 管理员 username 写入访问日志上下文，并把固定 `role=admin` 的会话信息交给后续路由。重复 Cookie 名、重复 Cookie field line、非规范 token 或歧义值均失败关闭；重启会清空全部会话。
 
 未登录响应取决于请求意图：
 
@@ -312,12 +313,12 @@ readiness 是一个容易混淆的例外：它在认证成功后由 API 分发�
 
 校验同时要求：
 
-1. 来源检查没有发现显式 cross-site，且存在 `Origin` 时其外部 scheme/authority 匹配；
-2. `X-Dufs-CSRF-Token` 与当前 session 绑定的 token 匹配。
+1. Foundation 严格来源检查确认唯一 `Origin`、effective Host 和 `Sec-Fetch-Site: same-origin` 全部存在、规范且一致；
+2. 唯一 `X-CSRF-Token` 与当前 session 绑定的 Foundation 256-bit token 以常量时间匹配。
 
 同源检查会考虑 `Origin`、`Host`、`Sec-Fetch-Site`。代理信息默认不受信；只有直连 peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才采用规范的单值 `X-Forwarded-Proto`。推荐的“浏览器 HTTPS → nginx → 回环 HTTP Dufs”拓扑因此还要显式配置 `127.0.0.1/32`，并通过 OS 隔离保证其他本机进程不能冒充网关。
 
-GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公共路由。公共登录 POST 也已在到达此阶段前完成。CSRF 失败时，内部 API 返回带稳定错误代码的 problem JSON；普通内容路由返回拒绝响应。
+GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公共路由。公共登录 POST 也已在到达此阶段前完成。Foundation auth API 的 CSRF 失败返回 Foundation `ErrorEnvelope`；Dufs browser API 返回带稳定错误 code 的 Problem Details；普通内容路由返回拒绝响应。
 
 不要用“请求有自定义头，所以一定安全”来理解 CSRF。真正的保证来自同源判断、会话绑定 token 和安全 Cookie 属性共同作用。
 
@@ -327,7 +328,8 @@ GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公�
 
 | 路由 | 方法 | 作用 |
 | --- | --- | --- |
-| `/__dufs__/logout` | POST | 销毁当前会话并清 Cookie |
+| `/api/v2/auth/session` | GET | 返回当前 Foundation `AdministratorSession` |
+| `/api/v2/auth/logout` | POST | 销毁当前会话并清 Cookie；要求严格同源与 `X-CSRF-Token` |
 | `/__dufs__/ready` | GET、HEAD | 实际探测共享根、空间、状态存储和生命周期 |
 | `/__dufs__/api/jobs/<uuid>` | GET | 查询一次被追踪写操作的状态 |
 | `/__dufs__/api/list` | GET | 返回分页目录或搜索 JSON |
@@ -434,7 +436,7 @@ sequenceDiagram
 ```http
 POST /__dufs__/api/rename
 Cookie: __Host-dufs-session=...
-X-Dufs-CSRF-Token: ...
+X-CSRF-Token: ...
 X-Dufs-Operation-Id: 规范 UUID
 Content-Type: application/json
 

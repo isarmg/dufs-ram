@@ -7,7 +7,7 @@
 3. 为什么项目需要 SQLite、路径租约、对象身份和“结果未知”状态？
 4. 修改代码后，怎样证明功能、安全边界和故障语义没有被破坏？
 
-文档以**当前工作区源码（Cargo 版本 0.50.0）**为准。Git 标签中的历史版本可能有不同界面、协议或文件结构。
+文档只描述**当前工作区源码（Cargo 版本 0.50.0）**。产品运行时、页面、配置和教程不提供其他版本合同；未来稳定版本若需要处理非当前数据，只能使用 `sarmg-upgrade` 中精确绑定 source/target 并独立审核的迁移 adapter、fixture 与 CLI，不能据历史标签推断当前行为。
 
 ## 适合谁阅读
 
@@ -30,7 +30,7 @@
 | 6 | [前端页面与交互](06-frontend-guide.md) | 页面如何启动、加载列表、显示固定操作列和刷新状态 |
 | 7 | [上传协议逐步拆解](07-upload-protocol.md) | 预检、PUT、PATCH、覆盖确认、断点续传和故障恢复 |
 | 8 | [测试、调试与安全改动](08-testing-debugging-and-change-workflow.md) | 如何运行检查、定位问题、写测试并完成一次低风险修改 |
-| 9 | [部署、安全与日常运维](09-deployment-security-and-operations.md) | nginx、systemd、健康检查、备份和升级的职责边界 |
+| 9 | [部署、安全与日常运维](09-deployment-security-and-operations.md) | nginx、systemd、健康检查、备份和 current-only 版本切换的职责边界 |
 | 10 | [源码阅读路线与术语表](10-reading-roadmap-and-glossary.md) | 分阶段读源码、练习、常见问题和术语速查 |
 
 如果只想完成某个任务，也可以走短路线：
@@ -72,7 +72,7 @@ flowchart LR
     A --> L[访问日志]
 ```
 
-开发测试会使用一个 Node.js HTTPS 代理模拟网关；生产运行不需要 Node.js。HTML、CSS 和 JavaScript 在编译时嵌入 Rust 二进制，由同一个服务返回。
+开发测试会使用一个 Node.js HTTPS 代理模拟网关；生产运行不需要 Node.js。HTML、CSS 和原生 ES modules 在编译时嵌入 Rust 二进制，由同一个服务返回。Dufs 是项目组唯一明确不使用 React/Vite 的前端；这一例外不改变 Foundation 管理员认证合同。
 
 ## 阅读源码的约定
 
@@ -95,13 +95,13 @@ flowchart LR
 仓库中搜索符号推荐使用：
 
 ```sh
-rg "符号名|协议字段|错误代码" src assets tests
+rg "符号名|协议字段|错误代码" src clients tests
 ```
 
 ## 不要先入为主的几个事实
 
 - 项目名称仍叫 Dufs，但当前产品是面向浏览器的文件管理器，不是原始 Dufs 的通用静态文件服务器功能全集。
-- 一个账号登录后可以管理整个共享根；当前没有用户级目录隔离和只读角色。
+- 可配置多个 canonical 管理员 username，但唯一角色是 `admin`；任一管理员都可管理整个共享根，没有普通用户、用户级目录隔离或只读角色。管理面 username 会成为本地文件操作 owner 的输入，但 data-plane 的 `user`/owner 字段不是第二套登录角色。
 - “上传预检时没有重名”不等于提交时仍没有重名，并发变化必须在真正提交点再次处理。
 - HTTP 超时不总能证明操作失败。上传的服务端总 deadline 会与首次 filesystem/upload-state mutation 原子竞争：deadline 先赢可返回 `not-started`，task 先越界后的外层超时只能返回 `unknown`；浏览器或网络自身的超时也不能证明哪个分支发生。普通写操作随后按原 Operation ID 查询，上传则始终先按原 Upload ID 对账。
 - 删除成功并不表示递归清理已经全部结束。目标会先原子移入隐藏回收区，再由持久化 purge job 异步清理。
@@ -125,7 +125,7 @@ rg "符号名|协议字段|错误代码" src assets tests
 
 - [项目工作流程](../project-workflow.md)是更紧凑的全流程参考；
 - [功能与取舍清单](../feature-inventory-and-tradeoffs.md)用于判断功能依赖和删除成本；
-- [生产运维手册](../operations.md)是部署、备份、升级和回滚的权威操作说明；
+- [生产运维手册](../operations.md)是部署、备份、current-only 版本切换与恢复的权威操作说明；
 - [根目录 README](../../README.md)给出产品范围、CLI 和协议的完整公开说明。
 
 教程为了帮助理解会使用简化例子；涉及生产参数、安全边界或故障处置时，以源码、测试和上述运维文档为准。

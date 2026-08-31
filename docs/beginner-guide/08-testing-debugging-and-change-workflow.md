@@ -43,7 +43,7 @@ flowchart TD
 
 ## 8.2 首次准备测试环境
 
-Rust 工具链由 [rust-toolchain.toml](../../rust-toolchain.toml) 固定为 1.97.1，并包含 Rustfmt 和 Clippy。先确认版本：
+Rust 工具链由 [rust-toolchain.toml](../../rust-toolchain.toml) 固定为 1.98.0，并包含 Rustfmt 和 Clippy。先确认版本：
 
 ```sh
 rustc --version

@@ -1,8 +1,8 @@
 # Dufs 浏览器文件管理器
 
-Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单个 Linux 可执行文件后，即可通过 Edge、Firefox 等现代桌面浏览器浏览和管理指定目录，不需要单独部署前端服务。
+Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单个 `x86_64-unknown-linux-gnu` 可执行文件后，即可通过 Edge、Firefox 等现代桌面浏览器浏览和管理指定目录，不需要单独部署前端服务。
 
-本项目面向个人或受控局域网环境。推荐部署约定是一台系统只运行一个 Dufs 进程，并由该进程管理一个共享根目录；代码强制保证的锁粒度则是“每个共享根唯一实例”：程序会在共享根目录 FD 上取得非阻塞独占锁，指向同一根的第二实例会启动失败，不同根目录之间不会互相加锁。该 advisory lock 不能阻止 shell、宿主机或其他程序写入；本文描述的一致性保证要求共享根由 Dufs 和停服后的受控运维流程独占写入。账号只决定能否登录；创建账号后即拥有整个共享根的完整文件管理权限。
+本项目面向个人或受控局域网环境。推荐部署约定是一台系统只运行一个 Dufs 进程，并由该进程管理一个共享根目录；代码强制保证的锁粒度则是“每个共享根唯一实例”：程序会在共享根目录 FD 上取得非阻塞独占锁，指向同一根的第二实例会启动失败，不同根目录之间不会互相加锁。该 advisory lock 不能阻止 shell、宿主机或其他程序写入；本文描述的一致性保证要求共享根由 Dufs 和停服后的受控运维流程独占写入。认证身份统一为 Foundation 定义的管理员；可配置多个管理员 username，但不存在普通用户、角色字段、只读角色或按路径授权，任一管理员都拥有整个共享根的完整文件管理权限。
 
 ## 支持范围
 
@@ -13,19 +13,22 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - 当前页面内的失败任务可校验服务端持久化检查点并继续上传；
 - 新建文件和目录，移动、重命名及删除文件或目录；
 - 从当前目录开始按文件名递归搜索；
-- Argon2id 密码、英文登录页、服务端会话和 CSRF 防护；
+- Foundation 统一的管理员 username、Argon2id 密码、会话、同源和 CSRF 合同；
 - 资源预算和异步访问日志；
 - 编译内置的原生 HTML、CSS、JavaScript 管理页面。
 
-本项目仅支持 Linux 服务端和现代桌面浏览器，不提供匿名访问、账号分级权限、手机 Web、WebDAV、无 JavaScript 客户端、拖放上传、在线预览或编辑、静态网站托管、运行时页面资源覆盖、URL 子路径部署、用户自定义隐藏规则、Unix socket、CORS 或环境变量配置。
+Dufs 是这一组项目中唯一不使用 React/Vite 的前端例外。`clients/web/` 保留无 bundler 的原生 ES modules，资源在编译期登记、摘要化并嵌入 Rust 二进制；这是一项明确的产品边界，不应把其他项目的 React/Vite 目录或构建流程机械复制进来。认证线协议仍与其他项目一致，例外只限于页面实现和打包方式。
+
+本项目服务端只支持 Linux AMD64 GNU，即精确 target `x86_64-unknown-linux-gnu`，并面向现代桌面浏览器。不提供匿名访问、非管理员角色、账号分级权限、手机 Web、WebDAV、无 JavaScript 客户端、拖放上传、在线预览或编辑、静态网站托管、运行时页面资源覆盖、URL 子路径部署、用户自定义隐藏规则、Unix socket、CORS 或环境变量配置。
 
 ## 文档分工
 
 - [从零读懂 Dufs：新手教学手册](docs/beginner-guide/README.md)：按十章课程从运行环境、Rust/HTTP 基础一路讲到前后端、上传状态机、测试和生产运维；
 - [项目工作流程与流程树](docs/project-workflow.md)：说明当前代码的启动、认证、浏览、上传、下载、持久化和停机流程；
-- [文档导航](docs/README.md)：区分当前规范、教学资料与历史审查记录；
+- [文档导航](docs/README.md)：只导航必要 README、初学者指南、流程树、功能取舍和运维文档；
 - [完整功能与取舍清单](docs/feature-inventory-and-tradeoffs.md)：逐项列出当前功能、依赖、删除影响和可精简候选；
-- [生产部署、备份、升级与回滚](docs/operations.md)：给出经过语法验证的 systemd/nginx 基线、健康检查、备份恢复演练和制品验证流程；
+- [开发者决策矩阵](docs/feature-decision-matrix.md)：以唯一 ID 和统一列完整覆盖代码锚点、分类、复杂度、删除后果及验证边界；
+- [生产部署、备份、current-only 版本切换与恢复](docs/operations.md)：给出经过语法验证的 systemd/nginx 基线、健康检查、备份恢复演练和制品验证流程；
 
 本 fork 托管在 `https://github.com/isarmg/dufs-ram`。只读 GitHub Actions 门禁不会创建或修改远端 tag、Release 或正式制品；版本 tag 工作流只在 tag、Cargo 版本和源码提交完全一致且全部质量门通过后构建便捷二进制，并生成只绑定当前版本和源码提交的发布说明。需要独立公钥验证、SBOM、许可证清单和构建环境记录的正式制品仍由 `scripts/package-release.sh` 从当前提交生成。
 
@@ -33,15 +36,18 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 
 ## 环境要求
 
-- 自动 CI、部署样例和正式制品的验证基线是 `x86_64-unknown-linux-gnu`；`build.rs` 也允许其他 64 位 Linux 源码构建，但 aarch64 等目标在加入等价 CI/部署矩阵前只属于未验证的 best effort；
+- 唯一可编译、测试、部署和正式发布的服务端 target 是 `x86_64-unknown-linux-gnu`；`build.rs` 同时检查 `arch=x86_64`、`os=linux`、`env=gnu` 和 64 位指针，其他 target 在编译期直接失败；
 - 运行内核必须提供 `openat2`；不支持时程序会拒绝启动，二进制还必须匹配 CPU、libc 和动态加载器 ABI；
-- Rust、rustc 和 Cargo 1.97.1，源码使用 Rust 2024 edition；
+- Rust、rustc 和 Cargo 1.98.0，源码使用 Rust 2024 edition；
+- Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target` 均精确
+  固定为 `=0.3.0`，Git rev 均精确固定为 `1fe326081cfd896f05ff502e80f99504797c14c6`；开发、CI 和发行不得
+  改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；
 - 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
-- Node.js 18 或更高版本用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
+- Node.js 24.8.0 用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
 - 本地开发门在安装 ShellCheck 时执行 `--severity=warning`，缺失时明确跳过而不会联网安装；远程 CI 按 SHA-256 固定并强制使用 ShellCheck 0.11.0，正式发布也要求 ShellCheck 可用；
-- 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、`cargo-audit 0.22.2`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.97.1 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
+- 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、`cargo-audit 0.22.2`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.98.0 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
 
-`build.rs` 会在编译期拒绝非 Linux 或非 64 位目标，但这个编译边界不等于每个 64 位架构都经过支持矩阵验证。`Cargo.lock` 中出现上游依赖的其他平台条件包属于 Cargo 的完整依赖图，也不表示本项目支持这些平台。
+`Cargo.lock` 中出现上游依赖的其他平台条件包属于 Cargo 的完整依赖图，不表示项目支持对应平台。不得用删除 `build.rs` 断言、交叉编译“恰好成功”或手工复制二进制的方式扩展支持矩阵；新增架构必须作为新的产品决策重新建立文件系统、CI、部署和发布证明。
 
 ## 编译
 
@@ -84,7 +90,7 @@ chmod 0600 /受保护配置目录/dufs.yaml
 ./target/release/dufs --config /受保护配置目录/dufs.yaml
 ```
 
-未指定 `--bind` 时，Dufs 默认只监听 `127.0.0.1:5000`。需要从其他主机上的网关回源时，必须显式指定内网 IP，并通过防火墙或 ACL 限制来源；需要 IPv6 时可显式使用 `--bind ::1` 或其他 IPv6 地址。CLI/YAML 至少要提供一个监听地址且不能重复，空的 `bind: []` 或完全重复的 IP 会在创建任何运行时资源前报错退出。全部地址都成功绑定后才初始化共享根和持久状态，运行时构建成功后再统一启动 accept；因此后项绑定失败不会创建或迁移状态库，也不会短暂发布前面的地址。多个 listener 先各自等待可读，只有取得共享连接许可后才从内核 backlog 接受 socket；因此空闲地址不预占许可，用户态已接受连接的总数也不会超过全局上限。
+未指定 `--bind` 时，Dufs 默认只监听 `127.0.0.1:5000`。需要从其他主机上的网关回源时，必须显式指定内网 IP，并通过防火墙或 ACL 限制来源；需要 IPv6 时可显式使用 `--bind ::1` 或其他 IPv6 地址。CLI/YAML 至少要提供一个监听地址且不能重复，空的 `bind: []` 或完全重复的 IP 会在创建任何运行时资源前报错退出。全部地址都成功绑定后才初始化共享根和持久状态，运行时构建成功后再统一启动 accept；因此后项绑定失败不会打开、创建或修改状态库，也不会短暂发布前面的地址。多个 listener 先各自等待可读，只有取得共享连接许可后才从内核 backlog 接受 socket；因此空闲地址不预占许可，用户态已接受连接的总数也不会超过全局上限。
 
 浏览器会话 Cookie 带有 `Secure` 属性，前端生成上传 UUID 使用的 `crypto.randomUUID()` 也要求安全上下文，因此浏览器入口必须使用 HTTPS。通常应在浏览器中打开网关提供的地址：
 
@@ -92,36 +98,39 @@ chmod 0600 /受保护配置目录/dufs.yaml
 https://files.example.com/
 ```
 
-服务至少需要一个通过受保护 YAML 配置的账号；缺少账号时会拒绝启动。登录后无需开启其他能力开关，即可使用全部文件管理功能。
+服务至少需要一个通过受保护 YAML 配置的 canonical 管理员 username；缺少管理员时会拒绝启动。登录后无需开启其他能力开关，即可使用全部文件管理功能。
 
-## 账号与登录
+## 管理员认证与登录
 
-账号格式为：
+管理员配置格式为：
 
 ```text
-用户名:$argon2id$...
+admin:$argon2id$...
 ```
 
-配置多个账号时在受保护 YAML 的 `auth` 列表中逐项添加：
+配置多个管理员时在受保护 YAML 的 `auth` 列表中逐项添加：
 
 ```yaml
 auth:
   - 'admin:$argon2id$…'
-  - 'user:$argon2id$…'
+  - 'admin-2:$argon2id$…'
 ```
 
 使用要求：
 
-- 原始密码必须非空且最多 1024 个 UTF-8 字节；`dufs hash-password`、登录表单解析和 Argon2id 哈希入口共用这一字节上限，配置中保存的是该命令生成的完整 PHC 字符串；
+- 配置 username 必须是 Foundation 当前 canonical 形式：3～64 个小写 ASCII 字节，首尾必须为字母或数字，中间只允许小写字母、数字、`.`、`_`、`-`；明确禁止 `@`，但允许相邻分隔符。登录候选必须是 1～64 个 printable ASCII 字节（每字节 `0x20`～`0x7e`），服务端先执行 ASCII whitespace trim 和 ASCII lowercase，再要求结果符合 canonical 规则；持久配置不自动修正，只接受 canonical 形式；
+- 原始密码必须为 12–1024 个 UTF-8 字节且不含 ASCII 控制字符；`dufs hash-password`、JSON 登录解析和 Argon2id 哈希入口共用同一 Foundation 策略，配置中保存的是该命令生成的完整 PHC 字符串；
 - 哈希包含 `$`，在 YAML 中建议使用单引号包围完整账号值；
-- 重复用户名和非 Argon2id 格式会阻止启动；
-- 每个账号均可浏览、上传、覆盖、移动、删除及搜索整个共享根；
+- 重复 username、非 canonical username、非当前 Argon2id 参数或错误 salt/output 长度都会阻止启动；
+- 唯一角色是 `admin`；每个管理员均可浏览、上传、覆盖、移动、删除及搜索整个共享根；
 - 登录成功后使用服务端内存会话；空闲 30 分钟或创建满 12 小时后失效，时限按 Linux `CLOCK_BOOTTIME` 计算，系统休眠时间也计入；
 - 每个账号最多保留 32 个会话，全局最多 1024 个；重复登录优先淘汰同账号最久未活动的会话；
 - 程序重启会清空会话，浏览器需要重新登录；
-- 登录 POST 使用独立的同源来源检查；注销和文件写入还必须通过当前会话绑定的 CSRF Token 校验。
+- 登录 API 固定为 `POST /api/v2/auth/login`，会话查询和注销固定为 `GET /api/v2/auth/session`、`POST /api/v2/auth/logout`；三者使用 Foundation 当前 JSON/ErrorEnvelope 合同，不保留表单 POST 或旧路径 fallback；
+- 登录 POST 使用严格同源来源检查；Foundation 要求唯一、规范的 `Origin`、effective Host（包括 HTTP/2 authority）与 `Sec-Fetch-Site: same-origin`，生产只接受 HTTPS，环回开发才允许 HTTP；重复、逗号拼接、缺失或互相矛盾的安全头失败关闭；
+- 注销和全部受保护写入还必须提供唯一 `X-CSRF-Token`，并与当前会话绑定摘要做常量时间比较；Cookie 解析同样拒绝重复同名值。
 
-登录 POST 在读取正文前同时消耗全局 burst 16/每秒补充 1 个及单来源 IP burst 8/每秒补充 1 个的令牌；正在读取的登录正文还受全局 32、每 IP 4 个并发许可、4 KiB 上限和 10 秒总时限约束。解析账号后再按“来源 IP + 账号摘要”组合键应用失败退避，并受全局最多两个 Argon2id 计算槽约束；一个来源对账号的失败不会在密码校验前锁定其他来源。`Retry-After` 会把剩余退避时间向上取整到完整秒，并只出现在重定向后的最终 `429` 登录错误页，不会被误解释为延迟跟随 `303`。应用限制与网关限流是叠加关系，不能互相替代。
+登录 POST 在读取正文前同时消耗全局 burst 16/每秒补充 1 个及单来源 IP burst 8/每秒补充 1 个的令牌；正在读取的登录正文还受全局 32、每 IP 4 个并发许可、16 KiB 上限和 10 秒总时限约束。解析并规范化 username 后再按“来源 IP + canonical username 摘要”组合键应用失败退避，并受全局最多两个 Argon2id 计算槽约束；一个来源对管理员的失败不会在密码校验前锁定其他来源。`Retry-After` 把剩余退避向上取整到完整秒并直接随当前 JSON `429` 错误返回。应用限制与网关限流是叠加关系，不能互相替代。
 
 未认证 GET/HEAD 只有在逐个 `Accept` 字段、逐个逗号项解析后发现精确的 `text/html` media type，且可选 `q` 值语法有效并大于 0 时，才会 `303` 到登录页。`text/htmlx`、`text/html;q=0`、重复或畸形 `q` 不会被当成页面导航，仍返回接口式 `401`。
 
@@ -190,7 +199,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 - 若进程在嵌套候选已经移入随机隔离名、尚未完成 unlink 时中断，后续 orphan maintenance 会把 trash 树中的该隔离名视为 `InvalidData`，将整棵根永久 quarantine，而不是把它当普通子项继续自动删除；
 - 内部删除暂存项不是回收站，不提供恢复或撤销功能。
 
-统一 state store 当前使用文件型 SQLite schema revision 1，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。任何 SQLite 打开前，现存 `-journal/-wal/-shm` 都必须以 no-follow fd 证明是身份稳定的单硬链接普通文件；主库不存在时任何 sidecar 都会阻止初始化。现存主库还会先从持有的 no-follow fd 建立不叠加 sidecar 的私有 raw snapshot，验证五列 `product_metadata` 契约、`application='dufs-ram'`、与当前二进制完全一致的 Cargo 版本、schema revision、统一 schema SHA-256、共享根绑定和完整性；随后原路径连接再次验证合并视图，通过后才允许 chmod、journal 配置或恢复写入。schema 指纹按 `sqlite_schema` 的 `type/name/tbl_name/sql` 排序，排除 `sqlite_*` 与 `product_metadata`，并对每个原始字段写入 u64 大端长度和字段字节后计算 SHA-256。只有不存在或不含持久对象的空数据库会初始化当前 schema；旧版本、无 `product_metadata`、版本或指纹漂移、额外对象及其他应用数据库全部在任何持久修改前拒绝，主库与 sidecar 字节、mode 和身份保持不变。版本/格式转换由独立升级流程负责，运行服务不执行 schema migration。
+统一 state store 当前使用文件型 SQLite schema revision 1，一并持久化管理 `operations`、`upload_sessions` 和 `purge_jobs`。CLI `--state-dir /var/lib/dufs` 或 YAML `state-dir: /var/lib/dufs` 是必填配置，数据库文件名固定为 `state.sqlite3`；不存在内存数据库或隐式临时状态模式。目录必须已经存在、由当前服务账号所有、权限为 `0700`、不是符号链接，且不能与共享根互为祖先/后代；固定数据库及 `-journal/-wal/-shm` sidecar 也不能与日志或配置文件冲突。同一个数据库绑定共享根设备号和 inode，不能拿给另一个共享根复用。任何 SQLite 打开前，现存 `-journal/-wal/-shm` 都必须以 no-follow fd 证明是身份稳定的单硬链接普通文件；主库不存在时任何 sidecar 都会阻止初始化。现存主库还会先从持有的 no-follow fd 建立不叠加 sidecar 的私有 raw snapshot，验证五列 `product_metadata` 契约、`application='dufs-ram'`、与当前二进制完全一致的 Cargo 版本、schema revision、统一 schema SHA-256、共享根绑定和完整性；随后原路径连接再次验证合并视图，通过后才允许 chmod、journal 配置或恢复写入。schema 指纹按 `sqlite_schema` 的 `type/name/tbl_name/sql` 排序，排除 `sqlite_*` 与 `product_metadata`，并对每个原始字段写入 u64 大端长度和字段字节后计算 SHA-256。只有不存在或不含持久对象的空数据库会初始化当前 schema；旧版本、无 `product_metadata`、版本或指纹漂移、额外对象及其他应用数据库全部在任何持久修改前拒绝，主库与 sidecar 字节、mode 和身份保持不变。版本/格式转换只能由 `sarmg-upgrade` 仓库中独立审核、精确绑定 source/target 的 adapter、fixture 与 CLI 负责；Dufs 运行服务不执行 schema migration，也不接受旧状态格式。
 
 文件型状态库启动恢复会删除 operation 中尚未进入文件系统提交边界的 `Reserved`，把 operation `CommitStarted` 转换为 `Completed/unknown`，把 upload `CommitStarted` 转换为 `Unknown` 并从恢复时刻重新给予完整的 upload session TTL，并把 purge `Claimed` 重置为可立即重试的 `Ready`。operation 终态 TTL 为 15 分钟；upload session TTL 为 7 天，容量为全局 16384、每账号 4096；purge job 没有固定失败次数或 TTL 逃生口，容量为全局 4096、每账号 1024。普通 I/O 故障保留 job 并退避；缺少已提交 revision、身份歧义或最终删除异常则 quarantine 当前对象并释放 job。SQLite 使用 rollback journal `DELETE` 模式和 `synchronous=EXTRA`。SQLite 事务与文件系统 mkdir、rename、文件/目录 `fsync` 不是一个共同事务：operation/upload 在跨域缝隙中恢复为 `unknown`；purge 只有 live DELETE 在 rename 与父目录同步后原子写入的完整 trash revision 才授权后续回收，`Prepared` 恢复从不以数据库意图猜测文件系统结果。
 
@@ -204,7 +213,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 
 目录页的 DELETE、MOVE、RENAME、MKDIR、空 PUT 和普通上传共用单一四值 mutation 失效通知：`committed` 表示确认写入，`outcome-unknown` 表示仍可能写入，`refresh-required` 表示服务器已经证明当前列表 snapshot 陈旧但不表示本次写入成功，`not-committed` 才表示确认未改变列表。前三者都会使现有分页 snapshot、游标和 DOM 失效并要求从第一页刷新；非法名称等能够证明目录未变的拒绝和分发前取消使用 `not-committed`。上传目标出现、消失、revision 改变或 reset-stage 等每一个可信 target-change 响应，以及 tracked DELETE/MOVE/RENAME 的确定 revision 冲突，都使用 `refresh-required`；上传不会因同一任务曾经失效过一次就抑制后续通知，所以用户在两次冲突之间刷新得到的新 snapshot 也会再次失效。对于已经分发后报 unknown 的空 PUT，即使一次随后 HEAD 暂时返回 `not-seen`，列表仍按可能与原请求竞态处理并保守失效。
 
-目录页 JavaScript 主动发起的 Fetch 在 30 秒 deadline 内按流读取响应；原生导航、登录表单和文件下载不在该客户端边界内。Fetch 错误体最多 16 KiB、成功体最多 16 MiB，先检查声明长度并在累计越界时立即取消；允许范围内直接重放已校验分块，不再先合并为第二份连续缓冲区。Problem Details 的 `detail`/`title` 最多接受 1024 个 JavaScript UTF-16 code units，超限整条丢弃。上传正文专用 XHR 在响应头、下载进度和最终 UTF-8 长度三个阶段拒绝任何超过 16 KiB 的响应（正常成功响应应为空），但不证明浏览器在事件前从未缓冲额外网络块。16 MiB 成功上限为最多 500 项、接近 Linux PATH_MAX 且可能经 JSON 转义放大的合法目录页保留余量。
+目录页 JavaScript 主动发起的 Fetch 在 30 秒 deadline 内按流读取响应；登录页另用 Foundation JSON Fetch，原生导航和文件下载不在该客户端边界内。Fetch 错误体最多 16 KiB、成功体最多 16 MiB，先检查声明长度并在累计越界时立即取消；允许范围内直接重放已校验分块，不再先合并为第二份连续缓冲区。Problem Details 的 `detail`/`title` 最多接受 1024 个 JavaScript UTF-16 code units，超限整条丢弃。上传正文专用 XHR 在响应头、下载进度和最终 UTF-8 长度三个阶段拒绝任何超过 16 KiB 的响应（正常成功响应应为空），但不证明浏览器在事件前从未缓冲额外网络块。16 MiB 成功上限为最多 500 项、接近 Linux PATH_MAX 且可能经 JSON 转义放大的合法目录页保留余量。
 
 ### 统一错误反馈
 
@@ -388,7 +397,7 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 | `$msec` | 响应正文完成或失败时的 Unix epoch 秒数，保留三位小数 |
 | `$log_level` | 本条访问日志的级别 |
 | `$remote_addr` | 与 Dufs 建立 TCP 连接的客户端地址；经网关时通常是网关地址 |
-| `$remote_user` | 已成功认证的用户名；未认证或认证失败时为 `-` |
+| `$remote_user` | 已成功认证的 canonical 管理员 username；未认证或认证失败时为 `-` |
 | `$request` | 完整请求行：方法、保留百分号编码的原始 request-target 和 HTTP 版本；控制字符会转义 |
 | `$request_method` | HTTP 请求方法 |
 | `$request_uri` | 百分号解码后的 URI；仅用于便于阅读，精确协议审计应使用 `$request` |
@@ -492,9 +501,9 @@ npm audit --audit-level=high
 ./scripts/check.sh
 ```
 
-该门禁还会用生产解析器校验 YAML 示例，以占位可执行文件做 systemd 静态验证，并让真实 nginx 对 mock upstream 执行隔离行为测试；它不启动真实 systemd unit 与 Dufs/nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是发布/部署必做项。门禁还执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测，并要求 Rust 总行覆盖率至少 70%、每个被插桩源码文件的行覆盖率至少 1%，避免零覆盖模块被总量掩盖；它还以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点，围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、升级和回滚步骤见[生产运维文档](docs/operations.md)。
+该门禁还会用生产解析器校验 YAML 示例，以占位可执行文件做 systemd 静态验证，并让真实 nginx 对 mock upstream 执行隔离行为测试；它不启动真实 systemd unit 与 Dufs/nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是发布/部署必做项。门禁还执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测，并要求 Rust 总行覆盖率至少 70%、每个被插桩源码文件的行覆盖率至少 1%，避免零覆盖模块被总量掩盖；它还以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点，围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、current-only 版本切换和恢复步骤见[生产运维文档](docs/operations.md)。
 
-`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。全部 Node 任务只使用当前固定版本 24.8.0，静态层同时固定 TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；Rust 层固定 1.97.1；质量层运行总量 70% 且逐文件 1% 的 Rust 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。`read-only-ci.yml` 的 runner 使用 `ubuntu-24.04` 标签，并在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。只读门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
+`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。全部 Node 任务只使用当前固定版本 24.8.0，静态层同时固定 TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；Rust 层固定 1.98.0；质量层运行总量 70% 且逐文件 1% 的 Rust 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。`read-only-ci.yml` 的 runner 使用 `ubuntu-24.04` 标签，并在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。只读门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
 
 `.github/workflows/release-binary.yml` 只接受 `v<version>` tag push，复核 tag、Cargo 版本和 workflow commit 完全一致，并等待同一 tag/SHA 的只读 CI、依赖审计和正式包 E2E 全部成功。只读构建 job 生成嵌入完整 Git SHA 的 GNU/Linux x86-64 二进制、SHA-256，以及仅含当前版本和源码提交的确定性发布说明；最小写权限 job 只消费并复核这些不可变输入。
 
@@ -513,7 +522,7 @@ git status --short
 
 发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；项目 `LICENSE-APACHE` 不会替代缺失的依赖许可证正文。
 
-固定 Rust 1.97.1 标准库 notice、`BUILD-ENVIRONMENT.txt`、项目 Apache-2.0 许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`。签名私钥只在全部内容验证完成后短暂打开；正式发布仍应把构建和签名置于独立信任域。
+固定 Rust 1.98.0 标准库 notice、`BUILD-ENVIRONMENT.txt`、项目 Apache-2.0 许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`。签名私钥只在全部内容验证完成后短暂打开；正式发布仍应把构建和签名置于独立信任域。
 
 ## 目录结构
 
@@ -532,11 +541,10 @@ git status --short
 │   ├── README.md                           # 当前规范、教程与历史资料导航
 │   ├── project-workflow.md                  # 当前实现流程与 Mermaid 流程树
 │   ├── feature-inventory-and-tradeoffs.md   # 完整功能、边界与精简决策清单
-│   ├── operations.md                        # 部署、备份、升级与回滚
-│   ├── history/                             # 历史审查与整改记录
-│   │   └── code-review-report.md
+│   ├── operations.md                        # 部署、备份、current-only 版本切换与恢复
 │   └── beginner-guide/                      # 从零理解项目的十章教程
-├── deploy/                        # 经语法验证的 systemd、nginx 和 YAML 示例
+├── config/                        # 唯一当前 YAML 配置模板
+├── deploy/                        # 经语法验证的 systemd 与 nginx 部署资产
 ├── scripts/                       # 质量门禁、部署校验和签名发布脚本
 ├── src/
 │   ├── main.rs                     # 启动、监听和连接生命周期

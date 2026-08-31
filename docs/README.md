@@ -6,7 +6,8 @@
 
 - [项目工作流程与流程树](project-workflow.md)：启动、认证、路由、文件操作、上传和停机流程。
 - [完整功能与取舍清单](feature-inventory-and-tradeoffs.md)：功能边界、依赖关系和删除成本。
-- [生产部署、备份、升级与回滚](operations.md)：生产环境的权威操作说明。
+- [开发者决策矩阵](feature-decision-matrix.md)：逐项唯一 ID、代码锚点、分类、复杂度、删除后果与验证边界。
+- [生产部署、备份、current-only 版本切换与恢复](operations.md)：生产环境的权威操作说明。
 - [根目录 README](../README.md)：产品范围、配置和公开协议总览。
 
 ## 教学资料

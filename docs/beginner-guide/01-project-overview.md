@@ -2,16 +2,16 @@
 
 ## 1.1 一句话理解 Dufs
 
-Dufs 是一个运行在 64 位 Linux 上的浏览器文件管理器：服务端把某个目录设为“共享根”，认证后的用户可以通过网页浏览、搜索、上传、下载、移动、重命名、新建和删除其中的文件。自动 CI、部署样例与正式制品验收以 `x86_64-unknown-linux-gnu` 为基线；其他 64 位架构即使通过编译守卫，在补齐等价矩阵前也只是未验证的 best effort。
+Dufs 是一个只运行在 Linux AMD64 GNU（`x86_64-unknown-linux-gnu`）上的浏览器文件管理器：服务端把某个目录设为“共享根”，认证后的管理员可以通过网页浏览、搜索、上传、下载、移动、重命名、新建和删除其中的文件。其他 CPU、操作系统或 ABI 由编译守卫直接拒绝，不存在 best-effort 支持层。
 
-它采用“一体化二进制”部署：Rust 程序既处理 API，也返回编译时嵌入的 HTML、CSS 和 JavaScript。生产环境通常在它前面放置 nginx，负责 TLS 和公网边界。
+它采用“一体化二进制”部署：Rust 程序既处理 API，也返回编译时嵌入的 HTML、CSS 和原生 ES modules。Dufs 是项目组唯一明确不使用 React/Vite 的前端例外；Foundation 管理员认证协议并不例外。生产环境通常在它前面放置 nginx，负责 TLS 和公网边界。
 
 ## 1.2 用户看到什么
 
 用户从浏览器看到的核心流程是：
 
 1. 打开 HTTPS 地址；
-2. 输入账号和密码；
+2. 输入 Foundation 管理员 username 和密码；登录 candidate 由共享规则执行 ASCII trim/lowercase 后变成 canonical username；
 3. 进入共享根，面包屑最左侧的房子图标代表根目录；
 4. 分页浏览或搜索文件；
 5. 在一列 Actions 中通过“移动、下载、删除、重命名”四个固定槽操作项目；
@@ -26,7 +26,7 @@ Dufs 是一个运行在 64 位 Linux 上的浏览器文件管理器：服务端�
 先认识产品边界，能避免在错误位置寻找不存在的实现：
 
 - 不提供匿名共享内容访问；health、登录路由和内容寻址静态资产仍是公共路由；
-- 不提供管理员、只读用户等分级权限；
+- 只提供 `admin` 一种角色；不提供普通用户、只读用户、角色分级或路径 ACL；
 - 不做多租户目录隔离；
 - 不提供在线预览或在线编辑；
 - 不提供目录打包下载；
@@ -125,20 +125,23 @@ sequenceDiagram
 ## 1.8 仓库目录地图
 
 ```text
-dufs/
+dufs-ram/
 ├── clients/web/                 浏览器页面、样式和原生 ES modules
-│   └── modules/            列表、操作、上传、API 等前端模块
-├── deploy/                 systemd、nginx、YAML 示例
+│   └── modules/                  列表、操作、上传、API 等前端模块
+├── config/                       唯一当前源码配置样例
+├── deploy/                       systemd、nginx 与代理头部署样例
 ├── docs/                   设计、取舍、运维和本教学手册
 ├── scripts/                质量门、文档检查、发布打包脚本
-├── src/                    Rust 库和可执行程序
-│   └── server/             HTTP 业务、文件系统和状态模块
-├── tests/                  Rust 集成测试和浏览器端到端测试
-├── build.rs                编译目标限制与构建 Git SHA 注入/变更跟踪
-├── Cargo.toml              Rust 包、依赖和 release 配置
-├── package.json            前端检查与测试命令
-└── rust-toolchain.toml     固定 Rust 工具链
+├── src/                          Rust 库和可执行程序
+│   └── server/                   HTTP 业务、文件系统和状态模块
+├── tests/                        Rust 集成测试和浏览器端到端测试
+├── build.rs                      精确 AMD64 GNU 编译守卫与 Git SHA 注入
+├── Cargo.toml                    Rust 包、依赖和 release 配置
+├── package.json                  前端检查与测试命令
+└── rust-toolchain.toml           固定 Rust 1.98 工具链
 ```
+
+源码配置一律位于 `config/`，部署资产一律位于 `deploy/`，客户端一律位于 `clients/web/`。生产安装故意使用 `/etc/dufs/dufs.yaml` 与 `/etc/dufs/tls/`：这是 Linux FHS/证书权限边界，不是仓库目录命名不一致，也不是历史兼容路径。
 
 ### `src/` 的重点
 
