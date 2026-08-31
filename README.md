@@ -28,9 +28,8 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - [完整功能与取舍清单](docs/feature-inventory-and-tradeoffs.md)：逐项列出当前功能、依赖、删除影响和可精简候选；
 - [生产部署、备份、升级与回滚](docs/operations.md)：给出经过语法验证的 systemd/nginx 基线、健康检查、备份恢复演练和制品验证流程；
 - [安全策略](SECURITY.md)：说明支持边界、私密报告要求和事件响应信息；
-- [本地变更记录](CHANGELOG.md)：记录从 0.46.0 起已经完成的改动及更早版本历史。
 
-本 fork 托管在 `https://github.com/isarmg/dufs-ram`。仓库的只读 GitHub Actions 门禁不会创建或修改远端 tag/GitHub Release，也不会上传正式制品；`.github/workflows/formal-release-e2e.yml` 只用临时 Ed25519 密钥真实跑完整正式打包链并销毁输出，不引用生产或自定义 secrets，只使用只读 GitHub token checkout，且不上传制品。`.github/workflows/release-binary.yml` 只在推送与 Cargo 版本精确一致的 `v<version>` tag 后运行：只读 job 等待同一 tag/SHA 的分层 CI、依赖审计和正式包 E2E，构建 `x86_64-unknown-linux-gnu` 便捷二进制、SHA-256 及从该版本 `CHANGELOG.md` 精确提取的说明；唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费按 artifact ID 和聚合摘要绑定的固定输入。工作流不会创建或移动 tag，也不接触发布私钥；GitHub Release 中的 SHA-256 用于传输完整性检查，不是发布者签名。首个自动便捷二进制版本 [`v0.48.0`](https://github.com/isarmg/dufs-ram/releases/tag/v0.48.0) 已于 2026-08-22 发布，受保护的附注 tag 精确指向提交 `c65d0251280bb8c451b6c002ccda364b4517b23d`；后续版本仍须在源码、审查和发布准备全部完成后创建与 Cargo 版本一致且精确指向目标 commit 的受保护 tag。需要独立公钥验证、SBOM、许可证清单和构建环境记录的正式制品仍使用本地 Git 与 `scripts/package-release.sh` 生成带 Git SHA、checksum、CycloneDX SBOM、`BUILD-ENVIRONMENT.txt` 和签名的可验证发布目录。输出目录经所有者/权限校验后以 FD 锁定，stage 创建、构建、清理、最终 rename 和目录同步都从该 FD 派生；全部制品先在同文件系统私有 stage 中验证并同步，在支持 Linux `RENAME_NOREPLACE` 的发布文件系统上再由一次 no-clobber 目录 rename 原子公开。Rust/Node 依赖仍来自锁文件指定的包仓库；首次构建、`npm ci` 和发布脚本的依赖 vendoring 需要可用仓库或已经填充的本地缓存，完成 vendoring 后的隔离 release 构建才强制离线；正式 yanked 检查则在全新私有 Cargo home 中填充锁图，当前仍要求 registry 网络可达，不能只依赖宿主缓存。
+本 fork 托管在 `https://github.com/isarmg/dufs-ram`。只读 GitHub Actions 门禁不会创建或修改远端 tag、Release 或正式制品；版本 tag 工作流只在 tag、Cargo 版本和源码提交完全一致且全部质量门通过后构建便捷二进制，并生成只绑定当前版本和源码提交的发布说明。需要独立公钥验证、SBOM、许可证清单和构建环境记录的正式制品仍由 `scripts/package-release.sh` 从当前提交生成。
 
 发布包完整保留仓库的 `docs/` 层次，并携带教程本地链接所引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置；这些支持材料用于离线阅读与核对，不是运行 Dufs 的额外依赖。打包和 `--self-test` 会先用包内文档检查器验证所有本地链接，再把除 `SHA256SUMS` 自身外的全部普通文件写入清单；此后只做只读覆盖校验，使 checksum 成为包内最后一次内容变更。
 
@@ -499,7 +498,7 @@ npm audit --audit-level=high
 
 `.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。全部 Node 任务只使用当前固定版本 24.8.0，静态层同时固定 TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；Rust 层固定 1.97.1；质量层运行总量 70% 且逐文件 1% 的 Rust 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。`read-only-ci.yml` 的 runner 使用 `ubuntu-24.04` 标签，并在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。只读门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
 
-`.github/workflows/release-binary.yml` 只接受 `v<version>` tag push，复核 tag、Cargo 版本、workflow commit 三者相同，并等待同一 tag/SHA 的只读 CI、依赖审计和真实正式包 E2E 全部成功。只读构建 job 用固定 Rust 工具链生成嵌入完整 Git SHA 的 GNU/Linux x86-64 二进制，验证动态库解析与版本字符串，并把二进制、SHA-256 和 tagged changelog 说明作为不可变 artifact 传给最小写权限 job。写权限 job 不 checkout 或执行这些输入；它校验固定文件集合、Action digest、聚合摘要和 checksum，发布前后都分页核对远端资产的名称、`uploaded` 状态、size，并回下载做 SHA-256 与逐字节比较。匹配草稿可安全续跑：缺失资产上传，相同资产保留，与 GitHub 502 失败形态一致、且连续稳定的同 ID `starter/0-byte` 空资产才按 ID 清理；普通异摘要、额外资产，以及受校验的 tag、标题、prerelease/draft 状态或说明漂移均失败关闭。所有受校验字段匹配的已公开 Release 可幂等验收，发布说明不再由前一 tag 自动生成。预发布版本保留 prerelease 状态。该便捷二进制由 `ubuntu-24.04` 托管 runner 构建，仍受该镜像的 glibc/动态加载器兼容边界约束，不是静态通用 Linux 二进制。版本 tag 应通过 GitHub Ruleset 限制为仅维护者可创建且禁止更新/删除；单维护者仓库可把受保护 tag 本身作为发布批准，不需要把长期私钥交给 Actions。
+`.github/workflows/release-binary.yml` 只接受 `v<version>` tag push，复核 tag、Cargo 版本和 workflow commit 完全一致，并等待同一 tag/SHA 的只读 CI、依赖审计和正式包 E2E 全部成功。只读构建 job 生成嵌入完整 Git SHA 的 GNU/Linux x86-64 二进制、SHA-256，以及仅含当前版本和源码提交的确定性发布说明；最小写权限 job 只消费并复核这些不可变输入。
 
 质量层把覆盖率、部署、发布脚本自测和 release binary smoke 作为独立步骤；只要各自前置条件成功且工作流未被取消，前一项实质检查失败不会跳过后面的独立检查，使一次运行尽量同时报告全部根因且避免缺少工具产生级联报错。
 
@@ -514,9 +513,9 @@ git status --short
 
 源树预检、隔离快照和每次解包检查会拒绝 symlink、submodule 及任何非普通文件/目录条目。脚本还会拒绝 Git replace refs、legacy grafts 和仓库私有 attributes；façade 只使用摘要锁定的最小 local config，所有 Git 命令清空 system/global 配置并禁用额外 attributes/replace。检查后、签名前和发布前都会重新确认 commit/tag/版本及原 checkout 的干净状态；前后两份源码 archive 还会复核 commit、tree、mode、额外路径和 SHA-256。
 
-发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。每个第三方包都必须声明非空 SPDX `license` 表达式；`license_file` 只能提供上游正文，不能替代缺失的表达式或充当分类 fallback。表达式按 `WITH > AND > OR` 的真实 SPDX AST 解析，只接受审核清单内的 identifier/exception，并要求存在完整 permissive 选择：`OR` 任一分支可选，`AND` 两侧都必须满足；只有明确列出的 Cargo 遗留写法会映射为 `OR`。生成器收集依赖声明的 `license_file` 及包根下全部常规 LICENSE/COPYING/NOTICE 文件；每个候选必须是该 vendored 包自身目录内的 no-follow 普通文件，并通过 UTF-8、非 NUL、非空与路径边界校验。项目 `LICENSE-MIT`/`LICENSE-APACHE` 不会替代缺失的上游文本；正文按 SHA-256 去重。
+发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；项目 `LICENSE-APACHE` 不会替代缺失的依赖许可证正文。
 
-固定 Rust 1.97.1 sysroot 的 `share/doc/rust/COPYRIGHT-library.html` 还必须是 sysroot 内的 no-follow 普通文件，并精确匹配已审核 SHA-256 `0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed`；未知工具链没有审核摘要时发布失败。它以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 进入包内。`BUILD-ENVIRONMENT.txt` 使用 `dufs-build-environment-v2` 格式，记录完整源码 SHA、版本、`SOURCE_DATE_EPOCH`、host target、本次实际使用的 cargo-audit、RustSec advisory DB revision/最近 fetch epoch，以及 Bash、Rust、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本；它用于复现与差异诊断，不表示这些宿主工具已全部由仓库钉死。该清单、标准库 notice、项目双许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`；SBOM 规范化会移除本地构建路径并给 Dufs 组件绑定完整源提交，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID，但这不替代完整 CycloneDX schema 校验。签名私钥只在所有构建、SBOM、notice、归档和 checksum 工作完成后短暂打开，并只接受 Ed25519、Ed448、RSA ≥3072 bit 或审核曲线 `prime256v1`/`secp384r1`/`secp521r1`；弱 RSA、DSA、未审核 EC 曲线及非签名算法会失败关闭。生产发布仍应把构建和签名放在不同账号、主机或 HSM 信任域中，因为同一 UID 的恶意构建代码不可能仅靠 Shell FD 管理得到彻底隔离。自动 GitHub Release 二进制应明确视为无独立发布者签名的便捷制品；需要正式信任链时必须使用 `package-release.sh` 的签名包和从独立渠道固定的公钥，不能只依赖同一 Release 中的 SHA-256 文件。
+固定 Rust 1.97.1 标准库 notice、`BUILD-ENVIRONMENT.txt`、项目 Apache-2.0 许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`。签名私钥只在全部内容验证完成后短暂打开；正式发布仍应把构建和签名置于独立信任域。
 
 ## 目录结构
 
@@ -606,7 +605,6 @@ git status --short
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE-APACHE
-├── LICENSE-MIT
 ├── SECURITY.md
 ├── package.json
 ├── playwright.config.js
@@ -617,4 +615,4 @@ git status --short
 
 Copyright (c) 2022 sigoden 及 Dufs contributors。
 
-本项目按 [MIT License](LICENSE-MIT) 或 [Apache License 2.0](LICENSE-APACHE) 双重许可，使用者可任选其一。
+本项目按 [Apache License 2.0](LICENSE-APACHE) 许可。

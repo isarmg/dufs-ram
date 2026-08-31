@@ -141,8 +141,8 @@ package must declare a non-empty reviewed SPDX `license` expression; a
 or act as a classification fallback. Expressions are parsed as SPDX syntax and
 must offer a complete approved permissive branch; every declared or
 conventional license/notice candidate must be a non-empty UTF-8, no-follow
-regular file inside that dependency's own vendored source. Project licenses
-are never fallback text for a dependency.
+regular file inside that dependency's own vendored source. The project license
+is never fallback text for a dependency.
 SBOM normalization accepts only an exact 40- or 64-character lowercase
 hexadecimal source revision and prevents local build-path leakage, but is not
 a complete CycloneDX schema validation.
@@ -150,7 +150,7 @@ a complete CycloneDX schema validation.
 The package must also contain
 `RUST-STANDARD-LIBRARY-COPYRIGHT.html`, copied from the pinned Rust 1.97.1
 sysroot only after its regular-file, containment, and reviewed SHA-256 checks
-pass. It, the project licenses, dependency notice, and SBOM are all covered by
+pass. It, the project license, dependency notice, and SBOM are all covered by
 the package `SHA256SUMS`; an unknown toolchain without a reviewed standard
 library notice digest is not releasable.
 

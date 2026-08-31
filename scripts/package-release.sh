@@ -1140,11 +1140,9 @@ install_release_support_tree() {
     build.rs
     Cargo.lock
     Cargo.toml
-    CHANGELOG.md
     deploy
     docs
     LICENSE-APACHE
-    LICENSE-MIT
     package-lock.json
     package.json
     playwright.config.js

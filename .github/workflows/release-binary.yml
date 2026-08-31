@@ -233,8 +233,10 @@ jobs:
             sha256sum "$asset_name" > "$asset_name.sha256"
             sha256sum --check "$asset_name.sha256"
           )
-          node scripts/extract-release-notes.mjs \
-            CHANGELOG.md "$VERSION" > dist/RELEASE_NOTES.md
+          {
+            printf '# Dufs %s\n\n' "$VERSION"
+            printf 'Source commit: `%s`\n' "$GITHUB_SHA"
+          } > dist/RELEASE_NOTES.md
           test -s dist/RELEASE_NOTES.md
 
           entry_count="$(find -P dist -mindepth 1 -printf x | wc -c)"
@@ -552,7 +554,7 @@ jobs:
               return 2
             fi
             if ! cmp -s "$work_dir/remote-notes.md" "$notes_path"; then
-              printf 'Existing release notes do not match tagged CHANGELOG notes.\n' >&2
+              printf 'Existing release notes do not match source-bound notes.\n' >&2
               return 1
             fi
             if ! jq -j '.body // ""' "$release_rest_state" \
@@ -561,7 +563,7 @@ jobs:
               return 2
             fi
             if ! cmp -s "$work_dir/remote-rest-notes.md" "$notes_path"; then
-              printf 'REST release notes do not match tagged CHANGELOG notes.\n' >&2
+              printf 'REST release notes do not match source-bound notes.\n' >&2
               return 1
             fi
           }

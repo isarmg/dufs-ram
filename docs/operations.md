@@ -27,7 +27,7 @@
    install -d -o root -g root -m 0755 /usr/share/doc/dufs
    install -o root -g root -m 0755 dufs /opt/dufs/bin/dufs
    install -o root -g root -m 0644 docs/operations.md /usr/share/doc/dufs/operations.md
-   install -o root -g root -m 0644 LICENSE-MIT LICENSE-APACHE \
+   install -o root -g root -m 0644 LICENSE-APACHE \
      BUILD-ENVIRONMENT.txt \
      THIRD_PARTY_LICENSES.txt RUST-STANDARD-LIBRARY-COPYRIGHT.html \
      dufs.cdx.json /usr/share/doc/dufs/
@@ -157,7 +157,7 @@ systemctl start dufs
 
 仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0、Rust 1.97.1、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
-仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，并等待同一 tag/SHA 的 `read-only-ci.yml`、`dependency-audit.yml` 与 `formal-release-e2e.yml` 全部成功。只读构建 job 用固定 Rust 工具链生成 `x86_64-unknown-linux-gnu` 二进制；版本字符串必须包含完整源码 SHA，动态库必须全部可解析，发布说明只取 tagged `CHANGELOG.md` 的精确版本段。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费按 artifact ID、Action digest 和聚合摘要绑定的固定输入。它在公开前后分页核对远端资产状态、size 与摘要并实际回下载；匹配草稿可幂等续跑，普通异摘要失败关闭，只有连续稳定的同 ID `starter/0-byte` 残留可按 GitHub 契约清理。所有受校验字段匹配的已公开 Release 只做幂等验收。工作流不会创建、移动或删除 tag，也不读取生产发布私钥；SHA-256 只提供传输完整性，不构成发布者签名。tag 必须通过 GitHub Ruleset 限制为仅维护者可创建并禁止更新/删除。`v0.48.0` 已于 2026-08-22 通过该流程发布，附注 tag 精确指向提交 `c65d0251280bb8c451b6c002ccda364b4517b23d`；后续版本不要为让工作流或脚本“先通过”而提前建 tag，只有最终源码、审查和发布准备完成后才创建并独立确认其目标 commit。
+仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，等待同一 tag/SHA 的全部质量门成功，并生成绑定当前版本与完整源码 SHA 的确定性发布说明。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费并复核不可变发布输入。
 
 `.github/workflows/formal-release-e2e.yml` 在版本 tag、每周计划或人工触发时使用临时 Ed25519 密钥调用未缩短的 `scripts/package-release.sh` 正式入口。它在含空格和 shell 元字符的隔离 clone 中建立精确本地 tag，实际经过完整质量门、vendor、release build、SBOM、checksum、签名和原子目录发布，再从外部复核四项制品、签名、公钥、包内 `SHA256SUMS` 以及二进制完整版本/SHA。该 job 只有 `contents: read`，不引用仓库或环境中的生产/自定义 secrets，只使用只读 GitHub token checkout，也不上传输出；临时密钥和制品随 runner 销毁，因此它验证路径正确性而不产生可分发的正式信任根。
 
@@ -177,9 +177,9 @@ SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA �
 
 `THIRD_PARTY_LICENSES.txt` 从 Cargo metadata 中 Dufs 可达的非开发依赖生成，依赖源码必须位于本轮 vendor 根。每个包必须声明非空、经审核的 SPDX `license` 表达式；metadata `license_file` 只用于收集上游正文，不能替代表达式或作为分类 fallback。生成器按 `WITH > AND > OR` 优先级解析真实 SPDX AST，只接受审核清单内的 license identifier/exception，并要求表达式存在一条完整 permissive 选择：`OR` 任一分支可行，`AND` 两侧都必须 permissive；只对明确列出的 Cargo 遗留 `MIT/Apache-2.0` 和 `Unlicense/MIT` 写法映射为 `OR`。例如 `LGPL AND (MIT OR Apache-2.0)` 会拒绝，而 `(LGPL AND Apache-2.0) OR MIT` 可选择完整 MIT 分支。
 
-生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。项目自身 `LICENSE-MIT`/`LICENSE-APACHE` 不能替代缺失的上游文本；路径逃逸、symlink、缺失、非 UTF-8、NUL 或空文本都会失败。正文规范化换行并按 SHA-256 去重，包索引记录 SPDX 和文本摘要。
+生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。项目自身 `LICENSE-APACHE` 不能替代缺失的上游文本。
 
-包内 `BUILD-ENVIRONMENT.txt` 使用稳定的 `dufs-build-environment-v2` 键值格式，记录完整源码 SHA、源码版本、`SOURCE_DATE_EPOCH`、host target、cargo-audit 版本、RustSec advisory DB revision/最近 fetch epoch，以及本次实际使用或依赖的 Bash、rustc、Cargo、cargo-cyclonedx、Node、npm、Git、OpenSSL、tar、gzip、mv 和 sha256sum 版本。它与 SBOM、第三方 notice、Rust 标准库 notice 和项目双许可证均纳入包内 `SHA256SUMS`。该文件用于复现比较、故障归因和升级审计；它记录事实，不会把未固定的宿主工具变成可重复构建保证。
+包内 `BUILD-ENVIRONMENT.txt`、SBOM、第三方 notice、Rust 标准库 notice 和项目 Apache-2.0 许可证均纳入 `SHA256SUMS`。
 
 二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。审查历史的唯一位置是 `docs/history/code-review-report.md`。发布脚本先用包内 `scripts/check-docs.mjs` 检查最终布局，再对除清单自身外的全部普通文件生成 `SHA256SUMS`，此后只读复核清单覆盖；`--self-test` 还放入深层 sentinel、验证篡改失败、两次归档一致并解包往返检查，避免源码树检查通过但最终制品或 checksum 失效。
 
@@ -267,7 +267,7 @@ openssl pkeyutl -verify -rawin -pubin \
 
 升级步骤：
 
-1. 阅读 `CHANGELOG.md`，确认配置、网关和文件系统行为变化。
+1. 审阅目标版本提交和发布说明，确认配置、网关和文件系统行为变化。
 2. 验证签名、checksum、`BUILD-ENVIRONMENT.txt` 的 SHA/版本/target/工具字段、SBOM、`THIRD_PARTY_LICENSES.txt`、`RUST-STANDARD-LIBRARY-COPYRIGHT.html` 和二进制嵌入 SHA；在隔离环境运行完整检查及数据副本冒烟测试。
 3. 创建共享根一致性快照，并备份旧二进制和配置。
 4. `systemctl stop dufs`，确认优雅停机完成。
