@@ -295,7 +295,7 @@ CSRF Token 与会话一起在服务端内存中创建和保存。除使用独立
 
 ```mermaid
 flowchart LR
-    SOURCE["仓库 assets/login.html、index.html<br/>login.css、index.css、index.js、modules/ 下全部 .js、favicon"] --> COMPILE["include_str!/include_bytes!"]
+    SOURCE["仓库 clients/web/login.html、index.html<br/>login.css、index.css、index.js、modules/ 下全部 .js、favicon"] --> COMPILE["include_str!/include_bytes!"]
     COMPILE --> BINARY["编译进 dufs 可执行文件"]
     BINARY --> HASH["启动时按名称、MIME、内容计算<br/>内置 JS、CSS、图标 SHA-256 摘要"]
     HASH --> URL["GET/HEAD /__dufs_assets_&lt;64个十六进制字符&gt;/资源"]
@@ -304,7 +304,7 @@ flowchart LR
     KNOWN -- 否 --> MISS["404 + private, no-store"]
 ```
 
-运行时外部 assets 覆盖已经删除，但仓库中的 `assets/` 仍是编译期页面源文件，不能删除。服务器不读取外部 `index.html`、`404.html` 或自定义资源目录。入口脚本使用原生 ES modules，按 `shared/`、`http/`、`listing/`、`operations/` 和 `upload/` 五组职责组织，不需要生产打包器；`shared/index_data.js` 验证并冻结页面启动数据，`http/headers.js` 提供严格无符号头解析，`http/response_buffer.js` 负责有界读取、取消和重放流，`upload/protocol.js` 集中定义上传头名、允许状态码及按当前文件总长度绑定的单一解析。目录页由 `index.js` 和 18 个 ES modules 构成。登录样式也位于内容寻址的 `login.css`，所以登录页 CSP 只需 `style-src 'self'`，不允许内联样式；小型登录校验脚本仍由精确 SHA-256 CSP hash 授权。后端 `server/assets.rs` 以单一注册表定义内置资源内容、类型、公开命中和摘要输入；资源前缀由全部内置模块、CSS 和图标的名称、MIME 类型与内容共同计算，并对各字段做长度分帧，其中任一项改变都会产生新的 URL。静态门还双向核对 `assets/modules/` 文件与 `EMBEDDED_ASSETS` 注册表，任何漏嵌或幽灵注册都失败。已知摘要资源的 HEAD 与 GET 返回相同状态、类型、缓存头和长度，但不发送正文；只有成功返回的已知摘要资源可以使用公共长期缓存，未知资源 `404` 返回 `private, no-store`。
+运行时外部 assets 覆盖已经删除，但仓库中的 `clients/web/` 仍是编译期页面源文件，不能删除。服务器不读取外部 `index.html`、`404.html` 或自定义资源目录。入口脚本使用原生 ES modules，按 `shared/`、`http/`、`listing/`、`operations/` 和 `upload/` 五组职责组织，不需要生产打包器；`shared/index_data.js` 验证并冻结页面启动数据，`http/headers.js` 提供严格无符号头解析，`http/response_buffer.js` 负责有界读取、取消和重放流，`upload/protocol.js` 集中定义上传头名、允许状态码及按当前文件总长度绑定的单一解析。目录页由 `index.js` 和 18 个 ES modules 构成。登录样式也位于内容寻址的 `login.css`，所以登录页 CSP 只需 `style-src 'self'`，不允许内联样式；小型登录校验脚本仍由精确 SHA-256 CSP hash 授权。后端 `server/assets.rs` 以单一注册表定义内置资源内容、类型、公开命中和摘要输入；资源前缀由全部内置模块、CSS 和图标的名称、MIME 类型与内容共同计算，并对各字段做长度分帧，其中任一项改变都会产生新的 URL。静态门还双向核对 `clients/web/modules/` 文件与 `EMBEDDED_ASSETS` 注册表，任何漏嵌或幽灵注册都失败。已知摘要资源的 HEAD 与 GET 返回相同状态、类型、缓存头和长度，但不发送正文；只有成功返回的已知摘要资源可以使用公共长期缓存，未知资源 `404` 返回 `private, no-store`。
 
 ## 5. 公共路由
 
@@ -981,7 +981,7 @@ flowchart TD
     I --> J["14. server/download.rs<br/>单句柄附件、弱 ETag 和单段 Range"]
     J --> K["15. server/{internal_names,maintenance}.rs + upload.rs + upload/{prepare,target,transfer,commit,failure,protocol,record,tests}.rs<br/>内部名称、维护、目标 inspection 与上传各阶段"]
     K --> L["16. server/storage.rs<br/>可注入的 sync/rename/父目录同步边界"]
-    L --> M["17. assets/login.html / modules/ 下全部 .js<br/>登录、响应缓冲、分页、operation 协议和上传状态机"]
+    L --> M["17. clients/web/login.html / modules/ 下全部 .js<br/>登录、响应缓冲、分页、operation 协议和上传状态机"]
     M --> N["18. Rust 集成测试<br/>协议、根替换、遍历复核、故障注入、上传与删除"]
     N --> O["19. Playwright<br/>HTTPS 网关下隔离的 Chromium + Firefox 流程"]
 ```
@@ -1007,7 +1007,7 @@ flowchart TD
 
 `build.rs` 在 Cargo 构建脚本阶段同时检查目标操作系统和指针宽度；只有 64 位 Linux 进入应用编译。它还把构建所对应的 Git SHA 写入 `dufs --version`；正式发布脚本显式传入完整 commit SHA，普通源码目录构建则读取当前仓库引用，无法确定时显示 `unknown`。`rust-toolchain.toml` 让 rustup 在仓库目录中自动选择 Rust/rustc/Cargo 1.97.1，并提供 Clippy 与 Rustfmt；`Cargo.toml` 用 `edition = "2024"` 和 `rust-version = "1.97.1"` 声明源码 edition 与最低 Rust 版本。项目已删除内置 TLS feature，唯一 Rust 构建与网关后的 HTTP 后端部署一致。
 
-JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法常量模型，识别字符串拼接、模板、数组 `join`、别名、反射和动态全局属性访问；任何 computed 解构在变量声明、赋值表达式及默认参数（包括嵌套和 const alias）中无法静态求值时都失败关闭，内置负例还覆盖运行时把 `globalThis` 传给参数的跨过程旁路。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查 `assets/index.js`、`assets/login.js` 和全部生产模块；外部/解析输入保持为 `unknown` 并经类型守卫收窄，生产源码不保留显式或隐式 `any`。这无需迁移 `.ts`，但也不等价于 ESLint 或完整跨过程污点证明。六个 Bash 源总是先过 `bash -n`；本地存在 ShellCheck 时运行 warning 门，缺失时明确跳过且不联网，远程 CI 则固定安装并强制使用 0.11.0。部署门禁除 `systemd-analyze verify`、`nginx -t` 外，还会从包含空格、`&`、`#` 与反斜杠的真实 checkout fixture 读取部署文件；执行 `nginx -t` 前，生产 upstream 与全部 IPv4/IPv6 `80/443` 监听会一一改写为私有 Unix socket，并核对替换数量且拒绝任何网络监听残留，因此非 root runner 无需占用生产端口。随后检查启动隔离 nginx 与 mock upstream，分别验证规范重定向、未知 SNI、合法 SNI 下未知 Host、固定回源头、伪造入站 XFF 被 `$remote_addr` 覆盖、登录别名正文上限，以及连接/请求限制产生 `429` 后恢复 `200`。
+JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法常量模型，识别字符串拼接、模板、数组 `join`、别名、反射和动态全局属性访问；任何 computed 解构在变量声明、赋值表达式及默认参数（包括嵌套和 const alias）中无法静态求值时都失败关闭，内置负例还覆盖运行时把 `globalThis` 传给参数的跨过程旁路。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查 `clients/web/index.js`、`clients/web/login.js` 和全部生产模块；外部/解析输入保持为 `unknown` 并经类型守卫收窄，生产源码不保留显式或隐式 `any`。这无需迁移 `.ts`，但也不等价于 ESLint 或完整跨过程污点证明。六个 Bash 源总是先过 `bash -n`；本地存在 ShellCheck 时运行 warning 门，缺失时明确跳过且不联网，远程 CI 则固定安装并强制使用 0.11.0。部署门禁除 `systemd-analyze verify`、`nginx -t` 外，还会从包含空格、`&`、`#` 与反斜杠的真实 checkout fixture 读取部署文件；执行 `nginx -t` 前，生产 upstream 与全部 IPv4/IPv6 `80/443` 监听会一一改写为私有 Unix socket，并核对替换数量且拒绝任何网络监听残留，因此非 root runner 无需占用生产端口。随后检查启动隔离 nginx 与 mock upstream，分别验证规范重定向、未知 SNI、合法 SNI 下未知 Host、固定回源头、伪造入站 XFF 被 `$remote_addr` 覆盖、登录别名正文上限，以及连接/请求限制产生 `429` 后恢复 `200`。
 
 远程反馈由 `.github/workflows/read-only-ci.yml` 分层执行：静态层运行 Bash/ShellCheck、Acorn、TypeScript 和文档门，Rust 层运行 Rustfmt、Clippy 与全 targets/features 测试，浏览器层分别运行 Chromium 和 Firefox；质量层另跑覆盖率、部署行为、release self-test 与 release binary smoke。质量层的四项检查使用各自的明确前置条件；除运行被取消或自身前置失败外，一项检查失败不会跳过其他独立项，单次运行可同时报告更多真实根因而不制造缺少工具的级联错误。`.github/workflows/dependency-audit.yml` 在依赖清单变更及每周计划任务上运行 RustSec/npm audit，并把 yanked crate 作为失败；`.github/workflows/performance.yml` 每周用 release 构建扫描十万真实目录项并对首屏 30 秒宽松基线失败关闭；`.github/workflows/formal-release-e2e.yml` 在 tag、每周及人工触发时用临时 Ed25519 密钥真实执行完整正式包入口并独立复核输出，但不上传制品。这些工作流只有 `contents: read`，checkout 不保留凭据，Action 固定完整 commit SHA；所有 Node 任务只接受 24.8.0，Rust 1.97.1、ShellCheck 0.11.0 及下载工具归档摘要也均固定，其中分层只读与性能任务把托管 `ubuntu-24.04` 镜像的实际 `ImageVersion` 和工具版本写入日志。这些矩阵不接触生产签名密钥，也不创建或修改远端 tag/GitHub Release；正式包 E2E 只在隔离 clone 中创建临时本地 tag，且不能替代发布者对最终远端 tag 的批准。
 

@@ -49,14 +49,14 @@ Dufs 因此把控制面和数据面分开：
 
 | 文件 | 负责什么 |
 | --- | --- |
-| [upload/manager.js](../../assets/modules/upload/manager.js) | 预检、队列、任务状态机、重试与冲突编排 |
-| [upload/selection.js](../../assets/modules/upload/selection.js) | 文件选择、批量路径预算与重复目标校验 |
-| [upload/preflight.js](../../assets/modules/upload/preflight.js) | 严格验证 preflight JSON |
-| [upload/protocol.js](../../assets/modules/upload/protocol.js) | 校验 HTTP status 与上传头部状态矩阵 |
-| [http/headers.js](../../assets/modules/http/headers.js) | 供上传、传输和正文预算共用的规范非负整数头解析 |
-| [upload/transport.js](../../assets/modules/upload/transport.js) | XHR 正文、进度、abort 和 timeout |
-| [upload/queue.js](../../assets/modules/upload/queue.js) | FIFO、取消和有界终态历史 |
-| [upload/view.js](../../assets/modules/upload/view.js) | DOM 行、速度、进度、ETA、按钮和 live status |
+| [upload/manager.js](../../clients/web/modules/upload/manager.js) | 预检、队列、任务状态机、重试与冲突编排 |
+| [upload/selection.js](../../clients/web/modules/upload/selection.js) | 文件选择、批量路径预算与重复目标校验 |
+| [upload/preflight.js](../../clients/web/modules/upload/preflight.js) | 严格验证 preflight JSON |
+| [upload/protocol.js](../../clients/web/modules/upload/protocol.js) | 校验 HTTP status 与上传头部状态矩阵 |
+| [http/headers.js](../../clients/web/modules/http/headers.js) | 供上传、传输和正文预算共用的规范非负整数头解析 |
+| [upload/transport.js](../../clients/web/modules/upload/transport.js) | XHR 正文、进度、abort 和 timeout |
+| [upload/queue.js](../../clients/web/modules/upload/queue.js) | FIFO、取消和有界终态历史 |
+| [upload/view.js](../../clients/web/modules/upload/view.js) | DOM 行、速度、进度、ETA、按钮和 live status |
 
 ### 服务端
 
@@ -567,7 +567,7 @@ XHR abort 只停止浏览器继续等待或发送，不能撤销服务器已经�
 
 例如收到 `204` 但 `X-Dufs-Upload-Id` 变成另一个 UUID，可能表示代理、服务器 bug 或响应错配。前端不能仅看 2xx 就把任务标绿。
 
-[upload/protocol.js](../../assets/modules/upload/protocol.js) 会联合验证：
+[upload/protocol.js](../../clients/web/modules/upload/protocol.js) 会联合验证：
 
 - 当前请求是 fresh、resume 还是 checkpoint；
 - HTTP status；

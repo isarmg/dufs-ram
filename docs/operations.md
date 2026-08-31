@@ -31,7 +31,7 @@
      BUILD-ENVIRONMENT.txt \
      THIRD_PARTY_LICENSES.txt RUST-STANDARD-LIBRARY-COPYRIGHT.html \
      dufs.cdx.json /usr/share/doc/dufs/
-   install -o root -g dufs -m 0640 deploy/dufs.yaml.example /etc/dufs/dufs.yaml
+   install -o root -g dufs -m 0640 config/dufs.yaml.example /etc/dufs/dufs.yaml
    install -o root -g root -m 0644 deploy/dufs.service /etc/systemd/system/dufs.service
    install -o root -g root -m 0644 deploy/nginx-dufs.conf /etc/nginx/conf.d/dufs.conf
    install -o root -g root -m 0644 deploy/dufs-proxy.conf /etc/nginx/snippets/dufs-proxy.conf
@@ -181,7 +181,7 @@ SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA �
 
 包内 `BUILD-ENVIRONMENT.txt`、SBOM、第三方 notice、Rust 标准库 notice 和项目 Apache-2.0 许可证均纳入 `SHA256SUMS`。
 
-二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。审查历史的唯一位置是 `docs/history/code-review-report.md`。发布脚本先用包内 `scripts/check-docs.mjs` 检查最终布局，再对除清单自身外的全部普通文件生成 `SHA256SUMS`，此后只读复核清单覆盖；`--self-test` 还放入深层 sentinel、验证篡改失败、两次归档一致并解包往返检查，避免源码树检查通过但最终制品或 checksum 失效。
+二进制包同时按仓库层次保留完整 `docs/`，并携带教程本地链接引用的 `clients/web/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置，使文档在离线解压后仍可导航到对应实现。发布脚本先用包内 `scripts/check-docs.mjs` 检查最终布局，再对除清单自身外的全部普通文件生成 `SHA256SUMS`，此后只读复核清单覆盖；`--self-test` 还放入深层 sentinel、验证篡改失败、两次归档一致并解包往返检查，避免源码树检查通过但最终制品或 checksum 失效。
 
 输出目录必须由当前发布账号拥有且不能让 group/other 写入；它会被解析为物理路径并通过已验证 fd 持有独占 `flock`。stage 创建、构建、清理、最终 rename 和目录同步均从锁定的目录 fd 路径派生，公开字符串路径在此后只用于身份复核和结果展示，祖先目录换绑不能重定向 mutation。发布后还会核对公开路径、锁定目录和最终 release 的 dev/inode；若公开路径被换绑则报告失败，但不会回滚已经完整提交到锁定目录的制品。
 
@@ -325,4 +325,4 @@ openssl pkeyutl -verify -rawin -pubin \
 
 ## 8. 事件响应
 
-发现疑似入侵时，先限制入口和后端网络访问，保全 journal、网关日志、配置、二进制摘要和共享根快照，再轮换网关密钥、账号密码及其他可能暴露的凭据。报告流程与支持边界见根目录的 `SECURITY.md`。
+发现疑似入侵时，先限制入口和后端网络访问，保全 journal、网关日志、配置、二进制摘要和共享根快照，再轮换网关密钥、账号密码及其他可能暴露的凭据。漏洞使用 GitHub Private Vulnerability Reporting 私密提交；公开 issue 不得包含生产路径、账号、密码、密钥、共享文件或日志中的敏感内容。安全修复只面向当前版本与当前 `main`。

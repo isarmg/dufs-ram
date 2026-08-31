@@ -128,7 +128,7 @@ $argon2id$v=19$m=...$...$...
 先复制受保护配置模板，把其中的共享根、状态目录和账号 PHC 替换为本章生成的真实值，再启动：
 
 ```sh
-cp deploy/dufs.yaml.example "$tutorial_root/dufs.yaml"
+cp config/dufs.yaml.example "$tutorial_root/dufs.yaml"
 chmod 0600 "$tutorial_root/dufs.yaml"
 # 用编辑器替换路径、PHC，并为本章的小型临时卷设置 min-free-space: 0
 target/debug/dufs --config "$tutorial_root/dufs.yaml"
@@ -246,7 +246,7 @@ password: test-password
 第 2.6 节已经复制了配置模板；若需要重新开始，可再次复制并立即收紧权限：
 
 ```sh
-cp deploy/dufs.yaml.example "$tutorial_root/dufs.yaml"
+cp config/dufs.yaml.example "$tutorial_root/dufs.yaml"
 chmod 0600 "$tutorial_root/dufs.yaml"
 ```
 

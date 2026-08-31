@@ -74,7 +74,7 @@ systemd 样例通过 `StateDirectory=dufs` 与 `StateDirectoryMode=0700` 创建 
 
 ## 9.4 生产配置基线
 
-[deploy/dufs.yaml.example](../../deploy/dufs.yaml.example) 是当前字段的起点：
+[config/dufs.yaml.example](../../config/dufs.yaml.example) 是当前字段的起点：
 
 ```yaml
 serve-path: /srv/dufs
@@ -464,7 +464,7 @@ YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝；升�
 5. 在副本或隔离环境分析；
 6. 不手工修改 SQLite 状态骗过启动校验；
 7. 不按文件名猜测删除内部 stage/trash；
-8. 按 [SECURITY.md](../../SECURITY.md) 的私密渠道处理安全漏洞。
+8. 按[运维文档的事件响应流程](../operations.md#8-事件响应)私密处理安全漏洞。
 
 “先保全证据”通常比“先把服务变绿”更能避免二次破坏。
 

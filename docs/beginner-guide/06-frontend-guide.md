@@ -9,7 +9,7 @@
 读完后，你应当能够回答：
 
 1. 为什么项目不用 React、Vue 和生产前端打包器，页面仍然能拆成多个模块？
-2. 修改 `assets/index.css` 后，为什么只刷新浏览器可能看不到变化？
+2. 修改 `clients/web/index.css` 后，为什么只刷新浏览器可能看不到变化？
 3. Rust 如何把当前目录、用户名和 CSRF token 交给 JavaScript？
 4. `listing/controller.js` 为什么同时维护数据项、cursor、revision 和 DOM 窗口？
 5. 文件夹没有下载按钮时，为什么删除和重命名按钮仍不会向左移动？
@@ -31,7 +31,7 @@
 
 它不是一个独立部署的 Node.js 服务，也没有运行时 npm 依赖。浏览器直接执行仓库里的 JavaScript 模块。根目录的 [package.json](../../package.json) 中，TypeScript、Playwright、axe 和 Acorn 都是检查或测试工具。
 
-最短的前端入口只有三行，见 [assets/index.js](../../assets/index.js)：
+最短的前端入口只有三行，见 [clients/web/index.js](../../clients/web/index.js)：
 
 ```js
 import { start } from "./modules/app.js";
@@ -39,7 +39,7 @@ import { start } from "./modules/app.js";
 start();
 ```
 
-这不表示页面逻辑很少，而表示入口只负责把控制权交给 `app.js`。真正的列表、操作、上传和 API 逻辑都在 `assets/modules/` 中。
+这不表示页面逻辑很少，而表示入口只负责把控制权交给 `app.js`。真正的列表、操作、上传和 API 逻辑都在 `clients/web/modules/` 中。
 
 ## 6.3 源码文件不等于运行时静态目录
 
@@ -49,11 +49,11 @@ Rust 通过 `include_str!` 和 `include_bytes!` 把 CSS、JavaScript、图标和
 
 ```mermaid
 flowchart LR
-    A[assets/index.css<br/>assets/modules/ 下全部 .js] -->|cargo build| B[Rust 可执行文件]
+    A[clients/web/index.css<br/>clients/web/modules/ 下全部 .js] -->|cargo build| B[Rust 可执行文件]
     B -->|HTTP 请求| C[浏览器]
 ```
 
-因此运行中的服务不会在每个请求时重新读取工作区的 `assets/`。典型修改流程是：
+因此运行中的服务不会在每个请求时重新读取工作区的 `clients/web/`。典型修改流程是：
 
 ```text
 修改源码 → cargo build → 停止旧进程 → 启动新二进制 → 重新加载页面
@@ -66,7 +66,7 @@ flowchart LR
 假设你创建了：
 
 ```text
-assets/modules/preview.js
+clients/web/modules/preview.js
 ```
 
 仅仅在另一个模块中 `import "./preview.js"` 还不够。必须同时在 [src/server/assets.rs](../../src/server/assets.rs) 的 `EMBEDDED_ASSETS` 中注册它，否则编译后的服务器不会返回该 URL，浏览器会报 module 404。
@@ -94,7 +94,7 @@ Cache-Control: public, max-age=31536000, immutable
 
 ### 6.3.4 登录脚本是一个例外
 
-[assets/login.js](../../assets/login.js) 不是外部 ES module，而是由服务端直接替换进登录 HTML 的 `<script>`。登录页 CSP 只允许这段脚本的固定 SHA-256 哈希，见 [src/server/session.rs](../../src/server/session.rs)。
+[clients/web/login.js](../../clients/web/login.js) 不是外部 ES module，而是由服务端直接替换进登录 HTML 的 `<script>`。登录页 CSP 只允许这段脚本的固定 SHA-256 哈希，见 [src/server/session.rs](../../src/server/session.rs)。
 
 修改 `login.js` 时必须同步更新 `LOGIN_CSP` 中的哈希，否则：
 
@@ -108,7 +108,7 @@ Cache-Control: public, max-age=31536000, immutable
 
 ### 6.4.1 `index.html` 只提供稳定骨架
 
-[assets/index.html](../../assets/index.html) 主要包含：
+[clients/web/index.html](../../clients/web/index.html) 主要包含：
 
 ```text
 body
@@ -165,7 +165,7 @@ Base64 只是为了安全、稳定地把文本嵌入 HTML，不是加密。认�
 
 ### 6.4.3 页面启动顺序
 
-[assets/modules/app.js](../../assets/modules/app.js) 是页面的“装配层”。启动过程如下：
+[clients/web/modules/app.js](../../clients/web/modules/app.js) 是页面的“装配层”。启动过程如下：
 
 ```mermaid
 sequenceDiagram
@@ -260,7 +260,7 @@ flowchart TD
 | `upload/manager.js` | 上传编排和状态机 | 通用文件列表渲染 |
 | `upload/{preflight,protocol,queue,selection,transport,view}.js` | 预检解析、协议、队列、选择预算、XHR 和进度视图 | 页面级装配 |
 
-目录页当前由 `index.js` 加 18 个 ES modules 构成；后端资源注册表与 `assets/modules/` 文件集合由静态门双向核对，新增模块不能只写 import 而漏掉二进制嵌入。
+目录页当前由 `index.js` 加 18 个 ES modules 构成；后端资源注册表与 `clients/web/modules/` 文件集合由静态门双向核对，新增模块不能只写 import 而漏掉二进制嵌入。
 
 `app.js` 通过回调连接这些模块。例如：
 
@@ -316,7 +316,7 @@ element.setAttribute(name, value);
 
 ## 6.7 登录页和注销
 
-登录页与文件页是两套页面，见 [assets/login.html](../../assets/login.html) 和 [assets/login.css](../../assets/login.css)。登录流程不是 JavaScript Fetch：
+登录页与文件页是两套页面，见 [clients/web/login.html](../../clients/web/login.html) 和 [clients/web/login.css](../../clients/web/login.css)。登录流程不是 JavaScript Fetch：
 
 1. 浏览器 GET 登录页；
 2. 用户填写用户名和密码；
@@ -377,7 +377,7 @@ GET /__dufs__/api/list
     &cursor=可选下一页游标
 ```
 
-三个关键限制定义在 [assets/modules/listing/controller.js](../../assets/modules/listing/controller.js)：
+三个关键限制定义在 [clients/web/modules/listing/controller.js](../../clients/web/modules/listing/controller.js)：
 
 | 常量 | 值 | 保护对象 |
 | --- | ---: | --- |
@@ -782,7 +782,7 @@ flowchart TD
 
 ## 6.13 统一列表失效协议
 
-所有可能改变目录可见内容的前端模块只能向列表报告四种效果，定义在 [assets/modules/shared/mutation_effect.js](../../assets/modules/shared/mutation_effect.js)：
+所有可能改变目录可见内容的前端模块只能向列表报告四种效果，定义在 [clients/web/modules/shared/mutation_effect.js](../../clients/web/modules/shared/mutation_effect.js)：
 
 ```js
 MUTATION_EFFECT.COMMITTED
@@ -940,7 +940,7 @@ JSDoc 保护开发者写代码时不自相矛盾；
 
 ### 6.15.3 `RequestError` 保存结构化事实
 
-[assets/modules/http/client.js](../../assets/modules/http/client.js) 中的 `RequestError` 不只有 message，还保存：
+[clients/web/modules/http/client.js](../../clients/web/modules/http/client.js) 中的 `RequestError` 不只有 message，还保存：
 
 - HTTP status；
 - Problem code、type、title、detail；
@@ -1072,7 +1072,7 @@ discard 不复用普通 operation 的 `succeeded` 解析。`http/client.js` 的 
 
 ### 6.17.5 亮色、暗色和强制颜色
 
-[assets/index.css](../../assets/index.css) 使用 CSS 变量定义背景、文字、危险色和边框：
+[clients/web/index.css](../../clients/web/index.css) 使用 CSS 变量定义背景、文字、危险色和边框：
 
 - `prefers-color-scheme: dark` 替换变量；
 - `forced-colors: active` 使用 Canvas、ButtonText、LinkText、Highlight；
@@ -1256,7 +1256,7 @@ npm run test:frontend
 
 ```sh
 rg "loadNextPage|validateListingPage|MAX_RENDERED_ITEMS" \
-  assets/modules/listing/controller.js tests/frontend
+  clients/web/modules/listing/controller.js tests/frontend
 ```
 
 尝试回答：
@@ -1271,7 +1271,7 @@ rg "loadNextPage|validateListingPage|MAX_RENDERED_ITEMS" \
 
 ```sh
 rg "startInlineRename|commitInlineRename|renamePath|relocatePath" \
-  assets/modules tests/frontend/operations.spec.js
+  clients/web/modules tests/frontend/operations.spec.js
 ```
 
 按顺序找出：
@@ -1288,7 +1288,7 @@ rg "startInlineRename|commitInlineRename|renamePath|relocatePath" \
 
 ```sh
 rg "createActionSlot|action-slots|data-action-slot" \
-  assets/modules/listing/controller.js assets/index.css \
+  clients/web/modules/listing/controller.js clients/web/index.css \
   tests/frontend/accessibility.spec.js
 ```
 

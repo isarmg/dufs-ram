@@ -80,7 +80,7 @@ flowchart LR
 
 - [程序入口](../../src/main.rs)
 - [服务组装](../../src/server.rs)
-- [前端入口](../../assets/index.js)
+- [前端入口](../../clients/web/index.js)
 - [Rust 集成测试](../../tests/browser_api.rs)
 - [浏览器端到端测试](../../tests/frontend/operations.spec.js)
 

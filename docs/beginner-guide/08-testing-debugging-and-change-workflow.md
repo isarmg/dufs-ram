@@ -264,7 +264,7 @@ npm run check:types
 allowJs + checkJs + strict + noEmit
 ```
 
-检查 [assets/index.js](../../assets/index.js)、[assets/login.js](../../assets/login.js) 和 [assets/modules](../../assets/modules) 下的生产 JavaScript。它不会生成任何文件。外部数据应该先保持为 `unknown`，经类型守卫验证后再使用；用 `any` 绕开问题会破坏这一层的意义。
+检查 [clients/web/index.js](../../clients/web/index.js)、[clients/web/login.js](../../clients/web/login.js) 和 [clients/web/modules](../../clients/web/modules) 下的生产 JavaScript。它不会生成任何文件。外部数据应该先保持为 `unknown`，经类型守卫验证后再使用；用 `any` 绕开问题会破坏这一层的意义。
 
 类型通过只证明静态模型一致，不证明服务器实际按该协议返回。协议关键路径还需要 Node 单测、Rust测试和浏览器测试交叉覆盖。
 

@@ -14,7 +14,7 @@
 | 保障 | 用户不一定直接看到，但负责认证、根目录隔离、并发正确性、真正落盘或资源保护，不应作为普通功能单独删除 |
 | 建议保留 | 对个人多设备使用价值明显，但在接受功能损失后可以删除 |
 | 可选 | 只在特定部署或使用习惯下有价值，可以优先判断是否需要 |
-| 开发/运维 | 不属于浏览器文件管理操作，但用于构建、诊断、测试或交付 |
+| 开发运维 | 不属于浏览器文件管理操作，但用于构建、诊断、测试或交付 |
 | 当前边界 | 不是可删除模块，而是当前实现明确不保证或不提供的语义 |
 
 ### 1.2 删除复杂度
@@ -57,6 +57,43 @@
 
 ## 2. 总体定位与运行边界
 
+### 2.0 跨章节开发者决策索引
+
+下表补足后续逐功能表的“实现入口、依赖和最低验证”信息，并确保配置、安全、协议、前端、持久化、部署和明确不提供的能力都能从一个索引定位。分类与复杂度使用第 1 节定义；删除时仍须阅读对应详细编号，不能把本索引当作隐藏按钮清单。
+
+| ID | 功能闭包 | 实现/主要依赖 | 分类 | 复杂度 | 删除后的确定后果 | 最低验证 |
+|---|---|---|---|---|---|---|
+| IDX-01 | 单共享根浏览与面包屑导航 | listing route、`clients/web/modules/listing` | 核心 | 高 | 无法查看目录和进入子目录 | 根/空目录/特殊字符/权限 |
+| IDX-02 | 单文件、Range、条件下载 | file response、ETag/metadata | 核心 | 高 | 文件无法可靠下载或续传 | GET/HEAD/Range/If-* 矩阵 |
+| IDX-03 | 新建目录 | MKCOL/operation、路径租约、Web | 核心 | 中 | 只能上传到既有目录 | 冲突、权限、深层路径 |
+| IDX-04 | 重命名与移动 | operation protocol、renameat、revision | 核心 | 高 | 无法整理文件；只剩上传/下载 | 同/跨目录、覆盖、竞态 |
+| IDX-05 | 删除和 durable purge | DELETE、purge queue、state SQLite | 核心 | 高 | 无法回收文件；直接简化会破坏崩溃语义 | 文件/目录、重启、故障注入 |
+| IDX-06 | 递归搜索和有界快照分页 | search cache、cursor、scan slots | 建议保留 | 高 | 大目录只能逐层浏览 | 预算、过期 cursor、变更隔离 |
+| IDX-07 | 上传预检/批量选择 | preflight route、Web selection | 建议保留 | 高 | 冲突和路径超限只能在传输后发现 | missing/existing/special/budget |
+| IDX-08 | 可续传上传检查点 | upload_sessions、PATCH、HEAD | 建议保留 | 高 | 断线后必须完整重传，终态歧义更难处理 | offset、重启、owner、满 stage |
+| IDX-09 | 条件覆盖与显式确认 | target revision、awaiting-confirmation | 保障 | 高 | 陈旧页面可盲目覆盖并发修改 | target changed、confirm/discard |
+| IDX-10 | 上传 durability 与磁盘水位 | stage、fsync、rename、space ledger | 保障 | 高 | 成功后可能丢数据或并发写满磁盘 | 断电点、不同 device、并发预算 |
+| IDX-11 | Argon2 多账号认证 | strict YAML、session/login | 核心 | 高 | 无认证则共享根暴露；单账号则失去独立撤销 | hash、未知账号、登录限流 |
+| IDX-12 | Session/CSRF/Origin 保护 | SQLite session、Cookie、middleware | 保障 | 高 | 浏览器登录态可被重放或跨站利用 | TTL、撤销、unsafe method |
+| IDX-13 | 根目录 fd 隔离和 `openat2` | filesystem layer、Linux kernel | 保障 | 高 | 路径竞态可越出共享根 | symlink/mount/rename race |
+| IDX-14 | 路径租约与 mutation ordering | lease manager、operation state | 保障 | 高 | 冲突操作可交错并产生不可解释结果 | 父子路径、超时、公平性 |
+| IDX-15 | SQLite 当前状态权威 | schema、sessions/uploads/purges/search | 保障 | 高 | 重启后丢失终态和安全绑定 | schema identity、sidecar、corruption |
+| IDX-16 | YAML/CLI 严格配置 | args.rs、`config/dufs.yaml.example` | 保障 | 中 | 拼错字段可能静默生效或读取不安全配置 | precedence、unknown、mode/owner |
+| IDX-17 | 连接/请求/正文/并发预算 | server admission、timeouts | 保障 | 高 | 慢连接和大请求可耗尽进程资源 | 各上限、恢复、公平性 |
+| IDX-18 | trusted proxy 与真实来源解析 | CIDR、XFF/XFP、logging/auth | 保障 | 高 | 来源和 HTTPS 判断可被伪造或全部失真 | trusted/untrusted、IPv4/IPv6 |
+| IDX-19 | 访问日志与 operation 可观测性 | logging、operation ID/state | 开发运维 | 中 | 无法关联用户请求和后台终态 | 格式、敏感字段、file safety |
+| IDX-20 | 编译期 Web 嵌入与摘要 URL | `clients/web`、assets registry、CSP | 建议保留 | 高 | 改成外部静态树后需协调版本和缓存 | 双向注册、hash、GET/HEAD/CSP |
+| IDX-21 | 键盘/焦点/错误恢复 UI | Web modules、Playwright/a11y | 建议保留 | 中 | 基本 API 仍在，但桌面可用性和无障碍下降 | keyboard、dialog、live region |
+| IDX-22 | doctor/self-test 与当前合同检查 | CLI、state/config/root verifier | 开发运维 | 高 | 部署问题只能运行后发现 | 健康、坏权限、错 schema、锁 |
+| IDX-23 | systemd/nginx 部署基线 | deploy、proxy headers、limits | 开发运维 | 高 | 操作者需自行重建 TLS/隔离/启动语义 | verify/nginx-t/isolated smoke |
+| IDX-24 | 可复现 release、SBOM、签名和全树 checksum | package script、workflow | 开发运维 | 高 | 来源、依赖和制品完整性不可独立证明 | clean/tag/SHA/tamper/reproducible |
+| IDX-25 | Rust/JS/浏览器/部署安全门禁 | tests、Acorn/TS、CI | 开发运维 | 高 | 路径、协议或动态 JS 绕过可能进入发行 | 全门禁和内置负例 |
+| IDX-26 | 中文学习、流程、功能和运维文档 | README、`docs/` | 开发运维 | 低 | 新开发者难以定位复杂状态机边界 | 本地链接、命令和代码引用 |
+| IDX-27 | 无旧配置/API/账号格式兼容 | strict parser/router/schema | 保障 | 中 | 若加入 fallback，测试矩阵和攻击面随历史版本增长 | 旧入口拒绝、unknown field |
+| IDX-28 | 不提供内置 TLS | 明确由 nginx/gateway 负责 | 可选 | 高 | 若删除外部网关前提则不能安全公网部署；若内置需承担证书生命周期 | 新 TLS 威胁模型/部署测试 |
+| IDX-29 | 不提供移动 Web、在线归档和任意插件 | 明确产品边界 | 核心 | 高 | 新增任一项都会改变资源预算、UI 或供应链模型 | 独立设计与端到端验证 |
+| IDX-30 | Linux 64 位与 `openat2` 支持边界 | build.rs、fd-relative filesystem | 保障 | 高 | 扩平台需重做核心安全证明，不能只让编译通过 | 新平台等价 CI/文件系统测试 |
+
 | ID | 当前特性 | 当前行为 | 删除或改变后的影响 | 级别 | 复杂度 |
 | --- | --- | --- | --- | --- | --- |
 | P-01 | 浏览器文件管理器 | 浏览、下载、上传、新建、移动、重命名、删除和搜索一个共享目录 | 删除其中核心 CRUD 后不再是完整文件管理器 | 核心 | 高 |
@@ -66,7 +103,7 @@
 | P-05 | 现代桌面浏览器 | 面向 Chromium、Edge、Firefox 桌面环境；不承诺手机 Web | 恢复移动端需要重新设计布局、交互和测试矩阵 | 核心 | 中 |
 | P-06 | 单个可执行文件 | HTML、CSS、JavaScript 和图标编译进 Rust 可执行文件 | 改成独立前端会增加部署单元和版本协调 | 建议保留 | 中 |
 | P-07 | 外部网关终止 HTTPS | Dufs 只提供明文 HTTP/TCP，默认绑定回环地址；是否仅在内网可达由显式 bind、防火墙/ACL 和网关部署共同保证。证书、TLS、HSTS 和公网策略由网关负责 | 若恢复内置 TLS，会重新引入证书配置和 TLS 依赖 | 保障 | 高 |
-| P-08 | 可验证交付 | 版本 tag 流程等待同 tag/SHA 的全部质量门，构建带完整源码 SHA 的 GNU/Linux x86-64 便捷二进制，并生成只绑定当前版本与提交的发布说明；仓库以 Apache-2.0 许可，并提供 SBOM、第三方许可证清单、标准库 notice、校验和与签名的正式发布链 | 自动便捷二进制没有独立发布者签名；正式信任链仍需本地签名包和独立渠道固定的公钥 | 开发/运维 | 中 |
+| P-08 | 可验证交付 | 版本 tag 流程等待同 tag/SHA 的全部质量门，构建带完整源码 SHA 的 GNU/Linux x86-64 便捷二进制，并生成只绑定当前版本与提交的发布说明；仓库以 Apache-2.0 许可，并提供 SBOM、第三方许可证清单、标准库 notice、校验和与签名的正式发布链 | 自动便捷二进制没有独立发布者签名；正式信任链仍需本地签名包和独立渠道固定的公钥 | 开发运维 | 中 |
 | P-09 | 不兼容旧配置 | 删除的旧参数、环境变量或账号格式不会被兼容；YAML 未知字段直接报错 | 增加兼容层会扩大分支和维护成本 | 建议保留 | 中 |
 
 ## 3. 启动、命令行和 YAML 配置
@@ -93,7 +130,7 @@
 | C-18 | `--max-search-entries` | 10000；必须为 1–100000 | 单次递归搜索最多检查的目录项；硬上限同时约束配置和运行时物化 | 保障 |
 | C-22 | `--max-concurrent-searches` | 2；必须大于 0 | 普通目录或递归搜索的首个快照扫描共用并发槽；后续 cursor 页只读取缓存快照，不再占扫描槽 | 保障 |
 | C-24 | `--request-timeout` | 300 秒；必须大于 0、最多 365 天且能由平台单调时钟表示 | 普通请求处理和响应头生成时限；不限制已开始的文件或 Range 正文总时长，但每个源分块读取及套接字写入分别有 30 秒 idle deadline | 保障 |
-| C-25 | `-h/--help`、`-V/--version` | Clap 内置；版本同时显示构建源码 Git SHA，无法取得时显示 `unknown` | 基础命令行自描述和制品来源追踪，删除收益极低 | 开发/运维 |
+| C-25 | `-h/--help`、`-V/--version` | Clap 内置；版本同时显示构建源码 Git SHA，无法取得时显示 `unknown` | 基础命令行自描述和制品来源追踪，删除收益极低 | 开发运维 |
 | C-26 | `--state-dir` / `state-dir` | 必填；固定使用私有 `0700` 目录内的 `state.sqlite3`，目录须由服务账号所有、非符号链接、与共享根分离，文件绑定共享根 dev/inode；数据库及 `-journal/-wal/-shm` 不得与配置/日志共享目录项或对象身份；只初始化空库并只接受五列 `product_metadata` 标识的当前应用版本/schema revision/统一指纹，不存在进程内数据库模式 | 文件型 store 在同一当前 schema 中持久化 operation 幂等结果、upload session 与 purge outbox；旧、无标记或漂移数据库在只读预检中零修改拒绝，格式转换由停服后的独立升级流程负责 | 保障 |
 
 所有信号量型配置还会拒绝超过 Tokio 最大 permit 数的值。上传时限互相矛盾、超过一年或平台单调时钟可表示范围的极端时限、零并发和零遍历上限都会阻止启动。严格 YAML 会拒绝任何未定义字段。
@@ -310,18 +347,18 @@
 
 | ID | 当前特性 | 详细行为 | 删除或简化后的影响 | 级别 | 复杂度 |
 | --- | --- | --- | --- | --- | --- |
-| O-01 | HTTP 访问日志 | 默认记录时间、级别、TCP peer、请求、状态，以及 mutation operation ID/state（无则为 `-`）；可加入认证用户名或请求头 | 完全删除会降低故障、访问和结果不确定性定位能力 | 开发/运维 | 中 |
+| O-01 | HTTP 访问日志 | 默认记录时间、级别、TCP peer、请求、状态，以及 mutation operation ID/state（无则为 `-`）；可加入认证用户名或请求头 | 完全删除会降低故障、访问和结果不确定性定位能力 | 开发运维 | 中 |
 | O-02 | 自定义日志变量 | 支持时间、毫秒、请求、方法、URI、状态、remote addr/user、operation ID/state、`$http_...` | 可硬编码固定格式以删除解析器 | 可选 | 中 |
 | O-03 | 敏感头脱敏 | Authorization、Proxy-Authorization、Cookie、CSRF 统一记录为 `[REDACTED]` | 删除可能把凭据写入日志 | 保障 | 低 |
 | O-04 | 单行转义和长度上限 | 控制字符转义；格式最多 4096 字节/128 元素；单条最多 16 KiB | 防止日志注入和巨型分配 | 保障 | 中 |
 | O-05 | 有界异步日志 | 容量 4096；请求线程不阻塞；满时丢最新并聚合告警；250 ms flush；刷新失败保留 dirty 状态供后续重试 | 改同步写会让慢磁盘阻塞请求 | 保障 | 中 |
 | O-06 | 安全文件或控制台输出 | `--log-file` 以 `O_NOFOLLOW|O_APPEND|O_NONBLOCK|O_CLOEXEC` 打开，要求当前服务用户拥有、单硬链接的普通文件；新文件固定 `0600`，已有文件必须预先精确为 `0600`，不安全权限不会被就地修改；未配置文件时全部日志使用 stderr，stdout 仅输出监听地址 | 防止高权限服务跟随符号链接、在特殊对象打开阶段阻塞或把 fd 泄漏给子进程，也避免 chmod 伪装修复已泄露或被预开 fd 持有的日志；单一控制台 sink 还避免 stdout 阻塞或刷新失败拖住 WARN/ERROR；只用 journald 时文件输出可删除 | 可选 | 低 |
-| O-07 | 连接错误分类 | 记录 peer、协议、超时、断开、I/O 类型和系统错误码 | 对定位网关 `502`、超时和协议错误有价值 | 开发/运维 | 低 |
+| O-07 | 连接错误分类 | 记录 peer、协议、超时、断开、I/O 类型和系统错误码 | 对定位网关 `502`、超时和协议错误有价值 | 开发运维 | 低 |
 | O-08 | accept 错误退避 | 从 50 ms 指数退避到 1 秒，下一次成功后重置 | 删除可能在 fd/内存耗尽时形成错误忙循环 | 保障 | 低 |
 | O-09 | 公开 liveness | `GET/HEAD /__dufs__/health` 不要求会话并返回 `{"status":"OK"}`；它不访问文件内容、账号或共享根，只证明进程仍能处理 HTTP | 可供网关无凭据探活；删除收益很小 | 建议保留 | 低 |
 | O-10 | 有硬截止的两阶段停机 | 首个 SIGINT/SIGTERM 停止接收并给普通任务/提交 30 秒；到期后取消普通工作、让停滞上传保存检查点或清理，再给受跟踪工作最多 10 秒。约 40 秒仍未完成则跳过日志 flush、立即以状态 1 强制退出；正常完成 tracked cleanup 后显式 `exit(0)`，避免 runtime drop 等待已取消但卡住的 blocking 工作突破时限 | 删除宽限会增加不明确结果；删除硬截止或显式退出会让故障内核/FUSE 工作无限拖住进程 | 保障 | 高 |
-| O-11 | 第二信号立即退出 | 第二次 SIGINT/SIGTERM 不再等待或 flush 日志；SIGKILL 同样无法保证收尾，尾部日志可能丢失 | 是管理员明确的强制退出边界 | 开发/运维 | 低 |
-| O-12 | 正常退出日志 flush | 仅正常停止在 tracked cleanup 后由专用命名 OS thread 执行一次最多 5 秒的日志刷新，不依赖 Tokio blocking pool；主任务以 biased select 继续监听第二信号。硬截止和第二信号路径跳过并立即退出 | 删除可能丢失最后一批诊断记录；把 flush 放进强退路径或可能耗尽的共享阻塞池会突破硬截止，停止监听第二信号又会破坏管理员强退语义 | 开发/运维 | 低 |
+| O-11 | 第二信号立即退出 | 第二次 SIGINT/SIGTERM 不再等待或 flush 日志；SIGKILL 同样无法保证收尾，尾部日志可能丢失 | 是管理员明确的强制退出边界 | 开发运维 | 低 |
+| O-12 | 正常退出日志 flush | 仅正常停止在 tracked cleanup 后由专用命名 OS thread 执行一次最多 5 秒的日志刷新，不依赖 Tokio blocking pool；主任务以 biased select 继续监听第二信号。硬截止和第二信号路径跳过并立即退出 | 删除可能丢失最后一批诊断记录；把 flush 放进强退路径或可能耗尽的共享阻塞池会突破硬截止，停止监听第二信号又会破坏管理员强退语义 | 开发运维 | 低 |
 | O-13 | 内置资源日志降噪 | 只有成功返回的版本化资源 `GET` 跳过普通访问日志；资源错误、HEAD、登录、健康检查和其他请求仍记录 | 删除过滤会增加静态资源噪声；扩大过滤会漏掉诊断 | 建议保留 | 低 |
 | O-14 | 认证 readiness | `GET/HEAD /__dufs__/ready` 要求有效会话；通过锚定根 fd 真实创建隐藏文件、写入、同步文件、删除并同步根目录，同时在现有 SQLite actor 连接执行 `BEGIN IMMEDIATE`、写入探针行并 `ROLLBACK`；还检查扣除进程预留后的 `min-free-space` 和停机状态，失败返回 `503 {"status":"not_ready"}` | 比 liveness 更适合受控冒烟检查；它证明当前根目录和状态库基本可写，但不执行 rename/介质读回，也不预测目标冲突、purge/上传容量等全部业务准入 | 建议保留 | 低 |
 
@@ -329,8 +366,8 @@
 
 | ID | 当前特性 | 详细行为 | 取舍建议 | 级别 |
 | --- | --- | --- | --- | --- |
-| E-01 | 编译时嵌入资源 | 生产运行不读取 `assets/` 外部目录，不支持运行时覆盖 | 保留可保证代码和页面版本一致 | 建议保留 |
-| E-02 | 内容摘要资源 URL | 目录页的 `index.js`、18 个 ES module、`index.css`、登录页的 `login.css` 和 favicon 由 `server/assets.rs` 的单一注册表按名称、MIME 类型和内容共同生成完整 256 位 SHA-256，即 64 个十六进制字符的资源前缀；HTML 和内联登录脚本不参与该前缀，后者由独立 CSP SHA-256 授权。静态门双向核对 `assets/modules/` 与 `EMBEDDED_ASSETS` | 删除后要改用短缓存或手工版本号；混淆两套摘要或漏嵌模块会造成缓存、404 或 CSP 文档漂移 | 建议保留 |
+| E-01 | 编译时嵌入资源 | 生产运行不读取 `clients/web/` 外部目录，不支持运行时覆盖 | 保留可保证代码和页面版本一致 | 建议保留 |
+| E-02 | 内容摘要资源 URL | 目录页的 `index.js`、18 个 ES module、`index.css`、登录页的 `login.css` 和 favicon 由 `server/assets.rs` 的单一注册表按名称、MIME 类型和内容共同生成完整 256 位 SHA-256，即 64 个十六进制字符的资源前缀；HTML 和内联登录脚本不参与该前缀，后者由独立 CSP SHA-256 授权。静态门双向核对 `clients/web/modules/` 与 `EMBEDDED_ASSETS` | 删除后要改用短缓存或手工版本号；混淆两套摘要或漏嵌模块会造成缓存、404 或 CSP 文档漂移 | 建议保留 |
 | E-03 | 静态资源长期缓存 | 只有精确命中的成功摘要资源使用一年 `immutable`；其他响应 no-store | 删除会增加重复资源传输，但不影响功能 | 可选 |
 | E-04 | 无前端构建步骤 | 二进制及内嵌 ES modules 只由 Cargo 构建，不需要 Node 前端打包器；发布阶段用 Node 运行 SBOM 规范化、从 vendored 可达非开发依赖生成/校验/去重 `THIRD_PARTY_LICENSES.txt`、按 lockfile integrity 播种私有 npm cache，以及 Markdown 检查 | 引入前端打包器只有在需要复杂前端生态时才有价值；发布脚本现有的 SBOM、notice、cache 和文档校验仍需 Node | 建议保留 |
 | E-05 | 分层前端脚本 | 目录页由 `index.js` 入口和 18 个 ES module 组成：`app.js`，`shared/{dom,index_data,mutation_effect,path}.js`，`http/{client,headers,response_buffer}.js`，`listing/controller.js`，`operations/{dialogs,file_operations}.js`，以及 `upload/{manager,preflight,protocol,queue,selection,transport,view}.js`。`index_data.js` 将 JSON.parse 的 unknown 严格验证为四字段 frozen 对象；`mutation_effect.js` 定义 committed/outcome-unknown/refresh-required/not-committed 四值失效；`http/headers.js` 提供严格无符号头解析，`http/response_buffer.js` 负责 Fetch 正文上限、取消和重放流，`upload/protocol.js` 集中维护上传头名、允许状态码及按当前文件总长度绑定的单一状态解析。独立 `login.js` 编译进可执行文件，并在渲染每次登录响应时内联，由精确 CSP hash 授权；登录 CSS 是同一摘要前缀下的外部资源，CSP 不再允许 inline style | 合并成单文件会减少文件数但降低可维护性和测试定位；复制响应或上传协议规则会重新引入调用方漂移；修改登录脚本必须同步通过 CSP 摘要测试 | 建议保留 |
@@ -338,8 +375,8 @@
 | E-07 | IPv6 | 显式 `--bind ::` 或其他 IPv6 地址；IPv6 listener 强制 `IPV6_V6ONLY`，因此 `::` 不同时承接 IPv4，双栈必须分别配置 IPv4 与 IPv6 地址 | 仅使用 IPv4 网关时可删除，但代码收益有限 | 可选 |
 | E-08 | 严格分离的前端协议与响应边界 | 目录页 JavaScript 主动发起的 Fetch 统一经 `http/client.js` 编排并使用 30 秒 deadline；原生导航、登录表单及文件下载不在此边界内，上传正文另用专用 XHR。`http/response_buffer.js` 复用 `http/headers.js` 的严格无符号头解析，先按严格 `Content-Length` 拒绝，再逐块读取；错误响应最多 16 KiB、成功响应最多 16 MiB，超限立即取消 reader/body。允许范围内直接以已校验分块构造重放流，不再先合并为第二份连续 `Uint8Array`；重建的 `Response` 保留 body、status、statusText 和 headers 以及当前调用者使用的 `text()/json()/clone()`，不保留原响应的 url、redirected 或 type。Problem Details 的 `detail`/`title` 最多接受 1024 个 JavaScript UTF-16 code units，超限时整条丢弃；只解析 `application/problem+json` 与平铺 snake_case 扩展，不接受旧 `message`、纯文本、vendor JSON 或嵌套别名。16 MiB 覆盖 500 项页面中接近 Linux PATH_MAX 且 JSON 转义放大的合法列表。上传 XHR 在响应头、下载 progress 和最终 UTF-8 字节数三个阶段拒绝任何超过 16 KiB 的响应。上传头名、允许状态码及当前文件总长度绑定规则集中在 `upload/protocol.js`，普通上传、新建空文件和 Retry HEAD 都使用这一个严格解析入口。普通 operation 成功必须返回同一 ID 和 `succeeded`，响应协议接受 `running/succeeded/failed/rejected/unknown`；job 状态查询使用 `job_id`，记录本身仍为 `running/succeeded/failed/unknown`。由 `http/client.js` 管理的新建零字节文件 fresh PUT 只有 `200/201 + committed + 同一 ID + 精确 length/offset` 才成功；异常 2xx、网络或协议结果只用同一 ID 做一次 HEAD，不重放 PUT，明确的 `not-started/rejected/not-seen` 保留已知未提交语义。普通上传 XHR 要求状态绑定同一 ID，只有 fresh PUT 为 `200/201` 或 PATCH 为 `200/204`、状态为 `committed` 且长度/满 offset 精确匹配时才成功；直接响应的 `running/rejected/not-started` 提供人工 Retry，严格长度/offset 校验推迟到 Retry 后的 HEAD。直接 `not-seen`、显式 `unknown`、缺失/非法状态或 committed 不匹配都保守归为 unknown 并暂停队列 | 删除会恢复无限等待/缓冲、协议词汇混用、错误文案分叉和无法安全判断 mutation 是否可重试的问题；降低成功上限则可能误拒合法大列表。原生下载和 XHR 的剩余边界见第 17 节 | 保障 |
 | E-09 | 明文 HTTP/1 回源 | 使用 Hyper HTTP/1 连接处理器，接受 HTTP/1.0 与 HTTP/1.1；拒绝明文 HTTP/2 prior knowledge，不实现 `Upgrade: h2c`。全部后端连接统一受 10 秒请求头时限、64 KiB 接收缓冲和连接预算约束 | 消除 HTTP/2 单连接并发 stream 绕过连接预算的边界；生产网关仍固定用 HTTP/1.1 回源 | 保障 |
-| E-10 | nginx 生产网关基线 | 样例要求 nginx ≥1.24.0、HTTP SSL/HTTP2 模块和仍获上游或发行商安全更新的 OpenSSL；固定规范域名并将 HTTP `308` 到该域名，拒绝未知 HTTP Host 与 HTTPS SNI/Host，启用 TLS 1.2/1.3 和 HSTS。它以 HTTP/1.1 回源并覆盖单值 Host/XFF/XFP，关闭请求/响应缓冲、缓存、错误拦截和重试；完整登录路径族按来源 IP 限制 5 请求/分钟、burst 5、4 个连接、4 KiB 正文和 10 秒正文时限。隔离的真实 nginx 行为测试验证拒绝与恢复 | 模板必须替换域名和证书；后端不是默认 `127.0.0.1:5000` 时还要替换 upstream，并配合防火墙。删除这些边界会让认证、来源 IP、结果不重放和超时假设失效 | 开发/运维 |
-| E-11 | systemd 最小权限基线 | 样例使用专用 `dufs` 用户/组、`UMask=0077`、`ProtectSystem=strict` 且只允许 `/srv/dufs` 写入，清空 capability 并启用 `NoNewPrivileges`、设备/临时目录/主目录/内核与 namespace 等沙箱；另设重启、65536 fd 和 120 秒停止超时。门禁对 unit 做 `systemd-analyze verify`，不宣称实际启动了沙箱服务 | 用户、路径和平台能力必须按部署同步调整；语法验证不能代替生产主机上的启动、权限和写入冒烟 | 开发/运维 |
+| E-10 | nginx 生产网关基线 | 样例要求 nginx ≥1.24.0、HTTP SSL/HTTP2 模块和仍获上游或发行商安全更新的 OpenSSL；固定规范域名并将 HTTP `308` 到该域名，拒绝未知 HTTP Host 与 HTTPS SNI/Host，启用 TLS 1.2/1.3 和 HSTS。它以 HTTP/1.1 回源并覆盖单值 Host/XFF/XFP，关闭请求/响应缓冲、缓存、错误拦截和重试；完整登录路径族按来源 IP 限制 5 请求/分钟、burst 5、4 个连接、4 KiB 正文和 10 秒正文时限。隔离的真实 nginx 行为测试验证拒绝与恢复 | 模板必须替换域名和证书；后端不是默认 `127.0.0.1:5000` 时还要替换 upstream，并配合防火墙。删除这些边界会让认证、来源 IP、结果不重放和超时假设失效 | 开发运维 |
+| E-11 | systemd 最小权限基线 | 样例使用专用 `dufs` 用户/组、`UMask=0077`、`ProtectSystem=strict` 且只允许 `/srv/dufs` 写入，清空 capability 并启用 `NoNewPrivileges`、设备/临时目录/主目录/内核与 namespace 等沙箱；另设重启、65536 fd 和 120 秒停止超时。门禁对 unit 做 `systemd-analyze verify`，不宣称实际启动了沙箱服务 | 用户、路径和平台能力必须按部署同步调整；语法验证不能代替生产主机上的启动、权限和写入冒烟 | 开发运维 |
 | E-12 | favicon | 目录页通过摘要资源前缀加载编译内置的 `favicon.ico`，浏览器标签页显示项目图标 | 纯外观能力，可与 X-18 一并删除 | 可选 |
 
 浏览器入口使用 HTTPS 不仅是因为会话 Cookie 带 `Secure`；前端生成上传 UUID 所用的 `crypto.randomUUID()` 也要求安全上下文。
@@ -350,24 +387,24 @@
 
 | ID | 当前特性 | 作用 | 删除后的影响 | 级别 |
 | --- | --- | --- | --- | --- |
-| T-01 | 固定 Rust 工具链 | Rust 1.97.1、edition 2024、Rustfmt、Clippy | 开发机结果可能漂移 | 开发/运维 |
-| T-02 | `Cargo.lock` | 固定完整依赖版本 | 构建不可重复且审计结果漂移 | 开发/运维 |
+| T-01 | 固定 Rust 工具链 | Rust 1.97.1、edition 2024、Rustfmt、Clippy | 开发机结果可能漂移 | 开发运维 |
+| T-02 | `Cargo.lock` | 固定完整依赖版本 | 构建不可重复且审计结果漂移 | 开发运维 |
 | T-03 | Linux 构建守卫 | 编译阶段明确拒绝错误目标 | 错误平台可能到运行时才失败 | 保障 |
-| T-04 | Rust 模块分层 | `server.rs` 保留共享状态与模块协调；`router.rs`、`assets.rs`、`delete.rs`、`purge.rs` 分别负责请求路由、内置资源注册/摘要、删除提交事务和回收调度。`listing/{snapshot,walk}.rs` 隔离进程级快照/游标缓存与有界递归遍历；`rooted_fs/purge.rs` 隔离 fd-relative 删除执行器；`internal_names.rs` 与 `maintenance.rs` 提供服务端中性的内部名称和清理边界；`upload/{prepare,target,transfer,commit,failure,protocol,record}.rs` 隔离路径/会话准备、目标 identity/revision、传输、提交、失败、协议与检查点持久化。`server`、`listing`、`rooted_fs` 与 `upload` 的大段内联单元测试均位于各自 `tests.rs`，仍保留模块私有访问 | 拆分只移动内部职责，不改变 HTTP/上传协议，也不新增第三方依赖；重新合并不会减少能力，只降低边界清晰度、维护性和测试定位 | 开发/运维 |
-| T-05 | 可复用 `lib.rs` | 测试可在进程内构造服务层 | 删除会增加只能启动外部进程的测试成本 | 开发/运维 |
-| T-06 | `RequestContext` | HTTP 边界集中 peer 和访问日志身份 | 删除会让认证身份和日志再次分散 | 开发/运维 |
+| T-04 | Rust 模块分层 | `server.rs` 保留共享状态与模块协调；`router.rs`、`assets.rs`、`delete.rs`、`purge.rs` 分别负责请求路由、内置资源注册/摘要、删除提交事务和回收调度。`listing/{snapshot,walk}.rs` 隔离进程级快照/游标缓存与有界递归遍历；`rooted_fs/purge.rs` 隔离 fd-relative 删除执行器；`internal_names.rs` 与 `maintenance.rs` 提供服务端中性的内部名称和清理边界；`upload/{prepare,target,transfer,commit,failure,protocol,record}.rs` 隔离路径/会话准备、目标 identity/revision、传输、提交、失败、协议与检查点持久化。`server`、`listing`、`rooted_fs` 与 `upload` 的大段内联单元测试均位于各自 `tests.rs`，仍保留模块私有访问 | 拆分只移动内部职责，不改变 HTTP/上传协议，也不新增第三方依赖；重新合并不会减少能力，只降低边界清晰度、维护性和测试定位 | 开发运维 |
+| T-05 | 可复用 `lib.rs` | 测试可在进程内构造服务层 | 删除会增加只能启动外部进程的测试成本 | 开发运维 |
+| T-06 | `RequestContext` | HTTP 边界集中 peer 和访问日志身份 | 删除会让认证身份和日志再次分散 | 开发运维 |
 | T-07 | `AppError` | 区分公开状态/说明与内部诊断来源；JSON API 错误稳定提供机器可读 `code` 和面向用户的 RFC `detail`，底层诊断只进入日志 | 删除可能把文件系统细节暴露给客户端，或迫使客户端解析自然语言判断错误类型 | 保障 |
-| T-08 | 可注入持久化边界 | `StorageDurability` 先独立注入文件 sync；替换边界返回 `Published`、`Rejected`、`NotPublished` 或 `PublishedDurabilityUnknown`，测试可区分发布前失败、Missing 发布后 identity 无法确认以及 rename 后父目录 fsync 失败 | 删除会使真正落盘的故障路径难以自动测试，也容易把确定未发布与发布后未知混淆 | 开发/运维 |
-| T-09 | Rust 自动化 | 单元、集成、故障注入、不可变分页/搜索快照、退役目录归档路由、Range、认证、限流、协议、符号链接、纯 fd 清理和真实停机测试；范围与 URI 编解码另有大样本性质测试 | 删除后修改核心文件语义的风险显著上升 | 开发/运维 |
-| T-10 | 隔离 Playwright | Chromium 和 Firefox 必需、正式 Edge 可选；通过只呈现一个客户端地址的本地 HTTPS 网关运行，因此固定单 worker 串行执行，避免无关用例争抢生产登录令牌桶；失败重试 1 次且 `failOnFlakyTests: true`，所以重试通过仍会让门禁失败；每项测试使用随机目录。Rust HTTP 集成测试精确断言安全响应头；Playwright 验证 Secure Cookie、CSP violation、可访问性语义和真实浏览器交互 | 删除后无法验证真实浏览器行为及测试间状态污染；删除 Rust 断言会让响应头策略漂移失去精确回归保护 | 开发/运维 |
-| T-11 | 依赖安全审计 | `cargo audit` 固定为 0.22.2，并与 `npm audit --audit-level=high` 一起由 lockfile/manifest push、PR、每周计划及人工任务触发；Rust 审计显式 `--deny yanked`。发布只复用通过 canonical origin、HEAD/FETCH_HEAD、新鲜度、物理/Git/内容完整性检查的宿主 RustSec DB；alternates、不安全条目、untracked 或 tracked 内容/mode 漂移均拒绝。数据库以无硬链接私有 clone 封存 revision/fetch epoch/index/config；否则在任何项目/依赖代码前用 dummy lockfile 联网刷新。先执行 sealed `--no-fetch --no-yanked` advisory pre-audit，再用私有 Cargo home `fetch --locked` 填充覆盖完整锁图的 crates.io 索引项并执行 `--deny yanked`，随后以必填 `DUFS_QUALITY_AUDIT_DB` 交给 `scripts/check.sh`，在任何构建、测试或依赖安装前复审；预审计和 yanked 检查后重验封存，完整门后随质量树销毁数据库。制品清单只记录 revision/fetch epoch | 无法及时发现已知漏洞或已撤回依赖；空 crates.io 索引会让 cargo-audit 只打印无法检查而仍返回成功，因此覆盖完整锁图的私有索引项也是绿色结论的必要输入；直接复用可变、过期、内容漂移或来源不明的数据库会破坏时间、来源和完整性证据 | 开发/运维 |
-| T-12 | 统一质量与部署门禁 | `scripts/check.sh` 运行 Rustfmt、Clippy `-D warnings`、全 targets/features 测试、固定 `cargo-llvm-cov 0.8.6` 且行覆盖率不低于 70%、Cargo/npm 审计、固定 Acorn 8.17.0 AST 与有界词法常量 JS 分析及正负对抗样例、TypeScript 5.9.3 strict `checkJs` 全生产源码类型检查、支持围栏代码与 symlink fail-closed 的 Markdown 链接/锚点检查、含固定 `@axe-core/playwright 4.12.1` WCAG A/AA 扫描的双浏览器测试、生产解析器 YAML 校验、systemd/nginx 语法及隔离的真实 nginx 行为测试，并执行发布 no-clobber、Git 来源替换、归档树、SPDX notice、签名算法矩阵/失败传播和 lockfile npm cache 播种自测。六个 Bash 源总是经过 `bash -n`，安装 ShellCheck 时再执行 warning 门；CI 固定安装并强制使用 0.11.0。动态 computed 解构的属性名无法静态求值时失败关闭；原生 `alert/confirm/prompt` 的直接、别名、计算属性和反射访问同样由 AST 负例门拒绝。外部/解析输入保持 `unknown` 并由类型守卫收窄，生产源码不保留显式或隐式 `any`。部署 fixture 的真实 checkout 路径包含空格、`&`、`#` 和反斜杠，运行副本再使用安全名称 | 仍可手工执行，但容易漏项或让文档/部署示例与代码漂移；Acorn 门是防御纵深静态分析，strict `checkJs` 无需迁移 `.ts`，二者仍不等价于完整跨过程污点证明、ESLint 或通用 CommonMark parser。本地缺少 ShellCheck 时会明确跳过以保持离线可用，强制性由 CI 提供 | 开发/运维 |
-| T-13 | 100000 项手工基准 | 默认忽略，按需创建真实超大目录检查第一页性能 | 删除不影响正确性，但失去大目录回归基线 | 开发/运维 |
-| T-14 | 可验证本地发布 | release profile 使用 `opt-level=3`、LTO、单 codegen unit、`panic=abort` 和 strip；脚本要求干净 worktree、Cargo 版本与精确指向 HEAD 的 tag。完整 `scripts/check.sh` 在已验证 commit archive 的无 Git 私有副本中以清空环境、独立 Cargo/npm/target/tmp 执行；Cargo vendor 后离线，npm cache 只按 lockfile HTTPS+SHA-512 播种并 prefer-offline。门禁后用 snapshot index 复验 tracked 内容/mode 并拒绝非忽略新增路径，丢弃质量树，再 fresh extract 构建；签名/发布前继续复核 exact source。所有源码树拒绝 symlink、submodule 和特殊文件，只从摘要锁定 bare façade 归档，前后构建/打包 archive 的 commit、树、mode、额外路径和 SHA-256 均复核。固定 `cargo-cyclonedx 0.5.9` 离线生成规范化 SBOM，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID；第三方 notice 要求每个 vendored 可达非开发依赖有非空、经审核的 SPDX `license` 表达式，再解析审核清单内 SPDX AST 并要求完整 permissive 分支。`license_file` 仅收集依赖自身 no-follow UTF-8 许可证文本，不能替代缺失表达式或作为分类 fallback，项目许可证也不作正文 fallback。Rust 1.97.1 标准库 notice 还须匹配审核摘要。`BUILD-ENVIRONMENT.txt` 记录完整 SHA/版本/epoch/target 和实际 Bash、Rust/Cargo、Node/npm、Git、OpenSSL、归档/coreutils 版本。该清单、SBOM、项目许可证、两类 notice 和包内文件均进 checksum；签名密钥最后才短暂打开，并只允许 Ed25519、Ed448、RSA ≥3072 bit 或 `prime256v1`/`secp384r1`/`secp521r1` ECDSA，其他算法/强度失败关闭。输出目录须为当前 UID 所有且 group/other 不可写，经目录 fd 独占锁和 `/proc/self/fd` 锚定；私有 stage 与目标必须同文件系统，并依赖支持 `--update=none --no-copy` 的 GNU `mv` 做原子 no-clobber 发布，且以 source 必须消失的后置条件把静默碰撞变为失败 | 删除会失去源码到制品的可追踪性、依赖/许可清单、密钥强度底线和隔离验收流程。npm 缺失包/审计仍可能联网，环境清单只记录事实而不钉扎宿主工具，SBOM 规范化不等于完整 CycloneDX schema 验证；晚打开只缩短同 UID 暴露面，正式签名仍需独立账号、主机或 HSM | 开发/运维 |
-| T-15 | Node、浏览器与宿主工具边界 | `package.json` 与根 lockfile 只接受当前 Node 24.8.0；`package-lock.json` 精确锁定 Playwright 1.61.1、`@axe-core/playwright` 4.12.1、Acorn 8.17.0 和 TypeScript 5.9.3；远程工作流固定 Rust 1.97.1、ShellCheck 0.11.0、cargo-audit 0.22.2 及 ShellCheck 归档 SHA-256；其中分层只读与性能任务记录 runner image 和实际工具版本。正式包另以 `BUILD-ENVIRONMENT.txt` v2 记录实际发布工具和 RustSec DB 身份。本地 ShellCheck、npm、nginx、systemd、OpenSSL、Bash、Git、curl、GNU tar/gzip/coreutils、util-linux `flock` 和可选 Edge 的版本未由仓库统一钉死 | 删除 lockfile 会让前端门禁漂移；环境清单只支持追溯，不会把“固定 CI 关键工具”或一次记录变成整条宿主链逐包可重复；仍须复验 GitHub runner 镜像和本地宿主工具 | 开发/运维 |
-| T-16 | 支持版本与私密报告策略 | 安全修复在当前源码树开发，但 dirty worktree 或仓库 HEAD 不自动成为受支持二进制；仅按 exact tag、checksum 和签名流程生成的最新正式制品受支持，正式发布前不声明任何受支持二进制。漏洞应通过供应方的私密安全/事件通道报告，提供受影响版本和 `dufs --version` 的完整 Git SHA，并对配置、路径和凭据材料脱敏；发行方必须随二进制公布实际受监控的私密联系地址，公开上游 issue 不视为保密渠道 | 删除明确策略会混淆源码审查、正式制品和下游修改版的支持责任，也可能把敏感报告泄露到公开渠道 | 开发/运维 |
-| T-17 | 只读分层远程 CI | `.github/workflows/read-only-ci.yml` 仅使用 `pull_request`、`push` 和人工触发，权限为 `contents: read`，checkout 不持久化凭据，Action 固定完整 commit SHA。静态层以唯一当前 Node 24.8.0 运行 Shell/JS/type/docs，Rust 层运行 fmt/Clippy/test，质量层独立报告覆盖率、部署、发布脚本自测和 release binary smoke，浏览器层独立矩阵运行 Chromium 与 Firefox；不接收发布密钥、不创建 tag/release、不上传制品 | 删除后仍可运行权威本地门，但会失去每次远程变更的分层反馈；把该门当正式发布会绕过审计、exact-tag、签名和原子发布链 | 开发/运维 |
-| T-18 | 正式发布包真实 E2E | `.github/workflows/formal-release-e2e.yml` 在 `v*` tag、每周和人工触发时，以只读权限在含 shell 元字符的隔离 clone 中建立精确本地版本 tag、生成临时 Ed25519 key，并不带跳过开关调用真实 `package-release.sh`。它经过完整检查、vendor/build/SBOM/checksum/sign/sync/no-clobber 链，随后独立核验外层四项制品、签名/公钥、包内 `SHA256SUMS` 与二进制完整版本/SHA；不引用生产或自定义 secrets，只使用只读 GitHub token checkout，也不上传输出。便捷 Release 必须等待同 tag/SHA 的该任务成功 | 删除后 helper 自测仍可通过，但 exact-tag、隔离总门、真实构建和最终签名发布组合路径可能长期无人执行；临时测试密钥只证明流程，不构成生产信任根 | 开发/运维 |
+| T-08 | 可注入持久化边界 | `StorageDurability` 先独立注入文件 sync；替换边界返回 `Published`、`Rejected`、`NotPublished` 或 `PublishedDurabilityUnknown`，测试可区分发布前失败、Missing 发布后 identity 无法确认以及 rename 后父目录 fsync 失败 | 删除会使真正落盘的故障路径难以自动测试，也容易把确定未发布与发布后未知混淆 | 开发运维 |
+| T-09 | Rust 自动化 | 单元、集成、故障注入、不可变分页/搜索快照、退役目录归档路由、Range、认证、限流、协议、符号链接、纯 fd 清理和真实停机测试；范围与 URI 编解码另有大样本性质测试 | 删除后修改核心文件语义的风险显著上升 | 开发运维 |
+| T-10 | 隔离 Playwright | Chromium 和 Firefox 必需、正式 Edge 可选；通过只呈现一个客户端地址的本地 HTTPS 网关运行，因此固定单 worker 串行执行，避免无关用例争抢生产登录令牌桶；失败重试 1 次且 `failOnFlakyTests: true`，所以重试通过仍会让门禁失败；每项测试使用随机目录。Rust HTTP 集成测试精确断言安全响应头；Playwright 验证 Secure Cookie、CSP violation、可访问性语义和真实浏览器交互 | 删除后无法验证真实浏览器行为及测试间状态污染；删除 Rust 断言会让响应头策略漂移失去精确回归保护 | 开发运维 |
+| T-11 | 依赖安全审计 | `cargo audit` 固定为 0.22.2，并与 `npm audit --audit-level=high` 一起由 lockfile/manifest push、PR、每周计划及人工任务触发；Rust 审计显式 `--deny yanked`。发布只复用通过 canonical origin、HEAD/FETCH_HEAD、新鲜度、物理/Git/内容完整性检查的宿主 RustSec DB；alternates、不安全条目、untracked 或 tracked 内容/mode 漂移均拒绝。数据库以无硬链接私有 clone 封存 revision/fetch epoch/index/config；否则在任何项目/依赖代码前用 dummy lockfile 联网刷新。先执行 sealed `--no-fetch --no-yanked` advisory pre-audit，再用私有 Cargo home `fetch --locked` 填充覆盖完整锁图的 crates.io 索引项并执行 `--deny yanked`，随后以必填 `DUFS_QUALITY_AUDIT_DB` 交给 `scripts/check.sh`，在任何构建、测试或依赖安装前复审；预审计和 yanked 检查后重验封存，完整门后随质量树销毁数据库。制品清单只记录 revision/fetch epoch | 无法及时发现已知漏洞或已撤回依赖；空 crates.io 索引会让 cargo-audit 只打印无法检查而仍返回成功，因此覆盖完整锁图的私有索引项也是绿色结论的必要输入；直接复用可变、过期、内容漂移或来源不明的数据库会破坏时间、来源和完整性证据 | 开发运维 |
+| T-12 | 统一质量与部署门禁 | `scripts/check.sh` 运行 Rustfmt、Clippy `-D warnings`、全 targets/features 测试、固定 `cargo-llvm-cov 0.8.6` 且行覆盖率不低于 70%、Cargo/npm 审计、固定 Acorn 8.17.0 AST 与有界词法常量 JS 分析及正负对抗样例、TypeScript 5.9.3 strict `checkJs` 全生产源码类型检查、支持围栏代码与 symlink fail-closed 的 Markdown 链接/锚点检查、含固定 `@axe-core/playwright 4.12.1` WCAG A/AA 扫描的双浏览器测试、生产解析器 YAML 校验、systemd/nginx 语法及隔离的真实 nginx 行为测试，并执行发布 no-clobber、Git 来源替换、归档树、SPDX notice、签名算法矩阵/失败传播和 lockfile npm cache 播种自测。六个 Bash 源总是经过 `bash -n`，安装 ShellCheck 时再执行 warning 门；CI 固定安装并强制使用 0.11.0。动态 computed 解构的属性名无法静态求值时失败关闭；原生 `alert/confirm/prompt` 的直接、别名、计算属性和反射访问同样由 AST 负例门拒绝。外部/解析输入保持 `unknown` 并由类型守卫收窄，生产源码不保留显式或隐式 `any`。部署 fixture 的真实 checkout 路径包含空格、`&`、`#` 和反斜杠，运行副本再使用安全名称 | 仍可手工执行，但容易漏项或让文档/部署示例与代码漂移；Acorn 门是防御纵深静态分析，strict `checkJs` 无需迁移 `.ts`，二者仍不等价于完整跨过程污点证明、ESLint 或通用 CommonMark parser。本地缺少 ShellCheck 时会明确跳过以保持离线可用，强制性由 CI 提供 | 开发运维 |
+| T-13 | 100000 项手工基准 | 默认忽略，按需创建真实超大目录检查第一页性能 | 删除不影响正确性，但失去大目录回归基线 | 开发运维 |
+| T-14 | 可验证本地发布 | release profile 使用 `opt-level=3`、LTO、单 codegen unit、`panic=abort` 和 strip；脚本要求干净 worktree、Cargo 版本与精确指向 HEAD 的 tag。完整 `scripts/check.sh` 在已验证 commit archive 的无 Git 私有副本中以清空环境、独立 Cargo/npm/target/tmp 执行；Cargo vendor 后离线，npm cache 只按 lockfile HTTPS+SHA-512 播种并 prefer-offline。门禁后用 snapshot index 复验 tracked 内容/mode 并拒绝非忽略新增路径，丢弃质量树，再 fresh extract 构建；签名/发布前继续复核 exact source。所有源码树拒绝 symlink、submodule 和特殊文件，只从摘要锁定 bare façade 归档，前后构建/打包 archive 的 commit、树、mode、额外路径和 SHA-256 均复核。固定 `cargo-cyclonedx 0.5.9` 离线生成规范化 SBOM，source revision 只接受恰为 40 或 64 位的小写十六进制对象 ID；第三方 notice 要求每个 vendored 可达非开发依赖有非空、经审核的 SPDX `license` 表达式，再解析审核清单内 SPDX AST 并要求完整 permissive 分支。`license_file` 仅收集依赖自身 no-follow UTF-8 许可证文本，不能替代缺失表达式或作为分类 fallback，项目许可证也不作正文 fallback。Rust 1.97.1 标准库 notice 还须匹配审核摘要。`BUILD-ENVIRONMENT.txt` 记录完整 SHA/版本/epoch/target 和实际 Bash、Rust/Cargo、Node/npm、Git、OpenSSL、归档/coreutils 版本。该清单、SBOM、项目许可证、两类 notice 和包内文件均进 checksum；签名密钥最后才短暂打开，并只允许 Ed25519、Ed448、RSA ≥3072 bit 或 `prime256v1`/`secp384r1`/`secp521r1` ECDSA，其他算法/强度失败关闭。输出目录须为当前 UID 所有且 group/other 不可写，经目录 fd 独占锁和 `/proc/self/fd` 锚定；私有 stage 与目标必须同文件系统，并依赖支持 `--update=none --no-copy` 的 GNU `mv` 做原子 no-clobber 发布，且以 source 必须消失的后置条件把静默碰撞变为失败 | 删除会失去源码到制品的可追踪性、依赖/许可清单、密钥强度底线和隔离验收流程。npm 缺失包/审计仍可能联网，环境清单只记录事实而不钉扎宿主工具，SBOM 规范化不等于完整 CycloneDX schema 验证；晚打开只缩短同 UID 暴露面，正式签名仍需独立账号、主机或 HSM | 开发运维 |
+| T-15 | Node、浏览器与宿主工具边界 | `package.json` 与根 lockfile 只接受当前 Node 24.8.0；`package-lock.json` 精确锁定 Playwright 1.61.1、`@axe-core/playwright` 4.12.1、Acorn 8.17.0 和 TypeScript 5.9.3；远程工作流固定 Rust 1.97.1、ShellCheck 0.11.0、cargo-audit 0.22.2 及 ShellCheck 归档 SHA-256；其中分层只读与性能任务记录 runner image 和实际工具版本。正式包另以 `BUILD-ENVIRONMENT.txt` v2 记录实际发布工具和 RustSec DB 身份。本地 ShellCheck、npm、nginx、systemd、OpenSSL、Bash、Git、curl、GNU tar/gzip/coreutils、util-linux `flock` 和可选 Edge 的版本未由仓库统一钉死 | 删除 lockfile 会让前端门禁漂移；环境清单只支持追溯，不会把“固定 CI 关键工具”或一次记录变成整条宿主链逐包可重复；仍须复验 GitHub runner 镜像和本地宿主工具 | 开发运维 |
+| T-16 | 支持版本与私密报告策略 | 安全修复在当前源码树开发，但 dirty worktree 或仓库 HEAD 不自动成为受支持二进制；仅按 exact tag、checksum 和签名流程生成的最新正式制品受支持，正式发布前不声明任何受支持二进制。漏洞应通过供应方的私密安全/事件通道报告，提供受影响版本和 `dufs --version` 的完整 Git SHA，并对配置、路径和凭据材料脱敏；发行方必须随二进制公布实际受监控的私密联系地址，公开上游 issue 不视为保密渠道 | 删除明确策略会混淆源码审查、正式制品和下游修改版的支持责任，也可能把敏感报告泄露到公开渠道 | 开发运维 |
+| T-17 | 只读分层远程 CI | `.github/workflows/read-only-ci.yml` 仅使用 `pull_request`、`push` 和人工触发，权限为 `contents: read`，checkout 不持久化凭据，Action 固定完整 commit SHA。静态层以唯一当前 Node 24.8.0 运行 Shell/JS/type/docs，Rust 层运行 fmt/Clippy/test，质量层独立报告覆盖率、部署、发布脚本自测和 release binary smoke，浏览器层独立矩阵运行 Chromium 与 Firefox；不接收发布密钥、不创建 tag/release、不上传制品 | 删除后仍可运行权威本地门，但会失去每次远程变更的分层反馈；把该门当正式发布会绕过审计、exact-tag、签名和原子发布链 | 开发运维 |
+| T-18 | 正式发布包真实 E2E | `.github/workflows/formal-release-e2e.yml` 在 `v*` tag、每周和人工触发时，以只读权限在含 shell 元字符的隔离 clone 中建立精确本地版本 tag、生成临时 Ed25519 key，并不带跳过开关调用真实 `package-release.sh`。它经过完整检查、vendor/build/SBOM/checksum/sign/sync/no-clobber 链，随后独立核验外层四项制品、签名/公钥、包内 `SHA256SUMS` 与二进制完整版本/SHA；不引用生产或自定义 secrets，只使用只读 GitHub token checkout，也不上传输出。便捷 Release 必须等待同 tag/SHA 的该任务成功 | 删除后 helper 自测仍可通过，但 exact-tag、隔离总门、真实构建和最终签名发布组合路径可能长期无人执行；临时测试密钥只证明流程，不构成生产信任根 | 开发运维 |
 
 T-12 的覆盖率门同时要求仓库总行覆盖率至少 70%，以及每个被插桩源码文件至少 1%；逐文件底线用于拒绝整个模块零覆盖，不代表 1% 已达到充分测试。
 

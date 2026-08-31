@@ -361,7 +361,7 @@ npm run check:types
 
 1. 在 [src/main.rs](../../src/main.rs) 中搜索 `Arc::new`、`Semaphore`、`TaskTracker` 和 `CancellationToken`，分别说明它们管理什么资源。
 2. 在 [src/server/protocol.rs](../../src/server/protocol.rs) 中找类型化协议状态，观察它们在哪里才转成字符串。
-3. 在 [assets/modules/http/client.js](../../assets/modules/http/client.js) 中搜索 `unknown` 或类型守卫，找出网络响应从“不可信值”变成可用对象的位置。
+3. 在 [clients/web/modules/http/client.js](../../clients/web/modules/http/client.js) 中搜索 `unknown` 或类型守卫，找出网络响应从“不可信值”变成可用对象的位置。
 4. 思考：如果上传正文已经写完，但浏览器在等待提交响应时断网，为什么页面不能直接显示“上传失败”？
 
 下一章会把这些概念放进真实的后端请求链。

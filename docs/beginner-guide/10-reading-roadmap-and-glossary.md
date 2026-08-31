@@ -4,7 +4,7 @@
 
 ## 10.1 不推荐从最大的文件开始硬读
 
-直接打开 [upload.rs](../../src/server/upload.rs) 或 [upload/manager.js](../../assets/modules/upload/manager.js) 从第一行读到最后，通常会同时遇到路径、状态、协议、DOM、取消和恢复，难以建立主线。
+直接打开 [upload.rs](../../src/server/upload.rs) 或 [upload/manager.js](../../clients/web/modules/upload/manager.js) 从第一行读到最后，通常会同时遇到路径、状态、协议、DOM、取消和恢复，难以建立主线。
 
 更有效的方法是：
 
@@ -59,8 +59,8 @@
 - [src/auth.rs](../../src/auth.rs)；
 - [src/server/session.rs](../../src/server/session.rs)；
 - [src/server/login_rate_limit.rs](../../src/server/login_rate_limit.rs)；
-- [assets/login.html](../../assets/login.html)；
-- [assets/login.js](../../assets/login.js)；
+- [clients/web/login.html](../../clients/web/login.html)；
+- [clients/web/login.js](../../clients/web/login.js)；
 - [tests/auth.rs](../../tests/auth.rs) 与 [tests/frontend/auth.spec.js](../../tests/frontend/auth.spec.js)。
 
 回答：
@@ -77,9 +77,9 @@
 - [src/server/listing.rs](../../src/server/listing.rs)；
 - [src/server/listing/snapshot.rs](../../src/server/listing/snapshot.rs)；
 - [src/server/listing/walk.rs](../../src/server/listing/walk.rs)；
-- [assets/index.html](../../assets/index.html)；
-- [assets/modules/app.js](../../assets/modules/app.js)；
-- [assets/modules/listing/controller.js](../../assets/modules/listing/controller.js)。
+- [clients/web/index.html](../../clients/web/index.html)；
+- [clients/web/modules/app.js](../../clients/web/modules/app.js)；
+- [clients/web/modules/listing/controller.js](../../clients/web/modules/listing/controller.js)。
 
 回答：
 
@@ -129,8 +129,8 @@ URI → RoutePath → RootedPath → 根 FD 相对打开 → fstat identity
 
 推荐先读重命名：
 
-- [assets/modules/operations/file_operations.js](../../assets/modules/operations/file_operations.js)；
-- [assets/modules/http/client.js](../../assets/modules/http/client.js)；
+- [clients/web/modules/operations/file_operations.js](../../clients/web/modules/operations/file_operations.js)；
+- [clients/web/modules/http/client.js](../../clients/web/modules/http/client.js)；
 - [src/server/browser_api.rs](../../src/server/browser_api.rs)；
 - [src/server/operation_registry.rs](../../src/server/operation_registry.rs)；
 - [src/server/problem.rs](../../src/server/problem.rs)；
@@ -563,7 +563,7 @@ Extended Attribute，Linux 文件扩展属性。覆盖重放时必须限制特�
 
 源码按前后端模块分开，但部署不是两个服务。前端资源编译进 Rust 二进制，由同一后端返回。
 
-### 修改 `assets/` 后为什么刷新没变化？
+### 修改 `clients/web/` 后为什么刷新没变化？
 
 运行中的旧二进制仍包含旧资源。重新 Cargo 构建、重启服务并重新取得页面。若修改的是 `EMBEDDED_ASSETS` 白名单中的 CSS、ES module、图标或其 MIME 声明，再确认页面请求了新的资源摘要 URL；`index.html`、`login.html` 和内联 `login.js` 不参与该摘要，修改它们时摘要前缀可以不变。
 

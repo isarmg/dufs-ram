@@ -26,11 +26,10 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - [文档导航](docs/README.md)：区分当前规范、教学资料与历史审查记录；
 - [完整功能与取舍清单](docs/feature-inventory-and-tradeoffs.md)：逐项列出当前功能、依赖、删除影响和可精简候选；
 - [生产部署、备份、升级与回滚](docs/operations.md)：给出经过语法验证的 systemd/nginx 基线、健康检查、备份恢复演练和制品验证流程；
-- [安全策略](SECURITY.md)：说明支持边界、私密报告要求和事件响应信息；
 
 本 fork 托管在 `https://github.com/isarmg/dufs-ram`。只读 GitHub Actions 门禁不会创建或修改远端 tag、Release 或正式制品；版本 tag 工作流只在 tag、Cargo 版本和源码提交完全一致且全部质量门通过后构建便捷二进制，并生成只绑定当前版本和源码提交的发布说明。需要独立公钥验证、SBOM、许可证清单和构建环境记录的正式制品仍由 `scripts/package-release.sh` 从当前提交生成。
 
-发布包完整保留仓库的 `docs/` 层次，并携带教程本地链接所引用的 `assets/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置；这些支持材料用于离线阅读与核对，不是运行 Dufs 的额外依赖。打包和 `--self-test` 会先用包内文档检查器验证所有本地链接，再把除 `SHA256SUMS` 自身外的全部普通文件写入清单；此后只做只读覆盖校验，使 checksum 成为包内最后一次内容变更。
+发布包完整保留仓库的 `docs/` 层次，并携带教程本地链接所引用的 `clients/web/`、`src/`、`tests/`、`scripts/`、部署样例和构建配置；这些支持材料用于离线阅读与核对，不是运行 Dufs 的额外依赖。打包和 `--self-test` 会先用包内文档检查器验证所有本地链接，再把除 `SHA256SUMS` 自身外的全部普通文件写入清单；此后只做只读覆盖校验，使 checksum 成为包内最后一次内容变更。
 
 ## 环境要求
 
@@ -328,7 +327,7 @@ YAML 会拒绝未知字段和空的 `bind` 列表。`trusted-proxies` 可写成�
 
 Linux 上的 YAML 文件必须由 root 或服务进程的有效用户拥有，只能使用精确的 `0400`、`0440`、`0600` 或 `0640`；使用组读位时，文件 gid 必须等于进程的有效 gid。文件还必须是无扩展 POSIX access ACL 的单硬链接普通文件。Dufs 以 `O_NOFOLLOW|O_NONBLOCK` 打开一次，在同一 fd 上探测 ACL、读取最多 1 MiB，并在探测和读取前后用 `fstat` 复核 dev/inode、mode、nlink、uid/gid、大小及纳秒级 mtime/ctime 均未变化。配置文件与日志文件都必须位于共享根之外；规范化父目录、最终目标及目录实体检查会拒绝经父目录符号链接等可解析别名落入共享根的路径，单硬链接要求则拒绝硬链接别名。两者不能指向同一规范目录项或同一已存在 dev/inode，也不能以目录项或对象别名碰撞 `state.sqlite3`、`state.sqlite3-journal`、`state.sqlite3-wal` 或 `state.sqlite3-shm`。
 
-仓库根目录的示例产物 `./dufs.yaml` 和 `./dufs.log` 分别含口令验证器及账号/请求路径等敏感信息，已由根 `.gitignore` 排除；不要强制加入版本控制，也不要把同类本地文件换名后提交。`deploy/dufs.yaml.example` 只保留占位符，继续作为可跟踪模板。
+仓库根目录的示例产物 `./dufs.yaml` 和 `./dufs.log` 分别含口令验证器及账号/请求路径等敏感信息，已由根 `.gitignore` 排除；不要强制加入版本控制，也不要把同类本地文件换名后提交。`config/dufs.yaml.example` 只保留占位符，继续作为可跟踪模板。
 
 ## 网关与反向代理
 
@@ -431,7 +430,7 @@ KillSignal=SIGTERM
 
 ## 内置页面
 
-`assets/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。注册为版本化资源的 CSS、JavaScript 和图标以资源名、MIME 类型和内容共同生成摘要 URL；HTML 骨架和内联登录脚本不参与该前缀。只有精确命中的已知版本化资源使用长期缓存。
+`clients/web/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。注册为版本化资源的 CSS、JavaScript 和图标以资源名、MIME 类型和内容共同生成摘要 URL；HTML 骨架和内联登录脚本不参与该前缀。只有精确命中的已知版本化资源使用长期缓存。
 
 生产运行不需要 Node.js 或前端打包步骤；Node.js 仅在质量门禁和签名发布阶段使用。
 
@@ -522,7 +521,7 @@ git status --short
 
 ```text
 .
-├── assets/                         # 编译内置的浏览器页面源码
+├── clients/web/                         # 编译内置的浏览器页面源码
 │   └── modules/                    # 无打包器的原生 ES modules
 │       ├── shared/                 # DOM、路径和跨功能 mutation 契约
 │       ├── http/                   # Fetch、Problem Details、响应预算与头解析
@@ -603,7 +602,6 @@ git status --short
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE-APACHE
-├── SECURITY.md
 ├── package.json
 ├── playwright.config.js
 └── rust-toolchain.toml

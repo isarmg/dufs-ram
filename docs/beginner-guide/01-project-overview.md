@@ -55,7 +55,7 @@ flowchart TB
 
 ### 展示层
 
-位于 [assets](../../assets)。它负责页面、键盘交互、对话框、列表 DOM、上传队列以及把后端问题显示给用户。
+位于 [clients/web](../../clients/web)。它负责页面、键盘交互、对话框、列表 DOM、上传队列以及把后端问题显示给用户。
 
 ### HTTP 层
 
@@ -126,7 +126,7 @@ sequenceDiagram
 
 ```text
 dufs/
-├── assets/                 浏览器页面、样式和原生 ES modules
+├── clients/web/                 浏览器页面、样式和原生 ES modules
 │   └── modules/            列表、操作、上传、API 等前端模块
 ├── deploy/                 systemd、nginx、YAML 示例
 ├── docs/                   设计、取舍、运维和本教学手册
@@ -159,19 +159,19 @@ dufs/
 - [server/rooted_fs.rs](../../src/server/rooted_fs.rs)：锚定共享根的安全文件系统操作；
 - [server/state_store.rs](../../src/server/state_store.rs)：SQLite actor 的外部接口。
 
-### `assets/modules/` 的重点
+### `clients/web/modules/` 的重点
 
-- [app.js](../../assets/modules/app.js)：页面启动和模块组装；
-- [http/client.js](../../assets/modules/http/client.js)：`fetch`、错误解码、超时和 Operation 查询；
-- [http/headers.js](../../assets/modules/http/headers.js)：严格解析规范的非负整数响应头；
-- [listing/controller.js](../../assets/modules/listing/controller.js)：列表、分页、搜索、固定操作槽和行内重命名；
-- [operations/file_operations.js](../../assets/modules/operations/file_operations.js)：新建、移动、重命名、删除、注销；
-- [operations/dialogs.js](../../assets/modules/operations/dialogs.js)：应用内对话框和焦点恢复；
-- [upload/manager.js](../../assets/modules/upload/manager.js)：上传编排和任务状态机；
-- [upload/selection.js](../../assets/modules/upload/selection.js)：批量选择、路径预算和重复目标校验；
-- [upload/protocol.js](../../assets/modules/upload/protocol.js)：严格解析上传响应头；
-- [upload/queue.js](../../assets/modules/upload/queue.js)：有界任务队列和终态历史；
-- [upload/view.js](../../assets/modules/upload/view.js)：进度、速度、剩余时间和操作按钮。
+- [app.js](../../clients/web/modules/app.js)：页面启动和模块组装；
+- [http/client.js](../../clients/web/modules/http/client.js)：`fetch`、错误解码、超时和 Operation 查询；
+- [http/headers.js](../../clients/web/modules/http/headers.js)：严格解析规范的非负整数响应头；
+- [listing/controller.js](../../clients/web/modules/listing/controller.js)：列表、分页、搜索、固定操作槽和行内重命名；
+- [operations/file_operations.js](../../clients/web/modules/operations/file_operations.js)：新建、移动、重命名、删除、注销；
+- [operations/dialogs.js](../../clients/web/modules/operations/dialogs.js)：应用内对话框和焦点恢复；
+- [upload/manager.js](../../clients/web/modules/upload/manager.js)：上传编排和任务状态机；
+- [upload/selection.js](../../clients/web/modules/upload/selection.js)：批量选择、路径预算和重复目标校验；
+- [upload/protocol.js](../../clients/web/modules/upload/protocol.js)：严格解析上传响应头；
+- [upload/queue.js](../../clients/web/modules/upload/queue.js)：有界任务队列和终态历史；
+- [upload/view.js](../../clients/web/modules/upload/view.js)：进度、速度、剩余时间和操作按钮。
 
 ## 1.9 主要技术为什么合适
 
@@ -218,14 +218,14 @@ Tokio 提供异步任务、网络、信号和同步原语；Hyper 提供底层 H
 在仓库根目录执行：
 
 ```sh
-rg --files src/server assets/modules tests/frontend | sort
+rg --files src/server clients/web/modules tests/frontend | sort
 rg "MKDIR_API_PATH|MOVE_API_PATH|RENAME_API_PATH" src
-rg "class .*Error|@typedef" assets/modules
+rg "class .*Error|@typedef" clients/web/modules
 ```
 
 尝试回答：
 
-1. 为什么 `assets/index.js` 很短，而页面逻辑仍然完整？
+1. 为什么 `clients/web/index.js` 很短，而页面逻辑仍然完整？
 2. 为什么状态目录不能放在共享根里面？
 3. 如果删除请求显示“请求超时”，你会先用原 Operation ID 查询，还是立即生成新 ID 再删一次？为什么？
 
