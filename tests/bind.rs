@@ -2,8 +2,8 @@
 mod fixtures;
 
 use fixtures::{
-    Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, TestServer, dufs_command, read_bound_url,
-    server, tmpdir,
+    ADMIN_ACCOUNT, Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, TestServer, dufs_command,
+    read_bound_url, server, tmpdir,
 };
 
 use assert_cmd::prelude::*;
@@ -99,6 +99,8 @@ fn bind_ipv4_ipv6(
     Ok(())
 }
 
+// These listener-only tests use a valid non-default account so the fixture
+// does not spend the sole connection permit on its automatic setup login.
 #[rstest]
 fn idle_listener_does_not_starve_another_bind_when_connection_limit_is_one(
     #[with(&[
@@ -108,7 +110,7 @@ fn idle_listener_does_not_starve_another_bind_when_connection_limit_is_one(
         "127.0.0.2",
         "--max-connections",
         "1",
-    ])]
+    ], &[ADMIN_ACCOUNT])]
     server: TestServer,
 ) -> Result<(), Error> {
     let client = Client::builder()
@@ -137,7 +139,7 @@ fn connection_limit_bounds_userspace_sockets_across_multiple_binds(
         "127.0.0.2",
         "--max-connections",
         "1",
-    ])]
+    ], &[ADMIN_ACCOUNT])]
     server: TestServer,
 ) -> Result<(), Error> {
     let pid = server.process_id();
