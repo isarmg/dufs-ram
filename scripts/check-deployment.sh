@@ -509,12 +509,12 @@ sed \
   -e "s#server 127\\.0\\.0\\.1:5000;#server unix:$socket_dir/upstream.sock;#" \
   -e "s#listen 80 default_server;#listen unix:$socket_dir/http.sock default_server;#" \
   -e "s#listen \[::\]:80 default_server;#listen unix:$socket_dir/http-v6.sock default_server;#" \
-  -e "s#listen 443 ssl http2 default_server;#listen unix:$socket_dir/https.sock ssl http2 default_server;#" \
-  -e "s#listen \[::\]:443 ssl http2 default_server;#listen unix:$socket_dir/https-v6.sock ssl http2 default_server;#" \
+  -e "s#listen 443 ssl default_server;#listen unix:$socket_dir/https.sock ssl default_server;#" \
+  -e "s#listen \[::\]:443 ssl default_server;#listen unix:$socket_dir/https-v6.sock ssl default_server;#" \
   -e "s#listen 80;#listen unix:$socket_dir/http.sock;#" \
   -e "s#listen \[::\]:80;#listen unix:$socket_dir/http-v6.sock;#" \
-  -e "s#listen 443 ssl http2;#listen unix:$socket_dir/https.sock ssl http2;#" \
-  -e "s#listen \[::\]:443 ssl http2;#listen unix:$socket_dir/https-v6.sock ssl http2;#" \
+  -e "s#listen 443 ssl;#listen unix:$socket_dir/https.sock ssl;#" \
+  -e "s#listen \[::\]:443 ssl;#listen unix:$socket_dir/https-v6.sock ssl;#" \
   "$validation_dir/dufs.conf" \
   > "$validation_dir/active-dufs.conf"
 
@@ -535,6 +535,14 @@ assert_active_occurrences 2 "listen unix:$socket_dir/http.sock"
 assert_active_occurrences 2 "listen unix:$socket_dir/http-v6.sock"
 assert_active_occurrences 2 "listen unix:$socket_dir/https.sock"
 assert_active_occurrences 2 "listen unix:$socket_dir/https-v6.sock"
+assert_active_occurrences 2 "http2 on;"
+if grep -Eq \
+  '^[[:space:]]*listen[[:space:]][^;]*[[:space:]]http2([[:space:]]|;)' \
+  "$validation_dir/active-dufs.conf"
+then
+  printf 'Active Nginx config retained the deprecated listen http2 parameter.\n' >&2
+  exit 1
+fi
 while IFS= read -r active_listener; do
   if [[ ! "$active_listener" =~ ^[[:space:]]*listen[[:space:]]+unix: ]]; then
     printf 'Active Nginx config retained a network listener: %s\n' \

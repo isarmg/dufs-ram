@@ -9,7 +9,7 @@
 - 唯一共享根为 `/srv/dufs`；
 - nginx 与 Dufs 位于同一主机，Dufs 只监听 `127.0.0.1:5000`。
 
-网关样例要求 nginx 1.24.0 或更高版本、HTTP SSL/HTTP2 模块，以及仍由上游或操作系统发行商提供安全更新的 OpenSSL；新部署优先使用 OpenSSL 3.5 LTS。源码质量门不只加载语法：部署检查会从包含空格、`&`、`#` 和反斜杠的真实 checkout fixture 读取文件，复制到安全运行名后启动隔离的真实 nginx 与 mock upstream，分别验证规范重定向、Host/SNI 拒绝、固定回源头与真实客户端 IP 覆盖、唯一当前 `POST /api/v2/auth/login` 的 exact 4 KiB 网关限制，以及连接/请求速率限制的拒绝和恢复。`/__dufs__/login` 仅为 GET 页面，不是登录 POST alias。脚本在创建第一个临时目录前安装清理 trap，并以首个目录创建后立即失败的内置自测验证部分初始化也会清除资源。systemd 校验会把 `ExecStart` 换为占位可执行文件；门禁不会真实启动 systemd unit 与 Dufs/nginx 组合，因此生产数据副本上的启动、readiness 和 CRUD 冒烟不能省略。
+网关样例要求 nginx 1.25.1 或更高版本、HTTP SSL/HTTP2 模块，以及仍由上游或操作系统发行商提供安全更新的 OpenSSL；新部署优先使用 OpenSSL 3.5 LTS。HTTP/2 只通过每个 HTTPS `server` 块中的独立 `http2 on;` 启用，不提供已弃用 `listen ... http2` 的旧版兼容。源码质量门不只加载语法：部署检查会从包含空格、`&`、`#` 和反斜杠的真实 checkout fixture 读取文件，复制到安全运行名后启动隔离的真实 nginx 与 mock upstream，分别验证规范重定向、Host/SNI 拒绝、固定回源头与真实客户端 IP 覆盖、唯一当前 `POST /api/v2/auth/login` 的 exact 4 KiB 网关限制，以及连接/请求速率限制的拒绝和恢复。`/__dufs__/login` 仅为 GET 页面，不是登录 POST alias。脚本在创建第一个临时目录前安装清理 trap，并以首个目录创建后立即失败的内置自测验证部分初始化也会清除资源。systemd 校验会把 `ExecStart` 换为占位可执行文件；门禁不会真实启动 systemd unit 与 Dufs/nginx 组合，因此生产数据副本上的启动、readiness 和 CRUD 冒烟不能省略。
 
 唯一支持的服务端架构和正式制品 target 是 `x86_64-unknown-linux-gnu`。`build.rs` 对其他架构、操作系统、ABI 或指针宽度直接失败，不存在 aarch64/ARM64 best-effort 路径；制品还必须匹配 AMD64 CPU、GNU libc/动态加载器并运行在提供 `openat2` 的内核上。
 
@@ -165,11 +165,11 @@ Foundation 也是制品供应链输入，不是运行时 sibling 服务。`sarmg
 改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；依赖不可取得或 rev 不符时停止，
 不能复制共享类型、目标守卫或认证实现继续构建。
 
-仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0、Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；`ubuntu-24.04` 托管镜像的实际版本及宿主工具写入日志。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
+仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0、Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；静态、Rust 与浏览器 job 使用 `ubuntu-24.04`，含 nginx 1.25.1+ 部署门的质量 job 使用 x64 `ubuntu-26.04`，两种托管镜像的实际版本及宿主工具均写入日志。GitHub 当前把 26.04 标为 preview；若该 runner 不可调度或镜像回归，质量门必须保持失败，不能退回 nginx 1.24 旧语法完成合并。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
 仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，等待同一 tag/SHA 的全部质量门成功，并生成绑定当前版本与完整源码 SHA 的确定性发布说明。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费并复核不可变发布输入。
 
-`.github/workflows/formal-release-e2e.yml` 在版本 tag、每周计划或人工触发时使用临时 Ed25519 密钥调用未缩短的 `scripts/package-release.sh` 正式入口。它在含空格和 shell 元字符的隔离 clone 中建立精确本地 tag，实际经过完整质量门、vendor、release build、SBOM、checksum、签名和原子目录发布，再从外部复核四项制品、签名、公钥、包内 `SHA256SUMS` 以及二进制完整版本/SHA。该 job 只有 `contents: read`，不引用仓库或环境中的生产/自定义 secrets，只使用只读 GitHub token checkout，也不上传输出；临时密钥和制品随 runner 销毁，因此它验证路径正确性而不产生可分发的正式信任根。
+`.github/workflows/formal-release-e2e.yml` 在版本 tag、每周计划或人工触发时使用 `ubuntu-26.04` 和临时 Ed25519 密钥调用未缩短的 `scripts/package-release.sh` 正式入口。它在含空格和 shell 元字符的隔离 clone 中建立精确本地 tag，实际经过完整质量门、vendor、release build、SBOM、checksum、签名和原子目录发布，再从外部复核四项制品、签名、公钥、包内 `SHA256SUMS` 以及二进制完整版本/SHA。该 job 只有 `contents: read`，不引用仓库或环境中的生产/自定义 secrets，只使用只读 GitHub token checkout，也不上传输出；临时密钥和制品随 runner 销毁，因此它验证路径正确性而不产生可分发的正式信任根。
 
 自动 GitHub Release 是面向直接下载运行的便捷通道：其二进制在 `ubuntu-24.04` 托管 runner 上构建，必须匹配目标 CPU、glibc、动态加载器与 `openat2` 内核能力。需要 CycloneDX SBOM、第三方和标准库许可证清单、构建环境记录、可重复归档及独立公钥签名时，仍必须执行下述本地正式发布流程；不能把同一 Release 中的 checksum 当作独立信任根。
 
