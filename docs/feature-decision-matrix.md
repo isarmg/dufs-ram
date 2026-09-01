@@ -39,7 +39,7 @@
 
 | ID | 功能/当前实现 | 实现/代码锚点 | 分类 | 复杂度 | 删除后的确定后果 | 验证与边界 |
 | --- | --- | --- | --- | --- | --- | --- |
-| DFM-022 | 身份协议来自 Foundation，唯一角色为 `admin`；四个共享 crate 均固定 `=0.3.0` + Git rev `1fe326081cfd896f05ff502e80f99504797c14c6` | `sarmg-contracts`、`sarmg-admin-auth`、`sarmg-schema-identity`、`sarmg-server-target`、`src/server/session.rs` | 核心 | 高 | 私有用户/角色协议或可漂移依赖会造成跨项目合同漂移 | 多管理员同权；无普通/只读角色、路径 ACL、网页账号管理；`cargo metadata`/lockfile 来源逐字匹配；无 workspace/path/branch/local-copy fallback |
+| DFM-022 | 身份协议来自 Foundation，唯一角色为 `admin`；四个共享 crate 均固定 `=0.3.1` + Git rev `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0` | `sarmg-contracts`、`sarmg-admin-auth`、`sarmg-schema-identity`、`sarmg-server-target`、`src/server/session.rs` | 核心 | 高 | 私有用户/角色协议或可漂移依赖会造成跨项目合同漂移 | 多管理员同权；无普通/只读角色、路径 ACL、网页账号管理；`cargo metadata`/lockfile 来源逐字匹配；无 workspace/path/branch/local-copy fallback |
 | DFM-023 | 管理员 username 使用 Foundation 唯一 current canonical 规则 | `src/auth.rs`、`clients/web/login.js` | 保障 | 中 | 大小写、Unicode、`@` 或边界差异会破坏跨项目身份与 owner 摘要 | 配置为 3～64 lowercase ASCII bytes、首尾 alnum、字符 `[a-z0-9._-]`；登录 candidate 为 1～64 bytes 且每字节 `0x20`～`0x7e`，trim/lowercase 后再校验；相邻分隔符允许 |
 | DFM-024 | 登录唯一 API 为 `POST /api/v2/auth/login` 严格 JSON | `src/server/router/dispatch.rs`、`src/server/session.rs` | 核心 | 中 | 删除后无法建会话；加旧 alias 恢复双协议 | 只含 username/password；应用 16 KiB；无表单、PRG、nonce、旧路径 |
 | DFM-025 | `GET /__dufs__/login` 只返回首方登录页面 | `src/server/session.rs`、`clients/web/login.html` | 核心 | 低 | 无首方入口；允许 POST 会形成 alias | GET 正例、其他方法 405、no-store、CSP、摘要 CSS |

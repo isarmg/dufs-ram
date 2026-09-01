@@ -1,6 +1,6 @@
 # 项目完整功能与取舍清单
 
-本文以当前工作树（Cargo 版本 `0.50.0`）的实际代码为准，盘点 Dufs 当前所有对外可见、可配置，以及会显著影响安全性、正确性、性能和可维护性的功能。普通辅助函数和测试夹具不单独作为“功能”列出；最终发布身份必须以制品内 `dufs --version` 的完整 Git SHA 为准。
+本文以当前工作树（Cargo 版本 `0.50.1`）的实际代码为准，盘点 Dufs 当前所有对外可见、可配置，以及会显著影响安全性、正确性、性能和可维护性的功能。普通辅助函数和测试夹具不单独作为“功能”列出；最终发布身份必须以制品内 `dufs --version` 的完整 Git SHA 为准。
 
 本文的用途是帮助判断后续应该保留、简化还是删除哪些能力。它不是删除计划；没有得到明确选择前，本文不会改变任何现有功能。
 
@@ -181,8 +181,8 @@
 - 用防火墙或私网阻止客户端绕过网关直连后端。
 
 管理员 username 与认证 wire 类型的唯一规则来自 Foundation；`sarmg-admin-auth`、`sarmg-contracts`、
-`sarmg-schema-identity`、`sarmg-server-target` 均精确固定为 `=0.3.0` 与 Git rev
-`1fe326081cfd896f05ff502e80f99504797c14c6`，不接受 workspace sibling、Cargo path dependency、可变 branch
+`sarmg-schema-identity`、`sarmg-server-target` 均精确固定为 `=0.3.1` 与 Git rev
+`7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`，不接受 workspace sibling、Cargo path dependency、可变 branch
 或本地副本。Dufs 只负责把受保护 YAML 映射到该规则及把认证后的稳定管理员 ID 用于本地
 operation/upload/purge owner domain。项目没有网页端新增管理员、删除管理员、改密码或改角色功能；配置变化
 必须重启。未知但形状合法的 canonical username 仍执行当前成本的 Argon2 校验，以缩小按响应时间枚举已配置
@@ -402,7 +402,7 @@ username 的差异。这里的管理员 username 是管理面身份；`SessionIn
 | ID | 当前特性 | 作用 | 删除后的影响 | 级别 |
 | --- | --- | --- | --- | --- |
 | T-01 | 固定 Rust 工具链 | Rust 1.98.0、edition 2024、Rustfmt、Clippy | 开发机结果可能漂移 | 开发运维 |
-| T-02 | `Cargo.lock` 与不可变 Foundation 来源 | 固定完整依赖图；四个 Foundation crate 均为 `=0.3.0` + Git rev `1fe326081cfd896f05ff502e80f99504797c14c6`，无 workspace/path/branch/local-copy fallback | 构建不可重复、认证/Schema/target 合同漂移且审计结果不可复核 | 开发运维 |
+| T-02 | `Cargo.lock` 与不可变 Foundation 来源 | 固定完整依赖图；四个 Foundation crate 均为 `=0.3.1` + Git rev `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`，无 workspace/path/branch/local-copy fallback | 构建不可重复、认证/Schema/target 合同漂移且审计结果不可复核 | 开发运维 |
 | T-03 | Linux 构建守卫 | 编译阶段明确拒绝错误目标 | 错误平台可能到运行时才失败 | 保障 |
 | T-04 | Rust 模块分层 | `server.rs` 保留共享状态与模块协调；`router.rs`、`assets.rs`、`delete.rs`、`purge.rs` 分别负责请求路由、内置资源注册/摘要、删除提交事务和回收调度。`listing/{snapshot,walk}.rs` 隔离进程级快照/游标缓存与有界递归遍历；`rooted_fs/purge.rs` 隔离 fd-relative 删除执行器；`internal_names.rs` 与 `maintenance.rs` 提供服务端中性的内部名称和清理边界；`upload/{prepare,target,transfer,commit,failure,protocol,record}.rs` 隔离路径/会话准备、目标 identity/revision、传输、提交、失败、协议与检查点持久化。`server`、`listing`、`rooted_fs` 与 `upload` 的大段内联单元测试均位于各自 `tests.rs`，仍保留模块私有访问 | 拆分只移动内部职责，不改变 HTTP/上传协议，也不新增第三方依赖；重新合并不会减少能力，只降低边界清晰度、维护性和测试定位 | 开发运维 |
 | T-05 | 可复用 `lib.rs` | 测试可在进程内构造服务层 | 删除会增加只能启动外部进程的测试成本 | 开发运维 |

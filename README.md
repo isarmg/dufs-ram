@@ -40,7 +40,7 @@ Dufs 是这一组项目中唯一不使用 React/Vite 的前端例外。`clients/
 - 运行内核必须提供 `openat2`；不支持时程序会拒绝启动，二进制还必须匹配 CPU、libc 和动态加载器 ABI；
 - Rust、rustc 和 Cargo 1.98.0，源码使用 Rust 2024 edition；
 - Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target` 均精确
-  固定为 `=0.3.0`，Git rev 均精确固定为 `1fe326081cfd896f05ff502e80f99504797c14c6`；开发、CI 和发行不得
+  固定为 `=0.3.1`，Git rev 均精确固定为 `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`；开发、CI 和发行不得
   改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；
 - 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
 - Node.js 24.8.0 用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
@@ -520,7 +520,7 @@ git status --short
 
 源树预检、隔离快照和每次解包检查会拒绝 symlink、submodule 及任何非普通文件/目录条目。脚本还会拒绝 Git replace refs、legacy grafts 和仓库私有 attributes；façade 只使用摘要锁定的最小 local config，所有 Git 命令清空 system/global 配置并禁用额外 attributes/replace。检查后、签名前和发布前都会重新确认 commit/tag/版本及原 checkout 的干净状态；前后两份源码 archive 还会复核 commit、tree、mode、额外路径和 SHA-256。
 
-发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；项目 `LICENSE-APACHE` 不会替代缺失的依赖许可证正文。
+发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；Foundation 0.3.1 的四个直接 crate 与可达的 `sarmg-error` 都在各自 crate 根分发同一份经上游门禁核验的 Apache-2.0 正文。项目 `LICENSE-APACHE` 不会替代任何缺失的依赖许可证正文。
 
 固定 Rust 1.98.0 标准库 notice、`BUILD-ENVIRONMENT.txt`、项目 Apache-2.0 许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`。签名私钥只在全部内容验证完成后短暂打开；正式发布仍应把构建和签名置于独立信任域。
 

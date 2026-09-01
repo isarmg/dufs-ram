@@ -75,7 +75,7 @@ target/release/dufs
 
 `--locked` 要求 Cargo 严格使用 [Cargo.lock](../../Cargo.lock)，避免一次普通构建意外改变依赖解析结果。
 其中 Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target`
-都必须是 `=0.3.0`，Git rev 都必须是 `1fe326081cfd896f05ff502e80f99504797c14c6`。即使只是开发联调，也不能
+都必须是 `=0.3.1`，Git rev 都必须是 `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`。即使只是开发联调，也不能
 改成相邻工作区、Cargo path dependency、可变 branch 或本地复制代码；那会让同一 Dufs 提交产生不同的认证、
 Schema 或正式 target 合同。
 

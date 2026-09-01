@@ -7,8 +7,8 @@
 - 部署约定为每个共享根仅运行一个 Dufs 实例；进程会在长期持有的共享根目录 fd 上取得非阻塞独占 `flock`，同机第二实例若指向同一根会在启动时失败；advisory lock 不阻止其他程序写入，一致性保证要求共享根由 Dufs 独占写入，人工修改只能停服执行；
 - `build.rs` 只接受 `x86_64-unknown-linux-gnu`；其他架构、操作系统、ABI 或指针宽度在应用编译前失败，运行内核还必须提供 `openat2`；
 - 本地构建使用 `rust-toolchain.toml` 精确固定的 Rust/rustc/Cargo 1.98.0，源码采用 Rust 2024 edition；
-- Foundation 四个 crate 均精确固定 `=0.3.0` 与不可变 Git rev
-  `1fe326081cfd896f05ff502e80f99504797c14c6`；开发、CI、发行均不接受 workspace sibling、Cargo path
+- Foundation 四个 crate 均精确固定 `=0.3.1` 与不可变 Git rev
+  `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`；开发、CI、发行均不接受 workspace sibling、Cargo path
   dependency、可变 branch 或本地副本；
 - 必须通过 Foundation 管理员 username 和密码认证，不存在匿名业务访问；
 - 唯一角色是 `admin`；每个有效管理员拥有整个共享目录的浏览和文件管理能力；

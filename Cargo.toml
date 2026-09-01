@@ -1,6 +1,6 @@
 [package]
 name = "dufs"
-version = "0.50.0"
+version = "0.50.1"
 edition = "2024"
 rust-version = "1.98"
 description = "A Linux browser file manager"
@@ -42,10 +42,10 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 sha2 = "0.11.0"
 subtle = "2.6"
 tempfile = "3"
-sarmg-admin-auth = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
-sarmg-contracts = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
-sarmg-schema-identity = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
-sarmg-server-target = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-admin-auth = { version = "=0.3.1", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0" }
+sarmg-contracts = { version = "=0.3.1", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0" }
+sarmg-schema-identity = { version = "=0.3.1", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0" }
+sarmg-server-target = { version = "=0.3.1", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0" }
 
 [dev-dependencies]
 assert_cmd = "2"

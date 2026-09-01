@@ -160,8 +160,8 @@ systemctl start dufs
 本节只说明停服后如何验证并原子替换“唯一当前合同”的制品，不表示 Dufs 支持从任意旧版本就地升级。运行服务不解析旧配置、不读取旧 wire/schema、不执行迁移，也不提供双读、fallback 或兼容 alias。未来稳定版本若当前数据需要转换，必须先由 `sarmg-upgrade` 仓库以独立 adapter、fixture、CLI 和 release 原子加入明确且经验证的转换边；没有该转换边时，只能为新版本初始化当前格式并按经批准的数据恢复方案导入结果。
 
 Foundation 也是制品供应链输入，不是运行时 sibling 服务。`sarmg-admin-auth`、`sarmg-contracts`、
-`sarmg-schema-identity`、`sarmg-server-target` 必须同时精确为 `=0.3.0`，Git rev 必须逐字等于
-`1fe326081cfd896f05ff502e80f99504797c14c6`，并由 `Cargo.lock` 固定。开发联调、质量门和正式发布都不得
+`sarmg-schema-identity`、`sarmg-server-target` 必须同时精确为 `=0.3.1`，Git rev 必须逐字等于
+`7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`，并由 `Cargo.lock` 固定。开发联调、质量门和正式发布都不得
 改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；依赖不可取得或 rev 不符时停止，
 不能复制共享类型、目标守卫或认证实现继续构建。
 
@@ -187,7 +187,7 @@ SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA �
 
 `THIRD_PARTY_LICENSES.txt` 从 Cargo metadata 中 Dufs 可达的非开发依赖生成，依赖源码必须位于本轮 vendor 根。每个包必须声明非空、经审核的 SPDX `license` 表达式；metadata `license_file` 只用于收集上游正文，不能替代表达式或作为分类 fallback。生成器按 `WITH > AND > OR` 优先级解析真实 SPDX AST，只接受审核清单内的 license identifier/exception，并要求表达式存在一条完整 permissive 选择：`OR` 任一分支可行，`AND` 两侧都必须 permissive；只对明确列出的 Cargo 遗留 `MIT/Apache-2.0` 和 `Unlicense/MIT` 写法映射为 `OR`。例如 `LGPL AND (MIT OR Apache-2.0)` 会拒绝，而 `(LGPL AND Apache-2.0) OR MIT` 可选择完整 MIT 分支。
 
-生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。项目自身 `LICENSE-APACHE` 不能替代缺失的上游文本。
+生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。Foundation 0.3.1 的四个直接 crate 和传递依赖 `sarmg-error` 均应在 cargo vendor 后保留 crate 根 `LICENSE`；缺少其中任意一份都会令正式打包失败。项目自身 `LICENSE-APACHE` 不能替代缺失的上游文本，也没有按依赖名称或 Git 来源放宽的 fallback。
 
 包内 `BUILD-ENVIRONMENT.txt`、SBOM、第三方 notice、Rust 标准库 notice 和项目 Apache-2.0 许可证均纳入 `SHA256SUMS`。
 
@@ -218,7 +218,7 @@ install -d -m 0700 ./dist
 ```sh
 set -eu
 
-bundle=/secure/releases/dufs-0.50.0-x86_64-unknown-linux-gnu-0123456789ab.release
+bundle=/secure/releases/dufs-0.50.1-x86_64-unknown-linux-gnu-0123456789ab.release
 pinned_public_key=/secure/trust/dufs-release-public.pem
 test -d "$bundle"
 test ! -L "$bundle"
@@ -243,7 +243,7 @@ test ! -L "$release_dir"
 (cd "$release_dir" && sha256sum --check SHA256SUMS)
 
 # 从独立可信的发布记录填写完整值，不从同一下载目录自行推断。
-expected_version=0.50.0
+expected_version=0.50.1
 expected_sha=0123456789abcdef0123456789abcdef01234567
 expected_target=x86_64-unknown-linux-gnu
 test "$("$release_dir/dufs" --version)" = \
