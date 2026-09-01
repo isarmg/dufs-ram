@@ -4,6 +4,7 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 required_cargo_audit_version="0.22.2"
+required_node_version="24.8.0"
 
 run() {
   printf '\n==> %s\n' "$*"
@@ -17,12 +18,81 @@ require() {
   fi
 }
 
+require_exact_node_version() {
+  local version_file="$project_dir/.node-version"
+  local declared_version=""
+  local additional_line=""
+  local declared_size
+  local expected_size
+  local node_version_fd
+  local node_output
+  local displayed_output
+
+  [[ -f "$version_file" && ! -L "$version_file" ]] || {
+    printf 'Node version contract is not a physical regular file: %s\n' \
+      "$version_file" >&2
+    exit 1
+  }
+  declared_size="$(stat -Lc '%s' -- "$version_file")" || {
+    printf 'Unable to inspect the Node version contract: %s\n' \
+      "$version_file" >&2
+    exit 1
+  }
+  expected_size=$((${#required_node_version} + 1))
+  [[ "$declared_size" == "$expected_size" ]] || {
+    printf 'The Node version contract must be exactly %s followed by one LF.\n' \
+      "$required_node_version" >&2
+    exit 1
+  }
+  exec {node_version_fd}<"$version_file"
+  IFS= read -r declared_version <&"$node_version_fd" || {
+    printf 'The Node version contract must end with one LF.\n' >&2
+    exit 1
+  }
+  if IFS= read -r additional_line <&"$node_version_fd" || \
+    [[ -n "$additional_line" ]]
+  then
+    printf 'The Node version contract must contain exactly one line.\n' >&2
+    exit 1
+  fi
+  exec {node_version_fd}<&-
+  [[ "$declared_version" == "$required_node_version" ]] || {
+    printf 'Node.js %s is required; .node-version declares %s.\n' \
+      "$required_node_version" \
+      "${declared_version:-<empty>}" >&2
+    exit 1
+  }
+
+  node_output="$(
+    LC_ALL=C node --version || exit $?
+    printf '\037'
+  )" || {
+    printf 'Unable to determine the Node.js version.\n' >&2
+    exit 1
+  }
+  if [[ "$node_output" != \
+    "v${required_node_version}"$'\n'$'\037' ]]
+  then
+    displayed_output="${node_output%$'\037'}"
+    displayed_output="${displayed_output%$'\n'}"
+    printf 'Node.js %s is required; found %q.\n' \
+      "$required_node_version" \
+      "${displayed_output:-<empty>}" >&2
+    exit 1
+  fi
+}
+
 require cargo
 require git
 require node
 require npm
 require nginx
+require stat
 require systemd-analyze
+
+# npm only warns for an engine mismatch. Reject it here before audits, builds,
+# dependency code, or browser tooling can create a false-green quality result.
+require_exact_node_version
 
 shell_scripts=(
   scripts/check.sh

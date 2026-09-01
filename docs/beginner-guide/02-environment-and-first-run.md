@@ -15,7 +15,7 @@
 
 [build.rs](../../build.rs) 会在编译期拒绝任何非 `x86_64-unknown-linux-gnu` 目标。启动时还会探测 `openat2`；精确 target 能编译仍不代表当前内核具备运行所需系统调用。
 
-Node.js 精确版本 24.8.0 用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本；正式质量门会拒绝其他 Node 版本。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
+Node.js 精确版本 24.8.0 用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本；仓库根目录的 [.node-version](../../.node-version) 是仓库级版本基准，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致。`scripts/check.sh` 与 `scripts/package-release.sh` 不依赖 npm 的 engine warning：二者都会在审计、构建、安装依赖或运行发布自测前，要求该文件只有 `24.8.0` 一行且以一个 LF 结尾，并要求 `node --version` 的完整输出精确为 `v24.8.0`。任一声明或运行时不匹配都会立即失败。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
 
 ## 2.2 先检查工具
 
@@ -32,6 +32,8 @@ curl --version
 rg --version
 ss --version
 ```
+
+这里的 `node --version` 必须输出 `v24.8.0`。诸如 `v24.8.1`、`v26.x` 或发行版自行回补的其他版本都不是当前工具链；项目不提供旧/新 Node 的兼容分支，也不会把 npm 的 `EBADENGINE` 警告当作有效门禁。
 
 `cc`、`ld` 和 `ar` 分别代表 C 编译器及链接/binutils 工具；SQLite bundled 源码构建需要它们。后续示例还假定存在 curl、ripgrep 的 `rg`、iproute2 的 `ss`，以及 GNU coreutils 提供的 `mktemp`、`install`、`stat` 和 `rm --one-file-system`。只编译后端时 Node/npm 可以暂缺，但浏览器测试和前端门禁需要它们。
 

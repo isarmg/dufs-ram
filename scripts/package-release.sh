@@ -79,6 +79,71 @@ capture_version_line() {
   printf '%s\n' "$output"
 }
 
+require_exact_node_version() {
+  local node_command="$1"
+  local version_file="$project_dir/.node-version"
+  local declared_version=""
+  local additional_line=""
+  local declared_size
+  local expected_size
+  local node_version_fd
+  local node_output
+  local displayed_output
+
+  [[ -f "$version_file" && ! -L "$version_file" ]] || {
+    printf 'Node version contract is not a physical regular file: %s\n' \
+      "$version_file" >&2
+    exit 1
+  }
+  declared_size="$(stat -Lc '%s' -- "$version_file")" || {
+    printf 'Unable to inspect the Node version contract: %s\n' \
+      "$version_file" >&2
+    exit 1
+  }
+  expected_size=$((${#required_node_version} + 1))
+  [[ "$declared_size" == "$expected_size" ]] || {
+    printf 'The Node version contract must be exactly %s followed by one LF.\n' \
+      "$required_node_version" >&2
+    exit 1
+  }
+  exec {node_version_fd}<"$version_file"
+  IFS= read -r declared_version <&"$node_version_fd" || {
+    printf 'The Node version contract must end with one LF.\n' >&2
+    exit 1
+  }
+  if IFS= read -r additional_line <&"$node_version_fd" || \
+    [[ -n "$additional_line" ]]
+  then
+    printf 'The Node version contract must contain exactly one line.\n' >&2
+    exit 1
+  fi
+  exec {node_version_fd}<&-
+  [[ "$declared_version" == "$required_node_version" ]] || {
+    printf 'Node.js %s is required; .node-version declares %s.\n' \
+      "$required_node_version" \
+      "${declared_version:-<empty>}" >&2
+    exit 1
+  }
+
+  node_output="$(
+    LC_ALL=C "$node_command" --version || exit $?
+    printf '\037'
+  )" || {
+    printf 'Unable to determine the Node.js version.\n' >&2
+    exit 1
+  }
+  if [[ "$node_output" != \
+    "v${required_node_version}"$'\n'$'\037' ]]
+  then
+    displayed_output="${node_output%$'\037'}"
+    displayed_output="${displayed_output%$'\n'}"
+    printf 'Node.js %s is required; found %q.\n' \
+      "$required_node_version" \
+      "${displayed_output:-<empty>}" >&2
+    exit 1
+  fi
+}
+
 validate_cargo_audit_version_line() {
   local actual="$1"
   local required_version="$2"
@@ -1224,6 +1289,7 @@ install_release_support_tree() {
   local package_root="$2"
   local entry
   local -a entries=(
+    .node-version
     build.rs
     Cargo.lock
     Cargo.toml
@@ -3325,6 +3391,7 @@ output_dir_was_set=false
 self_test=false
 required_cargo_cyclonedx_version="0.5.9"
 required_cargo_audit_version="0.22.2"
+required_node_version="24.8.0"
 rustsec_advisory_database_url="https://github.com/RustSec/advisory-db.git"
 rustsec_advisory_database_maximum_age_seconds=604800
 rustsec_advisory_database_maximum_future_skew_seconds=300
@@ -3394,6 +3461,9 @@ done
 git_command="$(command -v git)"
 node_command="$(command -v node)"
 npm_command="$(command -v npm)"
+# The package entrypoint is independently guarded because --self-test does not
+# call check.sh, while the formal path must fail before any dependency code.
+require_exact_node_version "$node_command"
 mv_help="$(LC_ALL=C mv --help 2>&1)"
 if [[ "$mv_help" != *"--no-copy"* || \
   "$mv_help" != *"--no-target-directory"* || \

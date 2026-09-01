@@ -475,7 +475,8 @@ Network 重点看：
 
 [scripts/check.sh](../../scripts/check.sh) 会依次执行：
 
-- 必需工具检查和 Bash 语法检查；
+- 必需工具检查，并在任何耗时步骤前把 [.node-version](../../.node-version) 的精确单行内容及实际 `node --version` 同时锁定到 24.8.0；
+- Bash 语法检查；
 - 可用时的 ShellCheck；
 - release 自测与真实部署配置测试；
 - Rustfmt、Clippy、全 targets/features 测试；

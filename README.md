@@ -43,7 +43,7 @@ Dufs 是这一组项目中唯一不使用 React/Vite 的前端例外。`clients/
   固定为 `=0.3.1`，Git rev 均精确固定为 `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`；开发、CI 和发行不得
   改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；
 - 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
-- Node.js 24.8.0 用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
+- `.node-version` 是当前 Node 的仓库级版本基准，内容精确为 `24.8.0`，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致；`scripts/check.sh` 和 `scripts/package-release.sh` 均在任何审计、构建或依赖代码前比对完整 `node --version` 输出并拒绝其他版本。Node 只用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
 - 本地开发门在安装 ShellCheck 时执行 `--severity=warning`，缺失时明确跳过而不会联网安装；远程 CI 按 SHA-256 固定并强制使用 ShellCheck 0.11.0，正式发布也要求 ShellCheck 可用；
 - 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、`cargo-audit 0.22.2`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.98.0 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
 

@@ -48,6 +48,10 @@ if (markdownTargets(maskFencedCode(fencedFixture)).length !== 0) {
 }
 
 const currentNodeVersion = "24.8.0";
+const nodeVersionSource = readFileSync(
+  resolve(projectRoot, ".node-version"),
+  "utf8",
+);
 const packageSource = readFileSync(resolve(projectRoot, "package.json"), "utf8");
 const packageLockSource = readFileSync(
   resolve(projectRoot, "package-lock.json"),
@@ -63,6 +67,7 @@ const workflowSources = invocation.checkWorkflowContracts
   : new Map();
 failures.push(
   ...currentNodeContractFailures(
+    nodeVersionSource,
     packageSource,
     packageLockSource,
     workflowSources,
@@ -70,6 +75,7 @@ failures.push(
 );
 if (
   currentNodeContractFailures(
+    nodeVersionSource,
     packageSource.replace(
       `"node": "${currentNodeVersion}"`,
       '"node": ">=18"',
@@ -82,6 +88,30 @@ if (
     "scripts/check-docs.mjs: old Node engine mutation fixture was accepted",
   );
 }
+if (
+  currentNodeContractFailures(
+    "18.20.8\n",
+    packageSource,
+    packageLockSource,
+    workflowSources,
+  ).length === 0
+) {
+  failures.push(
+    "scripts/check-docs.mjs: old .node-version mutation fixture was accepted",
+  );
+}
+if (
+  currentNodeContractFailures(
+    `${currentNodeVersion}\n\n`,
+    packageSource,
+    packageLockSource,
+    workflowSources,
+  ).length === 0
+) {
+  failures.push(
+    "scripts/check-docs.mjs: malformed .node-version mutation fixture was accepted",
+  );
+}
 if (invocation.checkWorkflowContracts) {
   const mutatedWorkflows = new Map(workflowSources);
   mutatedWorkflows.set(
@@ -92,6 +122,7 @@ if (invocation.checkWorkflowContracts) {
   );
   if (
     currentNodeContractFailures(
+      nodeVersionSource,
       packageSource,
       packageLockSource,
       mutatedWorkflows,
@@ -234,6 +265,7 @@ function checkTextFormat(name, source) {
 }
 
 function currentNodeContractFailures(
+  nodeVersionFileSource,
   manifestSource,
   lockSource,
   checkedWorkflows,
@@ -241,6 +273,11 @@ function currentNodeContractFailures(
   const nodeFailures = [];
   let manifest;
   let lock;
+  if (nodeVersionFileSource !== `${currentNodeVersion}\n`) {
+    nodeFailures.push(
+      `.node-version: must be exactly ${currentNodeVersion} followed by one LF`,
+    );
+  }
   try {
     manifest = JSON.parse(manifestSource);
     lock = JSON.parse(lockSource);

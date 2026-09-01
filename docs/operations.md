@@ -165,7 +165,7 @@ Foundation 也是制品供应链输入，不是运行时 sibling 服务。`sarmg
 改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；依赖不可取得或 rev 不符时停止，
 不能复制共享类型、目标守卫或认证实现继续构建。
 
-仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0、Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 在工作流中固定；静态、Rust 与浏览器 job 使用 `ubuntu-24.04`，含 nginx 1.25.1+ 部署门的质量 job 使用 x64 `ubuntu-26.04`，两种托管镜像的实际版本及宿主工具均写入日志。GitHub 当前把 26.04 标为 preview；若该 runner 不可调度或镜像回归，质量门必须保持失败，不能退回 nginx 1.24 旧语法完成合并。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
+仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0 由 `.node-version`、manifest/lockfile 和工作流共同声明；`scripts/check.sh` 与正式打包入口还会在任何审计、构建或依赖代码前精确比对实际运行时，因此 npm 的 `EBADENGINE` warning 不能形成绿色结论。Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 也在工作流中固定；静态、Rust 与浏览器 job 使用 `ubuntu-24.04`，含 nginx 1.25.1+ 部署门的质量 job 使用 x64 `ubuntu-26.04`，两种托管镜像的实际版本及宿主工具均写入日志。GitHub 当前把 26.04 标为 preview；若该 runner 不可调度或镜像回归，质量门必须保持失败，不能退回 nginx 1.24 旧语法完成合并。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
 仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，等待同一 tag/SHA 的全部质量门成功，并生成绑定当前版本与完整源码 SHA 的确定性发布说明。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费并复核不可变发布输入。
 
