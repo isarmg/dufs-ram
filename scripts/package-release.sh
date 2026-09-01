@@ -393,6 +393,7 @@ validate_advisory_database_state() (
   local expected_config_checksum="${5:-}"
   local identity
   local revision
+  local final_revision
   local fetch_epoch
   local git_directory
   local git_common_directory
@@ -410,22 +411,7 @@ validate_advisory_database_state() (
 
   validate_extracted_source_tree "$database" || return $?
   validate_source_git_metadata "$database" || return $?
-  identity="$(read_advisory_database_identity "$database")" || return $?
-  read -r revision fetch_epoch <<< "$identity"
-  if [[ -n "$expected_revision" && "$revision" != "$expected_revision" ]]; then
-    printf 'RustSec advisory database revision changed from %s to %s.\n' \
-      "$expected_revision" \
-      "$revision" >&2
-    return 1
-  fi
-  if [[ -n "$expected_fetch_epoch" && \
-    "$fetch_epoch" != "$expected_fetch_epoch" ]]
-  then
-    printf 'RustSec advisory database fetch epoch changed from %s to %s.\n' \
-      "$expected_fetch_epoch" \
-      "$fetch_epoch" >&2
-    return 1
-  fi
+  revision="$(advisory_database_revision "$database")" || return $?
 
   git_directory="$(
     run_advisory_database_git "$database" \
@@ -456,28 +442,6 @@ validate_advisory_database_state() (
     printf 'RustSec advisory database lacks a physical Git configuration.\n' >&2
     return 1
   }
-  index_checksum="$(sha256sum < "$git_directory/index")"
-  index_checksum="${index_checksum%% *}"
-  config_checksum="$(sha256sum < "$git_common_directory/config")"
-  config_checksum="${config_checksum%% *}"
-  [[ "$index_checksum" =~ ^[0-9a-f]{64}$ && \
-    "$config_checksum" =~ ^[0-9a-f]{64}$ ]] || {
-    printf 'RustSec advisory database metadata checksums are invalid.\n' >&2
-    return 1
-  }
-  if [[ -n "$expected_index_checksum" && \
-    "$index_checksum" != "$expected_index_checksum" ]]
-  then
-    printf 'RustSec advisory database index changed after it was sealed.\n' >&2
-    return 1
-  fi
-  if [[ -n "$expected_config_checksum" && \
-    "$config_checksum" != "$expected_config_checksum" ]]
-  then
-    printf 'RustSec advisory database Git configuration changed after it was sealed.\n' \
-      >&2
-    return 1
-  fi
   if ! run_advisory_database_git "$database" \
     diff-index --cached --quiet "$revision" --
   then
@@ -519,12 +483,136 @@ validate_advisory_database_state() (
     return $?
   advisory_validation_index=""
 
+  # Capture the seal only after the expensive tracked-tree and untracked-path
+  # checks finish. A freshly cloned cargo-audit database can finalize its
+  # FETCH_HEAD timestamp while the first read-only validation is in progress;
+  # returning the earlier timestamp would create a mixed snapshot. The caller
+  # establishes a seal only after two complete captures agree exactly.
+  identity="$(read_advisory_database_identity "$database")" || return $?
+  read -r final_revision fetch_epoch <<< "$identity"
+  [[ "$final_revision" == "$revision" ]] || {
+    printf 'RustSec advisory database revision changed during validation.\n' >&2
+    return 1
+  }
+  revision="$final_revision"
+  index_checksum="$(sha256sum < "$git_directory/index")"
+  index_checksum="${index_checksum%% *}"
+  config_checksum="$(sha256sum < "$git_common_directory/config")"
+  config_checksum="${config_checksum%% *}"
+  [[ "$index_checksum" =~ ^[0-9a-f]{64}$ && \
+    "$config_checksum" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'RustSec advisory database metadata checksums are invalid.\n' >&2
+    return 1
+  }
+  if [[ -n "$expected_revision" && "$revision" != "$expected_revision" ]]; then
+    printf 'RustSec advisory database revision changed from %s to %s.\n' \
+      "$expected_revision" \
+      "$revision" >&2
+    return 1
+  fi
+  if [[ -n "$expected_fetch_epoch" && \
+    "$fetch_epoch" != "$expected_fetch_epoch" ]]
+  then
+    printf 'RustSec advisory database fetch epoch changed from %s to %s.\n' \
+      "$expected_fetch_epoch" \
+      "$fetch_epoch" >&2
+    return 1
+  fi
+  if [[ -n "$expected_index_checksum" && \
+    "$index_checksum" != "$expected_index_checksum" ]]
+  then
+    printf 'RustSec advisory database index changed after it was sealed.\n' >&2
+    return 1
+  fi
+  if [[ -n "$expected_config_checksum" && \
+    "$config_checksum" != "$expected_config_checksum" ]]
+  then
+    printf 'RustSec advisory database Git configuration changed after it was sealed.\n' \
+      >&2
+    return 1
+  fi
+
   printf '%s %s %s %s\n' \
     "$revision" \
     "$fetch_epoch" \
     "$index_checksum" \
     "$config_checksum"
 )
+
+capture_fresh_advisory_database_state() {
+  local database="$1"
+  shift
+  local state
+  local revision
+  local fetch_epoch
+  local index_checksum
+  local config_checksum
+  local current_epoch
+  local freshness_status=0
+
+  state="$(validate_advisory_database_state "$database" "$@")" || return $?
+  read -r revision fetch_epoch index_checksum config_checksum <<< "$state"
+  current_epoch="$(date -u +%s)"
+  [[ "$current_epoch" =~ ^[0-9]{1,12}$ ]] || {
+    printf 'Unable to determine the current epoch for RustSec checks.\n' >&2
+    return 1
+  }
+  validate_advisory_database_freshness \
+    "$fetch_epoch" \
+    "$current_epoch" \
+    "$rustsec_advisory_database_maximum_age_seconds" \
+    "$rustsec_advisory_database_maximum_future_skew_seconds" || \
+    freshness_status=$?
+  case "$freshness_status" in
+    0) ;;
+    1)
+      printf 'The RustSec advisory database is stale.\n' >&2
+      return 1
+      ;;
+    *)
+      printf 'The RustSec advisory database has an invalid future timestamp.\n' >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$state"
+}
+
+require_matching_advisory_database_snapshots() {
+  local first="$1"
+  local second="$2"
+
+  [[ "$first" == "$second" ]] || {
+    printf '%s\n' \
+      'RustSec advisory database state changed between complete seal validations.' >&2
+    return 1
+  }
+  printf '%s\n' "$second"
+}
+
+seal_fresh_advisory_database_state() {
+  local database="$1"
+  local first
+  local second
+
+  first="$(capture_fresh_advisory_database_state "$database")" || return $?
+  second="$(capture_fresh_advisory_database_state "$database")" || return $?
+  require_matching_advisory_database_snapshots "$first" "$second"
+}
+
+validate_sealed_advisory_database_state() {
+  local database="$1"
+  local revision="$2"
+  local fetch_epoch="$3"
+  local index_checksum="$4"
+  local config_checksum="$5"
+
+  capture_fresh_advisory_database_state \
+    "$database" \
+    "$revision" \
+    "$fetch_epoch" \
+    "$index_checksum" \
+    "$config_checksum" >/dev/null
+}
 
 write_build_environment_manifest() {
   local destination="$1"
@@ -1979,8 +2067,12 @@ run_publication_self_test() {
   local advisory_database_test_classification
   local advisory_database_test_status
   local advisory_database_test_state
+  local advisory_database_test_first_state
+  local advisory_database_test_second_state
   local advisory_database_test_index_checksum
   local advisory_database_test_config_checksum
+  local advisory_database_test_changed_fetch_epoch
+  local advisory_database_stability_iteration
   local advisory_database_filter_marker
   local advisory_database_test_mode
   local advisory_database_untracked_directory
@@ -2096,7 +2188,7 @@ EOF
     -C "$advisory_database_test" \
     config --unset-all filter.release-self-test-filter.clean
   advisory_database_test_state="$(
-    validate_advisory_database_state "$advisory_database_test"
+    seal_fresh_advisory_database_state "$advisory_database_test"
   )" || return $?
   read -r \
     advisory_database_test_revision \
@@ -2104,6 +2196,49 @@ EOF
     advisory_database_test_index_checksum \
     advisory_database_test_config_checksum <<< \
     "$advisory_database_test_state"
+
+  # The release seal is intentionally a pair of complete validations. Prove
+  # that a stable database remains sealable under repetition, while a changed
+  # FETCH_HEAD timestamp produces two different snapshots and is rejected.
+  for ((
+    advisory_database_stability_iteration = 0;
+    advisory_database_stability_iteration < 8;
+    advisory_database_stability_iteration++
+  )); do
+    seal_fresh_advisory_database_state \
+      "$advisory_database_test" >/dev/null || return $?
+  done
+  advisory_database_test_first_state="$(
+    capture_fresh_advisory_database_state "$advisory_database_test"
+  )" || return $?
+  advisory_database_test_changed_fetch_epoch="$((
+    advisory_database_test_fetch_epoch - 1
+  ))"
+  touch \
+    --date="@$advisory_database_test_changed_fetch_epoch" \
+    -- \
+    "$advisory_database_test/.git/FETCH_HEAD"
+  advisory_database_test_second_state="$(
+    capture_fresh_advisory_database_state "$advisory_database_test"
+  )" || return $?
+  if require_matching_advisory_database_snapshots \
+    "$advisory_database_test_first_state" \
+    "$advisory_database_test_second_state" >/dev/null 2>&1
+  then
+    printf '%s\n' \
+      'release self-test accepted different complete RustSec snapshots' >&2
+    return 1
+  fi
+  touch \
+    --date="@$advisory_database_test_fetch_epoch" \
+    -- \
+    "$advisory_database_test/.git/FETCH_HEAD"
+  validate_sealed_advisory_database_state \
+    "$advisory_database_test" \
+    "$advisory_database_test_revision" \
+    "$advisory_database_test_fetch_epoch" \
+    "$advisory_database_test_index_checksum" \
+    "$advisory_database_test_config_checksum" || return $?
 
   printf 'changed after the RustSec seal\n' > "$advisory_database_test/README.md"
   if validate_advisory_database_state \
@@ -3773,7 +3908,7 @@ if [[ "$quality_audit_db_reused" != true ]]; then
 fi
 
 quality_audit_database_state="$(
-  validate_advisory_database_state "$quality_audit_db"
+  seal_fresh_advisory_database_state "$quality_audit_db"
 )" || exit $?
 read -r \
   rustsec_advisory_db_revision \
@@ -3781,31 +3916,13 @@ read -r \
   rustsec_advisory_db_index_checksum \
   rustsec_advisory_db_config_checksum <<< \
   "$quality_audit_database_state"
-advisory_database_current_epoch="$(date -u +%s)"
-[[ "$advisory_database_current_epoch" =~ ^[0-9]{1,12}$ ]] || {
-  printf 'Unable to refresh the current epoch for RustSec checks.\n' >&2
-  exit 1
-}
-advisory_database_freshness_status=0
-validate_advisory_database_freshness \
-  "$rustsec_advisory_db_fetch_epoch" \
-  "$advisory_database_current_epoch" \
-  "$rustsec_advisory_database_maximum_age_seconds" \
-  "$rustsec_advisory_database_maximum_future_skew_seconds" || \
-  advisory_database_freshness_status=$?
-case "$advisory_database_freshness_status" in
-  0) ;;
-  1)
-    printf 'The private RustSec advisory database is stale after refresh.\n' >&2
-    exit 1
-    ;;
-  *)
-    printf 'The private RustSec advisory database has an invalid future timestamp.\n' >&2
-    exit 1
-    ;;
-esac
-
 printf 'Running the sealed RustSec pre-audit for commit %s.\n' "$source_sha"
+validate_sealed_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum"
 (
   cd "$quality_source"
   "${audit_environment[@]}" \
@@ -3815,6 +3932,12 @@ printf 'Running the sealed RustSec pre-audit for commit %s.\n' "$source_sha"
     --no-fetch \
     --no-yanked
 )
+validate_sealed_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum"
 printf 'Fetching the locked release graph into the private Cargo index.\n'
 (
   cd "$release_stage"
@@ -3823,7 +3946,19 @@ printf 'Fetching the locked release graph into the private Cargo index.\n'
     --locked \
     --manifest-path "$quality_source/Cargo.toml"
 )
+validate_sealed_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum"
 printf 'Checking the locked release graph for yanked crates.\n'
+validate_sealed_advisory_database_state \
+  "$quality_audit_db" \
+  "$rustsec_advisory_db_revision" \
+  "$rustsec_advisory_db_fetch_epoch" \
+  "$rustsec_advisory_db_index_checksum" \
+  "$rustsec_advisory_db_config_checksum"
 (
   cd "$quality_source"
   "${audit_environment[@]}" \
@@ -3832,12 +3967,12 @@ printf 'Checking the locked release graph for yanked crates.\n'
     --no-fetch \
     --deny yanked
 )
-validate_advisory_database_state \
+validate_sealed_advisory_database_state \
   "$quality_audit_db" \
   "$rustsec_advisory_db_revision" \
   "$rustsec_advisory_db_fetch_epoch" \
   "$rustsec_advisory_db_index_checksum" \
-  "$rustsec_advisory_db_config_checksum" >/dev/null
+  "$rustsec_advisory_db_config_checksum"
 
 quality_vendor_config="$release_stage/quality-vendor-config.toml"
 (
@@ -3951,22 +4086,12 @@ validate_private_directory_binding \
   "$quality_tmp_dir_physical" \
   "$quality_tmp_metadata" \
   'Quality-gate temporary directory'
-validate_advisory_database_state \
+validate_sealed_advisory_database_state \
   "$quality_audit_db" \
   "$rustsec_advisory_db_revision" \
   "$rustsec_advisory_db_fetch_epoch" \
   "$rustsec_advisory_db_index_checksum" \
-  "$rustsec_advisory_db_config_checksum" >/dev/null
-advisory_database_current_epoch="$(date -u +%s)"
-validate_advisory_database_freshness \
-  "$rustsec_advisory_db_fetch_epoch" \
-  "$advisory_database_current_epoch" \
-  "$rustsec_advisory_database_maximum_age_seconds" \
-  "$rustsec_advisory_database_maximum_future_skew_seconds" || {
-  printf 'The sealed RustSec advisory database is no longer fresh enough to release.\n' \
-    >&2
-  exit 1
-}
+  "$rustsec_advisory_db_config_checksum"
 verify_quality_source_after_gate \
   "$quality_source" \
   "$release_stage/quality-after.index" \
