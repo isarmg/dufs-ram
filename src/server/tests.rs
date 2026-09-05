@@ -737,8 +737,8 @@ fn server_init_rejects_unvalidated_runtime_limits() {
     assert!(error.to_string().contains("max-concurrent-searches"));
 }
 
-#[test]
-fn servers_from_the_same_auth_config_have_isolated_sessions() {
+#[tokio::test]
+async fn servers_from_the_same_auth_config_have_isolated_sessions() {
     let temp = assert_fs::TempDir::new().unwrap();
     let first_root = temp.path().join("first");
     let second_root = temp.path().join("second");
@@ -764,12 +764,34 @@ fn servers_from_the_same_auth_config_have_isolated_sessions() {
 
     let created = first
         .content
-        .auth
-        .login("user", "test-password", None)
-        .unwrap()
+        .administrator
+        .login(
+            "user",
+            "test-password",
+            &sarmg_admin_core::LoginContext {
+                source: "127.0.0.1".into(),
+                request_id: None,
+                now_micros: 1,
+            },
+        )
+        .await
         .unwrap();
-    assert!(first.content.auth.authenticate(&created.token).is_some());
-    assert!(second.content.auth.authenticate(&created.token).is_none());
+    assert!(
+        first
+            .content
+            .administrator
+            .authenticate_session(&created.session_token, 2)
+            .await
+            .is_ok()
+    );
+    assert!(
+        second
+            .content
+            .administrator
+            .authenticate_session(&created.session_token, 2)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@ import {
   UPLOAD_ID_HEADER,
   classifyUploadResponse,
 } from "../upload/protocol.js";
+import { platformErrorCode } from "./platform-error.js";
 import {
   ERROR_RESPONSE_BODY_LIMIT,
   SUCCESS_RESPONSE_BODY_LIMIT,
@@ -16,7 +17,6 @@ export {
 } from "./response_buffer.js";
 
 export const CSRF_HEADER = "X-CSRF-Token";
-export const AUTH_ERROR_HEADER = "X-Dufs-Auth-Error";
 export const AUTH_REQUIRED_MESSAGE =
   "Your session is no longer valid. Returning to the sign-in page.";
 export const PAGE_EXPIRED_MESSAGE =
@@ -162,10 +162,7 @@ export class RequestError extends Error {
  * @returns {Promise<Response>}
  */
 export async function bufferResponse(response, method = "GET", options = {}) {
-  if (authFailureMessage(
-    response.status,
-    response.headers.get(AUTH_ERROR_HEADER),
-  )) {
+  if (response.status === 401) {
     cancelUnreadResponseBody(response.body);
     return response;
   }
@@ -205,9 +202,33 @@ class AuthenticationError extends RequestError {
   }
 }
 
-/** @param {number} status @param {string | null} authError */
-export function isCsrfAuthFailure(status, authError) {
-  return status === 403 && authError === "csrf";
+/** @param {number} status @param {string | null} errorCode */
+export function isCsrfAuthFailure(status, errorCode) {
+  return status === 403 && errorCode === "auth.csrf_rejected";
+}
+
+/** @type {WeakMap<Response, string | null>} */
+const platformResponseErrors = new WeakMap();
+
+/** Platform errors precede business operation registration. Bound the body before decoding.
+ * @param {Response} response @returns {Promise<string | null>}
+ */
+export async function responsePlatformErrorCode(response) {
+  if (response.status !== 403) return null;
+  if (platformResponseErrors.has(response)) return platformResponseErrors.get(response) ?? null;
+  let buffered;
+  try {
+    buffered = await bufferBoundedResponse(response.clone(), "GET", { limit: ERROR_RESPONSE_BODY_LIMIT },
+      (message, options) => new RequestError(message, { ...options, outcomeUnknown: true }));
+  } catch (error) {
+    // A rejected tee branch must also cancel the original; never wait for a
+    // cancellation promise whose completion depends on that other branch.
+    cancelUnreadResponseBody(response.body);
+    throw error;
+  }
+  const code = platformErrorCode(await buffered.text(), response.headers.get("content-type"));
+  platformResponseErrors.set(response, code);
+  return code;
 }
 
 /** @param {number} status @param {string | null} authError */
@@ -228,15 +249,15 @@ export async function assertResponse(response, onUnauthorized) {
     response.headers.get(OPERATION_STATE_HEADER) || "";
   const authMessage = authFailureMessage(
     response.status,
-    response.headers.get(AUTH_ERROR_HEADER),
+    await responsePlatformErrorCode(response),
   );
   if (authMessage) {
     onUnauthorized?.();
     throw new AuthenticationError(authMessage, {
       status: response.status,
       code: response.status === 401
-        ? "authentication_required"
-        : "csrf_failed",
+        ? "auth.session_required"
+        : "auth.csrf_rejected",
       kind: response.status === 401 ? "authentication" : "csrf",
       operationId,
       operationState,
@@ -336,6 +357,7 @@ export async function assertDiscardUploadResponse(
 ) {
   const classification = classifyUploadResponse({
     phase: "discard",
+    errorCode: await responsePlatformErrorCode(response),
     status: response.status,
     headers: response.headers,
     expectedUploadId,
@@ -381,6 +403,7 @@ export async function assertFreshUploadResponse(
 ) {
   const classification = classifyUploadResponse({
     phase: "fresh",
+    errorCode: await responsePlatformErrorCode(response),
     status: response.status,
     headers: response.headers,
     expectedUploadId,
@@ -862,7 +885,7 @@ async function performRequest(url, init, options, consume) {
     });
     const authMessage = authFailureMessage(
       response.status,
-      response.headers.get(AUTH_ERROR_HEADER),
+      await responsePlatformErrorCode(response),
     );
     // Authentication happens before the operation registry on the server, so
     // these responses intentionally do not carry an operation envelope. Let
@@ -1136,7 +1159,7 @@ export async function queryJob(jobId, onUnauthorized) {
         jobId,
         state: "unknown",
         status: 0,
-        code: "authentication_required",
+        code: "auth.session_required",
         message: AUTH_REQUIRED_MESSAGE,
         authenticationFailed: true,
       });
@@ -1201,6 +1224,7 @@ export async function queryUnknownUpload(
     });
     const classification = classifyUploadResponse({
       phase: "checkpoint",
+      errorCode: await responsePlatformErrorCode(response),
       status: response.status,
       headers: response.headers,
       expectedUploadId: error.operationId,
@@ -1230,7 +1254,7 @@ export async function queryUnknownUpload(
         operationId: error.operationId,
         state: "unknown",
         status: 0,
-        code: "authentication_required",
+        code: "auth.session_required",
         message: AUTH_REQUIRED_MESSAGE,
         authenticationFailed: true,
       });

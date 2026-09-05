@@ -70,9 +70,9 @@ test("upload transport settles authentication at response headers", async () => 
         },
       },
       {
-        name: "streamed oversized CSRF",
-        status: 403,
-        headers: { "X-Dufs-Auth-Error": "csrf" },
+        name: "streamed oversized 401",
+        status: 401,
+        headers: {},
         afterHeaders(request) {
           request.emit("progress", { loaded: responseLimit + 1 });
           request.responseText = "x".repeat(responseLimit + 1);

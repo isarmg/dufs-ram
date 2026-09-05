@@ -1,3 +1,4 @@
+mod administrator_web;
 mod assets;
 mod blocking_io;
 mod browser_api;
@@ -7,7 +8,6 @@ mod download;
 mod identity;
 mod internal_names;
 mod listing;
-mod login_rate_limit;
 mod maintenance;
 mod operation_registry;
 mod path_coordinator;
@@ -17,7 +17,6 @@ mod protocol;
 mod purge;
 mod rooted_fs;
 mod router;
-mod session;
 mod state_store;
 mod storage;
 mod upload;
@@ -28,7 +27,6 @@ use self::{
     assets::embedded_assets_prefix,
     disk_space::DiskSpaceTracker,
     listing::ListSnapshotCache,
-    login_rate_limit::LoginRateLimiter,
     maintenance::UPLOAD_SESSION_TTL,
     operation_registry::OperationRegistry,
     path_coordinator::{PathCoordinator, PathLease},
@@ -37,14 +35,11 @@ use self::{
     protocol::UploadPublicState,
     purge::{PurgeQueue, PurgeSignal},
     rooted_fs::{RootedEntryKey, RootedFs},
-    session::LoginBodyAdmission,
     state_store::StateStore,
     storage::DurableStorage,
     upload::{UploadOptions, UploadRecordStore},
 };
-use crate::{
-    Args, app_error::AppError, args::ValidatedConfig, auth::AccessControl, http_utils::body_full,
-};
+use crate::{Args, app_error::AppError, args::ValidatedConfig, http_utils::body_full};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -75,8 +70,6 @@ pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
 const BUF_SIZE: usize = 65536;
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 const READINESS_CHECK_PATH: &str = "__dufs__/ready";
-const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
-const CSRF_AUTH_ERROR: &str = "csrf";
 const NON_UPLOAD_MUTATION_CAPACITY: usize = 64;
 const READINESS_PROBE_CAPACITY: usize = 1;
 const STATE_PATH_SCAN_CAPACITY: usize = 4;
@@ -283,7 +276,10 @@ pub struct Server {
 /// own background-task shutdown or durable command processing.
 struct ContentServices {
     args: ValidatedConfig,
-    auth: AccessControl,
+    administrator:
+        Arc<sarmg_admin_core::AdministratorService<sarmg_admin_static::StaticAdministratorStore>>,
+    administrator_router: sarmg_admin_hyper::HyperAdministratorRouter,
+    administrator_origin: sarmg_admin_auth::AdministratorOriginMode,
     assets_prefix: String,
     path_policy: PathPolicy,
     path_coordinator: PathCoordinator,
@@ -317,9 +313,6 @@ type ListMetadataPhaseHook = Mutex<Option<Arc<dyn Fn(listing::ListMetadataPhase)
 /// policy independently reviewable from routing and persistence.
 struct AdmissionControl {
     active_upload_files: Arc<Mutex<HashSet<RootedEntryKey>>>,
-    login_slots: Arc<Semaphore>,
-    login_body_admission: LoginBodyAdmission,
-    login_rate_limiter: LoginRateLimiter,
     upload_preflight_slots: Arc<Semaphore>,
     upload_slots: Arc<Semaphore>,
     mutation_slots: Arc<Semaphore>,
@@ -387,7 +380,17 @@ impl Server {
         list_snapshot_cache: ListSnapshotCache,
     ) -> Result<Self> {
         let args = ValidatedConfig::try_from(args)?;
-        let auth = AccessControl::from_config(args.auth.clone());
+        let administrator = args.auth.administrator_service()?;
+        let administrator_origin = if args.development {
+            sarmg_admin_auth::AdministratorOriginMode::LoopbackDevelopmentHttp
+        } else {
+            sarmg_admin_auth::AdministratorOriginMode::ProductionHttps
+        };
+        let administrator_router = sarmg_admin_hyper::HyperAdministratorRouter::new(
+            "dufs-ram",
+            administrator_origin,
+            administrator.clone(),
+        )?;
         let assets_prefix = embedded_assets_prefix();
         let rooted_fs = RootedFs::new(&args.serve_path)?;
         let path_policy = PathPolicy::new(args.serve_path.clone(), &assets_prefix);
@@ -410,7 +413,9 @@ impl Server {
         Ok(Self {
             content: ContentServices {
                 args,
-                auth,
+                administrator,
+                administrator_router,
+                administrator_origin,
                 assets_prefix,
                 path_policy,
                 path_coordinator: PathCoordinator::new(rooted_fs.clone()),
@@ -427,9 +432,6 @@ impl Server {
             },
             admission: AdmissionControl {
                 active_upload_files: Arc::new(Mutex::new(HashSet::new())),
-                login_slots: Arc::new(Semaphore::new(2)),
-                login_body_admission: LoginBodyAdmission::default(),
-                login_rate_limiter: LoginRateLimiter::new(),
                 upload_preflight_slots: Arc::new(Semaphore::new(
                     browser_api::UPLOAD_PREFLIGHT_CONCURRENCY,
                 )),
@@ -966,17 +968,6 @@ fn to_timestamp(time: &SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn status_forbid(res: &mut Response) {
-    *res.status_mut() = StatusCode::FORBIDDEN;
-    *res.body_mut() = body_full("Forbidden");
-}
-
-fn status_csrf_forbid(res: &mut Response) {
-    status_forbid(res);
-    res.headers_mut()
-        .insert(AUTH_ERROR_HEADER, HeaderValue::from_static(CSRF_AUTH_ERROR));
 }
 
 fn status_not_found(res: &mut Response) {

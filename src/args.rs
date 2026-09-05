@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, value_parser};
-use ipnet::IpNet;
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use rustix::{
     fs::fgetxattr,
     io::Errno,
@@ -16,7 +15,6 @@ use std::net::IpAddr;
 use std::ops::Deref;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::auth::AuthConfig;
@@ -39,7 +37,6 @@ const CONFIG_REGULAR_FILE_TYPE: u32 = 0o100000;
 const CONFIG_PERMISSION_MASK: u32 = 0o7777;
 const CONFIG_POSIX_ACL_XATTR: &str = "system.posix_acl_access";
 const MAX_BIND_ADDRESSES: usize = 128;
-const MAX_TRUSTED_PROXIES: usize = 128;
 const STATE_DATABASE_FILE_NAME: &str = "state.sqlite3";
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -257,40 +254,6 @@ fn ensure_distinct_path_identities(
     Ok(())
 }
 
-/// An immediate proxy whose forwarded client and scheme headers may be trusted.
-///
-/// The wrapped network is private so CLI, YAML, and library callers all use the
-/// same parsing and canonicalization rules.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TrustedProxy(IpNet);
-
-impl TrustedProxy {
-    pub fn contains(&self, address: &IpAddr) -> bool {
-        self.0.contains(address)
-    }
-}
-
-impl FromStr for TrustedProxy {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        let network = if let Ok(address) = value.parse::<IpAddr>() {
-            IpNet::from(address)
-        } else {
-            value.parse::<IpNet>().map_err(|_| {
-                anyhow::anyhow!("Invalid trusted proxy `{value}`: expected an IP or CIDR")
-            })?
-        };
-        Ok(Self(network.trunc()))
-    }
-}
-
-impl fmt::Display for TrustedProxy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 pub fn build_cli() -> Command {
     Command::new(env!("CARGO_CRATE_NAME"))
         .version(LONG_VERSION)
@@ -315,6 +278,12 @@ pub fn build_cli() -> Command {
                 .value_name("file"),
         )
         .arg(
+            Arg::new("development")
+                .long("development")
+                .action(ArgAction::SetTrue)
+                .help("Enable Foundation HTTP development mode on loopback only"),
+        )
+        .arg(
             Arg::new("state-dir")
                 .long("state-dir")
                 .value_parser(value_parser!(PathBuf))
@@ -330,15 +299,6 @@ pub fn build_cli() -> Command {
                 .action(ArgAction::Append)
                 .value_delimiter(',')
                 .value_name("addrs"),
-        )
-        .arg(
-            Arg::new("trusted-proxy")
-                .long("trusted-proxy")
-                .value_parser(ValueParser::new(parse_trusted_proxy))
-                .help("Trust forwarded client/scheme headers only from this IP or CIDR")
-                .action(ArgAction::Append)
-                .value_delimiter(',')
-                .value_name("networks"),
         )
         .arg(
             Arg::new("port")
@@ -437,6 +397,7 @@ pub fn build_cli() -> Command {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "kebab-case")]
 pub struct Args {
+    pub development: bool,
     #[serde(default = "default_serve_path")]
     pub serve_path: PathBuf,
     pub state_dir: Option<PathBuf>,
@@ -444,8 +405,6 @@ pub struct Args {
     #[serde(rename = "bind")]
     #[serde(default = "default_addrs")]
     pub addrs: Vec<IpAddr>,
-    #[serde(default, deserialize_with = "deserialize_trusted_proxies")]
-    pub trusted_proxies: Vec<TrustedProxy>,
     #[serde(default = "default_port")]
     pub port: u16,
     pub auth: AuthConfig,
@@ -511,9 +470,9 @@ impl Default for Args {
             serve_path: default_serve_path(),
             state_dir: None,
             addrs: default_addrs(),
-            trusted_proxies: Vec::new(),
             port: default_port(),
             auth: AuthConfig::default(),
+            development: false,
             http_logger: HttpLogger::default(),
             log_file: None,
             max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
@@ -559,13 +518,12 @@ impl Args {
         if let Some(port) = matches.get_one::<u16>("port") {
             args.port = *port
         }
+        if matches.get_flag("development") {
+            args.development = true;
+        }
 
         if let Some(addrs) = matches.get_many::<IpAddr>("bind") {
             args.addrs = addrs.copied().collect();
-        }
-
-        if let Some(trusted_proxies) = matches.get_many::<TrustedProxy>("trusted-proxy") {
-            args.trusted_proxies = trusted_proxies.copied().collect();
         }
 
         if let Some(log_format) = matches.get_one::<String>("log-format") {
@@ -705,6 +663,9 @@ impl Args {
         if self.addrs.is_empty() {
             bail!("bind must contain at least one IP address");
         }
+        if self.development && self.addrs.iter().any(|address| !address.is_loopback()) {
+            bail!("development mode requires exclusively loopback bind addresses");
+        }
         if self.addrs.len() > MAX_BIND_ADDRESSES {
             bail!("bind must not contain more than {MAX_BIND_ADDRESSES} IP addresses");
         }
@@ -713,16 +674,6 @@ impl Args {
         if sorted_addrs.windows(2).any(|pair| pair[0] == pair[1]) {
             bail!("bind must not contain duplicate IP addresses");
         }
-        if self.trusted_proxies.len() > MAX_TRUSTED_PROXIES {
-            bail!("trusted-proxies must not contain more than {MAX_TRUSTED_PROXIES} networks");
-        }
-        if trusted_proxy_union_covers_entire_family(&self.trusted_proxies, true)
-            || trusted_proxy_union_covers_entire_family(&self.trusted_proxies, false)
-        {
-            bail!("trusted-proxies must not trust the entire IPv4 or IPv6 address space");
-        }
-        self.trusted_proxies.sort_unstable();
-        self.trusted_proxies.dedup();
         if self.max_search_entries > MAX_SEARCH_ENTRIES {
             bail!("max-search-entries must not exceed {MAX_SEARCH_ENTRIES}");
         }
@@ -1224,50 +1175,6 @@ fn parse_bind_addrs(addrs: &[&str]) -> Result<Vec<IpAddr>> {
     Ok(bind_addrs)
 }
 
-fn parse_trusted_proxy(value: &str) -> Result<TrustedProxy> {
-    value.parse()
-}
-
-fn parse_trusted_proxies(values: &[&str]) -> Result<Vec<TrustedProxy>> {
-    values
-        .iter()
-        .map(|value| parse_trusted_proxy(value))
-        .collect()
-}
-
-fn trusted_proxy_union_covers_entire_family(networks: &[TrustedProxy], ipv4: bool) -> bool {
-    let mut ranges = networks
-        .iter()
-        .filter_map(
-            |network| match (network.0.network(), network.0.broadcast()) {
-                (IpAddr::V4(start), IpAddr::V4(end)) if ipv4 => {
-                    Some((u32::from(start) as u128, u32::from(end) as u128))
-                }
-                (IpAddr::V6(start), IpAddr::V6(end)) if !ipv4 => {
-                    Some((u128::from(start), u128::from(end)))
-                }
-                _ => None,
-            },
-        )
-        .collect::<Vec<_>>();
-    ranges.sort_unstable();
-
-    let maximum = if ipv4 { u32::MAX as u128 } else { u128::MAX };
-    let Some(&(first_start, mut covered_to)) = ranges.first() else {
-        return false;
-    };
-    if first_start != 0 {
-        return false;
-    }
-    for &(start, end) in &ranges[1..] {
-        if start > covered_to.saturating_add(1) {
-            return false;
-        }
-        covered_to = covered_to.max(end);
-    }
-    covered_to == maximum
-}
-
 fn deserialize_bind_addrs<'de, D>(deserializer: D) -> Result<Vec<IpAddr>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1295,39 +1202,6 @@ where
             let addrs: Vec<&'de str> =
                 Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
             parse_bind_addrs(&addrs).map_err(serde::de::Error::custom)
-        }
-    }
-
-    deserializer.deserialize_any(StringOrVec)
-}
-
-fn deserialize_trusted_proxies<'de, D>(deserializer: D) -> Result<Vec<TrustedProxy>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct StringOrVec;
-
-    impl<'de> serde::de::Visitor<'de> for StringOrVec {
-        type Value = Vec<TrustedProxy>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("trusted proxy IP/CIDR string or list of strings")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            parse_trusted_proxies(&[value]).map_err(serde::de::Error::custom)
-        }
-
-        fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: serde::de::SeqAccess<'de>,
-        {
-            let values: Vec<&'de str> =
-                Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
-            parse_trusted_proxies(&values).map_err(serde::de::Error::custom)
         }
     }
 

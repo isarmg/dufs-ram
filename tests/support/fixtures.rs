@@ -33,7 +33,7 @@ pub const UPLOAD_STAGE_DIRECTORY: &str = ".dufs-upload-stages";
 pub const USER_ACCOUNT: &str = "user:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
 #[allow(dead_code)]
 pub const ADMIN_ACCOUNT: &str = "admin:$argon2id$v=19$m=19456,t=2,p=1$HdPI2G8k0h+yEgnqIt2rSw$P+MRyz7wH+b/iPY+He/9DApcy6yB9TAoo7j2JG1Smzs";
-const SESSION_COOKIE_NAME: &str = "__Host-dufs-session";
+const SESSION_COOKIE_NAME: &str = "sarmg-dufs-ram-session";
 const CSRF_HEADER: &str = "x-csrf-token";
 
 #[allow(dead_code)]
@@ -317,6 +317,27 @@ where
     A: IntoIterator,
     A::Item: AsRef<str>,
 {
+    server_in_mode(args, accounts, true)
+}
+
+#[allow(dead_code)]
+pub fn production_server<I, A>(args: I, accounts: A) -> TestServer
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+    A: IntoIterator,
+    A::Item: AsRef<str>,
+{
+    server_in_mode(args, accounts, false)
+}
+
+fn server_in_mode<I, A>(args: I, accounts: A, development: bool) -> TestServer
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+    A: IntoIterator,
+    A::Item: AsRef<str>,
+{
     let tmpdir = tmpdir();
     let args = args
         .into_iter()
@@ -362,6 +383,9 @@ where
     };
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
     command.arg(tmpdir.path()).arg("-p").arg("0").args(&args);
+    if development {
+        command.arg("--development");
+    }
     if let Some(auth_config) = auth_config.as_ref() {
         command.arg("--config").arg(auth_config.path());
     }
@@ -703,6 +727,7 @@ impl TestServer {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!());
         command
             .arg(self.tmpdir.path())
+            .arg("--development")
             .arg("-p")
             .arg("0")
             .arg("--config")

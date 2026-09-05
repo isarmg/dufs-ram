@@ -331,15 +331,16 @@ test("operation authentication is classified before its result envelope", async 
     } = await import("../../../clients/web/modules/http/client.js");
     const operationId = "00000000-0000-4000-8000-000000000040";
     const cases = [
-      { status: 401, headers: {}, code: "authentication_required" },
+      { status: 401, headers: {}, code: "auth.session_required", body: null },
       {
         status: 403,
-        headers: { "x-dufs-auth-error": "csrf" },
-        code: "csrf_failed",
+        headers: { "content-type": "application/json" },
+        code: "auth.csrf_rejected",
+        body: JSON.stringify({ code: "auth.csrf_rejected", message: "Request rejected", retryable: false }),
       },
     ];
     for (const entry of cases) {
-      globalThis.fetch = async () => new Response(null, {
+      globalThis.fetch = async () => new Response(entry.body, {
         status: entry.status,
         headers: entry.headers,
       });
@@ -365,13 +366,12 @@ test("operation authentication is classified before its result envelope", async 
   }
 });
 
-test("authentication headers bypass oversized and stalled Fetch bodies", async () => {
+test("401 status bypasses oversized and stalled Fetch bodies", async () => {
   const previousWindow = globalThis.window;
   const previousFetch = globalThis.fetch;
   globalThis.window = globalThis;
   try {
     const {
-      AUTH_ERROR_HEADER,
       ERROR_RESPONSE_BODY_LIMIT,
       assertResponse,
       isAuthenticationError,
@@ -383,7 +383,7 @@ test("authentication headers bypass oversized and stalled Fetch bodies", async (
         name: "JSON 401",
         status: 401,
         headers: {},
-        code: "authentication_required",
+        code: "auth.session_required",
         async request() {
           const result = await requestJson(
             "https://example.invalid/auth-json",
@@ -395,10 +395,10 @@ test("authentication headers bypass oversized and stalled Fetch bodies", async (
         },
       },
       {
-        name: "no-content CSRF",
-        status: 403,
-        headers: { [AUTH_ERROR_HEADER]: "csrf" },
-        code: "csrf_failed",
+        name: "no-content 401",
+        status: 401,
+        headers: {},
+        code: "auth.session_required",
         request() {
           return requestNoContent(
             "https://example.invalid/auth-no-content",

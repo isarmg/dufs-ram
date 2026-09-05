@@ -5,8 +5,6 @@ serve-path: /srv/dufs
 state-dir: /var/lib/dufs
 bind:
   - 127.0.0.1
-trusted-proxies:
-  - 127.0.0.1/32
 port: 5000
 auth:
   # Replace the username and hash with one canonical lowercase administrator

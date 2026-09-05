@@ -25,7 +25,7 @@ flowchart LR
 
 - 浏览器只访问 HTTPS 网关；
 - Dufs 默认只绑定回环地址；
-- 代理头默认不受信，直连网关必须显式列入 `trusted-proxies`；
+- 认证始终忽略代理头；生产固定 HTTPS Origin，后端端口必须只对网关开放。
 - 防火墙或 ACL 让后端端口仅可信网关可达；
 - 一个 Dufs 实例管理一个共享根；
 - 服务使用专用、低权限 Linux 账号；
@@ -81,8 +81,6 @@ serve-path: /srv/dufs
 state-dir: /var/lib/dufs
 bind:
   - 127.0.0.1
-trusted-proxies:
-  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$REPLACE_WITH_A_REAL_HASH'
@@ -126,7 +124,7 @@ request-timeout: 300
 
 - 服务端内存会话；
 - Cookie 使用 `Secure`、`HttpOnly` 和 `__Host-` 约束；
-- 空闲约 30 分钟或创建满约 12 小时失效；时限按 Linux `CLOCK_BOOTTIME` 计算，系统休眠时间也计入；
+- Foundation Static Store 持有内存会话，重启全部失效；空闲期限 30 分钟、绝对期限 12 小时，每管理员最多 32 个活动会话、全局最多 1024 个。平台 HTTP Adapter 使用统一的 Unix 微秒时间；访问不延长绝对期限，存储拒绝倒退时间。会话和 CSRF 为 32 字节随机值，服务端只保留其摘要。恢复接口轮换 CSRF；其他页面仍使用旧 CSRF 写入时会失败关闭，客户端刷新并重新恢复，绝不重放未知结果的写入。
 - 进程重启后用户需要重新登录；
 - 写请求还需页面绑定的 CSRF token；
 - 登录入口有应用内速率、并发、正文和密码计算限制。
@@ -159,9 +157,9 @@ proxy_set_header X-Forwarded-Host $server_name;
 proxy_set_header X-Forwarded-Proto https;
 ```
 
-Dufs 用外部 scheme/host 做同源检查，也在直连 peer 匹配显式 `--trusted-proxy` / `trusted-proxies` 时采用来源地址做登录限制。官方同机 YAML 样例信任 `127.0.0.1/32`；远端网关应配置精确 IP 或窄 CIDR。没有显式配置时这些头被忽略，经 HTTPS 网关且带 `Origin` 的写请求会失败关闭。
+生产模式固定要求 HTTPS Origin，并与唯一规范 Host/URI authority 和 `Sec-Fetch-Site: same-origin` 一致；不读取 Forwarded 或 X-Forwarded-* 来决定认证、scheme 或限流来源。nginx 必须终止 TLS、覆盖 Host 为规范域名，并通过防火墙、网络命名空间或精确 ACL 阻止客户端及不可信本机进程直连后端。仅显式 `--development` 允许 HTTP，且所有监听地址必须为 loopback；不能用于公网部署。
 
-受信网段不是代理身份认证。回环绑定不能区分 nginx 与另一个本机进程，所以还必须让后端端口只对网关可达：同机用可信进程边界、容器/网络命名空间或进程级防火墙，跨主机用隔离私网与精确 ACL。
+回环绑定不能区分 nginx 与其他本机进程；后端必须由进程隔离、网络命名空间或精确防火墙规则限制为仅可信网关可达。
 
 ### 禁止代理重放写请求
 
@@ -417,7 +415,7 @@ rollback journal 模式下，不要在活跃事务中只复制 `state.sqlite3` �
 Dufs 每个版本都是一套新的 current-only 合同；运行服务不识别旧配置、旧 wire schema 或旧状态库，也不内置迁移。切换前先检查：
 
 - 新版本当前 YAML、API、Foundation 管理员认证与页面合同；
-- 新版本 nginx/systemd 样例、精确 AMD64 GNU target 及 Rust 1.98/Node 24.8 构建要求；
+- 新版本 nginx/systemd 样例、精确 AMD64 GNU target 及 Rust 1.98/Node 26.7.0 构建要求；
 - 原状态是否需要转换；未来稳定版本如需要，必须交给 `sarmg-upgrade` 中已公开支持的精确迁移边并在停服副本上执行；
 - 备份、恢复与转换失败后的回到原快照演练是否最新；
 - 新制品版本、Git SHA、checksum、签名和 SBOM 是否可验证。
@@ -475,7 +473,7 @@ YAML 对未知字段严格拒绝，CLI 对未声明选项也统一拒绝。不�
 
 | 现象 | 常见原因 | 优先检查 |
 | --- | --- | --- |
-| 服务启动但浏览器登录循环 | 用 HTTP、代理未列入受信列表或 scheme/host 不一致 | HTTPS、Cookie、`trusted-proxies`、Host 与 `X-Forwarded-Proto` |
+| 服务启动但浏览器登录循环 | 非 HTTPS、Host/Origin 不一致或 Cookie 被拒绝 | 生产 HTTPS、规范 Host、浏览器 Cookie 与 Origin；开发必须显式启用且仅 loopback |
 | health 200、ready 503 | 根/SQLite 不可写、空间不足、正在停机 | journal、权限、挂载、`df -h`、inode |
 | 第二实例启动失败 | 同一共享根的 flock 已被持有 | 现有进程和根真实路径 |
 | 写请求普遍 403 | CSRF 或 Origin/代理头不一致 | nginx snippet、后端是否被直连 |

@@ -138,18 +138,18 @@ function defaultErrorFactory(message, options) {
 }
 
 /** @param {ReadableStream<Uint8Array> | null} body */
-async function cancelResponseBody(body) {
+function cancelResponseBody(body) {
   try {
-    await body?.cancel();
+    void body?.cancel().catch(() => {});
   } catch {
     // Cancellation is best-effort after the response has already been rejected.
   }
 }
 
 /** @param {ReadableStreamDefaultReader<Uint8Array>} reader */
-async function cancelReader(reader) {
+function cancelReader(reader) {
   try {
-    await reader.cancel();
+    void reader.cancel().catch(() => {});
   } catch {
     // Cancellation is best-effort after the response has already been rejected.
   }

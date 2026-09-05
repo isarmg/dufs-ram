@@ -3,7 +3,6 @@ use super::super::{
     browser_api::{BROWSER_API_PREFIX, is_tracked_browser_mutation},
     listing::LIST_API_PATH,
     operation_registry::{JOB_STATUS_PREFIX, parse_operation_id},
-    session::{ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH, ADMIN_SESSION_PATH},
     upload::{parse_upload_id, parse_upload_length, parse_upload_offset},
 };
 
@@ -45,9 +44,8 @@ impl RequestProfile {
         let tracked_operation = method == Method::DELETE
             || (method == Method::POST && relative_path.is_some_and(is_tracked_browser_mutation));
         let request_path = req.uri().path();
-        let administrator_auth_api = request_path == ADMIN_LOGIN_PATH
-            || request_path == ADMIN_SESSION_PATH
-            || request_path == ADMIN_LOGOUT_PATH;
+        let administrator_auth_api =
+            sarmg_admin_hyper::HyperAdministratorRouter::owns_path(request_path);
         let internal_api = relative_path.is_some_and(|path| {
             path == LIST_API_PATH
                 || path.starts_with(BROWSER_API_PREFIX)

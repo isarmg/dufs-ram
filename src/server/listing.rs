@@ -7,7 +7,7 @@ use super::{
     rooted_fs::{RootedDirEntry, RootedFs},
     upload::{TargetRevision, target_revision},
 };
-use crate::{auth::SessionInfo, http_utils::body_full};
+use crate::{auth::FilePrincipal, http_utils::body_full};
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -642,7 +642,7 @@ impl Server {
         exist: bool,
         _query_params: &HashMap<String, String>,
         head_only: bool,
-        session: SessionInfo,
+        _principal: FilePrincipal,
         res: &mut Response,
     ) -> Result<()> {
         self.send_index(
@@ -650,7 +650,7 @@ impl Server {
             IndexOptions {
                 exist,
                 head_only,
-                session,
+                _principal,
             },
             res,
         )
@@ -661,7 +661,7 @@ impl Server {
         path: &Path,
         query_params: &HashMap<String, String>,
         head_only: bool,
-        session: SessionInfo,
+        _principal: FilePrincipal,
         res: &mut Response,
     ) -> Result<()> {
         let search = query_params
@@ -670,7 +670,7 @@ impl Server {
             .to_lowercase();
         if search.is_empty() {
             return self
-                .handle_ls_dir(path, true, query_params, head_only, session, res)
+                .handle_ls_dir(path, true, query_params, head_only, _principal, res)
                 .await;
         }
 
@@ -679,7 +679,7 @@ impl Server {
             IndexOptions {
                 exist: true,
                 head_only,
-                session,
+                _principal,
             },
             res,
         )
@@ -791,7 +791,7 @@ impl Server {
         res.headers_mut().insert(
             "content-security-policy",
             HeaderValue::from_static(
-                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
             ),
         );
         if options.head_only {
@@ -810,7 +810,6 @@ impl Server {
         let data = IndexData {
             href,
             dir_exists: options.exist,
-            session: options.session.administrator_session()?,
         };
         let index_data = STANDARD.encode(serde_json::to_string(&data)?);
         let output = INDEX_HTML
@@ -1286,14 +1285,13 @@ fn pathitem_from_rooted_entry(
 struct IndexOptions {
     exist: bool,
     head_only: bool,
-    session: SessionInfo,
+    _principal: FilePrincipal,
 }
 
 #[derive(Debug, Serialize)]
 struct IndexData {
     href: String,
     dir_exists: bool,
-    session: sarmg_contracts::AdministratorSession,
 }
 
 #[derive(Debug, Serialize)]

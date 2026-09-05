@@ -27,7 +27,7 @@
 | DFM-012 | `serve-path` canonicalize 并作为唯一共享根 | `src/args.rs`、`src/server/rooted_fs.rs` | 核心 | 高 | 所有浏览、写入和路径隔离失去边界 | 不存在/非目录拒绝；相对路径按 cwd；根 fd identity |
 | DFM-013 | `state-dir` 必填、私有 `0700`，与根/配置/日志分离 | `src/args.rs`、`src/server/state_store.rs` | 保障 | 高 | 重启证据丢失或敏感状态泄露 | owner/mode/symlink/祖先关系/object alias/sidecar 冲突 |
 | DFM-014 | 一个或多个明确 IP listener，共享全局连接许可 | `src/main.rs`、`src/args.rs` | 可选 | 中 | 收敛为单地址会失去 IPv6/多网卡；删许可会失去资源上限 | bind 非空无重复；IPv6 v6-only；全部绑定后才 accept |
-| DFM-015 | trusted proxy 只接受显式 IP/CIDR，不能覆盖完整地址空间 | `src/args.rs`、`src/server/router/request.rs` | 保障 | 高 | XFF/XFP 可被伪造，或 HTTPS 来源判断全部失败 | trusted/untrusted、单值 XFF/XFP、IPv4/IPv6、窄网段 |
+| DFM-015 | 生产 HTTPS，显式开发仅 loopback | Foundation Origin Mode、`src/args.rs` | 保障 | 高 | 错误信任代理头可破坏认证边界 | 忽略 XFF/XFP；开发 wildcard 拒绝 |
 | DFM-016 | 连接、请求头、普通请求与流式 I/O deadline | `src/main.rs`、`src/server/router.rs`、`src/server/download.rs` | 保障 | 高 | 慢连接和停滞 I/O 可无限占资源 | 默认 256 连接；10 秒/64 KiB header；300 秒请求；30 秒 stream idle |
 | DFM-017 | blocking-I/O 有界，许可活到真实 syscall 返回 | `src/server/blocking_io.rs` | 保障 | 高 | 故障 FUSE/NFS 可挤占 Tokio 或无界占满 pool | 64 默认；取消等待者不遗留任务；已开始 syscall 不提前归还 |
 | DFM-018 | 访问日志格式、元素、单行转义和队列都有预算 | `src/http_logger.rs`、`src/logger.rs` | 可选 | 中 | 删除定制会失去字段；删除预算会允许注入/巨型分配 | 4096-byte 格式、128 元素、16 KiB 行、4096 队列、Secret 脱敏 |
@@ -39,20 +39,20 @@
 
 | ID | 功能/当前实现 | 实现/代码锚点 | 分类 | 复杂度 | 删除后的确定后果 | 验证与边界 |
 | --- | --- | --- | --- | --- | --- | --- |
-| DFM-022 | 身份协议来自 Foundation，唯一角色为 `admin`；四个共享 crate 均固定 `=0.3.1` + Git rev `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0` | `sarmg-contracts`、`sarmg-admin-auth`、`sarmg-schema-identity`、`sarmg-server-target`、`src/server/session.rs` | 核心 | 高 | 私有用户/角色协议或可漂移依赖会造成跨项目合同漂移 | 多管理员同权；无普通/只读角色、路径 ACL、网页账号管理；`cargo metadata`/lockfile 来源逐字匹配；无 workspace/path/branch/local-copy fallback |
+| DFM-022 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
 | DFM-023 | 管理员 username 使用 Foundation 唯一 current canonical 规则 | `src/auth.rs`、`clients/web/login.js` | 保障 | 中 | 大小写、Unicode、`@` 或边界差异会破坏跨项目身份与 owner 摘要 | 配置为 3～64 lowercase ASCII bytes、首尾 alnum、字符 `[a-z0-9._-]`；登录 candidate 为 1～64 bytes 且每字节 `0x20`～`0x7e`，trim/lowercase 后再校验；相邻分隔符允许 |
-| DFM-024 | 登录唯一 API 为 `POST /api/v2/auth/login` 严格 JSON | `src/server/router/dispatch.rs`、`src/server/session.rs` | 核心 | 中 | 删除后无法建会话；加旧 alias 恢复双协议 | 只含 username/password；应用 16 KiB；无表单、PRG、nonce、旧路径 |
-| DFM-025 | `GET /__dufs__/login` 只返回首方登录页面 | `src/server/session.rs`、`clients/web/login.html` | 核心 | 低 | 无首方入口；允许 POST 会形成 alias | GET 正例、其他方法 405、no-store、CSP、摘要 CSS |
-| DFM-026 | 成功返回精确五字段 `AdministratorSession` | `sarmg-contracts`、`src/server/session.rs`、`clients/web/login.js` | 保障 | 中 | 页面可能信任畸形身份或不同 wire shape | authenticated、user_id、username、role=admin、csrf_token |
-| DFM-027 | Auth 错误统一 Foundation `ErrorEnvelope` | `src/server/session.rs` | 保障 | 中 | 客户端按自然语言判断或和 Problem Details 混淆 | 400/401/403/405/429、code/message/retryable/detail、media type |
+| DFM-024 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-025 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-026 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-027 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
 | DFM-028 | 严格同源覆盖登录及所有已认证 unsafe method | `sarmg-admin-auth`、`src/server/router/dispatch.rs` | 保障 | 高 | Cookie 可被跨站诱导；重复头造成解析分歧 | Origin/effective Host/Sec-Fetch-Site 均必需、唯一、一致；生产 HTTPS |
-| DFM-029 | CSRF 使用唯一 `X-CSRF-Token` 与 session token 常量时间比较 | `src/auth.rs`、`src/server/router/dispatch.rs`、`clients/web/modules/http/client.js` | 保障 | 高 | 已登录浏览器写请求可被伪造 | POST/PUT/PATCH/DELETE；重复/非规范/错误 token；登录无 CSRF |
-| DFM-030 | 256-bit session/CSRF token 是 43 字符规范无填充 base64url | `src/auth.rs`、`clients/web/modules/shared/index_data.js` | 保障 | 中 | 低熵或多编码扩大猜测和歧义 | 32 随机 bytes、final-char canonical subset；拒绝 padding |
-| DFM-031 | Cookie 固定 `__Host-dufs-session; Path=/; HttpOnly; Secure; SameSite=Strict` | `src/server/session.rs` | 保障 | 中 | token 可被脚本读取、明文发送或跨站携带 | Set/Clear 属性一致；独占主机名；Cookie 不按端口隔离 |
-| DFM-032 | 内存 session：idle 30 分钟、absolute 12 小时、重启失效 | `src/auth.rs` | 保障 | 中 | 无过期长期授权；持久化增加 Secret/schema 负担 | CLOCK_BOOTTIME；访问仅续 idle；重启重新登录 |
-| DFM-033 | session 容量每管理员 32、全局 1024 | `src/auth.rs` | 保障 | 中 | 无上限耗尽内存；过小挤掉合法设备 | 淘汰/撤销/管理员隔离；session 不进 SQLite |
-| DFM-034 | 登录 bucket、正文许可、组合退避和两个 Argon2 槽 | `src/server/login_rate_limit.rs`、`src/server/session.rs` | 保障 | 高 | 密码入口可耗尽 CPU/连接 | global/IP bucket、32/4 body、10 秒、IP+canonical username backoff、429 |
-| DFM-035 | 未知 username 仍执行当前成本 Argon2 校验 | `src/auth.rs`、`src/server/session.rs` | 保障 | 中 | 响应时间会明显枚举管理员 | 已知/未知都 401；不宣称消除所有侧信道 |
+| DFM-029 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-030 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-031 | 平台安全 Cookie | Foundation Core/Hyper | 保障 | 中 | Cookie 属性弱化扩大盗用风险 | 生产 __Host-sarmg-dufs-ram-session；开发 sarmg-dufs-ram-session；Set/Clear 一致 |
+| DFM-032 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-033 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-034 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
+| DFM-035 | Foundation 管理员控制面 | Core/Static/Hyper/Auth/contracts；产品仅配置与 HTML Adapter | 保障 | 高 | 产品副本会造成平台策略漂移 | 见功能清单 A-01～A-20；共享 wire 与真实产品 HTTP 回归 |
 | DFM-036 | session 查询/注销固定 Foundation 路径 | `src/server/router/dispatch.rs`、`clients/web/modules/operations/file_operations.js` | 核心 | 中 | 无注销则只能等过期；私有路径令集成漂移 | GET `/api/v2/auth/session`；POST `/api/v2/auth/logout` 要 CSRF/同源 |
 
 ## 4. 浏览、下载与普通写操作
@@ -114,8 +114,8 @@
 | ID | 功能/当前实现 | 实现/代码锚点 | 分类 | 复杂度 | 删除后的确定后果 | 验证与边界 |
 | --- | --- | --- | --- | --- | --- | --- |
 | DFM-076 | 名称/MIME/内容共同生成 SHA-256 URL并编译嵌入 | `src/server/assets.rs`、`clients/web/` | 建议保留 | 高 | 页面/代码版本漂移，长期缓存返回旧模块 | registry/目录双向一致；GET/HEAD；immutable 仅精确资源 |
-| DFM-077 | 登录内联脚本由精确 CSP hash 授权，无 unsafe-inline | `src/server/session.rs`、`clients/web/login.js` | 保障 | 中 | 弱 CSP 扩大 XSS；漏同步 hash 导致无法登录 | script/hash 正反例、login CSS 摘要、CSP header |
-| DFM-078 | IndexData 外层三字段并嵌套 Foundation 五字段 session | `src/server/listing.rs`、`clients/web/modules/shared/index_data.js` | 保障 | 中 | 页面接受额外/旧字段或错误角色/token | own data property、canonical path/username/token、frozen copies |
+| DFM-077 | 登录使用同源外部 ESM，平台字体与许可证嵌入 | `administrator_web.rs`、`login.js`、平台 Vite | 保障 | 中 | inline/eval 或外站字体扩大注入与网络依赖 | 精确资产摘要、CSP、preload、真实字体字节 |
+| DFM-078 | HTML 仅含两个业务字段，独立恢复共享 Session | `listing.rs`、`shared/index_data.js`、Foundation Admin Client | 保障 | 中 | 嵌入凭据或本地合同可造成泄露和漂移 | 严格 own data、Foundation session guard、frozen copies |
 | DFM-079 | DOM 通过 textContent/安全属性构造业务内容 | `clients/web/modules/shared/dom.js` | 保障 | 中 | 文件名/错误文本可成为可执行 HTML | 注入 payload、禁动态 HTML API、CSP；静态 SVG 例外 |
 | DFM-080 | DOM window、列表状态和 mutation invalidation 有界 | `clients/web/modules/listing/controller.js`、`shared/mutation_effect.js` | 建议保留 | 中 | 大列表无限 DOM；写后继续显示陈旧结果 | 200 window、cursor、四种 effect、focus/scroll |
 | DFM-081 | 原生 dialog、键盘、focus return、live region、forced colors | `clients/web/modules/operations/dialogs.js`、`clients/web/index.css` | 建议保留 | 中 | 键盘/低视力用户无法可靠操作 | Chromium/Firefox、axe标签、Escape、320px；非完整 WCAG 声明 |
@@ -130,7 +130,7 @@
 | ID | 功能/当前实现 | 实现/代码锚点 | 分类 | 复杂度 | 删除后的确定后果 | 验证与边界 |
 | --- | --- | --- | --- | --- | --- | --- |
 | DFM-087 | 不提供匿名文件访问 | `src/server/router/dispatch.rs` | 保障 | 高 | 若删除限制会直接暴露共享根 | 仅 health、login page/API、摘要资源公开；普通内容 401/303 |
-| DFM-088 | 不提供角色分级、路径权限或租户隔离 | `src/auth.rs`、`src/server/session.rs` | 核心 | 高 | 新角色需完整授权矩阵/UI/审计/Foundation 合同 | 全管理员全根同权；隐藏按钮不是授权 |
+| DFM-088 | 不提供角色分级、路径权限或租户隔离 | `src/auth.rs`、`src/server/administrator_web.rs` | 核心 | 高 | 新角色需完整授权矩阵/UI/审计/Foundation 合同 | 全管理员全根同权；隐藏按钮不是授权 |
 | DFM-089 | 不提供 WebDAV、CORS 或通用第三方 API | `src/server/router/` | 可选 | 高 | 新增会扩大 method/lock/cache/cross-site/兼容矩阵 | unknown internal 404、known wrong method 405；无 CORS 承诺 |
 | DFM-090 | 不提供 preview/edit/static site/SPA fallback | `src/server/download.rs`、router | 可选 | 高 | 新增会执行/渲染不可信内容并改变 CSP/MIME | 下载 attachment；未知路径不回退 index；内容不 inline |
 | DFM-091 | 不提供目录 ZIP、多段 Range 或空目录上传 | `src/server/download.rs`、`upload/selection.js` | 可选 | 高 | 新增需归档预算、流错误和目录 metadata 合同 | 仅单文件/单 Range；webkitdirectory 只产生文件 |

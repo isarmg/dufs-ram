@@ -44,16 +44,18 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
   );
   await submit.click();
   expect((await rejectedLogin).status()).toBe(401);
-  await expect(alert).toHaveText("Invalid username or password.");
+  await expect(alert).toContainText("Authentication request could not be completed.");
+  await expect(password).toHaveValue("");
+  await expect(password).toBeFocused();
   expect(
     (await anonymous.cookies()).find(
-      cookie => cookie.name === "__Host-dufs-session",
+      cookie => cookie.name === "__Host-sarmg-dufs-ram-session",
     ),
   ).toBeUndefined();
   await anonymous.close();
 
   const sessionCookie = (await context.cookies()).find(
-    cookie => cookie.name === "__Host-dufs-session",
+    cookie => cookie.name === "__Host-sarmg-dufs-ram-session",
   );
   expect(sessionCookie).toMatchObject({
     httpOnly: true,
@@ -74,7 +76,7 @@ test("登录错误、会话 Cookie 与注销均由服务端生效", async ({
   expect((await logoutResponse).status()).toBe(204);
   expect(
     (await context.cookies()).find(
-      cookie => cookie.name === "__Host-dufs-session",
+      cookie => cookie.name === "__Host-sarmg-dufs-ram-session",
     ),
   ).toBeUndefined();
 
@@ -140,7 +142,7 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
     `${testInfo.project.use.baseURL}/__dufs__/login`,
   );
   expect(response.headers()["content-security-policy"]).toContain(
-    "script-src 'sha256-",
+    "script-src 'self'",
   );
   expect(response.headers()["content-security-policy"]).toContain(
     "connect-src 'self'",
@@ -170,6 +172,7 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
       loginPosts += 1;
     }
   });
+  await page.getByLabel("Username").fill("frontend-test-0");
   await password.fill(`a${"é".repeat(512)}`);
   expect(
     await password.evaluate(input => ({
@@ -178,11 +181,14 @@ test("登录密码按 UTF-8 字节而非字符数执行浏览器边界校验", a
     })),
   ).toEqual({
     bytes: 1025,
-    message: "Password must contain 12 to 1024 UTF-8 bytes and no control characters.",
+    message: "",
   });
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(/\/__dufs__\/login$/);
   expect(loginPosts).toBe(0);
+  await expect(page.getByRole("alert")).toHaveText("Enter a valid administrator username and password.");
+  await expect(password).toHaveValue("");
+  await expect(password).toBeFocused();
 
   await anonymous.close();
 });

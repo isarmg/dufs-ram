@@ -35,11 +35,11 @@ fn job_status_requires_authentication_validates_routing_and_delete_replays(
     assert_eq!(unauthenticated.status(), 401);
     assert_eq!(
         unauthenticated.headers().get("content-type").unwrap(),
-        "application/problem+json"
+        "application/json"
     );
     assert_eq!(
         response_json(unauthenticated)?["code"],
-        "authentication_required"
+        "auth.session_required"
     );
     let authenticated = context.request(Method::GET, status_url).send()?;
     assert_eq!(authenticated.status(), 200);

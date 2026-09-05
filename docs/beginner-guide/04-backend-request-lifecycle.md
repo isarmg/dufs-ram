@@ -31,7 +31,7 @@ flowchart LR
 | Router 外层 | [src/server/router.rs](../../src/server/router.rs) | 请求分类、总超时、日志、错误与缓存 |
 | 请求画像 | [src/server/router/request.rs](../../src/server/router/request.rs) | `RequestProfile` 和 `MutationProgress` |
 | 分阶段路由 | [src/server/router/dispatch.rs](../../src/server/router/dispatch.rs) | 公共路由、认证、CSRF、API、内容路由 |
-| 会话 | [src/server/session.rs](../../src/server/session.rs) | 登录、Cookie、来源校验和 CSRF |
+| 认证 Adapter | [src/server/administrator_web.rs](../../src/server/administrator_web.rs) | 适配 Foundation 响应与产品 HTML；认证、Cookie、来源和 CSRF 由上游独占 |
 | 浏览器写 API | [src/server/browser_api.rs](../../src/server/browser_api.rs) | 新建、移动、重命名和上传预检 |
 | 列表与下载 | [src/server/listing.rs](../../src/server/listing.rs)、[download.rs](../../src/server/download.rs) | 目录页面、列表 JSON 和文件流 |
 
@@ -267,8 +267,8 @@ CSRF
 - 只接受严格 JSON，未知、重复、缺失或错类型字段均拒绝；
 - 应用正文上限 16 KiB，官方 nginx 仅对 exact `/api/v2/auth/login` 进一步限制为 4 KiB；
 - 正文读取总 deadline 为 10 秒；
-- 有全局 32、每来源 IP 4 个正文接纳许可，以及全局/IP token bucket；
-- 有“来源 IP + canonical 管理员 username 摘要”的失败退避；未知 username 仍执行当前成本的 Argon2id 校验；
+- Foundation 统一限制登录正文为 16 KiB、读取期限 10 秒、全局 32/每个真实 TCP 来源 4 个读取许可；取消或失败释放许可。失败预算为五分钟内每来源 20 次、每规范账号 10 次，最多两个 Argon2id 计算槽，取得计算槽最多等待两秒。失败预算耗尽返回 `429 auth.rate_limited` 和保守的 `Retry-After: 300`。这些是共享平台政策，不由 Dufs 实现或配置；网关仍须独立按真实客户端 IP 限速。
+- 未知或无效 username 由 Foundation 执行固定成本的虚拟 PHC 校验，统一错误凭据响应。
 - 密码验证占用最多两个 Argon2id 计算槽，满载用 Foundation `429` 和 `Retry-After` 直接返回，不经重定向。
 
 这些限制不是普通业务 Router 总超时的替代品，而是登录这个高成本入口自己的更窄边界。
@@ -283,7 +283,7 @@ Foundation 登录 POST 是公共路由阶段的特殊写请求：它发生在会
 
 ## 4.9 阶段二：验证会话 Cookie
 
-登录成功后，服务端设置名为 `__Host-dufs-session` 的 Cookie。它具有：
+登录成功后，服务端设置名为 `__Host-sarmg-dufs-ram-session` 的 Cookie。它具有：
 
 - `Path=/`；
 - `HttpOnly`，页面 JavaScript 不能直接读取；
@@ -295,8 +295,8 @@ Dispatcher 从请求的 `Cookie` 头提取唯一规范 token，再交给内存�
 未登录响应取决于请求意图：
 
 - 浏览器访问普通 GET/HEAD 且明确接受 HTML：`303` 跳转登录页；
-- 内部 API：`401 application/problem+json`；
-- 其他内容请求：普通 `401`。
+- 内部 API：`401 application/json`，使用 Foundation ErrorEnvelope。
+- 其他内容请求：Foundation ErrorEnvelope `401`。
 
 这种差别是有意的。页面导航适合重定向；`fetch` 调用更需要明确的机器可解析错误，避免把登录页 HTML 误当成 JSON。
 
@@ -316,9 +316,9 @@ readiness 是一个容易混淆的例外：它在认证成功后由 API 分发�
 1. Foundation 严格来源检查确认唯一 `Origin`、effective Host 和 `Sec-Fetch-Site: same-origin` 全部存在、规范且一致；
 2. 唯一 `X-CSRF-Token` 与当前 session 绑定的 Foundation 256-bit token 以常量时间匹配。
 
-同源检查会考虑 `Origin`、`Host`、`Sec-Fetch-Site`。代理信息默认不受信；只有直连 peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才采用规范的单值 `X-Forwarded-Proto`。推荐的“浏览器 HTTPS → nginx → 回环 HTTP Dufs”拓扑因此还要显式配置 `127.0.0.1/32`，并通过 OS 隔离保证其他本机进程不能冒充网关。
+生产模式固定要求 HTTPS Origin，并与唯一规范 Host/URI authority 和 `Sec-Fetch-Site: same-origin` 一致；不读取 Forwarded 或 X-Forwarded-* 来决定认证、scheme 或限流来源。nginx 必须终止 TLS、覆盖 Host 为规范域名，并通过防火墙、网络命名空间或精确 ACL 阻止客户端及不可信本机进程直连后端。仅显式 `--development` 允许 HTTP，且所有监听地址必须为 loopback；不能用于公网部署。
 
-GET 和 HEAD 不走 CSRF，但仍需登录，除非它们属于前一节的公共路由。公共登录 POST 也已在到达此阶段前完成。Foundation auth API 的 CSRF 失败返回 Foundation `ErrorEnvelope`；Dufs browser API 返回带稳定错误 code 的 Problem Details；普通内容路由返回拒绝响应。
+安全方法不走 CSRF，但仍需登录，公开路由除外。认证与 CSRF 失败统一为 Foundation ErrorEnvelope；业务失败才由 Dufs 业务协议表示。
 
 不要用“请求有自定义头，所以一定安全”来理解 CSRF。真正的保证来自同源判断、会话绑定 token 和安全 Cookie 属性共同作用。
 
@@ -435,7 +435,7 @@ sequenceDiagram
 
 ```http
 POST /__dufs__/api/rename
-Cookie: __Host-dufs-session=...
+Cookie: __Host-sarmg-dufs-ram-session=...
 X-CSRF-Token: ...
 X-Dufs-Operation-Id: 规范 UUID
 Content-Type: application/json

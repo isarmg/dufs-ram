@@ -225,7 +225,7 @@ Future 被丢弃通常代表调用者不再等待，但这不等于外部世界�
 ```http
 POST /__dufs__/api/rename HTTP/1.1
 Host: files.example.com
-Cookie: __Host-dufs-session=...
+Cookie: __Host-sarmg-dufs-ram-session=...
 Content-Type: application/json
 X-CSRF-Token: ...
 X-Dufs-Operation-Id: 123e4567-e89b-42d3-a456-426614174000
@@ -284,7 +284,7 @@ Header 是请求或响应的元数据。Dufs 会对 Operation ID、上传协议�
 
 ### Cookie
 
-登录成功后，服务端设置 `__Host-dufs-session` Cookie。`__Host-` 前缀要求更严格的 Cookie 属性，当前会话还使用 `Secure`、`HttpOnly` 等限制。浏览器自动携带 Cookie，JavaScript 不需要也不应该读取会话秘密。
+登录成功后，服务端设置 `__Host-sarmg-dufs-ram-session` Cookie。`__Host-` 前缀要求更严格的 Cookie 属性，当前会话还使用 `Secure`、`HttpOnly` 等限制。浏览器自动携带 Cookie，JavaScript 不需要也不应该读取会话秘密。
 
 ### CSRF token
 

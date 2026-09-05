@@ -2060,14 +2060,8 @@ test("取消认证重载后下一次 401 仍会再次请求重载", async ({
     mkdirRequests++;
     return route.fulfill({
       status: 401,
-      contentType: "application/problem+json",
-      body: JSON.stringify({
-        type: "urn:dufs:problem:authentication_required",
-        title: "Authentication required",
-        status: 401,
-        code: "authentication_required",
-        detail: "Sign in again",
-      }),
+      contentType: "application/json",
+      body: JSON.stringify({ code: "auth.session_required", message: "Sign in again", retryable: false }),
     });
   });
 

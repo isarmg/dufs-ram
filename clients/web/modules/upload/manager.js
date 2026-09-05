@@ -1,5 +1,6 @@
 import { createElement, errorMessage, formatFileSize } from "../shared/dom.js";
 import { MUTATION_EFFECT } from "../shared/mutation_effect.js";
+import { platformErrorCode } from "../http/platform-error.js";
 import {
   AUTH_REQUIRED_MESSAGE,
   CSRF_HEADER,
@@ -14,6 +15,7 @@ import {
   requestHead,
   requestJson,
   requestNoContent,
+  responsePlatformErrorCode,
 } from "../http/client.js";
 import {
   childUrl,
@@ -530,6 +532,7 @@ export function createUploadManager(options) {
       this.clearTimeouts();
       const classification = classifyUploadResponse({
         phase: this.uploadRequestPhase === "resume" ? "resume" : "fresh",
+        errorCode: request.status === 403 ? platformErrorCode(request.responseText, request.getResponseHeader("Content-Type")) : null,
         status: request.status,
         headers: name => request.getResponseHeader(name),
         expectedUploadId: this.uploadId,
@@ -789,7 +792,7 @@ export function createUploadManager(options) {
       } catch (error) {
         if (isAuthenticationError(error)) {
           pauseForAuthentication();
-          const csrfFailed = isRequestErrorCode(error, "csrf_failed");
+          const csrfFailed = isRequestErrorCode(error, "auth.csrf_rejected");
           if (!csrfFailed) onUnauthorized();
           this.fail(csrfFailed ? PAGE_EXPIRED_MESSAGE : AUTH_REQUIRED_MESSAGE);
           return;
@@ -809,6 +812,7 @@ export function createUploadManager(options) {
         });
         const classification = classifyUploadResponse({
           phase: "checkpoint",
+          errorCode: await responsePlatformErrorCode(response),
           status: response.status,
           headers: response.headers,
           expectedUploadId: this.uploadId,
@@ -836,7 +840,7 @@ export function createUploadManager(options) {
       } catch (error) {
         if (isAuthenticationError(error)) {
           pauseForAuthentication();
-          const csrfFailed = isRequestErrorCode(error, "csrf_failed");
+          const csrfFailed = isRequestErrorCode(error, "auth.csrf_rejected");
           if (!csrfFailed) onUnauthorized();
           this.fail(csrfFailed ? PAGE_EXPIRED_MESSAGE : AUTH_REQUIRED_MESSAGE);
           return;
@@ -992,6 +996,7 @@ export function createUploadManager(options) {
         });
         const classification = classifyUploadResponse({
           phase: "checkpoint",
+          errorCode: await responsePlatformErrorCode(response),
           status: response.status,
           headers: response.headers,
           expectedUploadId: this.uploadId,
@@ -1468,7 +1473,7 @@ export function createUploadManager(options) {
     } catch (error) {
       if (isAuthenticationError(error)) {
         pauseForAuthentication();
-        if (!isRequestErrorCode(error, "csrf_failed")) onUnauthorized();
+        if (!isRequestErrorCode(error, "auth.csrf_rejected")) onUnauthorized();
         return;
       }
       queueMessage.textContent =

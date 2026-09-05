@@ -135,7 +135,7 @@ dufs-ram/
 ├── src/                          Rust 库和可执行程序
 │   └── server/                   HTTP 业务、文件系统和状态模块
 ├── tests/                        Rust 集成测试和浏览器端到端测试
-├── .node-version                 当前 Node 24.8.0 仓库级版本基准
+├── .node-version                 当前 Node 26.7.0 仓库级版本基准
 ├── build.rs                      精确 AMD64 GNU 编译守卫与 Git SHA 注入
 ├── Cargo.toml                    Rust 包、依赖和 release 配置
 ├── package.json                  前端检查与测试命令

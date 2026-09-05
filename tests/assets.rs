@@ -32,6 +32,41 @@ fn verify_embedded_assets(server: &TestServer) -> Result<(), Error> {
 
     let assets = [
         (
+            "dist/platform.js",
+            format!("{asset_prefix}dist/platform.js"),
+            "application/javascript; charset=UTF-8",
+        ),
+        (
+            "dist/platform.css",
+            format!("{asset_prefix}dist/platform.css"),
+            "text/css; charset=UTF-8",
+        ),
+        (
+            "dist/MapleMono.woff2",
+            format!("{asset_prefix}dist/MapleMono.woff2"),
+            "font/woff2",
+        ),
+        (
+            "dist/MapleMono-Italic.woff2",
+            format!("{asset_prefix}dist/MapleMono-Italic.woff2"),
+            "font/woff2",
+        ),
+        (
+            "dist/OFL.txt",
+            format!("{asset_prefix}dist/OFL.txt"),
+            "text/plain; charset=UTF-8",
+        ),
+        (
+            "login.js",
+            format!("{asset_prefix}login.js"),
+            "application/javascript; charset=UTF-8",
+        ),
+        (
+            "modules/platform-session.js",
+            format!("{asset_prefix}modules/platform-session.js"),
+            "application/javascript; charset=UTF-8",
+        ),
+        (
             "index.js",
             index_js,
             "application/javascript; charset=UTF-8",
@@ -51,6 +86,11 @@ fn verify_embedded_assets(server: &TestServer) -> Result<(), Error> {
         (
             "modules/http/client.js",
             format!("{asset_prefix}modules/http/client.js"),
+            "application/javascript; charset=UTF-8",
+        ),
+        (
+            "modules/http/platform-error.js",
+            format!("{asset_prefix}modules/http/platform-error.js"),
             "application/javascript; charset=UTF-8",
         ),
         (

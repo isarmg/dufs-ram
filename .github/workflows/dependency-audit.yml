@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "24.8.0"
+  NODE_VERSION: "26.7.0"
   RUST_TOOLCHAIN: "1.98.0"
   CARGO_AUDIT_VERSION: "0.22.2"
   CARGO_TERM_COLOR: always

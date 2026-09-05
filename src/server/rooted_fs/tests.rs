@@ -63,7 +63,7 @@ async fn resolved_path_key_opens_a_complete_deep_parent_once() {
         parent.push("d");
     }
     std::fs::create_dir_all(&parent).unwrap();
-    let expected_parent = file_identity(&std::fs::metadata(&parent).unwrap());
+    let expected_parent = FileIdentity::from_metadata(&std::fs::metadata(&parent).unwrap());
     let target = parent.join("leaf");
 
     assert_eq!(rooted.take_resolved_path_prefix_probes(), 0);
@@ -88,7 +88,7 @@ async fn resolved_path_key_finds_a_missing_tail_with_logarithmic_prefix_probes()
         target.push("d");
     }
     std::fs::create_dir_all(&target).unwrap();
-    let expected_parent = file_identity(&std::fs::metadata(&target).unwrap());
+    let expected_parent = FileIdentity::from_metadata(&std::fs::metadata(&target).unwrap());
     for _ in EXISTING_DEPTH..PARENT_DEPTH {
         target.push("d");
     }

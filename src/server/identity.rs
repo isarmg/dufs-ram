@@ -20,10 +20,6 @@ impl OwnerId {
         Self::domain_separated(b"dufs-list-snapshot-owner-v1\0", owner)
     }
 
-    pub(super) fn login_throttle(owner: &str) -> Self {
-        Self::domain_separated(b"dufs-login-throttle-owner-v1\0", owner)
-    }
-
     fn domain_separated(domain: &[u8], owner: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(domain);
@@ -76,10 +72,6 @@ mod tests {
         assert_ne!(
             OwnerId::listing_snapshot("alice"),
             OwnerId::persistent("alice")
-        );
-        assert_ne!(
-            OwnerId::login_throttle("alice"),
-            OwnerId::listing_snapshot("alice")
         );
     }
 }

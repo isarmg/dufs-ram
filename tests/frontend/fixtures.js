@@ -226,7 +226,15 @@ async function pageData(page) {
   const encoded = await page.locator("#index-data").evaluate(
     template => template.content.textContent,
   );
-  return JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  const metadata = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  expect(Object.keys(metadata).sort()).toEqual(["dir_exists", "href"]);
+  const session = await page.evaluate(async () => {
+    const entry = document.querySelector('script[type="module"][src$="/index.js"]');
+    const { administratorApi } = await import(new URL("modules/platform-session.js", entry.src).href);
+    return administratorApi.currentSession();
+  });
+  expect(session?.authenticated).toBe(true);
+  return { ...metadata, session };
 }
 
 function currentDirectoryPath(page) {

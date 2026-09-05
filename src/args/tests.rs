@@ -86,7 +86,7 @@ fn test_default() {
     assert_eq!(args.serve_path, cwd);
     assert_eq!(args.port, default_port());
     assert_eq!(args.addrs, vec![IpAddr::from([127, 0, 0, 1])]);
-    assert!(args.trusted_proxies.is_empty());
+    assert!(!args.development);
     assert_eq!(args.max_upload_size, DEFAULT_MAX_UPLOAD_SIZE);
     assert_eq!(args.upload_idle_timeout, DEFAULT_UPLOAD_IDLE_TIMEOUT);
     assert_eq!(args.upload_total_timeout, DEFAULT_UPLOAD_TOTAL_TIMEOUT);
@@ -99,169 +99,6 @@ fn test_default() {
         DEFAULT_MAX_CONCURRENT_SEARCHES
     );
     assert_eq!(args.request_timeout, DEFAULT_REQUEST_TIMEOUT);
-}
-
-#[test]
-fn trusted_proxies_accept_cli_ips_and_cidrs_and_normalize_them() {
-    let state_dir = private_state_dir();
-    let matches = matches_with_state(
-        [
-            "",
-            "--trusted-proxy",
-            "198.51.100.42/24,127.0.0.1",
-            "--trusted-proxy",
-            "2001:db8::1",
-            "--trusted-proxy",
-            "127.0.0.1/32",
-        ],
-        state_dir.path(),
-    );
-    let args = Args::parse(matches).unwrap();
-    let networks = args
-        .trusted_proxies
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        networks,
-        ["127.0.0.1/32", "198.51.100.0/24", "2001:db8::1/128"]
-    );
-}
-
-#[test]
-fn trusted_proxy_cli_values_replace_yaml_values() {
-    let tmpdir = assert_fs::TempDir::new().unwrap();
-    let state_dir = private_state_dir();
-    let config_file = tmpdir.child("config.yaml");
-    config_file
-        .write_str(&format!(
-            "trusted-proxies:\n  - 10.0.0.7/24\n  - 127.0.0.1\nauth:\n  - {TEST_ACCOUNT}\n"
-        ))
-        .unwrap();
-    make_config_private(config_file.path());
-
-    let yaml_matches =
-        matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
-    let yaml_args = Args::parse(yaml_matches).unwrap();
-    assert_eq!(
-        yaml_args
-            .trusted_proxies
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["10.0.0.0/24", "127.0.0.1/32"]
-    );
-
-    let cli_matches = matches_with_state(
-        [
-            "",
-            "-c",
-            &config_file.to_string_lossy(),
-            "--trusted-proxy",
-            "192.0.2.7",
-        ],
-        state_dir.path(),
-    );
-    let cli_args = Args::parse(cli_matches).unwrap();
-    assert_eq!(
-        cli_args
-            .trusted_proxies
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["192.0.2.7/32"]
-    );
-}
-
-#[test]
-fn trusted_proxy_yaml_accepts_a_scalar() {
-    let tmpdir = assert_fs::TempDir::new().unwrap();
-    let state_dir = private_state_dir();
-    let config_file = tmpdir.child("config.yaml");
-    config_file
-        .write_str(&format!(
-            "trusted-proxies: 2001:db8::1\nauth:\n  - {TEST_ACCOUNT}\n"
-        ))
-        .unwrap();
-    make_config_private(config_file.path());
-
-    let matches = matches_with_state(["", "-c", &config_file.to_string_lossy()], state_dir.path());
-    let args = Args::parse(matches).unwrap();
-    assert_eq!(args.trusted_proxies[0].to_string(), "2001:db8::1/128");
-}
-
-#[test]
-fn invalid_or_unbounded_trusted_proxy_networks_are_rejected() {
-    for invalid in ["not-a-proxy", "192.0.2.1/33", "2001:db8::/129"] {
-        let error = build_cli()
-            .try_get_matches_from(["", "--trusted-proxy", invalid])
-            .expect_err("invalid trusted proxy was accepted");
-        assert!(error.to_string().contains("expected an IP or CIDR"));
-    }
-
-    for unbounded in ["0.0.0.0/0", "::/0"] {
-        let state_dir = private_state_dir();
-        let matches = matches_with_state(["", "--trusted-proxy", unbounded], state_dir.path());
-        let error = Args::parse(matches).expect_err("unbounded trusted proxy was accepted");
-        assert!(error.to_string().contains("entire IPv4 or IPv6"));
-    }
-}
-
-#[test]
-fn trusted_proxy_union_cannot_cover_an_entire_address_family() {
-    for networks in [["0.0.0.0/1", "128.0.0.0/1"], ["::/1", "8000::/1"]] {
-        let tmpdir = assert_fs::TempDir::new().unwrap();
-        let state_dir = private_state_dir();
-        let args = Args {
-            serve_path: tmpdir.path().to_path_buf(),
-            state_dir: Some(state_dir.path().to_path_buf()),
-            auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
-            trusted_proxies: networks
-                .into_iter()
-                .map(|network| network.parse().unwrap())
-                .collect(),
-            ..Args::default()
-        };
-        let error = args
-            .validate()
-            .expect_err("collectively unbounded trusted proxies were accepted");
-        assert!(error.to_string().contains("entire IPv4 or IPv6"));
-    }
-}
-
-#[test]
-fn trusted_proxy_union_may_leave_part_of_an_address_family_untrusted() {
-    let tmpdir = assert_fs::TempDir::new().unwrap();
-    let state_dir = private_state_dir();
-    let args = Args {
-        serve_path: tmpdir.path().to_path_buf(),
-        state_dir: Some(state_dir.path().to_path_buf()),
-        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
-        trusted_proxies: ["0.0.0.0/1", "128.0.0.0/2"]
-            .into_iter()
-            .map(|network| network.parse().unwrap())
-            .collect(),
-        ..Args::default()
-    };
-    args.validate()
-        .expect("a bounded trusted proxy union was rejected");
-}
-
-#[test]
-fn excessive_trusted_proxy_networks_are_rejected_for_library_callers() {
-    let tmpdir = assert_fs::TempDir::new().unwrap();
-    let state_dir = private_state_dir();
-    let args = Args {
-        serve_path: tmpdir.path().to_path_buf(),
-        state_dir: Some(state_dir.path().to_path_buf()),
-        auth: AuthConfig::new(&[TEST_ACCOUNT]).unwrap(),
-        trusted_proxies: vec!["127.0.0.1".parse().unwrap(); MAX_TRUSTED_PROXIES + 1],
-        ..Args::default()
-    };
-    let error = args
-        .validate()
-        .expect_err("an excessive trusted proxy list was accepted");
-    assert!(error.to_string().contains("trusted-proxies"));
 }
 
 #[test]
@@ -279,6 +116,32 @@ fn test_args_from_empty_config_file_requires_auth() {
     assert!(
         err.to_string()
             .contains("At least one administrator username account is required")
+    );
+}
+
+#[test]
+fn development_mode_is_explicit_and_requires_only_loopback_bindings() {
+    for bind in ["127.0.0.1", "::1"] {
+        let state_dir = private_state_dir();
+        let matches = matches_with_state(["", "--development", "--bind", bind], state_dir.path());
+        let args = Args::parse(matches).unwrap();
+        assert!(args.development);
+        assert!(args.addrs.iter().all(IpAddr::is_loopback));
+    }
+    for bind in ["0.0.0.0", "::", "192.0.2.1"] {
+        let state_dir = private_state_dir();
+        let matches = matches_with_state(["", "--development", "--bind", bind], state_dir.path());
+        assert!(
+            Args::parse(matches)
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
+        );
+    }
+    assert!(
+        build_cli()
+            .try_get_matches_from(["", "--trusted-proxy", "127.0.0.1"])
+            .is_err()
     );
 }
 

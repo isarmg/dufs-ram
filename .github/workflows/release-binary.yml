@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "24.8.0"
+  NODE_VERSION: "26.7.0"
   RUST_TOOLCHAIN: "1.98.0"
   CARGO_AUDIT_VERSION: "0.22.2"
   TARGET: x86_64-unknown-linux-gnu
@@ -184,6 +184,7 @@ jobs:
           cargo audit --deny yanked
           npm ci --ignore-scripts --no-audit --no-fund
           npm audit --audit-level=high
+          npm run build:platform
 
       - name: Build the release binary
         shell: bash

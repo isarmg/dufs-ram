@@ -3,7 +3,7 @@ mod fixtures;
 
 use fixtures::{
     ADMIN_ACCOUNT, Error, TEST_ACCOUNT, TEST_PASSWORD, TEST_USER, TestServer, dufs_command,
-    read_bound_url, server, tmpdir,
+    production_server, read_bound_url, server, tmpdir,
 };
 
 use assert_cmd::prelude::*;
@@ -79,8 +79,8 @@ fn non_ip_bind_is_rejected(tmpdir: TempDir, #[case] bind: &str) -> Result<(), Er
 
 #[rstest]
 #[case(server(&[] as &[&str], &[TEST_ACCOUNT]), true, false)]
-#[case(server(&["-b", "0.0.0.0"], &[TEST_ACCOUNT]), true, false)]
-#[case(server(&["-b", "127.0.0.1", "-b", "::"], &[TEST_ACCOUNT]), true, true)]
+#[case(production_server(&["-b", "0.0.0.0"], &[ADMIN_ACCOUNT]), true, false)]
+#[case(production_server(&["-b", "127.0.0.1", "-b", "::"], &[ADMIN_ACCOUNT]), true, true)]
 #[case(server(&["-b", "127.0.0.1", "-b", "::1"], &[TEST_ACCOUNT]), true, true)]
 fn bind_ipv4_ipv6(
     #[case] server: TestServer,
@@ -216,6 +216,7 @@ fn validate_printed_url(tmpdir: TempDir) -> Result<(), Error> {
     let state_dir = private_state_dir()?;
     let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
     let mut child = command
+        .arg("--development")
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")

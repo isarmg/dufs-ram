@@ -7,4 +7,5 @@
 /dufs.yaml
 /dufs.log
 /dist/
+/clients/web/dist/
 target/**

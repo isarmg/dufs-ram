@@ -66,8 +66,6 @@ macro_rules! declare_error_codes {
 
 declare_error_codes! {
     API_ENDPOINT_NOT_FOUND => "api_endpoint_not_found",
-    AUTHENTICATION_REQUIRED => "authentication_required",
-    CSRF_FAILED => "csrf_failed",
     DELETE_NOT_COMMITTED => "delete_not_committed",
     DELETE_STATE_CONFLICT => "delete_state_conflict",
     DELETE_TARGET_CHANGED => "delete_target_changed",

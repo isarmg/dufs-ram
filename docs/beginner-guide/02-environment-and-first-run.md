@@ -15,7 +15,7 @@
 
 [build.rs](../../build.rs) 会在编译期拒绝任何非 `x86_64-unknown-linux-gnu` 目标。启动时还会探测 `openat2`；精确 target 能编译仍不代表当前内核具备运行所需系统调用。
 
-Node.js 精确版本 24.8.0 用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本；仓库根目录的 [.node-version](../../.node-version) 是仓库级版本基准，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致。`scripts/check.sh` 与 `scripts/package-release.sh` 不依赖 npm 的 engine warning：二者都会在审计、构建、安装依赖或运行发布自测前，要求该文件只有 `24.8.0` 一行且以一个 LF 结尾，并要求 `node --version` 的完整输出精确为 `v24.8.0`。任一声明或运行时不匹配都会立即失败。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
+Node.js 精确版本 26.7.0 用于 JavaScript 安全/类型检查、前端单元测试、文档检查、Playwright/部署测试和发布辅助脚本；仓库根目录的 [.node-version](../../.node-version) 是仓库级版本基准，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致。`scripts/check.sh` 与 `scripts/package-release.sh` 不依赖 npm 的 engine warning：二者都会在审计、构建、安装依赖或运行发布自测前，要求该文件只有 `26.7.0` 一行且以一个 LF 结尾，并要求 `node --version` 的完整输出精确为 `v26.7.0`。任一声明或运行时不匹配都会立即失败。生产服务器运行已经构建好的 Dufs 二进制时不需要 Node.js。
 
 ## 2.2 先检查工具
 
@@ -33,7 +33,7 @@ rg --version
 ss --version
 ```
 
-这里的 `node --version` 必须输出 `v24.8.0`。诸如 `v24.8.1`、`v26.x` 或发行版自行回补的其他版本都不是当前工具链；项目不提供旧/新 Node 的兼容分支，也不会把 npm 的 `EBADENGINE` 警告当作有效门禁。
+这里的 `node --version` 必须输出 `v26.7.0`。诸如 `v24.8.1`、`v26.x` 或发行版自行回补的其他版本都不是当前工具链；项目不提供旧/新 Node 的兼容分支，也不会把 npm 的 `EBADENGINE` 警告当作有效门禁。
 
 `cc`、`ld` 和 `ar` 分别代表 C 编译器及链接/binutils 工具；SQLite bundled 源码构建需要它们。后续示例还假定存在 curl、ripgrep 的 `rg`、iproute2 的 `ss`，以及 GNU coreutils 提供的 `mktemp`、`install`、`stat` 和 `rm --one-file-system`。只编译后端时 Node/npm 可以暂缺，但浏览器测试和前端门禁需要它们。
 
@@ -76,10 +76,7 @@ target/release/dufs
 ```
 
 `--locked` 要求 Cargo 严格使用 [Cargo.lock](../../Cargo.lock)，避免一次普通构建意外改变依赖解析结果。
-其中 Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target`
-都必须是 `=0.3.1`，Git rev 都必须是 `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`。即使只是开发联调，也不能
-改成相邻工作区、Cargo path dependency、可变 branch 或本地复制代码；那会让同一 Dufs 提交产生不同的认证、
-Schema 或正式 target 合同。
+当前 Foundation 依赖为平台化联调路径，独立发行仍待新的不可变上游版本和锁文件验收。不能把本工作区编译成功视为发行完成，也不能复制认证、Schema 或 target 合同代替共享包。源码构建必须先执行 `npm ci` 和 `npm run build:platform`，生成 Rust 需要嵌入的平台资源。
 
 ## 2.4 准备隔离目录
 
@@ -265,8 +262,6 @@ serve-path: /tmp/dufs-learning.ABCDEFGH/shared
 state-dir: /tmp/dufs-learning.ABCDEFGH/state
 bind:
   - 127.0.0.1
-trusted-proxies:
-  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$v=19$...'
@@ -285,7 +280,7 @@ target/debug/dufs --config "$tutorial_root/dufs.yaml"
 
 YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项会直接失败，不会静默忽略。这样在 current-only 版本切换时会明确暴露不匹配，并能防止操作者误以为某个安全限制仍然生效。
 
-配置优先级是“内置默认值 → YAML → 命令行中明确给出的非认证参数”。因此命令行中的 `--bind` 和 `--trusted-proxy` 会分别整体替换 YAML 中的对应列表，而不是追加合并。账号只能来自受保护 YAML 的 `auth`；CLI 不定义账号参数，未声明选项由 clap 统一拒绝。YAML 中的相对路径按启动进程的当前工作目录解析，不按配置文件所在目录解析，生产中优先使用绝对路径。
+配置优先级是“内置默认值 → YAML → 命令行显式参数”。命令行 `--bind` 整体替换 YAML 列表；账号只能来自受保护 YAML 的 `auth`。生产使用 HTTPS 网关和绝对路径；仅本机开发才显式启用 `--development`。
 
 配置文件本身必须是不超过 1 MiB 的普通 UTF-8 文件，不能是符号链接、FIFO 或设备。Linux 上只允许 root 或服务 euid 拥有，mode 必须精确为 `0400/0440/0600/0640`；组读模式要求 gid 匹配服务 egid，还要求单硬链接且没有扩展 POSIX access ACL。文件只打开一次，ACL 探测与正文读取使用同一 fd，并在读取前后复核身份、安全属性、大小和修改时间没有变化。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量；测试脚本中名字相似的环境变量只控制测试工具，不会成为服务配置。
 
@@ -299,7 +294,7 @@ YAML 采用严格字段校验。写错字段或保留已经删除的旧配置项
 | `state-dir` | 无，必须显式配置 | 位于共享根之外、权限和属主受校验的持久状态目录 |
 | `auth` | 无账号，启动校验失败 | 至少一个 `user:<argon2id PHC>` 全权限账号 |
 | `bind` | `127.0.0.1` | 监听地址，可重复指定 |
-| `trusted-proxies` | 空 | 可声明代理头的直连网关 IP/CIDR；默认不信任任何代理 |
+| `development` | false | 显式允许 loopback HTTP；所有监听必须为回环地址 |
 | `port` | `5000` | HTTP 后端端口 |
 | `max-upload-size` | 100 GiB | 单文件声明长度上限 |
 | `upload-idle-timeout` | 60 秒 | 上传没有进展的允许时间 |

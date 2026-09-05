@@ -98,11 +98,13 @@ SQLite 提交与共享根中的 mkdir、rename、文件同步和目录 `fsync` �
 
 仓库内 nginx 示例固定 HTTP/1.1 回源，传递单值 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，关闭请求重放与缓存，并只对 exact `POST /api/v2/auth/login` 所在 location 使用来源 IP 请求速率、连接数和短正文时限。未知 HTTP Host 由默认 server 拒绝，合法 HTTP server 只跳转到配置中的固定规范 HTTPS 域名；未知 HTTPS SNI/Host 在默认 server 拒绝。Dufs 的内部路由本身也只接受规范 URI，尾斜杠、重复斜杠和非规范百分号编码不会成为另一个登录入口。
 
-Dufs 在读取登录正文前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket；应用正文上限为 16 KiB，生产 nginx exact location 进一步限制为 4 KiB，应用读取还受全局 32、每 IP 4 个并发许可和 10 秒总 deadline。解析严格 `{username,password}` JSON 并用 Foundation 规范化 username 后，继续执行“来源 IP + canonical 管理员 username 摘要”组合键失败退避和最多两个 Argon2id 计算槽；一个来源不能借错误密码把同一管理员在其他来源全局锁定。`Retry-After` 由 Foundation JSON `429` 直接返回。应用只在直连 TCP peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才采用合法单值 `X-Forwarded-For` 作为登录限流地址并用单值 `X-Forwarded-Proto` 证明外部 scheme；默认列表为空。网关若位于另一台主机，必须同时配置其窄来源网段并保留网关侧真实来源 IP 限流。
+Foundation 统一限制登录正文为 16 KiB、读取期限 10 秒、全局 32/每个真实 TCP 来源 4 个读取许可；取消或失败释放许可。失败预算为五分钟内每来源 20 次、每规范账号 10 次，最多两个 Argon2id 计算槽，取得计算槽最多等待两秒。失败预算耗尽返回 `429 auth.rate_limited` 和保守的 `Retry-After: 300`。这些是共享平台政策，不由 Dufs 实现或配置；网关仍须独立按真实客户端 IP 限速。
+
+生产模式固定要求 HTTPS Origin，并与唯一规范 Host/URI authority 和 `Sec-Fetch-Site: same-origin` 一致；不读取 Forwarded 或 X-Forwarded-* 来决定认证、scheme 或限流来源。nginx 必须终止 TLS、覆盖 Host 为规范域名，并通过防火墙、网络命名空间或精确 ACL 阻止客户端及不可信本机进程直连后端。仅显式 `--development` 允许 HTTP，且所有监听地址必须为 loopback；不能用于公网部署。
 
 Dufs 的普通文件和 Range 正文没有总时长/最低速率限制，但每个源文件分块的门控等待及读取连续 30 秒未完成会使正文报错，已经取得的分块在套接字连续 30 秒没有写入进展也会关闭连接。两项 idle deadline 独立重置；公网网关仍应设置符合业务容量的响应总时长、最低速率和空闲策略，不能把它们当作完整的慢客户端或总时长防护。
 
-后端必须由主机防火墙或网络 ACL 限制为仅网关可达。受信代理列表不是身份验证；`127.0.0.1/32` 仍允许任何能连接该回环端口的本机进程声明代理头，所以不可信本机进程必须再由容器/网络命名空间、进程级防火墙或等效机制隔离。TLS 私钥、会话 Cookie、CSRF token、完整 Argon2id PHC 和文件内容均不得进入诊断工单或公开日志。
+后端必须由主机防火墙或网络 ACL 限制为仅网关可达。回环端口不区分 nginx 和其他本机进程；不可信本机进程必须隔离。TLS 私钥、Cookie、CSRF、完整 PHC 和文件内容不得进入诊断工单或公开日志。
 
 ## 3. 健康检查和监控
 
@@ -159,13 +161,9 @@ systemctl start dufs
 
 本节只说明停服后如何验证并原子替换“唯一当前合同”的制品，不表示 Dufs 支持从任意旧版本就地升级。运行服务不解析旧配置、不读取旧 wire/schema、不执行迁移，也不提供双读、fallback 或兼容 alias。未来稳定版本若当前数据需要转换，必须先由 `sarmg-upgrade` 仓库以独立 adapter、fixture、CLI 和 release 原子加入明确且经验证的转换边；没有该转换边时，只能为新版本初始化当前格式并按经批准的数据恢复方案导入结果。
 
-Foundation 也是制品供应链输入，不是运行时 sibling 服务。`sarmg-admin-auth`、`sarmg-contracts`、
-`sarmg-schema-identity`、`sarmg-server-target` 必须同时精确为 `=0.3.1`，Git rev 必须逐字等于
-`7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`，并由 `Cargo.lock` 固定。开发联调、质量门和正式发布都不得
-改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；依赖不可取得或 rev 不符时停止，
-不能复制共享类型、目标守卫或认证实现继续构建。
+Foundation 是编译期供应链输入，不是运行时共享服务。目前工作区的 Rust/Web 依赖为联调路径，尚未完成新不可变版本发布。正式发行必须统一精确版本、不可变来源和 Cargo/npm 锁文件，并在独立源码树验收；依赖不可取得或身份不符时停止，不能复制共享类型、目标守卫或认证实现继续构建。
 
-仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 24.8.0 由 `.node-version`、manifest/lockfile 和工作流共同声明；`scripts/check.sh` 与正式打包入口还会在任何审计、构建或依赖代码前精确比对实际运行时，因此 npm 的 `EBADENGINE` warning 不能形成绿色结论。Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 也在工作流中固定；静态、Rust 与浏览器 job 使用 `ubuntu-24.04`，含 nginx 1.25.1+ 部署门的质量 job 使用 x64 `ubuntu-26.04`，两种托管镜像的实际版本及宿主工具均写入日志。GitHub 当前把 26.04 标为 preview；若该 runner 不可调度或镜像回归，质量门必须保持失败，不能退回 nginx 1.24 旧语法完成合并。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
+仓库的 `.github/workflows/read-only-ci.yml` 只提供远程回归反馈：权限为 `contents: read`，checkout 不保留凭据，静态、Rust、质量和 Chromium/Firefox 层不会创建 tag/release 或签名，也不会上传制品。质量层分别运行覆盖率、部署行为、发布脚本自测和 release binary smoke；各步骤只在自己的前置条件成功时运行，一项实质检查失败不会跳过其余独立检查。唯一当前 Node 26.7.0 由 `.node-version`、manifest/lockfile 和工作流共同声明；`scripts/check.sh` 与正式打包入口还会在任何审计、构建或依赖代码前精确比对实际运行时，因此 npm 的 `EBADENGINE` warning 不能形成绿色结论。Rust 1.98.0、ShellCheck 0.11.0、锁定的 npm 工具和 Action commit SHA 也在工作流中固定；静态、Rust 与浏览器 job 使用 `ubuntu-24.04`，含 nginx 1.25.1+ 部署门的质量 job 使用 x64 `ubuntu-26.04`，两种托管镜像的实际版本及宿主工具均写入日志。GitHub 当前把 26.04 标为 preview；若该 runner 不可调度或镜像回归，质量门必须保持失败，不能退回 nginx 1.24 旧语法完成合并。合并前应查看全部矩阵结果，但它不包含正式签名边界，也不替代目标 exact tag 上的完整本地门和下述发布流程。
 
 仓库另有 `.github/workflows/release-binary.yml`，只在推送 `v<version>` tag 后运行。它复核 tag、Cargo 版本和 workflow commit 一致，等待同一 tag/SHA 的全部质量门成功，并生成绑定当前版本与完整源码 SHA 的确定性发布说明。唯一的 `contents: write` job 不 checkout、不调用仓库脚本或执行下载的二进制，只消费并复核不可变发布输入。
 
@@ -179,7 +177,7 @@ Foundation 也是制品供应链输入，不是运行时 sibling 服务。`sarmg
 
 脚本从 façade 解析一次完整 commit ID。它先生成并验证一份质量门 archive，在没有 `.git` 的 `0700` 私有副本中运行检查；门禁结束后用独立 snapshot index 比较 tracked 内容和 mode，并拒绝任何非忽略新增路径。随后整棵质量树及其缓存被删除，再从同一 commit 分别生成全新的签名构建归档和打包归档。每份 tar 都作为独立文件保存到私有 stage 并立即验证，再解包并用目标 commit tree 建立独立临时 index；解包树会以 no-follow 方式拒绝 symlink 及任何非普通文件/目录条目，缺失、额外、类型、mode 或内容不同都会失败。后两份 tar 的 SHA-256 还必须完全相同。因此本地 replace object、private attributes、质量工具或构建期间改变 worktree/Git 元数据，不能让同一声明 SHA 对应另一棵检查、构建或打包树。只有最后一份重新验证的树提供文档和部署材料。同 UID 恶意进程仍属于必须用身份/主机隔离解决的边界。
 
-隔离质量门以 `env -i` 启动，固定 PATH、Rust 工具链和完整源码 SHA，并使用私有 HOME、Cargo home/target、npm cache、XDG 目录与临时目录。Cargo 先从锁文件 vendor，再以 offline source replacement 运行；这与之后签名构建使用的独立 vendor 树相互隔离。npm cache 播种器只接受 `package-lock.json` 中带 HTTPS resolved URL 与 SHA-512 integrity 的条目，并重新散列宿主 cache 内容后写入私有 cache；`npm ci` 使用 `prefer-offline`，缺失包以及 `npm audit` 仍可能访问网络。宿主 RustSec Git 数据库只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 `FETCH_HEAD` 时间戳不得比当前时间早超过 7 天或晚超过 300 秒，并通过完整物理/Git/内容检查后才可复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径和 tracked 内容/mode 漂移均拒绝。合格输入以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新，离线失败关闭。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed pre-audit；随后用私有 Cargo home 执行 `cargo fetch --locked`，保证 yanked 检查拥有完整锁图所需的 crates.io 索引项，再以同一封存数据库运行 `cargo audit --no-fetch --deny yanked`。索引缺失、抓取失败或锁图含已撤回 crate 都失败关闭；该 Cargo home 每次全新创建，因此当前正式发布要求 registry 网络可达，宿主 Cargo 缓存不能替代这一步。之后通过必填 `DUFS_QUALITY_AUDIT_DB` 把同一数据库交给隔离 `scripts/check.sh`，该脚本也在其他项目/依赖步骤前先审计。封存时校验 seal 与新鲜度，pre-audit 和 yanked 检查后重验 seal；完整门禁后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。包内环境清单只记录 advisory revision/fetch epoch，不记录内部 seal 摘要。Playwright 只复用显式浏览器 cache，不让测试依赖用户 npm/Cargo 配置。JavaScript 安全门固定使用 Acorn 8.17.0 AST 与有界词法常量分析，并以内置正负对抗样例校验关键规则；动态 computed 解构的属性名无法静态求值时，在变量声明、赋值表达式和默认参数（含嵌套及 const alias）中都失败关闭。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript，外部/解析输入保持为 `unknown` 并经守卫收窄，生产源码不保留显式或隐式 `any`。该门无需迁移 `.ts`，但仍不等价于 ESLint 或完整跨过程污点证明。本地有 ShellCheck 时统一门执行 warning 检查，缺失时明确跳过且不联网安装；远程 CI 固定并强制执行 0.11.0。
+隔离质量门以 `env -i` 启动，固定 PATH、Rust 工具链和完整源码 SHA，并使用私有 HOME、Cargo home/target、npm cache、XDG 目录与临时目录。Cargo 先从锁文件 vendor，再以 offline source replacement 运行；这与之后签名构建使用的独立 vendor 树相互隔离。npm cache 播种器只接受 `package-lock.json` 中带 HTTPS resolved URL 与 SHA-512 integrity 的条目，并重新散列宿主 cache 内容后写入私有 cache；`npm ci` 使用 `prefer-offline`，缺失包以及 `npm audit` 仍可能访问网络。宿主 RustSec Git 数据库只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 `FETCH_HEAD` 时间戳不得比当前时间早超过 7 天或晚超过 300 秒，并通过完整物理/Git/内容检查后才可复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径和 tracked 内容/mode 漂移均拒绝。合格输入以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新，离线失败关闭。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed pre-audit；随后用私有 Cargo home 执行 `cargo fetch --locked`，保证 yanked 检查拥有完整锁图所需的 crates.io 索引项，再以同一封存数据库运行 `cargo audit --no-fetch --deny yanked`。索引缺失、抓取失败或锁图含已撤回 crate 都失败关闭；该 Cargo home 每次全新创建，因此当前正式发布要求 registry 网络可达，宿主 Cargo 缓存不能替代这一步。之后通过必填 `DUFS_QUALITY_AUDIT_DB` 把同一数据库交给隔离 `scripts/check.sh`，该脚本也在其他项目/依赖步骤前先审计。封存时校验 seal 与新鲜度，pre-audit 和 yanked 检查后重验 seal；完整门禁后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。包内环境清单只记录 advisory revision/fetch epoch，不记录内部 seal 摘要。Playwright 只复用显式浏览器 cache，不让测试依赖用户 npm/Cargo 配置。JavaScript 安全门固定使用 Acorn 8.17.0 AST 与有界词法常量分析，并以内置正负对抗样例校验关键规则；动态 computed 解构的属性名无法静态求值时，在变量声明、赋值表达式和默认参数（含嵌套及 const alias）中都失败关闭。TypeScript 5.8.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript，外部/解析输入保持为 `unknown` 并经守卫收窄，生产源码不保留显式或隐式 `any`。该门无需迁移 `.ts`，但仍不等价于 ESLint 或完整跨过程污点证明。本地有 ShellCheck 时统一门执行 warning 检查，缺失时明确跳过且不联网安装；远程 CI 固定并强制执行 0.11.0。
 
 脚本严格校验 Rust/rustc/Cargo 1.98.0、`cargo-cyclonedx 0.5.9` 与 `cargo-audit 0.22.2`。固定工具链 sysroot 的 `share/doc/rust/COPYRIGHT-library.html` 必须是 sysroot 内 no-follow 普通文件，并精确匹配发布脚本中对 Rust 1.98.0 固定的已审核 SHA-256；未知工具链没有审核摘要时直接拒绝。验证后的副本以 `RUST-STANDARD-LIBRARY-COPYRIGHT.html` 打包。签名构建另用锁文件 vendor 依赖，随后以清空环境、私有 Cargo home、离线 source replacement、关闭增量编译和显式编译器运行 release 构建；完整 Git SHA 嵌入版本字符串，私有构建路径经过 remap 并在二进制中复查。`SOURCE_DATE_EPOCH` 同时传给 Rust 构建、SBOM 和归档；未显式设置时使用提交时间。
 
@@ -187,7 +185,7 @@ SBOM 递归把本地 Dufs `bom-ref`/`purl` 规范化为绑定完整源码 SHA �
 
 `THIRD_PARTY_LICENSES.txt` 从 Cargo metadata 中 Dufs 可达的非开发依赖生成，依赖源码必须位于本轮 vendor 根。每个包必须声明非空、经审核的 SPDX `license` 表达式；metadata `license_file` 只用于收集上游正文，不能替代表达式或作为分类 fallback。生成器按 `WITH > AND > OR` 优先级解析真实 SPDX AST，只接受审核清单内的 license identifier/exception，并要求表达式存在一条完整 permissive 选择：`OR` 任一分支可行，`AND` 两侧都必须 permissive；只对明确列出的 Cargo 遗留 `MIT/Apache-2.0` 和 `Unlicense/MIT` 写法映射为 `OR`。例如 `LGPL AND (MIT OR Apache-2.0)` 会拒绝，而 `(LGPL AND Apache-2.0) OR MIT` 可选择完整 MIT 分支。
 
-生成器同时收集 metadata `license_file` 与包根下所有匹配 LICENSE/COPYING/NOTICE 的常规文件；每个候选都必须是对应依赖真实源码目录内、同时仍在 vendor real root 内的 no-follow 普通文件。Foundation 0.3.1 的四个直接 crate 和传递依赖 `sarmg-error` 均应在 cargo vendor 后保留 crate 根 `LICENSE`；缺少其中任意一份都会令正式打包失败。项目自身 `LICENSE-APACHE` 不能替代缺失的上游文本，也没有按依赖名称或 Git 来源放宽的 fallback。
+生成器收集 metadata `license_file` 与包根下 LICENSE/COPYING/NOTICE 的常规文件。每个候选必须是依赖源码及 vendor real root 内的 no-follow 普通文件；所有当前 Foundation crate 必须携带真实 Apache-2.0 文本，字体必须携带 OFL。缺失任何必要许可证即失败，不能用产品许可证或按名称特判绕过。
 
 包内 `BUILD-ENVIRONMENT.txt`、SBOM、第三方 notice、Rust 标准库 notice 和项目 Apache-2.0 许可证均纳入 `SHA256SUMS`。
 

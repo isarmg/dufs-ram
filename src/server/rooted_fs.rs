@@ -7,27 +7,26 @@ use super::{
     },
     state_store::StoredFileIdentity,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rustix::{
     fd::OwnedFd,
     fs::{
-        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
-        XattrFlags, fchmod, fchown, fgetxattr, flistxattr, flock, fremovexattr, fsetxattr, fstat,
-        fsync, mkdirat, openat, openat2, renameat, renameat_with, statat, unlinkat,
+        AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags, XattrFlags, fchmod,
+        fchown, fgetxattr, flistxattr, fremovexattr, fsetxattr, fstat, fsync, mkdirat, openat,
+        openat2, renameat, renameat_with, statat, unlinkat,
     },
     io::{Errno, dup},
     process::{Gid, Uid, geteuid},
 };
+pub(super) use sarmg_fs_safety::linux::FileIdentity;
+use sarmg_fs_safety::linux::{AdvisoryLock, MountPolicy, OpenAt2Root};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fs::File,
     io::Write,
     os::fd::AsFd,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
-    },
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -58,6 +57,7 @@ pub(super) struct RootedFs {
 
 struct RootedFsInner {
     root: File,
+    _root_lock: AdvisoryLock,
     root_identity: FileIdentity,
     root_path: PathBuf,
     resolve: ResolveFlags,
@@ -244,12 +244,6 @@ pub(super) enum CheckedTrashMove {
     DurabilityUnknown(std::io::Error),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RootedEntryKey {
     parent: FileIdentity,
@@ -304,38 +298,23 @@ pub(super) enum DirectoryVisitProgress {
 
 impl RootedFs {
     pub(super) fn new(root_path: &Path) -> Result<Self> {
-        let root = File::open(root_path)
+        let root = OpenAt2Root::open(root_path, MountPolicy::AllowNestedMounts)
             .with_context(|| format!("Failed to open shared root `{}`", root_path.display()))?;
-        let root_metadata = root.metadata()?;
-        if !root_metadata.is_dir() {
-            return Err(anyhow!(
-                "The rooted filesystem anchor is not a directory: `{}`",
+        let root_identity = root.identity();
+        let root = root.into_directory();
+        let root_lock = AdvisoryLock::directory(&root).with_context(|| {
+            format!(
+                "Failed to acquire the single-instance lock for shared root `{}`",
                 root_path.display()
-            ));
-        }
-        flock(&root, FlockOperation::NonBlockingLockExclusive)
-            .map_err(std::io::Error::from)
-            .with_context(|| {
-                format!(
-                    "Failed to acquire the single-instance lock for shared root `{}`",
-                    root_path.display()
-                )
-            })?;
+            )
+        })?;
         let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS;
-        openat2(
-            &root,
-            ".",
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            resolve,
-        )
-        .map_err(std::io::Error::from)
-        .context("Linux openat2 is required for safe rooted file operations")?;
 
         Ok(Self {
             inner: Arc::new(RootedFsInner {
-                root_identity: file_identity(&root_metadata),
+                root_identity,
                 root,
+                _root_lock: root_lock,
                 root_path: root_path.to_path_buf(),
                 resolve,
                 ancestor_creation: Mutex::new(()),
@@ -813,7 +792,9 @@ impl RootedFs {
                         Mode::empty(),
                     )
                     .map_err(std::io::Error::from)?;
-                    Some(file_identity(&File::from(directory).metadata()?))
+                    Some(FileIdentity::from_metadata(
+                        &File::from(directory).metadata()?,
+                    ))
                 }
                 Ok(_) | Err(Errno::NOENT) => None,
                 Err(error) => return Err(std::io::Error::from(error)),
@@ -1581,7 +1562,7 @@ impl RootedFs {
         let parent = self.open_parent_blocking(path, false)?;
         let parent_file = File::from(dup(&parent.fd).map_err(std::io::Error::from)?);
         Ok(RootedEntryKey {
-            parent: file_identity(&parent_file.metadata()?),
+            parent: FileIdentity::from_metadata(&parent_file.metadata()?),
             name: parent.name,
         })
     }
@@ -2650,13 +2631,6 @@ impl RootedFs {
             ));
         }
         Ok(relative)
-    }
-}
-
-fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
     }
 }
 

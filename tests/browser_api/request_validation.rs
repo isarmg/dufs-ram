@@ -42,10 +42,7 @@ fn browser_api_requires_csrf_and_json(server: TestServer) -> Result<(), Error> {
 
     let missing_csrf = post_json(&context, "mkdir", json!({"path": "/blocked"}), None)?;
     assert_eq!(missing_csrf.status(), 403);
-    assert_eq!(
-        missing_csrf.headers().get(AUTH_ERROR_HEADER).unwrap(),
-        "csrf"
-    );
+    assert_eq!(response_json(missing_csrf)?["code"], "auth.csrf_rejected");
     assert!(!server.path().join("blocked").exists());
 
     let invalid_csrf = post_json(
@@ -55,10 +52,7 @@ fn browser_api_requires_csrf_and_json(server: TestServer) -> Result<(), Error> {
         Some("invalid"),
     )?;
     assert_eq!(invalid_csrf.status(), 403);
-    assert_eq!(
-        invalid_csrf.headers().get(AUTH_ERROR_HEADER).unwrap(),
-        "csrf"
-    );
+    assert_eq!(response_json(invalid_csrf)?["code"], "auth.csrf_rejected");
 
     let wrong_type_operation_id = Uuid::new_v4();
     let wrong_type = context
@@ -138,7 +132,7 @@ fn file_mutations_require_session_csrf(server: TestServer) -> Result<(), Error> 
         }
         let response = request.send()?;
         assert_eq!(response.status(), 403, "PUT csrf={csrf_token:?}");
-        assert_eq!(response.headers().get(AUTH_ERROR_HEADER).unwrap(), "csrf");
+        assert_eq!(response_json(response)?["code"], "auth.csrf_rejected");
         assert!(!server.path().join("csrf-protected.txt").exists());
     }
 
@@ -166,7 +160,7 @@ fn file_mutations_require_session_csrf(server: TestServer) -> Result<(), Error> 
         }
         let response = request.send()?;
         assert_eq!(response.status(), 403, "PATCH csrf={csrf_token:?}");
-        assert_eq!(response.headers().get(AUTH_ERROR_HEADER).unwrap(), "csrf");
+        assert_eq!(response_json(response)?["code"], "auth.csrf_rejected");
         assert!(!server.path().join("csrf-protected.txt").exists());
     }
 
@@ -195,7 +189,7 @@ fn file_mutations_require_session_csrf(server: TestServer) -> Result<(), Error> 
         }
         let response = request.send()?;
         assert_eq!(response.status(), 403, "DELETE csrf={csrf_token:?}");
-        assert_eq!(response.headers().get(AUTH_ERROR_HEADER).unwrap(), "csrf");
+        assert_eq!(response_json(response)?["code"], "auth.csrf_rejected");
         assert!(server.path().join("csrf-protected.txt").is_file());
     }
 
@@ -244,6 +238,7 @@ fn unsupported_methods_are_rejected(server: TestServer) -> Result<(), Error> {
     for method in [b"OPTIONS".as_slice(), b"BREW"] {
         let response = context
             .request(Method::from_bytes(method)?, url.clone())
+            .header(CSRF_HEADER, &context.csrf_token)
             .send()?;
         assert_eq!(
             response.status(),

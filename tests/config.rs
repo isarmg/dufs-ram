@@ -25,6 +25,7 @@ fn use_config_file(tmpdir: TempDir) -> Result<(), Error> {
     let config_path = config_path.display().to_string();
     let state_dir = private_state_dir()?;
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg("--development")
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")
@@ -186,13 +187,7 @@ fn deployment_yaml_example_parses(tmpdir: TempDir) -> Result<(), Error> {
     assert_eq!(args.serve_path, std::fs::canonicalize(tmpdir.path())?);
     assert_eq!(args.state_dir.as_deref(), Some(state_dir.as_path()));
     assert_eq!(args.addrs, [std::net::IpAddr::from([127, 0, 0, 1])]);
-    assert_eq!(
-        args.trusted_proxies
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["127.0.0.1/32"]
-    );
+    assert!(!args.development);
     assert_eq!(args.port, 5000);
     assert!(args.auth.has_users());
     Ok(())

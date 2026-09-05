@@ -5,22 +5,32 @@
     "linux"
   ],
   "engines": {
-    "node": "24.8.0"
+    "node": ">=26.7.0 <27"
   },
   "scripts": {
+    "build:platform": "vite build --config vite.platform.config.mjs && tsc -p clients/web/tsconfig.platform.json",
     "check:docs": "node scripts/check-docs.mjs",
     "check:js": "node scripts/check-js.mjs",
     "check:types": "tsc -p clients/web/tsconfig.json",
     "test:frontend:unit": "node --test tests/frontend/unit/*.test.mjs",
-    "test:frontend": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs",
-    "test:frontend:headed": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --headed",
-    "test:frontend:edge": "cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --edge --project=edge",
+    "test:frontend": "npm run build:platform && cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs",
+    "test:frontend:headed": "npm run build:platform && cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --headed",
+    "test:frontend:edge": "npm run build:platform && cargo build --locked --quiet --target x86_64-unknown-linux-gnu && node tests/frontend/run.mjs --edge --project=edge",
     "test:frontend:install": "playwright install chromium firefox"
+  },
+  "dependencies": {
+    "@sarmg/admin-web": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-admin-web-0.6.0.tgz",
+    "@sarmg/contracts": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-contracts-0.6.0.tgz",
+    "@sarmg/http-client": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-http-client-0.6.0.tgz",
+    "@sarmg/design-tokens": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-design-tokens-0.6.0.tgz",
+    "@sarmg/web-fonts": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-web-fonts-0.6.0.tgz",
+    "@sarmg/web-toolchain": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-web-toolchain-0.6.0.tgz"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.12.1",
     "@playwright/test": "1.61.1",
     "acorn": "8.17.0",
-    "typescript": "5.9.3"
+    "typescript": "5.8.3",
+    "vite": "7.3.6"
   }
 }

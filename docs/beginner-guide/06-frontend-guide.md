@@ -10,7 +10,7 @@
 
 1. 为什么 Dufs 是项目组唯一不使用 React/Vite 的明确例外，页面仍然能拆成多个模块？
 2. 修改 `clients/web/index.css` 后，为什么只刷新浏览器可能看不到变化？
-3. Rust 如何把当前目录与完整 Foundation 管理员 session 交给 JavaScript？
+3. HTML 业务元数据与独立恢复的 Foundation session 如何一起启动页面？
 4. `listing/controller.js` 为什么同时维护数据项、cursor、revision 和 DOM 窗口？
 5. 文件夹没有下载按钮时，为什么删除和重命名按钮仍不会向左移动？
 6. 为什么点击“新建文件夹”后先创建 `newfolder`，再在原位置编辑？
@@ -94,7 +94,7 @@ Cache-Control: public, max-age=31536000, immutable
 
 ### 6.3.4 登录脚本是一个例外
 
-[clients/web/login.js](../../clients/web/login.js) 不是外部 ES module，而是由服务端直接替换进登录 HTML 的 `<script>`。登录页 CSP 只允许这段脚本的固定 SHA-256 哈希，见 [src/server/session.rs](../../src/server/session.rs)。
+[clients/web/login.js](../../clients/web/login.js) 是同源外置 ES module，调用 Foundation Admin Client。平台资源经共享原生 Vite 配置构建后与业务脚本共同嵌入二进制；CSP 只允许同源脚本和字体，不允许内联脚本或 eval，见 [src/server/administrator_web.rs](../../src/server/administrator_web.rs)。
 
 修改 `login.js` 时必须同步更新 `LOGIN_CSP` 中的哈希，否则：
 
@@ -144,14 +144,7 @@ body
 ```js
 {
   href: "/photos",
-  dir_exists: true,
-  session: {
-    authenticated: true,
-    user_id: "dufs:...",
-    username: "admin",
-    role: "admin",
-    csrf_token: "..."
-  }
+  dir_exists: true
 }
 ```
 
@@ -161,13 +154,8 @@ body
 | --- | --- |
 | `href` | 当前共享根内的逻辑目录，以 `/` 开头 |
 | `dir_exists` | 当前目录是否已经存在 |
-| `session.authenticated` | 只能为 `true`，证明页面由已认证分支生成 |
-| `session.user_id` | Foundation 稳定管理员标识，1～128 个允许字符 |
-| `session.username` | Foundation canonical 管理员 username：3～64 lowercase ASCII bytes、首尾 alnum、字符仅 `[a-z0-9._-]` |
-| `session.role` | 唯一允许值 `admin`；不存在普通用户或其他角色 |
-| `session.csrf_token` | 当前页面写请求必须携带的 32-byte、43 字符规范 base64url token |
 
-服务端先把 JSON 序列化，再编码为 Base64，最后替换 `__INDEX_DATA__` 占位符。JavaScript 从 `<template id="index-data">` 读取并解码；`JSON.parse()` 的结果仍是 `unknown`，必须通过 `shared/index_data.js` 的 `parseIndexData()` 严格校验后才能使用。
+服务端把两个业务字段序列化、编码为 Base64，替换 `__INDEX_DATA__` 占位符。JavaScript 读取 `<template id="index-data">`，解码并解析为 `unknown`。随后共享 Admin Client 独立恢复会话并轮换 CSRF；`parseIndexData(raw, session)` 验证业务字段和 Foundation 五字段 Session，再复制、冻结后使用。HTML 不含身份或 CSRF。
 
 Base64 只是为了安全、稳定地把文本嵌入 HTML，不是加密。认证和传输机密性仍依赖会话、HTTPS、CSP 和响应缓存策略。
 
@@ -188,7 +176,10 @@ sequenceDiagram
     H->>A: 求值 app.js，解析 URL 参数
     E->>A: start()
     A->>A: 等待 DOMContentLoaded
-    A->>A: 解码 index-data → JSON.parse 为 unknown → parseIndexData
+    A->>A: 解码 index-data → JSON.parse 为 unknown
+    A->>S: Foundation Admin Client 恢复 Session
+    S-->>A: 当前会话与轮换后的 CSRF
+    A->>A: parseIndexData(raw, session)
     A->>A: 生成面包屑
     A->>L: createDirectoryListing(...)
     A->>O: createFileOperations(...)
@@ -330,11 +321,11 @@ element.setAttribute(name, value);
 2. 用户填写管理员 username candidate 和密码；candidate 必须是 1～64 bytes 且每字节 `0x20`～`0x7e`，允许外层 ASCII space 和大写字母；
 3. `login.js` 阻止默认 form navigation，以 Fetch 向 `POST /api/v2/auth/login` 发送恰好 `username/password` 的 JSON；
 4. 浏览器自动附带同源安全上下文，服务端还要求唯一且一致的 Origin、effective Host 与 `Sec-Fetch-Site: same-origin`；
-5. 服务端验证 Foundation 当前 Argon2id PHC，设置 `__Host-dufs-session` Secure Cookie，并返回恰好五字段的 `AdministratorSession`；
+5. 服务端验证 Foundation 当前 Argon2id PHC，设置 `__Host-sarmg-dufs-ram-session` Secure Cookie，并返回恰好五字段的 `AdministratorSession`；
 6. 客户端严格验证 session 的字段集合、canonical 管理员 username、`role=admin` 与 token 规范，成功才 `location.replace("/")`；
 7. `400/401/429` 等错误直接解析 Foundation `ErrorEnvelope` 并在原页面安全显示，不使用 PRG、查询字符串 token 或旧表单 alias。
 
-登录脚本严格复制 Foundation 当前 username 形状，并使用 `TextEncoder.encodeInto()` 按 UTF-8 字节检查密码：
+登录脚本直接使用 Foundation `isAdministratorLoginRequest` 与 `isAdministratorPassword`，不复制 username/token 正则或密码字节策略：
 
 - username candidate 必须为 1～64 bytes 且每字节 `0x20`～`0x7e`；客户端和服务端均执行 ASCII trim/lowercase，结果必须为 3～64 字节、首尾 alnum、字符仅 `[a-z0-9._-]` 的 canonical username；`@`、Unicode、控制字符和首尾分隔符拒绝，相邻分隔符允许；
 - 密码必须为 12～1024 个 UTF-8 字节且没有 ASCII 控制字符。
@@ -927,7 +918,7 @@ const item = payload;
 因此外部边界仍然需要运行时解析器：
 
 - `validateListingPage()` 校验目录页；
-- `parseIndexData()` 校验服务端注入的三字段启动对象及嵌套五字段 Foundation session；
+- `parseIndexData(raw, session)` 校验 HTML 两个业务字段，再用 Foundation guard 校验独立恢复的会话。
 - `parseUploadPreflight()` 校验预检顺序和 revision；
 - `classifyUploadResponse()` 校验上传状态矩阵；
 - `parseErrorPayload()` 只从 `application/problem+json` 中容错读取有界、规范命名的顶层字段；
@@ -935,7 +926,7 @@ const item = payload;
 
 `parseErrorPayload()` 也不是完整 Problem Details schema validator：只要 media type 正确，它会尝试读取受支持的有界字段，缺失或非法字段会回落为空值/默认值；只有调用方需要的 HTTP status、协议头和业务组合另行做权威校验。
 
-`parseIndexData()` 只接受普通对象和恰好 `href/dir_exists/session` 三个 own data property，不接受 accessor 或额外字段；`href` 必须是规范绝对逻辑路径，`dir_exists` 必须是 boolean。嵌套 session 又必须恰好包含 `authenticated/user_id/username/role/csrf_token`：authenticated 只能为 true，user_id 匹配 Foundation 标识字符集，username 是 3～64 字节的 canonical 管理员 username，role 只能是 admin，CSRF 是 32-byte 无填充规范 base64url token。解析器复制并冻结外层和 session，调用方不会继续持有未经验证的对象。修改这个 current-only schema 时必须同步 Rust 生成端、解析器、嵌入资源和正反测试，不增加旧字段兼容分支。
+服务端 HTML 的 IndexData 只含 `href` 与 `dir_exists` 两个字段，不嵌入身份或 CSRF。页面经共享 Admin Client 调用 `GET /api/v2/auth/session` 恢复会话，再把结果交给 `parseIndexData(raw, session)`；它严格验证两个业务字段，并使用 Foundation `isAdministratorSession` 验证独立的五字段会话合同，复制并冻结结果后才启动文件业务界面。
 
 一个实用原则是：
 
@@ -1112,7 +1103,7 @@ axe 测试覆盖登录页、文件页、行内编辑器和操作对话框的 WCA
 2. 确认旧服务进程已经停止；
 3. 启动刚生成的二进制；
 4. 重新加载目录 HTML；
-5. 若改的是 `EMBEDDED_ASSETS` 白名单中的 CSS/ES module/图标，在 Network 或 Sources 中查看 `__dufs_assets_...` 前缀是否变化；若改的是 `index.html`、`login.html` 或内联 `login.js`，前缀可以不变，应直接核对新 document 内容及登录 CSP。
+5. 若改的是 `EMBEDDED_ASSETS` 白名单中的 CSS/ES module/图标，在 Network 或 Sources 中查看 `__dufs_assets_...` 前缀是否变化；若改的是 `index.html`、`login.html` 或外部 `login.js`，前缀可以不变，应直接核对新 document 内容及登录 CSP。
 
 只有浏览器重新取得新 HTML，才会知道新的页面内容和资源 URL。一个已经打开的旧标签页不会自动替换它内存中的模块。
 
@@ -1194,7 +1185,7 @@ axe 测试覆盖登录页、文件页、行内编辑器和操作对话框的 WCA
 | 快速连点新建只执行一次 | `create-item` pending 防重复 |
 | 点击 Move 后整段路径变蓝 | 对话框为方便替换而主动 `select()` |
 | 改了 JS 却出现 module 404 | 新模块未加入 Rust 资源清单 |
-| 登录页脚本不执行 | CSP 哈希与内联 `login.js` 不一致 |
+| 登录页脚本不执行 | 外部 login.js/平台 ESM 缺失或违反同源 CSP |
 
 ## 6.19 修改前端时的最小验证闭环
 
@@ -1252,7 +1243,7 @@ npm run test:frontend
 - 修改上传：补 `upload.spec.js` 和协议单元测试；
 - 修改登录输入：补 `auth.spec.js`，并同步 CSP 哈希。
 
-最后还要重新构建和重启真实开发实例。若改动属于 `EMBEDDED_ASSETS` 哈希白名单，手工确认浏览器加载了新摘要 URL；若改的是 `index.html`、`login.html` 或内联 `login.js`，则确认加载了新 document，并在适用时核对登录 CSP 哈希。
+最后还要重新构建和重启真实开发实例。若改动属于 `EMBEDDED_ASSETS` 哈希白名单，手工确认浏览器加载了新摘要 URL；若改的是 `index.html`、`login.html` 或外部 `login.js`，则确认加载了新 document，并在适用时核对登录 CSP 和外部模块 URL。
 
 ## 6.20 三个动手阅读练习
 

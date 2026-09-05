@@ -47,7 +47,7 @@ if (markdownTargets(maskFencedCode(fencedFixture)).length !== 0) {
   );
 }
 
-const currentNodeVersion = "24.8.0";
+const currentNodeVersion = "26.7.0";
 const nodeVersionSource = readFileSync(
   resolve(projectRoot, ".node-version"),
   "utf8",
@@ -77,7 +77,7 @@ if (
   currentNodeContractFailures(
     nodeVersionSource,
     packageSource.replace(
-      `"node": "${currentNodeVersion}"`,
+      `"node": ">=${currentNodeVersion} <27"`,
       '"node": ">=18"',
     ),
     packageLockSource,
@@ -284,14 +284,15 @@ function currentNodeContractFailures(
   } catch {
     return ["package.json and package-lock.json must be valid JSON"];
   }
-  if (manifest.engines?.node !== currentNodeVersion) {
+  const currentNodeRange = `>=${currentNodeVersion} <27`;
+  if (manifest.engines?.node !== currentNodeRange) {
     nodeFailures.push(
-      `package.json: engines.node must be exactly ${currentNodeVersion}`,
+      `package.json: engines.node must be exactly ${currentNodeRange}`,
     );
   }
-  if (lock.packages?.[""]?.engines?.node !== currentNodeVersion) {
+  if (lock.packages?.[""]?.engines?.node !== currentNodeRange) {
     nodeFailures.push(
-      `package-lock.json: root engines.node must be exactly ${currentNodeVersion}`,
+      `package-lock.json: root engines.node must be exactly ${currentNodeRange}`,
     );
   }
 

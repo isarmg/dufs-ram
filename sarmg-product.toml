@@ -1,0 +1,22 @@
+format = 1
+product_id = "dufs-ram"
+
+[foundation]
+platform_generation = 1
+version = "0.6.0"
+git_rev = "1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+
+[[components]]
+id = "server"
+profile = "server-filesystem"
+http_adapter = "hyper"
+web_profile = "web-embedded-native"
+capabilities = [
+  "admin-static",
+  "memory-sessions",
+  "server-runtime",
+  "server-health",
+  "filesystem-root",
+  "linux-openat2",
+  "durable-operations",
+]

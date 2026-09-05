@@ -342,21 +342,14 @@ export function createFileOperations(options) {
     const returnFocus = document.querySelector(".logout-btn");
     if (!begin("logout", returnFocus, "Signing out…")) return;
     try {
-      const response = await requestNoContent("/api/v2/auth/logout", {
-        method: "POST",
-        headers: {
-          [CSRF_HEADER]: data.session.csrf_token,
-        },
-      }, {
-        outcomeUnknown: true,
-      });
-      await assertResponse(response, onUnauthorized);
+      const { administratorApi } = await import("../platform-session.js");
+      await administratorApi.logout();
       onUnauthorized();
     } catch (error) {
       if (isAuthenticationError(error)) return;
       await dialogs.showMessage({
         title: "Sign out failed",
-        message: `Unable to sign out: ${errorMessage(error)}`,
+        message: "Unable to sign out. Please try again.",
         returnFocus,
       });
     } finally {

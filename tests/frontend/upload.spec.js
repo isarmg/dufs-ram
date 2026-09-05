@@ -1368,6 +1368,8 @@ test("终态历史淘汰聚焦行时把焦点移到相邻结果或历史摘要",
       character => character.charCodeAt(0),
     );
     const data = JSON.parse(new TextDecoder().decode(bytes));
+    const { administratorApi } = await import(new URL("modules/platform-session.js", entrypoint).href);
+    data.session = administratorApi.currentSession();
 
     const fixture = document.createElement("section");
     fixture.id = "focus-history-fixture";

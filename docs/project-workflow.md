@@ -7,14 +7,12 @@
 - 部署约定为每个共享根仅运行一个 Dufs 实例；进程会在长期持有的共享根目录 fd 上取得非阻塞独占 `flock`，同机第二实例若指向同一根会在启动时失败；advisory lock 不阻止其他程序写入，一致性保证要求共享根由 Dufs 独占写入，人工修改只能停服执行；
 - `build.rs` 只接受 `x86_64-unknown-linux-gnu`；其他架构、操作系统、ABI 或指针宽度在应用编译前失败，运行内核还必须提供 `openat2`；
 - 本地构建使用 `rust-toolchain.toml` 精确固定的 Rust/rustc/Cargo 1.98.0，源码采用 Rust 2024 edition；
-- Foundation 四个 crate 均精确固定 `=0.3.1` 与不可变 Git rev
-  `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`；开发、CI、发行均不接受 workspace sibling、Cargo path
-  dependency、可变 branch 或本地副本；
+- Foundation Core/Static/Hyper 和 Web 平台包为唯一上游；当前联调路径依赖尚未发布，正式交付必须改为新不可变来源并验证锁文件；
 - 必须通过 Foundation 管理员 username 和密码认证，不存在匿名业务访问；
 - 唯一角色是 `admin`；每个有效管理员拥有整个共享目录的浏览和文件管理能力；
 - 服务只通过内网 HTTP/TCP 地址监听，HTTPS 统一由网关终止；
 - TCP 接收错误使用分类日志和有界退避；SIGINT/SIGTERM 触发分阶段优雅停机；
-- 目录页只使用编译进程序的 HTML、CSS、原生 ES modules 和图标；Dufs 是项目组唯一不使用 React/Vite 的前端例外；
+- 目录页使用编译进程序的 HTML、CSS、原生 ES modules、Maple 字体和图标；Dufs 使用 Foundation 原生 Vite Profile，不使用 React；
 - 浏览器通过 HTTPS 网关使用会话 Cookie 进行下载、持久化上传、删除和同源 JSON POST 操作；
 
 ## 1. 总体流程树
@@ -39,7 +37,7 @@ flowchart TD
     LOGIN_POST --> LOGIN_OK{"管理员 username 和密码正确？"}
     LOGIN_OK -- 否 --> LOGIN_FAIL["返回统一 JSON ErrorEnvelope<br/>400/401/429"]
     LOGIN_OK -- 是 --> SESSION_NEW["创建随机内存会话<br/>Set-Cookie + AdministratorSession JSON"]
-    LOGIN -- 否 --> SESSION["验证 __Host-dufs-session Cookie"]
+    LOGIN -- 否 --> SESSION["验证 __Host-sarmg-dufs-ram-session Cookie"]
     SESSION --> PASS{"会话有效？"}
     PASS -- 否 --> NAV{"GET/HEAD 且 Accept 含<br/>精确 text/html; q>0？"}
     NAV -- 是 --> REDIRECT["303 跳转英文登录页"]
@@ -162,9 +160,9 @@ flowchart LR
     PUBLIC["其他网络来源"] -. 防火墙拒绝直接访问 .-> D
 ```
 
-`__Host-dufs-session` 带有 `Secure`，因此浏览器必须从 HTTPS 入口访问。Nginx 的未知 Host 默认 server 会拒绝请求，合法 HTTP server 只重定向到配置中的固定 HTTPS 域名；网关只对唯一当前登录端点 `location = /api/v2/auth/login` 施加来源 IP 请求率、连接数、4 KiB 正文和 10 秒正文时限，不保留 `/__dufs__/login` POST 兼容位置。应用自身在读取 JSON 前同时消耗全局 burst 16/每秒补充 1 个和来源 IP burst 8/每秒补充 1 个的 token bucket，正文上限为 16 KiB 并另受全局 32、每 IP 4 个并发许可及 10 秒总 deadline；生产链路取网关与应用的更小边界。解析严格 `username/password` JSON 并用 Foundation 把 candidate 规范化后，只对“来源 IP + canonical 管理员 username SHA-256 摘要”组合累计失败；同一组合第 5 次失败起按 1、2、4……秒指数退避，最长 60 秒，成功登录只清除该组合，其他来源不受影响。限流直接返回 Foundation JSON `429` 并携带向上取整的 `Retry-After`。全局最多同时执行两个 Argon2id 校验；槽位由 blocking 任务持有到计算真正结束，请求取消不会提前释放，会话只在校验结果返回到仍存活的请求后创建。
+Foundation 统一限制登录正文为 16 KiB、读取期限 10 秒、全局 32/每个真实 TCP 来源 4 个读取许可；取消或失败释放许可。失败预算为五分钟内每来源 20 次、每规范账号 10 次，最多两个 Argon2id 计算槽，取得计算槽最多等待两秒。失败预算耗尽返回 `429 auth.rate_limited` 和保守的 `Retry-After: 300`。这些是共享平台政策，不由 Dufs 实现或配置；网关仍须独立按真实客户端 IP 限速。
 
-应用层默认不信任代理头；只有直接 TCP peer 匹配显式 `--trusted-proxy` / `trusted-proxies` IP 或 CIDR 时，才接受恰好一个、不含逗号且可解析为单个 IP 的 `X-Forwarded-For`。未匹配、缺失、重复或非法时，限流使用直接 peer 地址。网关必须覆盖客户端传入的同名头，只发送一个可信地址。即使 Dufs 自身已有正文前全局/每 IP 请求预算和解析后的 IP/账号组合退避，网关仍应在可信代理链上按真实客户端 IP 限速。网关还必须只接受配置的规范主机名，以这个固定规范值覆盖上游 `Host`，并传递恰好一个值为 `https` 的 `X-Forwarded-Proto`，使 `Origin` 的 scheme 与 authority 都能和外部请求匹配；代理未受信、头重复、包含逗号或使用其他 scheme 会使经 HTTPS 网关且带 `Origin` 的写请求失败关闭。受信列表不是身份认证：回环绑定不能区分 nginx 与其他本机进程，后端端口仍必须通过 OS 隔离、私网 ACL 或防火墙限制为只有网关可达。Dufs 必须独占一个主机名并固定部署在该域名的根路径 `/`；不支持 `/files/` 等 URL 子路径。
+生产模式固定要求 HTTPS Origin，并与唯一规范 Host/URI authority 和 `Sec-Fetch-Site: same-origin` 一致；不读取 Forwarded 或 X-Forwarded-* 来决定认证、scheme 或限流来源。nginx 必须终止 TLS、覆盖 Host 为规范域名，并通过防火墙、网络命名空间或精确 ACL 阻止客户端及不可信本机进程直连后端。仅显式 `--development` 允许 HTTP，且所有监听地址必须为 loopback；不能用于公网部署。 Dufs 必须独占主机名并部署在根路径 `/`。
 
 服务器初始化时打开共享根目录，在该 fd 上取得非阻塞独占 `flock`，并试用 Linux `openat2`。根 fd 和锁会保持到进程退出；指向同一根目录的第二个本机实例无法取得锁并会明确启动失败。旧于 Linux 5.6 的内核、禁止该系统调用的 seccomp/容器策略或其他不支持场景也会启动失败；`RootedFs` 的最终文件打开和写变更不会为这些环境退回字符串路径实现。
 
@@ -189,42 +187,17 @@ flowchart TD
 
 ### 3.2 登录与单次请求认证
 
-```mermaid
-flowchart TD
-    REQ(["收到请求"]) --> CANON{"内部 URI 是唯一规范形式？"}
-    CANON -- 否 --> BAD["400"]
-    CANON -- 是 --> PAGE{"GET /__dufs__/login？"}
-    PAGE -- 是 --> HTML["返回英文 HTML 登录页"]
-    PAGE -- 否 --> LOGIN{"POST /api/v2/auth/login？"}
-    LOGIN -- 是 --> HEADERS{"Origin/Host-or-authority/Sec-Fetch-Site<br/>唯一、规范、严格同源？"}
-    HEADERS -- 否 --> HERR["400 invalid_security_header<br/>或 403 forbidden"]
-    HEADERS -- 是 --> EARLY{"正文前全局/IP admission？"}
-    EARLY -- 否 --> LIMITED["429 ErrorEnvelope + Retry-After"]
-    EARLY -- 是 --> BODY["application/json；应用上限 16 KiB<br/>10 秒；全局32/每IP4读取许可"]
-    BODY --> FIELDS{"恰好 username/password？<br/>candidate 为 1～64 bytes、每字节 0x20～0x7e，trim/lowercase 后 canonical；密码符合当前策略？"}
-    FIELDS -- 否 --> INVALID["400 ErrorEnvelope"]
-    FIELDS -- 是 --> RATE{"来源 IP + canonical username 摘要<br/>组合退避已解除？"}
-    RATE -- 否 --> LIMITED
-    RATE -- 是 --> SLOT{"取得两个 Argon2id 槽之一？"}
-    SLOT -- 否 --> LIMITED
-    SLOT -- 是 --> VERIFY{"当前 Argon2id 校验成功？"}
-    VERIFY -- 否 --> WRONG["401 invalid_credentials"]
-    VERIFY -- 是 --> NEW["生成两个规范 256-bit token<br/>轮换已有 session"]
-    NEW --> COOKIE["Set-Cookie + AdministratorSession JSON"]
-    LOGIN -- 否 --> SESSION{"Cookie field lines 唯一且 token 规范？<br/>内存 session 存在且未过期？"}
-    SESSION -- 是 --> PASS["认证通过：username/role=admin/CSRF"]
-    SESSION -- 否 --> NAV{"GET/HEAD 且 Accept 含<br/>精确 text/html; q>0？"}
-    NAV -- 是 --> REDIRECT["303 到 /__dufs__/login"]
-    NAV -- 否 --> FAIL["认证 API 用 Foundation JSON 401<br/>其他接口按自身 401 合同"]
-```
+Dufs 的认证唯一所有者是 Foundation：受保护 YAML 经 `AuthConfig` 验证后映射为 Static Administrator Store，Hyper Router 接收真实 TCP peer 并处理三个当前认证 API。产品只拥有登录 HTML、响应正文类型适配、HTML 导航重定向和已认证的文件操作归属键，不实现 Session/Cookie/CSRF/密码哈希/登录限流。静态管理员不开放网页新增、改密或停用，配置变化必须重启。
 
-三个认证 API 路径来自 `sarmg-contracts`：`POST /api/v2/auth/login`、`GET /api/v2/auth/session` 和 `POST /api/v2/auth/logout`。登录只接受 JSON；请求必须恰好为 `{username,password}`，不存在额外或旧身份字段、`/__dufs__/login` POST、URL 编码表单、一次性错误 nonce 或兼容路径。策略形状错误返回 400，形状正确但凭据错误返回 401，资源/退避用尽返回 429；错误体统一使用 Foundation `ErrorEnvelope`。成功返回的 `AdministratorSession` 必须恰好包含 `authenticated=true`、稳定 `user_id`、canonical `username`、`role=admin` 和规范 `csrf_token`。
+三个唯一端点是 POST /api/v2/auth/login、GET /api/v2/auth/session、POST /api/v2/auth/logout。登录只接受恰好 username/password 的 JSON；wire 形状错误为 400，错误凭据为 401。成功返回 authenticated、user_id、username、role=admin、csrf_token 五字段合同。认证和 CSRF 失败统一为 Foundation ErrorEnvelope，不按产品路由改写成 Problem Details。
 
-会话令牌和 CSRF 令牌均为 32 bytes 随机值，编码成无 padding 的 canonical base64url 43 字符；Cookie 保存 session token 原文，服务端内存只以 SHA-256 digest 做 key/比较。会话空闲 30 分钟或创建满 12 小时后失效，计时采用 Linux `CLOCK_BOOTTIME`，系统休眠也计入。每管理员最多 32 个、全局最多 1024 个；达到管理员上限或全局已满时优先淘汰该管理员最久未活动会话，否则淘汰全局最久未活动项。状态不落盘，进程重启使全部会话失效。
+Foundation 统一限制登录正文为 16 KiB、读取期限 10 秒、全局 32/每个真实 TCP 来源 4 个读取许可；取消或失败释放许可。失败预算为五分钟内每来源 20 次、每规范账号 10 次，最多两个 Argon2id 计算槽，取得计算槽最多等待两秒。失败预算耗尽返回 `429 auth.rate_limited` 和保守的 `Retry-After: 300`。这些是共享平台政策，不由 Dufs 实现或配置；网关仍须独立按真实客户端 IP 限速。
 
-Cookie 固定为 `__Host-dufs-session; Path=/; HttpOnly; Secure; SameSite=Strict`，不设置 `Domain`。解析器保留每条 Cookie field line，不按第一个或最后一个值猜测；重复同名 Cookie、非法字节、非规范 token 都失败关闭。成功登录若请求已有有效旧 Cookie，会先撤销旧 session 再返回新 token；失败登录不撤销仍有效的旧 session。
+Foundation Static Store 持有内存会话，重启全部失效；空闲期限 30 分钟、绝对期限 12 小时，每管理员最多 32 个活动会话、全局最多 1024 个。平台 HTTP Adapter 使用统一的 Unix 微秒时间；访问不延长绝对期限，存储拒绝倒退时间。会话和 CSRF 为 32 字节随机值，服务端只保留其摘要。恢复接口轮换 CSRF；其他页面仍使用旧 CSRF 写入时会失败关闭，客户端刷新并重新恢复，绝不重放未知结果的写入。
 
-未认证请求只有在方法为 GET/HEAD，且一个或多个 `Accept` 字段的逗号项中存在精确、不区分大小写的 `text/html` media type、可选 `q` 语法有效且大于 0 时，才被视为浏览器导航并 `303` 到登录页；`text/htmlx`、`text/html;q=0`、重复或畸形 `q` 不会触发跳转。Argon2id permit 移入 blocking closure 并持续到计算真正结束；外层请求取消不会提前释放 CPU admission。网关仍须按可信代理链上的真实客户端 IP 限制唯一当前登录 API。
+生产 Cookie 为 `__Host-sarmg-dufs-ram-session; Path=/; HttpOnly; Secure; SameSite=Strict`；显式 loopback 开发模式使用 `sarmg-dufs-ram-session` 且不带 Secure。重复 Cookie field line、重复当前名称和畸形 token 失败关闭。登录生成独立的新会话，其他有效会话仍受共享容量和过期规则管理；退出撤销当前会话并清除 Cookie。
+
+业务请求先经 Foundation authenticate_request。安全方法不要求 CSRF；不安全方法必须同时满足严格同源和唯一有效 X-CSRF-Token。未认证 HTML GET/HEAD 导航可 303 到登录页，其他请求保留平台 JSON 401。
 
 ## 4. 英文登录、目录页与会话 CSRF
 
@@ -244,22 +217,23 @@ sequenceDiagram
     S-->>B: 3:2 六行圆角登录卡 + no-store
     U->>B: 输入管理员 username 和密码
     B->>S: POST /api/v2/auth/login（JSON）
-    S->>S: Foundation 严格同源、应用 16 KiB/网关 4 KiB、双层限流、Argon2id
+    S->>S: Foundation 严格同源、正文预算、失败预算、Argon2id
     alt 登录失败
         S-->>B: 400/401/429 Foundation ErrorEnvelope JSON
-        B->>B: 在当前页安全显示 message，密码框重新聚焦
+        B->>B: 显示固定安全错误与 Request ID，清空密码并聚焦
     else 登录成功
         S-->>B: Set-Cookie + AdministratorSession JSON
         B->>B: 严格校验 session 字段、role 和 token shape
         B->>B: location.replace("/")
         B->>S: GET /目录/ + 会话 Cookie
         S->>S: 验证会话和共享根目录
-        S->>S: 构造含路径、目录存在标志和 Foundation session 的 IndexData
-        S->>S: Base64 编码 IndexData 并注入页面骨架
+        S->>S: 构造仅含路径与目录存在标志的 IndexData
+        S->>S: Base64 编码业务 JSON 并注入不可执行 template
         S-->>B: private, no-store HTML
         B->>S: GET 版本化 ES modules/index.css/favicon + Cookie
         S-->>B: 编译期内置资源
-        B->>B: Base64 解码 → JSON.parse 为 unknown → parseIndexData
+        B->>S: 共享 Admin Client 恢复会话并轮换 CSRF
+        B->>B: JSON.parse 为 unknown → parseIndexData(raw, session)
         B->>S: GET /__dufs__/api/list?path=…&limit=200
         S->>F: 从长期根 fd 枚举、物化并排序一次
         F-->>S: 有预算上限的不可变内存结果
@@ -271,19 +245,7 @@ sequenceDiagram
 
 每个可操作列表项还携带绑定当前 owner、规范路径和完整文件身份的不透明 `revision`。浏览器必须把该 token 随 DELETE、Move 或 Rename 带回，不能从文件名、时间或下载 ETag 自行构造。
 
-```text
-IndexData
-├─ href：当前目录的逻辑路径
-├─ dir_exists：目录是否已经存在
-└─ session
-   ├─ authenticated：固定 true
-   ├─ user_id：稳定 Foundation 标识
-   ├─ username：canonical 管理员 username
-   ├─ role：固定 admin
-   └─ csrf_token：当前会话专属的规范 43 字符 token
-```
-
-浏览器不会用 JSDoc 断言跳过这个页面边界。`JSON.parse()` 的结果保持为 `unknown`，再由 `shared/index_data.js` 的 `parseIndexData()` 验证：顶层必须是普通对象并恰好具有 `href/dir_exists/session` 三个 own data property，不接受 accessor 或额外字段；`session` 也必须恰好匹配 Foundation 五字段管理员合同，username 必须为 3～64 字节的 canonical current 形式、role 只能是 `admin`、CSRF 为 canonical 43 字符 base64url token。解析器分别返回新的 frozen 顶层对象和 frozen session 后，`app.js` 才创建列表、操作和上传模块。
+服务端 HTML 的 IndexData 只含 `href` 与 `dir_exists` 两个字段，不嵌入身份或 CSRF。页面经共享 Admin Client 调用 `GET /api/v2/auth/session` 恢复会话，再把结果交给 `parseIndexData(raw, session)`；它严格验证两个业务字段，并使用 Foundation `isAdministratorSession` 验证独立的五字段会话合同，复制并冻结结果后才启动文件业务界面。
 
 目录项不再嵌入 HTML。分页 API 接受 `path`、`limit`、`sort`、`order`、`q` 和不透明 `cursor`。第一页在受跟踪的阻塞任务中完整物化并排序一次；递归搜索边遍历边转换 `PathItem`，逐项累计结构、路径字符串和 lowercase 排序键的真实容量，达到 32 MiB 结果预算前即停止；递归 DFS 本身另受 1024 层和 32 MiB 工作集限制，不会先在 Tokio runtime worker 上构造超预算向量。稳定索引归并排序在索引构造、每次合并选择和每个最终置换步骤都检查停机标志与总 deadline。如果超过一页，结果存入进程内不可变结果集，后续页只按 offset 切片，不再重复扫描或排序。
 
@@ -308,7 +270,7 @@ flowchart LR
     KNOWN -- 否 --> MISS["404 + private, no-store"]
 ```
 
-运行时外部 assets 覆盖已经删除，但仓库中的 `clients/web/` 仍是编译期页面源文件，不能删除。服务器不读取外部 `index.html`、`404.html` 或自定义资源目录。入口脚本使用原生 ES modules，按 `shared/`、`http/`、`listing/`、`operations/` 和 `upload/` 五组职责组织，不需要生产打包器；`shared/index_data.js` 验证并冻结页面启动数据，`http/headers.js` 提供严格无符号头解析，`http/response_buffer.js` 负责有界读取、取消和重放流，`upload/protocol.js` 集中定义上传头名、允许状态码及按当前文件总长度绑定的单一解析。目录页由 `index.js` 和 18 个 ES modules 构成。登录样式也位于内容寻址的 `login.css`，所以登录页 CSP 只需 `style-src 'self'`，不允许内联样式；小型登录校验脚本仍由精确 SHA-256 CSP hash 授权。后端 `server/assets.rs` 以单一注册表定义内置资源内容、类型、公开命中和摘要输入；资源前缀由全部内置模块、CSS 和图标的名称、MIME 类型与内容共同计算，并对各字段做长度分帧，其中任一项改变都会产生新的 URL。静态门还双向核对 `clients/web/modules/` 文件与 `EMBEDDED_ASSETS` 注册表，任何漏嵌或幽灵注册都失败。已知摘要资源的 HEAD 与 GET 返回相同状态、类型、缓存头和长度，但不发送正文；只有成功返回的已知摘要资源可以使用公共长期缓存，未知资源 `404` 返回 `private, no-store`。
+Dufs 使用 Foundation 原生 ESM Profile：`platform.js` 仅导出共享 Admin Client、合同和密码策略，并导入设计令牌与 Maple 字体；不引入 React。先执行 `npm ci` 和 `npm run build:platform`，再编译 Rust。共享 Vite 配置生成同源外部模块、CSS、正体/斜体 WOFF2 和 OFL 许可证；单资源 256 KiB 硬预算、禁止 source map。`server/assets.rs` 唯一注册表按名称、MIME 和字节计算摘要并嵌入全部平台/业务资源，精确资源 GET/HEAD 才可长期缓存。HTML 使用外部登录模块和字体 preload；CSP 仅允许同源脚本、样式及字体，不允许内联脚本或 eval。 运行时不读取外部页面或资源覆盖。
 
 ## 5. 公共路由
 
@@ -427,7 +389,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    CLICK["用户点击文件下载"] --> GET["GET + __Host-dufs-session Cookie"]
+    CLICK["用户点击文件下载"] --> GET["GET + __Host-sarmg-dufs-ram-session Cookie"]
     GET --> SESSION{"会话有效？"}
     SESSION -- 否 --> UNAUTH["HTML 导航 303；其他请求 401"]
     SESSION -- 是 --> OPEN["从根 fd 用 openat2 打开一次<br/>同一句柄读取 metadata 与正文"]
@@ -863,7 +825,7 @@ flowchart TD
 现代桌面浏览器加载目录页
 ├─ 无有效会话：303 到英文登录页
 │  └─ POST `/api/v2/auth/login` JSON → Foundation 同源 + Argon2id → Set-Cookie + session JSON
-├─ 携带 __Host-dufs-session Cookie
+├─ 携带 __Host-sarmg-dufs-ram-session Cookie
 ├─ 解码 IndexData → JSON.parse 为 unknown → parseIndexData 严格校验并冻结
 ├─ 分页 list API → 每页最多 500 项 → DocumentFragment 批量渲染
 ├─ 使用编译期内置 ES modules/CSS/图标
@@ -922,7 +884,7 @@ flowchart TD
 
 operation 错误体可附加平铺的 `operation_id`/`state`/`http_status`，但客户端以 `X-Dufs-Operation-Id` 和 `X-Dufs-Operation-State` 为权威值。上传错误体可附加平铺的 `upload_id`/`upload_state`/`upload_length`/`upload_offset`，但客户端以 `X-Dufs-Upload-Id`、`X-Dufs-Operation-State`、`X-Dufs-Upload-Length` 和 `X-Dufs-Upload-Offset` 为权威值；只有严格绑定的 `409`、精确 upload 状态/长度/偏移和合法 `X-Dufs-Target-Revision`/`X-Dufs-Target-Replaceable` 才能触发覆盖选择。前端不解析旧 `message`、纯文本、vendor JSON 或嵌套/驼峰扩展。详细字段和恢复枚举见 [README 的统一错误反馈](../README.md#统一错误反馈)。
 
-Problem Details 只是 API 失败协议，不改变成功资源的表示。登录导航/表单错误仍可是 HTML，原生文件下载及其错误保持原协议；首方 API 的认证/CSRF 错误结构化，客户端仍先以 HTTP 状态与 `X-Dufs-Auth-Error` 分类。HEAD 不发送响应体，`204` 成功响应不增加 JSON 体。
+Problem Details 只表示 Dufs 业务 API 失败，不改变成功资源表示；认证/CSRF 失败始终使用 Foundation ErrorEnvelope。客户端按 HTTP 状态和经过共享合同验证的 auth.session_required/auth.csrf_rejected 分类，不使用私有认证响应头。HEAD 不发送正文，204 不增加 JSON。
 
 页面资源与文件接口只按同源方式工作，不生成 `Access-Control-Allow-*` 响应头。只有管理员 JSON 密码校验成功或会话验证成功的请求才把已验证 canonical username 写入 `remote_user`，认证失败或未认证请求在日志中显示 `-`。自定义 `$http_...` 变量中位于固定 `$http_` 前缀后的请求头名称会先统一为 ASCII 小写，再把下划线转换为连字符；因此 Authorization、Proxy-Authorization、Cookie 和 CSRF 的名称部分使用全小写、全大写或混合大小写时都会输出 `[REDACTED]`，普通请求头仍按 HTTP 的大小写不敏感语义记录。
 
@@ -977,7 +939,7 @@ flowchart TD
     B --> C["3. auth.rs<br/>Argon2id 账号、会话摘要和 CSRF"]
     C --> D["4. server.rs + server/{identity,path_policy,protocol,problem}.rs<br/>内容/状态/准入/生命周期组合，身份与公开协议"]
     D --> R["5. server/router.rs + router/{request,dispatch}.rs + assets.rs<br/>一次请求分类、生命周期/超时策略、端点分发与资源摘要"]
-    R --> G["6. server/session.rs + login_rate_limit.rs<br/>登录限流、Cookie、注销与写请求同源防护"]
+    R --> G["6. Foundation Admin Hyper + administrator_web.rs<br/>登录限流、Cookie、注销与写请求同源防护"]
     G --> OP["7. server/operation_registry.rs + state_store/{actor,database,model,operation,upload,purge}.rs<br/>当前 schema 分域仓储、统一 metadata/指纹、live 探针与恢复"]
     OP --> H["8. server/browser_api.rs<br/>mkdir/move/rename 与 upload preflight/discard JSON API"]
     H --> E["9. server/path_coordinator.rs<br/>同路径与祖先/后代写租约"]
@@ -1014,9 +976,9 @@ flowchart TD
 
 `build.rs` 在 Cargo 构建脚本阶段同时要求目标架构 `x86_64`、操作系统 `linux`、环境 `gnu` 和 64 位指针；只有精确 `x86_64-unknown-linux-gnu` 进入应用编译。它还把构建所对应的 Git SHA 写入 `dufs --version`；正式发布脚本显式传入完整 commit SHA，普通源码目录构建则读取当前仓库引用，无法确定时显示 `unknown`。`rust-toolchain.toml` 让 rustup 在仓库目录中自动选择 Rust/rustc/Cargo 1.98.0，并提供 Clippy 与 Rustfmt；`Cargo.toml` 用 `edition = "2024"` 和 `rust-version = "1.98"` 声明源码 edition 与最低 Rust 版本。项目不提供内置 TLS，唯一 Rust 服务端构建与网关后的 HTTP 后端部署一致。
 
-JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法常量模型，识别字符串拼接、模板、数组 `join`、别名、反射和动态全局属性访问；任何 computed 解构在变量声明、赋值表达式及默认参数（包括嵌套和 const alias）中无法静态求值时都失败关闭，内置负例还覆盖运行时把 `globalThis` 传给参数的跨过程旁路。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查 `clients/web/index.js`、`clients/web/login.js` 和全部生产模块；外部/解析输入保持为 `unknown` 并经类型守卫收窄，生产源码不保留显式或隐式 `any`。这无需迁移 `.ts`，但也不等价于 ESLint 或完整跨过程污点证明。六个 Bash 源总是先过 `bash -n`；本地存在 ShellCheck 时运行 warning 门，缺失时明确跳过且不联网，远程 CI 则固定安装并强制使用 0.11.0。部署门禁除 `systemd-analyze verify`、`nginx -t` 外，还会从包含空格、`&`、`#` 与反斜杠的真实 checkout fixture 读取部署文件；执行 `nginx -t` 前，生产 upstream 与全部 IPv4/IPv6 `80/443` 监听会一一改写为私有 Unix socket，并核对替换数量且拒绝任何网络监听残留，因此非 root runner 无需占用生产端口。随后检查启动隔离 nginx 与 mock upstream，分别验证规范重定向、未知 SNI、合法 SNI 下未知 Host、固定回源头、伪造入站 XFF 被 `$remote_addr` 覆盖、登录别名正文上限，以及连接/请求限制产生 `429` 后恢复 `200`。
+JavaScript 安全门固定使用 Acorn 8.17.0 解析 AST，并建立有界词法常量模型，识别字符串拼接、模板、数组 `join`、别名、反射和动态全局属性访问；任何 computed 解构在变量声明、赋值表达式及默认参数（包括嵌套和 const alias）中无法静态求值时都失败关闭，内置负例还覆盖运行时把 `globalThis` 传给参数的跨过程旁路。TypeScript 5.8.3 另以 `allowJs + checkJs + strict + noEmit` 检查 `clients/web/index.js`、`clients/web/login.js` 和全部生产模块；外部/解析输入保持为 `unknown` 并经类型守卫收窄，生产源码不保留显式或隐式 `any`。这无需迁移 `.ts`，但也不等价于 ESLint 或完整跨过程污点证明。六个 Bash 源总是先过 `bash -n`；本地存在 ShellCheck 时运行 warning 门，缺失时明确跳过且不联网，远程 CI 则固定安装并强制使用 0.11.0。部署门禁除 `systemd-analyze verify`、`nginx -t` 外，还会从包含空格、`&`、`#` 与反斜杠的真实 checkout fixture 读取部署文件；执行 `nginx -t` 前，生产 upstream 与全部 IPv4/IPv6 `80/443` 监听会一一改写为私有 Unix socket，并核对替换数量且拒绝任何网络监听残留，因此非 root runner 无需占用生产端口。随后检查启动隔离 nginx 与 mock upstream，分别验证规范重定向、未知 SNI、合法 SNI 下未知 Host、固定回源头、伪造入站 XFF 被 `$remote_addr` 覆盖、登录别名正文上限，以及连接/请求限制产生 `429` 后恢复 `200`。
 
-远程反馈由 `.github/workflows/read-only-ci.yml` 分层执行：静态层运行 Bash/ShellCheck、Acorn、TypeScript 和文档门，Rust 层运行 Rustfmt、Clippy 与全 targets/features 测试，浏览器层分别运行 Chromium 和 Firefox；质量层另跑覆盖率、部署行为、release self-test 与 release binary smoke。质量层的四项检查使用各自的明确前置条件；除运行被取消或自身前置失败外，一项检查失败不会跳过其他独立项，单次运行可同时报告更多真实根因而不制造缺少工具的级联错误。`.github/workflows/dependency-audit.yml` 在依赖清单变更及每周计划任务上运行 RustSec/npm audit，并把 yanked crate 作为失败；`.github/workflows/performance.yml` 每周用 release 构建扫描十万真实目录项并对首屏 30 秒宽松基线失败关闭；`.github/workflows/formal-release-e2e.yml` 在 tag、每周及人工触发时用临时 Ed25519 密钥真实执行完整正式包入口并独立复核输出，但不上传制品。这些工作流只有 `contents: read`，checkout 不保留凭据，Action 固定完整 commit SHA；所有 Node 任务只接受 24.8.0，仓库的两个权威入口也会在运行时精确验证 `.node-version` 与 `node --version`，从而在审计、构建和依赖执行前拒绝错误工具链。Rust 1.98.0、ShellCheck 0.11.0 及下载工具归档摘要也均固定。静态、Rust、浏览器、依赖审计、性能和 release binary 继续使用托管 `ubuntu-24.04`；需要 nginx 1.25.1+ 的质量 job 与正式包 E2E 使用 x64 `ubuntu-26.04`。GitHub 当前把 26.04 标为 preview，调度或镜像回归必须阻断门禁而不能触发旧语法 fallback。各 job 都把实际 `ImageVersion` 和工具版本写入日志。这些矩阵不接触生产签名密钥，也不创建或修改远端 tag/GitHub Release；正式包 E2E 只在隔离 clone 中创建临时本地 tag，且不能替代发布者对最终远端 tag 的批准。
+远程反馈由 `.github/workflows/read-only-ci.yml` 分层执行：静态层运行 Bash/ShellCheck、Acorn、TypeScript 和文档门，Rust 层运行 Rustfmt、Clippy 与全 targets/features 测试，浏览器层分别运行 Chromium 和 Firefox；质量层另跑覆盖率、部署行为、release self-test 与 release binary smoke。质量层的四项检查使用各自的明确前置条件；除运行被取消或自身前置失败外，一项检查失败不会跳过其他独立项，单次运行可同时报告更多真实根因而不制造缺少工具的级联错误。`.github/workflows/dependency-audit.yml` 在依赖清单变更及每周计划任务上运行 RustSec/npm audit，并把 yanked crate 作为失败；`.github/workflows/performance.yml` 每周用 release 构建扫描十万真实目录项并对首屏 30 秒宽松基线失败关闭；`.github/workflows/formal-release-e2e.yml` 在 tag、每周及人工触发时用临时 Ed25519 密钥真实执行完整正式包入口并独立复核输出，但不上传制品。这些工作流只有 `contents: read`，checkout 不保留凭据，Action 固定完整 commit SHA；所有 Node 任务只接受 26.7.0，仓库的两个权威入口也会在运行时精确验证 `.node-version` 与 `node --version`，从而在审计、构建和依赖执行前拒绝错误工具链。Rust 1.98.0、ShellCheck 0.11.0 及下载工具归档摘要也均固定。静态、Rust、浏览器、依赖审计、性能和 release binary 继续使用托管 `ubuntu-24.04`；需要 nginx 1.25.1+ 的质量 job 与正式包 E2E 使用 x64 `ubuntu-26.04`。GitHub 当前把 26.04 标为 preview，调度或镜像回归必须阻断门禁而不能触发旧语法 fallback。各 job 都把实际 `ImageVersion` 和工具版本写入日志。这些矩阵不接触生产签名密钥，也不创建或修改远端 tag/GitHub Release；正式包 E2E 只在隔离 clone 中创建临时本地 tag，且不能替代发布者对最终远端 tag 的批准。
 
 正式发布脚本只接受干净且由匹配 Cargo 版本的 tag 精确指向的 HEAD。它先从摘要锁定 bare façade 生成并验证目标 commit archive，在没有 `.git` 的私有副本中用 `env -i`、固定 PATH/工具链和独立 HOME、Cargo home/target、npm cache、XDG/tmp 强制运行完整检查。Cargo 依赖先 vendor 后 offline；npm 播种器只从 lockfile 的 HTTPS URL 与 SHA-512 integrity 接受宿主 cache 内容并重新散列，随后 prefer-offline，缺失包与 npm audit 仍可能联网。宿主 RustSec DB 只有在 canonical origin、`HEAD=FETCH_HEAD`、实体 FETCH_HEAD 不得比当前时间早超过 7 天或晚超过 300 秒，并通过物理/Git/内容封存检查时才可复用；alternates、不安全元数据、symlink/submodule/特殊项、untracked 路径以及 tracked 内容/mode 漂移均拒绝。合格数据库以无硬链接私有 clone 封存 revision、fetch epoch、index/config 校验和；不合格、过期或缺失时，在任何项目或依赖代码前用 dummy lockfile 在私有数据库联网刷新。发布入口先执行 `cargo audit --db ... --no-fetch --no-yanked` sealed pre-audit；随后在私有 Cargo home 以 `cargo fetch --locked` 填充完整锁图所需的 crates.io 索引项，再用同一封存运行 `--deny yanked`，避免 cargo-audit 在空索引上只打印“无法检查”却返回成功。完整 `scripts/check.sh` 必须通过 `DUFS_QUALITY_AUDIT_DB` 使用同一封存，并在其他项目/依赖步骤前先审计。封存时校验 seal 与新鲜度，pre-audit 和 yanked 检查后重验 seal；完整门禁后重验 seal 与新鲜度，随后销毁质量树和该 RustSec 数据库。该私有 Cargo home 每次全新创建，因此正式打包当前要求 registry 网络可达；宿主缓存不能替代锁图索引项抓取，缺失或抓取失败即失败关闭。门禁后用独立 snapshot index 复验 tracked 内容/mode 和非忽略新增路径，再从 commit fresh extract 进行签名构建。检查后、签名前和发布前继续反复确认 exact source。source revision 只接受完整 40 或 64 位小写十六进制 object ID；签名 key 只允许 Ed25519、Ed448、RSA ≥3072 bit 或 `prime256v1`/`secp384r1`/`secp521r1` ECDSA，弱/未知/非签名算法在产生可发布签名前失败关闭，所有关键 Shell 子命令显式传播失败而不依赖 `errexit` 上下文。
 

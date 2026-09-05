@@ -1,22 +1,22 @@
 :root {
-  color-scheme: light;
-  --bg-primary: #fff;
-  --bg-secondary: #fafafa;
-  --bg-tertiary: #fff;
-  --bg-hover: #fafafa;
-  --text-primary: #24292e;
-  --text-secondary: #5c5c5c;
-  --text-tertiary: #586069;
-  --text-accent: #0366d6;
-  --text-danger: #b42318;
-  --svg-primary: #24292e;
-  --svg-secondary: rgba(3, 47, 98, 0.5);
-  --svg-tertiary: #24292e;
-  --border-primary: #ddd;
+  color-scheme: light dark;
+  --bg-primary: var(--sarmg-bg-page);
+  --bg-secondary: var(--sarmg-bg-panel);
+  --bg-tertiary: var(--sarmg-bg-panel);
+  --bg-hover: var(--sarmg-bg-panel);
+  --text-primary: var(--sarmg-text-primary);
+  --text-secondary: var(--sarmg-text-primary);
+  --text-tertiary: var(--sarmg-text-primary);
+  --text-accent: var(--sarmg-text-link);
+  --text-danger: var(--sarmg-text-danger);
+  --svg-primary: var(--sarmg-text-primary);
+  --svg-secondary: var(--sarmg-text-primary);
+  --svg-tertiary: var(--sarmg-text-primary);
+  --border-primary: color-mix(in srgb, var(--sarmg-text-primary) 35%, transparent);
 }
 
 html {
-  font-family: -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--sarmg-font-ui);
   line-height: 1.5;
   color: var(--text-primary);
 }
@@ -664,26 +664,6 @@ button {
   .list-pagination {
     min-width: 0;
     overflow-wrap: anywhere;
-  }
-}
-
-/* dark theme */
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg-primary: #000;
-    --bg-secondary: #111;
-    --bg-tertiary: #111;
-    --bg-hover: #1a1a1a;
-    --text-primary: #fff;
-    --text-secondary: #ddd;
-    --text-tertiary: #586069;  /*Unchanged in both color schemes*/
-    --text-accent: #3191ff;
-    --text-danger: #ff7b72;
-    --svg-primary: #fff;
-    --svg-secondary: #fff;
-    --svg-tertiary: #fff6;
-    --border-primary: #fff6;
   }
 }
 

@@ -1,9 +1,10 @@
 use super::{MutationProgress, render_upload_problem};
 use crate::{
-    auth::{SessionInfo, session_token_from_headers},
+    auth::FilePrincipal,
     request_context::RequestContext,
     server::{
         HEALTH_CHECK_PATH, READINESS_CHECK_PATH, Request, Response, Server,
+        administrator_web::LOGIN_PATH,
         browser_api::{
             BROWSER_API_PREFIX, SOURCE_REVISION_HEADER, apply_revision_header,
             is_browser_api_endpoint,
@@ -23,9 +24,7 @@ use crate::{
         path_policy::{RootedPath, RoutePath},
         problem::{ApiError, ErrorCode, OperationProblemContext, RecoveryAdvice, render_problem},
         protocol::{OperationPublicState, UploadPublicState},
-        render_path_wait_limit,
-        session::{ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH, ADMIN_SESSION_PATH, LOGIN_PATH},
-        status_bad_request, status_csrf_forbid, status_method_not_allowed, status_not_found,
+        render_path_wait_limit, status_bad_request, status_method_not_allowed, status_not_found,
         upload::{
             TargetRevision, UploadErrorContext, UploadMode, UploadOptions,
             UploadOverwriteParseError, UploadOverwritePolicy, apply_upload_problem,
@@ -92,11 +91,6 @@ enum DeleteCondition {
     Missing,
     Invalid,
     Revision(TargetRevision),
-}
-
-struct AuthenticatedRequest {
-    token: String,
-    session: SessionInfo,
 }
 
 enum DeletePreparation {
@@ -173,33 +167,16 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch(mut self) -> Result<Response> {
-        if self.is_administrator_auth_request()
-            && !self
-                .server
-                .administrator_auth_headers_are_unambiguous(&self.headers, &self.uri)
-        {
-            self.server.render_administrator_auth_error(
-                &mut self.response,
-                StatusCode::BAD_REQUEST,
-                "invalid_security_header",
-                "Administrator authentication headers are invalid or ambiguous",
-                false,
-                None,
-            )?;
-            return Ok(self.response);
-        }
         if self.dispatch_public_routes().await? == Phase::Complete {
             return Ok(self.response);
         }
-        let Some(authenticated) = self.authenticate()? else {
+        let Some(authenticated) = self.authenticate().await? else {
             return Ok(self.response);
         };
-        if self.enforce_csrf(&authenticated)? == Phase::Complete
-            || self.dispatch_authenticated_api(&authenticated).await? == Phase::Complete
-        {
+        if self.dispatch_authenticated_api(&authenticated).await? == Phase::Complete {
             return Ok(self.response);
         }
-        self.dispatch_content(&authenticated.session).await?;
+        self.dispatch_content(&authenticated).await?;
         Ok(self.response)
     }
 
@@ -216,32 +193,25 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Complete);
         }
 
-        if self.request_path == ADMIN_LOGIN_PATH {
-            if self.method == Method::POST {
-                let peer_ip = self.context.peer().ip();
-                let request = self.take_request();
-                if let Some(username) = self
-                    .server
-                    .handle_login(request, peer_ip, &mut self.response)
-                    .await?
-                {
-                    self.server
-                        .content
-                        .args
-                        .http_logger
-                        .set_authenticated_user(self.context.access_log_mut(), &username);
-                }
-            } else {
-                status_method_not_allowed(&mut self.response, "POST");
-                self.server.render_administrator_auth_error(
-                    &mut self.response,
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    "Method not allowed for this administrator auth endpoint",
-                    false,
-                    None,
-                )?;
+        if sarmg_admin_hyper::HyperAdministratorRouter::owns_path(&self.request_path) {
+            let request = self.take_request();
+            let response = self
+                .server
+                .content
+                .administrator_router
+                .handle_incoming(request, self.context.peer())
+                .await;
+            if let Some(identity) = response
+                .extensions()
+                .get::<sarmg_admin_hyper::VerifiedAdministrator>()
+            {
+                self.server
+                    .content
+                    .args
+                    .http_logger
+                    .set_authenticated_user(self.context.access_log_mut(), identity.username());
             }
+            self.response = super::super::administrator_web::platform_response(response).await?;
             return Ok(Phase::Complete);
         }
 
@@ -266,115 +236,42 @@ impl<'a> RequestDispatcher<'a> {
         Ok(Phase::Continue)
     }
 
-    fn authenticate(&mut self) -> Result<Option<AuthenticatedRequest>> {
-        let token = session_token_from_headers(&self.headers)
-            .ok()
-            .flatten()
-            .map(str::to_owned);
-        let authenticated = token.and_then(|token| {
-            self.server
-                .content
-                .auth
-                .authenticate(&token)
-                .map(|session| AuthenticatedRequest { token, session })
-        });
-        let Some(authenticated) = authenticated else {
-            let administrator_auth_api = self.is_administrator_auth_request();
-            self.server.reject_unauthenticated(
-                &self.method,
-                &self.headers,
-                self.internal_api_request,
-                administrator_auth_api,
-                &mut self.response,
-            )?;
-            return Ok(None);
+    async fn authenticate(&mut self) -> Result<Option<FilePrincipal>> {
+        let identity = match sarmg_admin_hyper::authenticate_request(
+            &self.server.content.administrator,
+            &self.headers,
+            &self.uri,
+            &self.method,
+            "dufs-ram",
+            self.server.content.administrator_origin,
+        )
+        .await
+        {
+            Ok(identity) => identity,
+            Err(response) => {
+                self.response =
+                    super::super::administrator_web::platform_response(*response).await?;
+                self.server.redirect_unauthenticated_page(
+                    &self.method,
+                    &self.headers,
+                    self.internal_api_request,
+                    &mut self.response,
+                );
+                return Ok(None);
+            }
         };
         self.server
             .content
             .args
             .http_logger
-            .set_authenticated_user(self.context.access_log_mut(), &authenticated.session.user);
-        Ok(Some(authenticated))
+            .set_authenticated_user(self.context.access_log_mut(), &identity.username);
+        Ok(Some(FilePrincipal {
+            username: identity.username,
+        }))
     }
 
-    fn enforce_csrf(&mut self, authenticated: &AuthenticatedRequest) -> Result<Phase> {
-        if !matches!(
-            self.method,
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ) || self.server.csrf_is_valid(
-            &self.headers,
-            &self.uri,
-            self.context.peer().ip(),
-            &authenticated.token,
-            &authenticated.session.csrf_token,
-        ) {
-            return Ok(Phase::Continue);
-        }
-
-        if self.is_administrator_auth_request() {
-            self.server.render_administrator_auth_error(
-                &mut self.response,
-                StatusCode::FORBIDDEN,
-                "csrf_failed",
-                "CSRF validation failed",
-                false,
-                None,
-            )?;
-        } else {
-            status_csrf_forbid(&mut self.response);
-        }
-        if self.internal_api_request && !self.is_administrator_auth_request() {
-            render_problem(
-                &mut self.response,
-                &ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    ErrorCode::CSRF_FAILED,
-                    "CSRF validation failed",
-                ),
-            )?;
-        }
-        Ok(Phase::Complete)
-    }
-
-    async fn dispatch_authenticated_api(
-        &mut self,
-        authenticated: &AuthenticatedRequest,
-    ) -> Result<Phase> {
+    async fn dispatch_authenticated_api(&mut self, authenticated: &FilePrincipal) -> Result<Phase> {
         let relative_path = self.route_path.as_str().to_owned();
-        if self.request_path == ADMIN_SESSION_PATH {
-            if self.method == Method::GET {
-                self.server
-                    .send_administrator_session(&authenticated.session, &mut self.response)?;
-            } else {
-                status_method_not_allowed(&mut self.response, "GET");
-                self.server.render_administrator_auth_error(
-                    &mut self.response,
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    "Method not allowed for this administrator auth endpoint",
-                    false,
-                    None,
-                )?;
-            }
-            return Ok(Phase::Complete);
-        }
-        if self.request_path == ADMIN_LOGOUT_PATH {
-            if self.method == Method::POST {
-                self.server
-                    .handle_logout(&authenticated.token, &mut self.response);
-            } else {
-                status_method_not_allowed(&mut self.response, "POST");
-                self.server.render_administrator_auth_error(
-                    &mut self.response,
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    "Method not allowed for this administrator auth endpoint",
-                    false,
-                    None,
-                )?;
-            }
-            return Ok(Phase::Complete);
-        }
         if relative_path == READINESS_CHECK_PATH {
             if matches!(self.method, Method::GET | Method::HEAD) {
                 self.server
@@ -386,7 +283,7 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Complete);
         }
         if let Some(operation_id) = relative_path.strip_prefix(JOB_STATUS_PREFIX) {
-            self.dispatch_job_status(operation_id, &authenticated.session.user)
+            self.dispatch_job_status(operation_id, &authenticated.username)
                 .await?;
             return Ok(Phase::Complete);
         }
@@ -394,7 +291,7 @@ impl<'a> RequestDispatcher<'a> {
             if self.method == Method::GET {
                 self.server
                     .handle_list_api(
-                        &authenticated.session.user,
+                        &authenticated.username,
                         &self.query_params,
                         &mut self.response,
                     )
@@ -405,17 +302,10 @@ impl<'a> RequestDispatcher<'a> {
             return Ok(Phase::Complete);
         }
         if relative_path.starts_with(BROWSER_API_PREFIX) {
-            self.dispatch_browser_api(&authenticated.session.user)
-                .await?;
+            self.dispatch_browser_api(&authenticated.username).await?;
             return Ok(Phase::Complete);
         }
         Ok(Phase::Continue)
-    }
-
-    fn is_administrator_auth_request(&self) -> bool {
-        self.request_path == ADMIN_LOGIN_PATH
-            || self.request_path == ADMIN_SESSION_PATH
-            || self.request_path == ADMIN_LOGOUT_PATH
     }
 
     async fn dispatch_job_status(&mut self, id: &str, owner: &str) -> Result<()> {
@@ -464,7 +354,7 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
-    async fn dispatch_content(&mut self, session: &SessionInfo) -> Result<Phase> {
+    async fn dispatch_content(&mut self, session: &FilePrincipal) -> Result<Phase> {
         let Some(headers) = self.parse_mutation_headers()? else {
             return Ok(Phase::Complete);
         };
@@ -475,11 +365,17 @@ impl<'a> RequestDispatcher<'a> {
         if self.reject_root_delete(&path, headers)? == Phase::Complete {
             return Ok(Phase::Complete);
         }
-        let Some(mut target) = self.prepare_target(&path, headers, &session.user).await? else {
+        let Some(mut target) = self
+            .prepare_target(&path, headers, &session.username)
+            .await?
+        else {
             return Ok(Phase::Complete);
         };
         if self.reject_hidden_target(&mut target, headers).await? == Phase::Complete
-            || self.dispatch_upload_status(&target, &session.user).await? == Phase::Complete
+            || self
+                .dispatch_upload_status(&target, &session.username)
+                .await?
+                == Phase::Complete
         {
             return Ok(Phase::Complete);
         }
@@ -1026,7 +922,7 @@ impl<'a> RequestDispatcher<'a> {
         &mut self,
         target: &mut PreparedTarget,
         headers: MutationHeaders,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         match self.method {
             Method::GET | Method::HEAD => self.dispatch_content_read(target, session).await,
@@ -1043,7 +939,7 @@ impl<'a> RequestDispatcher<'a> {
     async fn dispatch_content_read(
         &mut self,
         target: &PreparedTarget,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         let head_only = self.method == Method::HEAD;
         if target.is_dir {
@@ -1099,7 +995,7 @@ impl<'a> RequestDispatcher<'a> {
         &mut self,
         target: &mut PreparedTarget,
         headers: MutationHeaders,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         let upload = headers.upload.expect("PUT headers were parsed");
         debug_assert_eq!(upload.mode, UploadMode::Fresh);
@@ -1149,7 +1045,7 @@ impl<'a> RequestDispatcher<'a> {
         &mut self,
         target: &mut PreparedTarget,
         headers: MutationHeaders,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         let upload = headers.upload.expect("PATCH headers were parsed");
         debug_assert!(upload.mode.is_resume());
@@ -1160,10 +1056,10 @@ impl<'a> RequestDispatcher<'a> {
         &mut self,
         target: &mut PreparedTarget,
         upload: UploadRequest,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         let options = UploadOptions {
-            owner: session.user.clone(),
+            owner: session.username.clone(),
             mode: upload.mode,
             upload_id: upload.id,
             upload_length: upload.length,
@@ -1197,7 +1093,7 @@ impl<'a> RequestDispatcher<'a> {
         &mut self,
         target: &mut PreparedTarget,
         headers: MutationHeaders,
-        session: &SessionInfo,
+        session: &FilePrincipal,
     ) -> Result<()> {
         let (id, operation) = target
             .delete_operation
@@ -1207,7 +1103,7 @@ impl<'a> RequestDispatcher<'a> {
             DeleteCondition::Revision(revision) => revision,
             _ => unreachable!("DELETE revision was validated before the operation began"),
         };
-        let revision_owner = OwnerId::persistent(&session.user);
+        let revision_owner = OwnerId::persistent(&session.username);
         let identity = self
             .server
             .content
@@ -1235,7 +1131,7 @@ impl<'a> RequestDispatcher<'a> {
         self.server
             .handle_delete(
                 DeleteRequest {
-                    owner: &session.user,
+                    owner: &session.username,
                     path: target.path.as_path(),
                     expected_revision_identity: identity,
                     expected_delete_identity: delete_identity,
@@ -1708,9 +1604,8 @@ mod tests {
             query_params: HashMap::new(),
             response: Response::default(),
         };
-        let session = SessionInfo {
-            user: "admin".to_owned(),
-            csrf_token: String::new(),
+        let session = FilePrincipal {
+            username: "admin".to_owned(),
         };
 
         let mut dispatch = Box::pin(dispatcher.dispatch_fresh_upload(

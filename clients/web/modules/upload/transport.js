@@ -1,8 +1,4 @@
 import { parseUnsignedHeader } from "../http/headers.js";
-import {
-  AUTH_ERROR_HEADER,
-  authFailureMessage,
-} from "../http/client.js";
 
 /**
  * @typedef {{
@@ -39,10 +35,7 @@ export function createUploadRequest(options) {
     ) {
       return;
     }
-    if (authFailureMessage(
-      request.status,
-      request.getResponseHeader(AUTH_ERROR_HEADER),
-    )) {
+    if (request.status === 401) {
       // Authentication is complete at the response-header boundary. Mark the
       // transport settled before invoking application code because its reload
       // callback can synchronously cause an abort event.

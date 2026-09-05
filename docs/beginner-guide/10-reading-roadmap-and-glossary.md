@@ -57,8 +57,8 @@
 阅读：
 
 - [src/auth.rs](../../src/auth.rs)；
-- [src/server/session.rs](../../src/server/session.rs)；
-- [src/server/login_rate_limit.rs](../../src/server/login_rate_limit.rs)；
+- [src/server/administrator_web.rs](../../src/server/administrator_web.rs)：Foundation HTTP 响应与产品页面的适配；
+- [clients/web/modules/platform-session.js](../../clients/web/modules/platform-session.js)：每文档唯一的 Foundation 浏览器客户端；
 - [clients/web/login.html](../../clients/web/login.html)；
 - [clients/web/login.js](../../clients/web/login.js)；
 - [tests/auth.rs](../../tests/auth.rs) 与 [tests/frontend/auth.spec.js](../../tests/frontend/auth.spec.js)。
@@ -187,7 +187,7 @@ URI → RoutePath → RootedPath → 根 FD 相对打开 → fstat identity
 
 | 用户动作/现象 | 前端起点 | 后端起点 | 先看测试 |
 | --- | --- | --- | --- |
-| 登录 | `login.html/js` | `session.rs` | `tests/auth.rs`、`auth.spec.js` |
+| 登录 | `login.html/js` | `administrator_web.rs` | `tests/auth.rs`、`auth.spec.js` |
 | 打开目录 | `app.js`、`listing/controller.js` | `listing.rs` | `tests/pagination.rs`、`browse.spec.js` |
 | 点击文件下载 | `listing/controller.js` | `download.rs` | `tests/range.rs` |
 | 点击房子回根目录 | `app.js` | 普通目录 GET | `browse.spec.js` |
@@ -565,7 +565,7 @@ Extended Attribute，Linux 文件扩展属性。覆盖重放时必须限制特�
 
 ### 修改 `clients/web/` 后为什么刷新没变化？
 
-运行中的旧二进制仍包含旧资源。重新 Cargo 构建、重启服务并重新取得页面。若修改的是 `EMBEDDED_ASSETS` 白名单中的 CSS、ES module、图标或其 MIME 声明，再确认页面请求了新的资源摘要 URL；`index.html`、`login.html` 和内联 `login.js` 不参与该摘要，修改它们时摘要前缀可以不变。
+修改平台或业务资源后，重新执行 npm run build:platform、Cargo 构建、重启并取得新页面。全部注册 JS（包括 login.js）、CSS、图标、字体和许可证参与资源摘要；HTML 模板本身不参与该资源摘要，修改模板时直接核对 document 与同源 CSP。
 
 ### 为什么 Dufs 不使用其他项目统一的 React/Vite？
 

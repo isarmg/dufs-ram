@@ -364,7 +364,7 @@ test("1280px 桌面在 400% 缩放时可在 320 CSS 像素内回流", async ({
         Number.parseFloat(style.borderLeftWidth) === 0 &&
         Number.parseFloat(style.borderBottomWidth) === 0 &&
         style.borderRadius === "0px" &&
-        style.outlineStyle === "none" &&
+        style.outlineStyle !== "none" && Number.parseFloat(style.outlineWidth) >= 2 &&
         style.boxShadow === "none",
     };
   });
@@ -411,7 +411,7 @@ test("强制颜色模式保留行内编辑器焦点与对话框语义", async ({
         style.borderRightStyle === "none" &&
         style.borderLeftStyle === "none" &&
         style.borderBottomStyle === "none" &&
-        style.outlineStyle === "none" &&
+        style.outlineStyle !== "none" && Number.parseFloat(style.outlineWidth) >= 2 &&
         style.boxShadow === "none" &&
         style.caretColor !== "rgba(0, 0, 0, 0)";
     }),
@@ -483,7 +483,7 @@ test("生产界面与公开错误源码只包含英文内置文案", async () =>
     join(assetsDir, "login.css"),
     join(assetsDir, "index.js"),
     resolve(__dirname, "../../src/server/listing.rs"),
-    resolve(__dirname, "../../src/server/session.rs"),
+    resolve(__dirname, "../../src/server/administrator_web.rs"),
     ...walkJavaScript(modulesDir),
   ];
   for (const file of files) {

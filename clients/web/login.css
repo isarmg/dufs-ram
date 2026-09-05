@@ -1,13 +1,12 @@
 :root {
-  color-scheme: light;
-  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont,
-    sans-serif;
-  --bg: #f5f6f3;
-  --surface-strong: #fafbf8;
-  --text: #202a33;
-  --muted: #60707c;
-  --primary: #245b75;
-  --danger: #a73d46;
+  color-scheme: light dark;
+  font-family: var(--sarmg-font-ui);
+  --bg: var(--sarmg-bg-page);
+  --surface-strong: var(--sarmg-bg-panel);
+  --text: var(--sarmg-text-primary);
+  --muted: var(--sarmg-text-primary);
+  --primary: var(--sarmg-text-link);
+  --danger: var(--sarmg-text-danger);
 }
 
 * {
@@ -176,18 +175,6 @@ input {
 
 .hidden {
   visibility: hidden;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg: #151a1d;
-    --surface-strong: #252c31;
-    --text: #edf2f4;
-    --muted: #a4b0b7;
-    --primary: #5fa8c8;
-    --danger: #ff8a92;
-  }
 }
 
 @media (forced-colors: active) {

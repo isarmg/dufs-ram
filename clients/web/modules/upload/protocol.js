@@ -108,8 +108,6 @@ export const UPLOAD_PROTOCOL_STATES = Object.freeze(
   /** @type {UploadProtocolState[]} */ (Object.keys(UPLOAD_STATE_RULES)),
 );
 
-const AUTH_ERROR_HEADER = "X-Dufs-Auth-Error";
-
 /**
  * Classify one upload response using the complete HTTP-status/header matrix.
  * This function is deliberately side-effect free so XHR, fetch-based empty
@@ -117,6 +115,7 @@ const AUTH_ERROR_HEADER = "X-Dufs-Auth-Error";
  *
  * @param {{
  *   phase: UploadRequestPhase,
+ *   errorCode?: string | null,
  *   status: number,
  *   headers: Headers | ((name: string) => string | null),
  *   expectedUploadId: string,
@@ -140,11 +139,10 @@ export function classifyUploadResponse(options) {
     return uploadClassification("invalid", null, true);
   }
 
-  const authError = readHeader(headers, AUTH_ERROR_HEADER);
   if (status === 401) {
     return uploadClassification("authentication", null, false);
   }
-  if (status === 403 && authError === "csrf") {
+  if (status === 403 && options.errorCode === "auth.csrf_rejected") {
     return uploadClassification("csrf", null, false);
   }
 

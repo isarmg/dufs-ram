@@ -1,9 +1,10 @@
 import { createActionDialogs } from "./operations/dialogs.js";
 import { createFileOperations } from "./operations/file_operations.js";
 import { createDirectoryListing } from "./listing/controller.js";
-import { createElement, createIcon, errorMessage } from "./shared/dom.js";
-// Dufs is the suite's explicit React/Vite migration exception: this client
-// remains a browser-native ES-module application with no framework bootstrap.
+import { createElement, createIcon } from "./shared/dom.js";
+import { ApiClientError } from "../dist/platform.js";
+import { administratorApi, authenticationErrorMessage } from "./platform-session.js";
+// The Foundation web-embedded-native profile supplies authentication and assets.
 import { parseIndexData } from "./shared/index_data.js";
 import { currentPageUrl } from "./shared/path.js";
 import { createUploadManager } from "./upload/manager.js";
@@ -36,8 +37,11 @@ const params = Object.freeze({
 export function start() {
   window.addEventListener("DOMContentLoaded", () => {
     void initialize().catch(error => {
-      console.error(error);
-      showFatalError(`Unable to initialize the file manager: ${errorMessage(error)}`);
+      if (error instanceof ApiClientError && error.status === 401) {
+        location.replace("/__dufs__/login");
+        return;
+      }
+      showFatalError(authenticationErrorMessage(error));
     });
   });
 }
@@ -48,8 +52,8 @@ async function initialize() {
   );
   if (!indexData) throw new Error("Page data is missing");
   /** @type {unknown} */
-  const rawData = JSON.parse(decodeBase64(indexData.content.textContent));
-  data = parseIndexData(rawData);
+  const rawData = JSON.parse(decodeBase64(indexData.content.textContent || ""));
+  data = parseIndexData(rawData, await administratorApi.restore());
   addBreadcrumb(data.href);
   document.title = `${data.href} - Dufs File Manager`;
 

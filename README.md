@@ -17,7 +17,7 @@ Dufs 是一个使用 Rust 编写的轻量级浏览器文件管理器。启动单
 - 资源预算和异步访问日志；
 - 编译内置的原生 HTML、CSS、JavaScript 管理页面。
 
-Dufs 是这一组项目中唯一不使用 React/Vite 的前端例外。`clients/web/` 保留无 bundler 的原生 ES modules，资源在编译期登记、摘要化并嵌入 Rust 二进制；这是一项明确的产品边界，不应把其他项目的 React/Vite 目录或构建流程机械复制进来。认证线协议仍与其他项目一致，例外只限于页面实现和打包方式。
+Dufs 采用 Foundation 正式的 `web-embedded-native` Profile。业务页面保持原生 ES modules，不引入 React；共享 Admin Client、设计令牌和 Maple 字体通过 Foundation 原生 Vite 配置构建，然后与业务资源一起登记、摘要化并嵌入 Rust 二进制。Node 基线、资源预算和认证策略由上游维护，不保留产品旧认证实现。
 
 本项目服务端只支持 Linux AMD64 GNU，即精确 target `x86_64-unknown-linux-gnu`，并面向现代桌面浏览器。不提供匿名访问、非管理员角色、账号分级权限、手机 Web、WebDAV、无 JavaScript 客户端、拖放上传、在线预览或编辑、静态网站托管、运行时页面资源覆盖、URL 子路径部署、用户自定义隐藏规则、Unix socket、CORS 或环境变量配置。
 
@@ -39,11 +39,9 @@ Dufs 是这一组项目中唯一不使用 React/Vite 的前端例外。`clients/
 - 唯一可编译、测试、部署和正式发布的服务端 target 是 `x86_64-unknown-linux-gnu`；`build.rs` 同时检查 `arch=x86_64`、`os=linux`、`env=gnu` 和 64 位指针，其他 target 在编译期直接失败；
 - 运行内核必须提供 `openat2`；不支持时程序会拒绝启动，二进制还必须匹配 CPU、libc 和动态加载器 ABI；
 - Rust、rustc 和 Cargo 1.98.0，源码使用 Rust 2024 edition；
-- Foundation 的 `sarmg-admin-auth`、`sarmg-contracts`、`sarmg-schema-identity`、`sarmg-server-target` 均精确
-  固定为 `=0.3.1`，Git rev 均精确固定为 `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0`；开发、CI 和发行不得
-  改用 workspace sibling、Cargo path dependency、可变 branch 或本地副本；
+- Foundation 认证使用 Core/Static/Hyper/Auth 与当前合同；本次平台化工作区仍为联调路径依赖，尚不是独立发行版。正式交付前必须统一新不可变来源、精确版本和锁文件，禁止复制平台实现或使用可变分支作为发布来源；
 - 建议使用 rustup；`rust-toolchain.toml` 已固定工具链并包含 Clippy、Rustfmt；
-- `.node-version` 是当前 Node 的仓库级版本基准，内容精确为 `24.8.0`，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致；`scripts/check.sh` 和 `scripts/package-release.sh` 均在任何审计、构建或依赖代码前比对完整 `node --version` 输出并拒绝其他版本。Node 只用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
+- `.node-version` 是当前 Node 的仓库级版本基准，内容精确为 `26.7.0`，并且必须与脚本常量、manifest/lockfile engine 和工作流声明交叉一致；`scripts/check.sh` 和 `scripts/package-release.sh` 均在任何审计、构建或依赖代码前比对完整 `node --version` 输出并拒绝其他版本。Node 只用于前端/文档门禁和发布 SBOM 规范化，不是生产运行依赖；
 - 本地开发门在安装 ShellCheck 时执行 `--severity=warning`，缺失时明确跳过而不会联网安装；远程 CI 按 SHA-256 固定并强制使用 ShellCheck 0.11.0，正式发布也要求 ShellCheck 可用；
 - 本地签名发布还要求可用的 `/proc/self/fd`、OpenSSL、`cargo-cyclonedx 0.5.9`、`cargo-audit 0.22.2`、支持 `mv --update=none --no-copy` 的 GNU coreutils、支持 Linux `RENAME_NOREPLACE` 的发布文件系统，以及固定 Rust 1.98.0 sysroot 中经过摘要审核的标准库版权文件；脚本只在 source 消失且 destination 仍是同一设备号/inode 的实体目录时确认发布，并把 `--update=none` 的静默跳过判为碰撞失败。这些不是 Dufs 生产进程依赖。
 
@@ -119,18 +117,18 @@ auth:
 使用要求：
 
 - 配置 username 必须是 Foundation 当前 canonical 形式：3～64 个小写 ASCII 字节，首尾必须为字母或数字，中间只允许小写字母、数字、`.`、`_`、`-`；明确禁止 `@`，但允许相邻分隔符。登录候选必须是 1～64 个 printable ASCII 字节（每字节 `0x20`～`0x7e`），服务端先执行 ASCII whitespace trim 和 ASCII lowercase，再要求结果符合 canonical 规则；持久配置不自动修正，只接受 canonical 形式；
-- 原始密码必须为 12–1024 个 UTF-8 字节且不含 ASCII 控制字符；`dufs hash-password`、JSON 登录解析和 Argon2id 哈希入口共用同一 Foundation 策略，配置中保存的是该命令生成的完整 PHC 字符串；
+- 原始密码必须为 12–1024 个 UTF-8 字节且不含 ASCII 控制字符；hash-password 与浏览器使用 Foundation 策略。登录 wire 只验证候选形状，错误凭据统一返回 401，不能据密码策略区分账号是否存在。
 - 哈希包含 `$`，在 YAML 中建议使用单引号包围完整账号值；
 - 重复 username、非 canonical username、非当前 Argon2id 参数或错误 salt/output 长度都会阻止启动；
 - 唯一角色是 `admin`；每个管理员均可浏览、上传、覆盖、移动、删除及搜索整个共享根；
-- 登录成功后使用服务端内存会话；空闲 30 分钟或创建满 12 小时后失效，时限按 Linux `CLOCK_BOOTTIME` 计算，系统休眠时间也计入；
-- 每个账号最多保留 32 个会话，全局最多 1024 个；重复登录优先淘汰同账号最久未活动的会话；
+- Foundation Static Store 持有内存会话，重启全部失效；空闲期限 30 分钟、绝对期限 12 小时，每管理员最多 32 个活动会话、全局最多 1024 个。平台 HTTP Adapter 使用统一的 Unix 微秒时间；访问不延长绝对期限，存储拒绝倒退时间。会话和 CSRF 为 32 字节随机值，服务端只保留其摘要。恢复接口轮换 CSRF；其他页面仍使用旧 CSRF 写入时会失败关闭，客户端刷新并重新恢复，绝不重放未知结果的写入。
+- 会话容量及淘汰顺序由 Foundation Static Store 固定实现，不在产品内复制策略。
 - 程序重启会清空会话，浏览器需要重新登录；
 - 登录 API 固定为 `POST /api/v2/auth/login`，会话查询和注销固定为 `GET /api/v2/auth/session`、`POST /api/v2/auth/logout`；三者使用 Foundation 当前 JSON/ErrorEnvelope 合同，不保留表单 POST 或旧路径 fallback；
 - 登录 POST 使用严格同源来源检查；Foundation 要求唯一、规范的 `Origin`、effective Host（包括 HTTP/2 authority）与 `Sec-Fetch-Site: same-origin`，生产只接受 HTTPS，环回开发才允许 HTTP；重复、逗号拼接、缺失或互相矛盾的安全头失败关闭；
 - 注销和全部受保护写入还必须提供唯一 `X-CSRF-Token`，并与当前会话绑定摘要做常量时间比较；Cookie 解析同样拒绝重复同名值。
 
-登录 POST 在读取正文前同时消耗全局 burst 16/每秒补充 1 个及单来源 IP burst 8/每秒补充 1 个的令牌；正在读取的登录正文还受全局 32、每 IP 4 个并发许可、16 KiB 上限和 10 秒总时限约束。解析并规范化 username 后再按“来源 IP + canonical username 摘要”组合键应用失败退避，并受全局最多两个 Argon2id 计算槽约束；一个来源对管理员的失败不会在密码校验前锁定其他来源。`Retry-After` 把剩余退避向上取整到完整秒并直接随当前 JSON `429` 错误返回。应用限制与网关限流是叠加关系，不能互相替代。
+Foundation 统一限制登录正文为 16 KiB、读取期限 10 秒、全局 32/每个真实 TCP 来源 4 个读取许可；取消或失败释放许可。失败预算为五分钟内每来源 20 次、每规范账号 10 次，最多两个 Argon2id 计算槽，取得计算槽最多等待两秒。失败预算耗尽返回 `429 auth.rate_limited` 和保守的 `Retry-After: 300`。这些是共享平台政策，不由 Dufs 实现或配置；网关仍须独立按真实客户端 IP 限速。
 
 未认证 GET/HEAD 只有在逐个 `Accept` 字段、逐个逗号项解析后发现精确的 `text/html` media type，且可选 `q` 值语法有效并大于 0 时，才会 `303` 到登录页。`text/htmlx`、`text/html;q=0`、重复或畸形 `q` 不会被当成页面导航，仍返回接口式 `401`。
 
@@ -250,7 +248,7 @@ Dufs 不提供用户自定义隐藏规则。目录列表和递归搜索会处理
 
 响应冲突时，实际 HTTP 状态码的优先级高于错误体的 `status`；operation 的 `X-Dufs-Operation-Id`/`X-Dufs-Operation-State` 响应头的优先级高于体内副本；上传的 `X-Dufs-Upload-Id`/`X-Dufs-Operation-State`/`X-Dufs-Upload-Length`/`X-Dufs-Upload-Offset` 响应头同样是权威值，覆盖冲突还要求严格解析 `X-Dufs-Target-Revision` 与 `X-Dufs-Target-Replaceable`。体内扩展用于统一显示和日志关联，不能覆盖传输层事实。
 
-Problem Details 不强行改写所有 HTTP 表示：登录导航和表单错误仍可返回 HTML，原生文件下载及其错误保持下载/纯文本语义。首方 API 的认证和 CSRF 失败也使用 Problem Details，但客户端仍先以 HTTP 状态和 `X-Dufs-Auth-Error` 分类。HEAD 响应不发送正文，上传状态必须从头读取；`204 No Content` 成功响应也不会为了“统一”而增加 JSON 体。
+业务 Problem Details 不改写平台认证合同：认证和 CSRF 失败原样返回 Foundation ErrorEnvelope。客户端对 401 立即结束未读正文；403 必须通过有界正文及当前合同校验才能识别 auth.csrf_rejected，不读取私有认证响应头。HTML 仅用于登录页面和业务导航。HEAD 响应不发送正文，204 不增加 JSON 体。
 
 解析后仍位于共享根内的相对符号链接可以使用。绝对符号链接和指向根外的符号链接会被隐藏并拒绝访问。需要管理其他磁盘或 virtiofs 导出目录时，应先将其挂载到共享根内。DELETE 可以处理挂载文件系统内部的普通对象，但后台目录回收不会跨越被删目录中的下一层 bind mount 或嵌套挂载；遇到该边界会保留并退避 purge job，卸载后继续清理，而不会递归删除另一存储域的内容。
 
@@ -270,7 +268,7 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 | `-c, --config <file>` | YAML 配置文件；路径及可解析别名必须位于共享根之外 |
 | `--state-dir <dir>` | 必填的 SQLite 状态目录；固定使用 `<dir>/state.sqlite3`，目录须为服务账号所有的 `0700` 非符号链接目录并与共享根分离 |
 | `-b, --bind <ips>` | 监听一个或多个 IPv4/IPv6 地址，默认 `127.0.0.1`；配置结果不能为空 |
-| `--trusted-proxy <networks>` | 信任一个或多个直连代理的 `X-Forwarded-For` / `X-Forwarded-Proto`；接受 IP 或 CIDR，默认不信任任何代理 |
+| `--development` | 显式启用 Foundation 回环 HTTP 开发模式；所有 bind 地址必须是回环地址，生产环境不得启用 |
 | `-p, --port <port>` | 监听端口，默认 `5000` |
 | `--log-format <format>` | 自定义 HTTP 访问日志格式 |
 | `--log-file <file>` | 将日志写入文件；路径及可解析别名必须位于共享根之外且不得与配置/状态文件冲突 |
@@ -290,7 +288,7 @@ Dufs 按 Linux 大小写敏感语义处理路径、路径租约和内部暂存�
 
 账号只能写入受保护 YAML 的 `auth`。CLI 不定义账号参数，任何未声明的命令行选项都由 clap 的通用未知参数检查拒绝。
 
-`--bind` 只接受 IP 地址，可以重复使用参数或用逗号分隔；主机名、文件路径、Unix socket 路径和完全重复的 IP 会被拒绝。`--trusted-proxy` 同样可重复或用逗号分隔，裸 IP 会规范化为单地址 CIDR；最多配置 128 个网段，单个 `/0` 或多个网段组合覆盖整个 IPv4/IPv6 地址空间都会被拒绝。命令行参数会整体覆盖 YAML 中对应的列表。
+`--bind` 只接受 IP 地址，可以重复或用逗号分隔；主机名、文件路径、Unix socket 路径和重复 IP 会被拒绝。命令行整体覆盖 YAML 列表。认证默认使用 Foundation 生产 HTTPS 模式，仅显式 `--development` 使用回环 HTTP 模式，认证和限流不读取代理头。
 
 `--request-timeout` 在响应头生成完成时结束计时。普通文件和单段 Range 正文传输没有总时长或最低速率限制，但每个文件分块连续 30 秒未能从源文件取得会使正文报错，已经取得的分块在服务端套接字连续 30 秒没有写入进展也会关闭连接；两项 idle deadline 相互独立，正文仍受活跃连接上限约束。公网部署仍应由网关施加符合业务需求的响应总时长、最低速率和空闲策略。
 
@@ -307,8 +305,6 @@ serve-path: /需要管理的目录
 state-dir: /var/lib/dufs
 bind:
   - 127.0.0.1
-trusted-proxies:
-  - 127.0.0.1/32
 port: 5000
 auth:
   - 'admin:$argon2id$…'
@@ -332,7 +328,7 @@ chmod 0600 ./dufs.yaml
 ./target/release/dufs --config ./dufs.yaml
 ```
 
-YAML 会拒绝未知字段和空的 `bind` 列表。`trusted-proxies` 可写成单个 IP/CIDR 字符串或列表，默认空；命令行显式提供 `--trusted-proxy` 时会整体覆盖 YAML 列表。`state-dir` 必须由 YAML 或命令行提供，目录必须满足上述私有目录约束，固定数据库目标不能是符号链接或目录；命令行显式指定时会覆盖 YAML 中的值。`max-search-entries` 必须位于支持的正数范围内，硬上限与直接列表的 100000 项保护一致。生产配置只来自命令行和 YAML，Dufs 不读取 `DUFS_*` 环境变量。
+YAML 拒绝未知字段和空的 `bind` 列表。`development` 默认为 false，仅用于回环 HTTP 联调。`state-dir` 必须由 YAML 或命令行提供，目录及固定数据库必须满足私有目录约束。命令行显式配置覆盖 YAML。`max-search-entries` 必须位于 1–100000。生产配置只来自命令行和 YAML，不读取 DUFS_* 环境变量。
 
 Linux 上的 YAML 文件必须由 root 或服务进程的有效用户拥有，只能使用精确的 `0400`、`0440`、`0600` 或 `0640`；使用组读位时，文件 gid 必须等于进程的有效 gid。文件还必须是无扩展 POSIX access ACL 的单硬链接普通文件。Dufs 以 `O_NOFOLLOW|O_NONBLOCK` 打开一次，在同一 fd 上探测 ACL、读取最多 1 MiB，并在探测和读取前后用 `fstat` 复核 dev/inode、mode、nlink、uid/gid、大小及纳秒级 mtime/ctime 均未变化。配置文件与日志文件都必须位于共享根之外；规范化父目录、最终目标及目录实体检查会拒绝经父目录符号链接等可解析别名落入共享根的路径，单硬链接要求则拒绝硬链接别名。两者不能指向同一规范目录项或同一已存在 dev/inode，也不能以目录项或对象别名碰撞 `state.sqlite3`、`state.sqlite3-journal`、`state.sqlite3-wal` 或 `state.sqlite3-shm`。
 
@@ -361,7 +357,7 @@ Dufs
 ./target/release/dufs --config /etc/dufs/dufs.yaml
 ```
 
-网关位于其他主机时，可显式绑定服务器内网 IP，并用 `--trusted-proxy <网关IP或窄CIDR>` 声明直连网关；只有确有多网卡监听需求时才使用 `0.0.0.0`，并应使用主机防火墙只允许网关访问该端口。
+网关位于其他主机时，可显式绑定服务器内网 IP；只有确有多网卡监听需求时才使用 0.0.0.0，并用防火墙只允许网关访问。生产同源模式要求外部 HTTPS Origin，网关必须固定并覆盖规范 Host。Foundation 登录来源预算使用真实 TCP peer，网关另外按实际客户端来源限流。
 
 Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等 URL 子路径。网关必须把外部根路径原样转发到 Dufs 根路径；推荐浏览器入口形如 `https://files.example.com/`。
 
@@ -376,11 +372,11 @@ Dufs 只支持部署在独立主机名的根路径 `/`，不支持 `/files/` 等
 - 网关到 Dufs 的回源协议必须固定为 HTTP/1.1，不能使用 h2c；浏览器到网关仍可使用 HTTP/2 或 HTTP/3；
 - 只接受配置的规范 Host；未知 HTTP/HTTPS Host 应由默认 server 在握手或请求阶段拒绝，HTTP 到 HTTPS 的跳转必须使用固定规范域名，不能把客户端 `$host` 拼入 Location；
 - 只接受规范域名，并以这个固定规范值覆盖上游 `Host`，同时把独立域名的根路径原样转发到后端，否则同源检查会失败；
-- 从可信网关传递单值 `X-Forwarded-Proto: https` 和单值真实客户端 `X-Forwarded-For`，并把网关的直连 IP 或窄 CIDR 显式配置到 `--trusted-proxy` / `trusted-proxies`；Dufs 只接受匹配直连 TCP peer 的代理头。没有配置时一律忽略这些头：登录限流使用 peer 地址，经 HTTPS 网关且带 `Origin` 的登录或写请求会因外部 scheme 无法证明而失败关闭；
+- Foundation 不以 X-Forwarded-For / X-Forwarded-Proto 作为认证或限流依据；网关必须终止 HTTPS、固定规范 Host，并防止其他进程绕过网关直连后端；
 - 不缓存登录、认证文件、Range、上传、API 或错误响应；
 - 保留上游的 `Cache-Control: private, no-store`；
 - 内部协议只使用规范 URI；尾斜杠、重复斜杠或非规范百分号编码不会被当成登录/API 的等价别名；
-- 保留 Dufs 在读取登录正文前的来源 IP admission、短正文总 deadline、全局 token bucket、按“客户端 IP + 账号摘要”组合键的失败退避和向上取整的 `Retry-After`；网关同时应对登录路由族设置 `limit_req`、`limit_conn`、短正文时限和明确的 `429`；
+- 使用 Foundation 登录正文、失败预算和 Argon2id 并发保护；网关另外限制真实客户端 IP。
 - 强制把 HTTP 入口重定向到 HTTPS，并在确认域名只提供 HTTPS 后启用 HSTS；
 - 必须使用独立主机名，不能与不可信应用共享同一主机名。
 
@@ -441,7 +437,7 @@ KillSignal=SIGTERM
 
 `clients/web/` 中的 HTML、CSS、JavaScript 和图标会在编译期固定写入可执行文件。运行时不读取外部页面目录，也不支持自定义 `404.html`。注册为版本化资源的 CSS、JavaScript 和图标以资源名、MIME 类型和内容共同生成摘要 URL；HTML 骨架和内联登录脚本不参与该前缀。只有精确命中的已知版本化资源使用长期缓存。
 
-生产运行不需要 Node.js 或前端打包步骤；Node.js 仅在质量门禁和签名发布阶段使用。
+生产运行不需要 Node.js；从源码构建必须先用当前 Node 26.7.0 执行 `npm ci`、`npm run build:platform`，再运行 Cargo。
 
 ## 本地检查
 
@@ -501,9 +497,9 @@ npm audit --audit-level=high
 ./scripts/check.sh
 ```
 
-该门禁还会用生产解析器校验 YAML 示例，以占位可执行文件做 systemd 静态验证，并让真实 nginx 对 mock upstream 执行隔离行为测试；它不启动真实 systemd unit 与 Dufs/nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是发布/部署必做项。门禁还执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测，并要求 Rust 总行覆盖率至少 70%、每个被插桩源码文件的行覆盖率至少 1%，避免零覆盖模块被总量掩盖；它还以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点，围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.9.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、current-only 版本切换和恢复步骤见[生产运维文档](docs/operations.md)。
+该门禁还会用生产解析器校验 YAML 示例，以占位可执行文件做 systemd 静态验证，并让真实 nginx 对 mock upstream 执行隔离行为测试；它不启动真实 systemd unit 与 Dufs/nginx 组合，生产数据副本上的启动、readiness 和 CRUD 冒烟仍是发布/部署必做项。门禁还执行原子发布目录的 no-clobber、Git replace/private-attributes 来源替换、许可证生成和 npm cache 播种自测，并要求 Rust 总行覆盖率至少 70%、每个被插桩源码文件的行覆盖率至少 1%，避免零覆盖模块被总量掩盖；它还以保守源码门检查 Markdown 的 inline/reference-style 本地链接和标题锚点，围栏代码块不参与链接解析，检查树中的符号链接会失败。JavaScript 安全检查使用固定的 Acorn 8.17.0 解析 AST，并以词法常量模型识别字符串拼接、模板、`join`、别名、反射及动态全局属性访问；动态 computed 解构的属性名无法静态求值时会失败关闭，变量声明、赋值表达式、默认参数、嵌套模式和 const alias 都有内置负例。TypeScript 5.8.3 另以 `allowJs + checkJs + strict + noEmit` 检查全部生产 JavaScript；请求、错误、上传协议、传输与 DOM 边界都用 JSDoc 从 `unknown` 显式收窄，显式或隐式 `any` 都不能绕过门禁。这是在保留原生 JavaScript 部署方式下的完整 strict 检查，但仍不等价于迁移为 `.ts`、ESLint 或完整跨过程污点证明。本地开发门在缺少 ShellCheck 时仍保持离线可用，但正式发布会失败关闭。Playwright 保留一次重试来收集诊断，但 `failOnFlakyTests` 会让“首轮失败、重试通过”仍然阻断门禁。发布包构建、签名验证、备份、current-only 版本切换和恢复步骤见[生产运维文档](docs/operations.md)。
 
-`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。全部 Node 任务只使用当前固定版本 24.8.0，静态层同时固定 TypeScript 5.9.3 和经 SHA-256 校验的 ShellCheck 0.11.0；Rust 层固定 1.98.0；质量层运行总量 70% 且逐文件 1% 的 Rust 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。`read-only-ci.yml` 的静态、Rust 和浏览器 job 使用 `ubuntu-24.04`，需要 nginx 1.25.1+ 的质量 job 使用 x64 `ubuntu-26.04`；同样执行真实部署检查的正式包 E2E 也使用该 26.04 标签。GitHub 当前将 26.04 镜像标为 preview；不可调度或镜像变化导致的门禁失败不得绕过，应等待官方 runner 恢复或经评审改用新的 current 基线。工作流在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。只读门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
+`.github/workflows/read-only-ci.yml` 只在 `pull_request`、`push` 或人工触发时读取源码：工作流权限固定为 `contents: read`，checkout 不持久化凭据，所有 Action 固定到完整 commit SHA。全部 Node 任务只使用当前固定版本 26.7.0，静态层同时固定 TypeScript 5.8.3 和经 SHA-256 校验的 ShellCheck 0.11.0；Rust 层固定 1.98.0；质量层运行总量 70% 且逐文件 1% 的 Rust 行覆盖率、真实 nginx/mock upstream 部署行为、发布脚本自测和 release binary smoke；浏览器层按 lockfile 的 Playwright 1.61.1 与 `@axe-core/playwright` 4.12.1 分开运行 Chromium 和 Firefox。Playwright 会在 runner 工作目录生成 retain-on-failure trace，但当前工作流不向 GitHub 上传该诊断目录；启用远程 artifact 需要另行明确授权并重新审查其中可能包含的请求与页面数据。独立依赖审计工作流在 lockfile/manifest 的 push、PR、每周计划或人工触发时联网运行固定的 cargo-audit 0.22.2 与 npm audit，避免漏掉直接推送同时不让无关变更承担审计数据库网络噪声。`read-only-ci.yml` 的静态、Rust 和浏览器 job 使用 `ubuntu-24.04`，需要 nginx 1.25.1+ 的质量 job 使用 x64 `ubuntu-26.04`；同样执行真实部署检查的正式包 E2E 也使用该 26.04 标签。GitHub 当前将 26.04 镜像标为 preview；不可调度或镜像变化导致的门禁失败不得绕过，应等待官方 runner 恢复或经评审改用新的 current 基线。工作流在日志记录实际 `ImageOS`、`ImageVersion` 和工具版本；GitHub 托管镜像中的 Bash、Git、curl、内核和系统库并没有被仓库逐包钉死。只读门不接触签名密钥、不创建发布，也不替代发布 tag 上的完整 `scripts/check.sh`。
 
 `.github/workflows/release-binary.yml` 只接受 `v<version>` tag push，复核 tag、Cargo 版本和 workflow commit 完全一致，并等待同一 tag/SHA 的只读 CI、依赖审计和正式包 E2E 全部成功。只读构建 job 生成嵌入完整 Git SHA 的 GNU/Linux x86-64 二进制、SHA-256，以及仅含当前版本和源码提交的确定性发布说明；最小写权限 job 只消费并复核这些不可变输入。
 
@@ -520,7 +516,7 @@ git status --short
 
 源树预检、隔离快照和每次解包检查会拒绝 symlink、submodule 及任何非普通文件/目录条目。脚本还会拒绝 Git replace refs、legacy grafts 和仓库私有 attributes；façade 只使用摘要锁定的最小 local config，所有 Git 命令清空 system/global 配置并禁用额外 attributes/replace。检查后、签名前和发布前都会重新确认 commit/tag/版本及原 checkout 的干净状态；前后两份源码 archive 还会复核 commit、tree、mode、额外路径和 SHA-256。
 
-发布包包含经固定 `cargo-cyclonedx 0.5.9` 离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；Foundation 0.3.1 的四个直接 crate 与可达的 `sarmg-error` 都在各自 crate 根分发同一份经上游门禁核验的 Apache-2.0 正文。项目 `LICENSE-APACHE` 不会替代任何缺失的依赖许可证正文。
+发布包必须包含离线生成并规范化的 `dufs.cdx.json`，以及从 vendored、可达的非开发依赖生成的 `THIRD_PARTY_LICENSES.txt`。第三方依赖必须提供经审核的 SPDX 表达式和自身许可证文本；每个 Foundation crate 的 Apache-2.0 正文与实际 Maple 字体的 OFL 许可证必须随发行物交付。项目许可证不能替代缺失的上游文本；新版不可变发布与完整供应链验收仍待完成。
 
 固定 Rust 1.98.0 标准库 notice、`BUILD-ENVIRONMENT.txt`、项目 Apache-2.0 许可证、第三方 notice 和 SBOM 均纳入包内 `SHA256SUMS`。签名私钥只在全部内容验证完成后短暂打开；正式发布仍应把构建和签名置于独立信任域。
 
@@ -563,7 +559,7 @@ git status --short
 │       │   ├── snapshot.rs         # 共享快照、HMAC 游标与显式缓存生命周期
 │       │   ├── tests.rs            # 列表、排序与遍历单元测试
 │       │   └── walk.rs             # 有界递归遍历、快照复核与 worker
-│       ├── login_rate_limit.rs     # 登录 token bucket 与失败退避
+│       ├── administrator_web.rs    # 仅登录 HTML 与共享响应正文适配
 │       ├── identity.rs             # owner/root 等稳定身份类型
 │       ├── internal_names.rs       # stage/trash 等内部保留名称
 │       ├── maintenance.rs          # 上传与删除内部项的统一后台维护
@@ -581,7 +577,7 @@ git status --short
 │       ├── router/
 │       │   ├── dispatch.rs         # 认证后端点与文件请求分发
 │       │   └── request.rs          # 单次解析的请求分类与 mutation 进度
-│       ├── session.rs              # 登录、注销与写请求校验
+│       # Session、Cookie、CSRF、限流由 Foundation Admin Hyper/Core/Static 拥有
 │       ├── state_store.rs           # 当前 revision 1 文件 SQLite 统一控制面 API
 │       ├── state_store/
 │       │   ├── actor.rs             # 有界命令 actor 与 live readiness 探针

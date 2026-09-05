@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const CSRF_HEADER: &str = "x-csrf-token";
-const AUTH_ERROR_HEADER: &str = "x-dufs-auth-error";
 
 struct BrowserContext<'a> {
     server: &'a TestServer,
@@ -64,9 +63,15 @@ fn browser_context<'a>(
     assert!(directives.contains(&"private"));
     assert!(directives.contains(&"no-store"));
     let data = utils::retrieve_json(&response.text()?).ok_or("Missing index data")?;
-    let csrf_token = data["session"]["csrf_token"]
-        .as_str()
+    assert_eq!(data.as_object().ok_or("Invalid index data")?.len(), 2);
+    assert!(data.get("href").is_some() && data.get("dir_exists").is_some());
+    let csrf_token = server
+        .request(Method::POST, server.url())
+        .build()?
+        .headers()
+        .get(CSRF_HEADER)
         .ok_or("Missing CSRF token")?
+        .to_str()?
         .to_string();
     let api_base = server.url().join("__dufs__/api/")?;
     Ok(BrowserContext {

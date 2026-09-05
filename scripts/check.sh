@@ -4,7 +4,7 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 required_cargo_audit_version="0.22.2"
-required_node_version="24.8.0"
+required_node_version="26.7.0"
 
 run() {
   printf '\n==> %s\n' "$*"
@@ -173,12 +173,13 @@ else
   run ./scripts/check-deployment.sh
 fi
 
+run npm ci --ignore-scripts --no-audit --no-fund
+run npm run build:platform
 run cargo fmt --all --check
 run cargo clippy --locked --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 run cargo test --locked --target x86_64-unknown-linux-gnu --all-targets --all-features
 run ./scripts/check-coverage.sh
 
-run npm ci --ignore-scripts --no-audit --no-fund
 run ./node_modules/.bin/tsc --version
 run node scripts/check-release-workflow.mjs
 run npm run check:js

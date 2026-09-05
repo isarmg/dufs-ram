@@ -20,6 +20,41 @@ struct EmbeddedAsset {
 // 运行时 URL 仍由下面的资源名和内容摘要生成，与仓库目录名解耦。
 const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
     EmbeddedAsset {
+        name: "dist/platform.js",
+        contents: include_bytes!("../../clients/web/dist/platform.js"),
+        content_type: "application/javascript; charset=UTF-8",
+    },
+    EmbeddedAsset {
+        name: "dist/platform.css",
+        contents: include_bytes!("../../clients/web/dist/platform.css"),
+        content_type: "text/css; charset=UTF-8",
+    },
+    EmbeddedAsset {
+        name: "dist/MapleMono.woff2",
+        contents: include_bytes!("../../clients/web/dist/MapleMono.woff2"),
+        content_type: "font/woff2",
+    },
+    EmbeddedAsset {
+        name: "dist/MapleMono-Italic.woff2",
+        contents: include_bytes!("../../clients/web/dist/MapleMono-Italic.woff2"),
+        content_type: "font/woff2",
+    },
+    EmbeddedAsset {
+        name: "dist/OFL.txt",
+        contents: include_bytes!("../../clients/web/dist/OFL.txt"),
+        content_type: "text/plain; charset=UTF-8",
+    },
+    EmbeddedAsset {
+        name: "login.js",
+        contents: include_bytes!("../../clients/web/login.js"),
+        content_type: "application/javascript; charset=UTF-8",
+    },
+    EmbeddedAsset {
+        name: "modules/platform-session.js",
+        contents: include_bytes!("../../clients/web/modules/platform-session.js"),
+        content_type: "application/javascript; charset=UTF-8",
+    },
+    EmbeddedAsset {
         name: "index.js",
         contents: include_str!("../../clients/web/index.js").as_bytes(),
         content_type: "application/javascript; charset=UTF-8",
@@ -47,6 +82,11 @@ const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
     EmbeddedAsset {
         name: "modules/http/client.js",
         contents: include_str!("../../clients/web/modules/http/client.js").as_bytes(),
+        content_type: "application/javascript; charset=UTF-8",
+    },
+    EmbeddedAsset {
+        name: "modules/http/platform-error.js",
+        contents: include_bytes!("../../clients/web/modules/http/platform-error.js"),
         content_type: "application/javascript; charset=UTF-8",
     },
     EmbeddedAsset {

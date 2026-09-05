@@ -82,6 +82,7 @@ fn signal_drains_an_active_download_and_stops_accepting(
         .context("size the large download fixture")?;
     let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
     let mut child = command
+        .arg("--development")
         .arg(temp.path())
         .args(["--bind", "127.0.0.1"])
         .args(["--port", "0"])
@@ -161,6 +162,7 @@ fn shutdown_deadline_checkpoints_a_stalled_upload_before_exit() -> Result<(), Bo
     let state_db = state_dir.path().join("state.sqlite3");
     let (mut command, _auth_config) = dufs_command(&[TEST_ACCOUNT]);
     let mut child = command
+        .arg("--development")
         .arg(temp.path())
         .args(["--bind", "127.0.0.1"])
         .args(["--port", "0"])

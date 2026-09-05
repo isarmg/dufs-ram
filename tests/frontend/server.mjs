@@ -46,7 +46,7 @@ const cargoTargetDir = resolve(
   projectRoot,
   process.env.CARGO_TARGET_DIR || "target",
 );
-const binary = join(
+const binary = process.env.DUFS_FRONTEND_BINARY || join(
   cargoTargetDir,
   "x86_64-unknown-linux-gnu",
   "debug",
@@ -81,8 +81,6 @@ const child = spawn(
     shareRoot,
     "--bind",
     "127.0.0.1",
-    "--trusted-proxy",
-    "127.0.0.1/32",
     "--port",
     "0",
     "--min-free-space",

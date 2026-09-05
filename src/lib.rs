@@ -15,4 +15,4 @@ pub mod request_context;
 pub mod server;
 pub mod utils;
 
-pub use args::{Args, TrustedProxy};
+pub use args::Args;

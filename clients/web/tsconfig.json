@@ -2,6 +2,7 @@
   "compilerOptions": {
     "allowJs": true,
     "checkJs": true,
+    "types": ["vite/client"],
     "lib": [
       "ES2022",
       "DOM",
@@ -16,5 +17,6 @@
   },
   "include": [
     "**/*.js"
-  ]
+  ],
+  "exclude": ["dist"]
 }

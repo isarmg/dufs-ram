@@ -75,7 +75,7 @@ fn invalid_session_is_not_written_to_access_log(tmpdir: TempDir) -> Result<(), E
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .get(format!("http://localhost:{port}"))
-        .header(COOKIE, "__Host-dufs-session=forged-admin")
+        .header(COOKIE, "sarmg-dufs-ram-session=forged-admin")
         .send()?;
     assert_eq!(response.status(), 401);
 
@@ -580,6 +580,7 @@ fn spawn_logged_server_with_accounts(
     let state_dir = private_state_dir()?;
     let (mut command, _auth_config) = dufs_command(accounts);
     let mut child = command
+        .arg("--development")
         .arg(tmpdir.path())
         .arg("-p")
         .arg("0")
