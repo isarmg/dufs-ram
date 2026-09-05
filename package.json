@@ -8,7 +8,7 @@
     "node": ">=26.7.0 <27"
   },
   "scripts": {
-    "build:platform": "vite build --config vite.platform.config.mjs && tsc -p clients/web/tsconfig.platform.json",
+    "build:platform": "node scripts/build-platform.mjs && tsc -p clients/web/tsconfig.platform.json",
     "check:docs": "node scripts/check-docs.mjs",
     "check:js": "node scripts/check-js.mjs",
     "check:types": "tsc -p clients/web/tsconfig.json",
