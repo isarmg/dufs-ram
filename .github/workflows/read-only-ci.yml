@@ -191,6 +191,8 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
         run: |
           set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build:platform
           ./scripts/check-coverage.sh
       - name: Install deployment validator when absent
         id: deployment_validator

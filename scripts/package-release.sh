@@ -3815,7 +3815,7 @@ rustc_bin_dir="${rustc_command%/*}"
 node_bin_dir="${node_command%/*}"
 npm_bin_dir="${npm_command%/*}"
 shellcheck_bin_dir="${shellcheck_command%/*}"
-release_tool_path="$cargo_bin_dir:$rustc_bin_dir:/usr/local/bin:/usr/bin:/bin"
+release_tool_path="$cargo_bin_dir:$rustc_bin_dir:$node_bin_dir:$npm_bin_dir:/usr/local/bin:/usr/bin:/bin"
 quality_tool_path="$cargo_bin_dir:$rustc_bin_dir:$node_bin_dir:$npm_bin_dir"
 quality_tool_path+=":$shellcheck_bin_dir"
 quality_tool_path+=":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -4215,6 +4215,37 @@ install -d -m 0700 "$release_build_source/.cargo"
 install -m 0600 \
   "$vendor_config" \
   "$release_build_source/.cargo/config.toml"
+
+# Compile embedded Web assets again from the fresh signed-build extraction.
+# Never reuse mutable output or npm configuration from the quality-gate tree.
+release_npm_cache="$release_stage/release-npm-cache"
+install -d -m 0700 "$release_npm_cache"
+run_node_entrypoint "$node_command" \
+  "$release_build_source/scripts/seed-npm-cache.mjs" \
+  "$release_build_source/package-lock.json" \
+  "$host_npm_cache" \
+  "$release_npm_cache" \
+  "$npm_command"
+install -m 0600 /dev/null "$release_isolated_home/npm-userconfig"
+install -m 0600 /dev/null "$release_isolated_home/npm-globalconfig"
+(
+  cd "$release_build_source"
+  release_web_environment=(
+    env -i
+    "HOME=$release_isolated_home"
+    "PATH=$release_tool_path"
+    "LANG=C"
+    "LC_ALL=C"
+    "TMPDIR=$release_tmp_dir"
+    "npm_config_cache=$release_npm_cache"
+    "npm_config_userconfig=$release_isolated_home/npm-userconfig"
+    "npm_config_globalconfig=$release_isolated_home/npm-globalconfig"
+    "npm_config_ignore_scripts=true"
+    "npm_config_offline=true"
+  )
+  "${release_web_environment[@]}" "$npm_command" ci --offline --ignore-scripts --no-audit --no-fund
+  "${release_web_environment[@]}" "$npm_command" run build:platform
+)
 
 release_rustflags="--remap-path-prefix=$release_build_source=/usr/src/dufs"
 release_rustflags+=$'\x1f'
