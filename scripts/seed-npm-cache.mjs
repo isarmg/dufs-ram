@@ -77,11 +77,18 @@ async function seedCache(lock, source, destination, cache) {
     try {
       record = await cache.get(sourceContentCache, key);
     } catch (error) {
-      if (error?.code === "ENOENT") {
+      if (error?.code !== "ENOENT") throw error;
+      // GitHub release downloads redirect to expiring asset URLs. npm can
+      // retain the content by digest without an index entry for the original
+      // locked URL. Retrieve only the exact locked bytes, never redirect data
+      // or arbitrary cache configuration; put() below rechecks SHA-512.
+      try {
+        record = { data: await cache.get.byDigest(sourceContentCache, package_.integrity) };
+      } catch (contentError) {
+        if (contentError?.code !== "ENOENT") throw contentError;
         missing++;
         continue;
       }
-      throw error;
     }
     // Passing the lockfile integrity to put() re-hashes the bytes. A poisoned
     // cache entry therefore fails instead of being copied under a trusted key.
@@ -144,6 +151,21 @@ async function runSelfTest(npmCliPath) {
     );
     if (!copied.data.equals(data)) {
       throw new Error("npm cache self-test changed tarball bytes");
+    }
+
+    const redirectedLock = structuredClone(lock);
+    const redirectedUrl = "https://github.com/example/library/releases/download/v1.0.0/library-1.0.0.tgz";
+    redirectedLock.packages["node_modules/example"].resolved = redirectedUrl;
+    const redirected = await seedCache(redirectedLock, source, join(root, "redirected"), cache);
+    if (redirected.seeded !== 1 || redirected.missing !== 0) {
+      throw new Error("npm cache self-test lost digest-bound redirected content");
+    }
+    const redirectedCopy = await cache.get(
+      join(root, "redirected", "_cacache"),
+      `make-fetch-happen:request-cache:${redirectedUrl}`,
+    );
+    if (!redirectedCopy.data.equals(data)) {
+      throw new Error("npm cache self-test changed redirected tarball bytes");
     }
 
     lock.packages["node_modules/example"].integrity = integrity;
